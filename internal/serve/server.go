@@ -3292,7 +3292,7 @@ func (s *Server) handlePaneInputV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build pane target
-	paneTarget := fmt.Sprintf("%s:%d", sessionID, paneIdx)
+	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
 
 	if err := tmux.SendKeys(paneTarget, req.Text, req.Enter); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
@@ -3325,7 +3325,7 @@ func (s *Server) handlePaneInterruptV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build pane target
-	paneTarget := fmt.Sprintf("%s:%d", sessionID, paneIdx)
+	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
 
 	// Send Ctrl+c to interrupt
 	if err := tmux.SendKeys(paneTarget, "C-c", false); err != nil {
@@ -3368,7 +3368,7 @@ func (s *Server) handlePaneOutputV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build pane target
-	paneTarget := fmt.Sprintf("%s:%d", sessionID, paneIdx)
+	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
 
 	if err := s.streamManager.StartStream(paneTarget); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
@@ -3404,7 +3404,7 @@ func (s *Server) handleGetPaneTitleV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build pane target
-	paneTarget := fmt.Sprintf("%s:%d", sessionID, paneIdx)
+	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
 
 	title, err := tmux.GetPaneTitle(paneTarget)
 	if err != nil {
@@ -3445,7 +3445,7 @@ func (s *Server) handleSetPaneTitleV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build pane target
-	paneTarget := fmt.Sprintf("%s:%d", sessionID, paneIdx)
+	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
 
 	if err := tmux.SetPaneTitle(paneTarget, req.Title); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
@@ -3478,7 +3478,7 @@ func (s *Server) handleStartPaneStreamV1(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Stream manager targets use raw tmux-style "session:pane_idx".
-	target := fmt.Sprintf("%s:%d", sessionID, paneIdx)
+	target := paneTargetForIndex(r.Context(), sessionID, paneIdx)
 	topic := streamTopicForTarget(target)
 
 	if err := s.streamManager.StartStream(target); err != nil {
@@ -3508,7 +3508,7 @@ func (s *Server) handleStopPaneStreamV1(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	target := fmt.Sprintf("%s:%d", sessionID, paneIdx)
+	target := paneTargetForIndex(r.Context(), sessionID, paneIdx)
 	s.streamManager.StopStream(target)
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
