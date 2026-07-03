@@ -1356,12 +1356,32 @@ func (c *Client) CapturePaneOutput(target string, lines int) (string, error) {
 	return c.CapturePaneOutputContext(ctx, target, lines)
 }
 
-// CapturePaneOutputContext captures the output of a pane with cancellation support.
-func (c *Client) CapturePaneOutputContext(ctx context.Context, target string, lines int) (string, error) {
+// capturePaneArgs builds the tmux capture-pane argv. The -e flag preserves ANSI
+// escape sequences (needed for xterm.js first-paint); without it tmux strips them.
+// Negative line counts are normalized so the -S offset is always well-formed.
+func capturePaneArgs(target string, lines int, ansi bool) []string {
 	if lines < 0 {
 		lines = -lines
 	}
-	return c.RunContext(ctx, "capture-pane", "-t", target, "-p", "-S", fmt.Sprintf("-%d", lines))
+	args := []string{"capture-pane", "-t", target, "-p", "-S", fmt.Sprintf("-%d", lines)}
+	if ansi {
+		args = append(args, "-e")
+	}
+	return args
+}
+
+func (c *Client) capturePane(ctx context.Context, target string, lines int, ansi bool) (string, error) {
+	return c.RunContext(ctx, capturePaneArgs(target, lines, ansi)...)
+}
+
+// CapturePaneOutputContext captures the output of a pane with cancellation support (ANSI stripped).
+func (c *Client) CapturePaneOutputContext(ctx context.Context, target string, lines int) (string, error) {
+	return c.capturePane(ctx, target, lines, false)
+}
+
+// CapturePaneOutputANSIContext captures pane output preserving ANSI escapes (capture-pane -e).
+func (c *Client) CapturePaneOutputANSIContext(ctx context.Context, target string, lines int) (string, error) {
+	return c.capturePane(ctx, target, lines, true)
 }
 
 // CapturePaneOutput captures the output of a pane (default client)
@@ -1389,6 +1409,11 @@ func CapturePaneVisible(target string) (string, error) {
 // CapturePaneOutputContext captures the output of a pane with cancellation support (default client).
 func CapturePaneOutputContext(ctx context.Context, target string, lines int) (string, error) {
 	return DefaultClient.CapturePaneOutputContext(ctx, target, lines)
+}
+
+// CapturePaneOutputANSIContext captures pane output preserving ANSI escapes (default client).
+func CapturePaneOutputANSIContext(ctx context.Context, target string, lines int) (string, error) {
+	return DefaultClient.CapturePaneOutputANSIContext(ctx, target, lines)
 }
 
 // GetCurrentSession returns the current session name (if in tmux)

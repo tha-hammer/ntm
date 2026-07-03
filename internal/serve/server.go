@@ -3387,7 +3387,17 @@ func (s *Server) handlePaneOutputV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	output, err := tmux.CapturePaneOutputContext(r.Context(), paneTarget, lines)
+	// ?ansi=1 preserves ANSI escapes for xterm.js first-paint; default stays stripped.
+	ansi := r.URL.Query().Get("ansi") == "1"
+	var (
+		output string
+		err    error
+	)
+	if ansi {
+		output, err = tmux.CapturePaneOutputANSIContext(r.Context(), paneTarget, lines)
+	} else {
+		output, err = tmux.CapturePaneOutputContext(r.Context(), paneTarget, lines)
+	}
 	if err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
 		return

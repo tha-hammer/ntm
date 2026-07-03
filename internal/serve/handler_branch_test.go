@@ -1734,6 +1734,40 @@ func TestHandlePaneOutputV1_DefaultLines(t *testing.T) {
 }
 
 // =============================================================================
+// handlePaneOutputV1 — ?ansi=1 wiring + validation ordering
+// =============================================================================
+
+func TestHandlePaneOutputV1_ANSIParam(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	// ansi=1 against a non-existent session still routes through the (ANSI) capture
+	// path and errors on the missing tmux session — proves the branch is wired and
+	// leaves status handling unchanged.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/noexist/panes/0/output?ansi=1", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("sessionId", "noexist")
+	rctx.URLParams.Add("paneIdx", "0")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	srv.handlePaneOutputV1(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("ansi=1 status = %d, want 500; body: %s", rec.Code, rec.Body.String())
+	}
+
+	// Invalid lines must still 400 even with ansi=1 (validation ordering unchanged).
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/sessions/noexist/panes/0/output?ansi=1&lines=abc", nil)
+	rctx = chi.NewRouteContext()
+	rctx.URLParams.Add("sessionId", "noexist")
+	rctx.URLParams.Add("paneIdx", "0")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	srv.handlePaneOutputV1(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("ansi=1&lines=abc status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// =============================================================================
 // handlePaneInterruptV1 — tmux error path
 // =============================================================================
 

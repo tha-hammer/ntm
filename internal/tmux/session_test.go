@@ -121,6 +121,42 @@ func contains(s, substr string) bool {
 	return false
 }
 
+// TestCapturePaneArgsANSIToggle locks the tmux capture-pane contract: -e is added
+// iff ansi is requested, the default argv is byte-for-byte unchanged (regression
+// guard for existing callers), and negative line counts are normalized.
+func TestCapturePaneArgsANSIToggle(t *testing.T) {
+	argvHas := func(argv []string, flag string) bool {
+		for _, a := range argv {
+			if a == flag {
+				return true
+			}
+		}
+		return false
+	}
+
+	base := capturePaneArgs("sess.1", 100, false)
+	if got := strings.Join(base, " "); got != "capture-pane -t sess.1 -p -S -100" {
+		t.Fatalf("default argv changed: %q", got)
+	}
+	if argvHas(base, "-e") {
+		t.Fatal("default (ansi=false) argv must not contain -e")
+	}
+
+	ansi := capturePaneArgs("sess.1", 100, true)
+	if !argvHas(ansi, "-e") {
+		t.Fatal("ansi=true argv must contain -e")
+	}
+	// ANSI argv == stripped argv + "-e" appended; nothing else changes.
+	if got := strings.Join(ansi, " "); got != "capture-pane -t sess.1 -p -S -100 -e" {
+		t.Fatalf("ansi argv unexpected: %q", got)
+	}
+
+	// Negative line counts normalize to a positive -S offset.
+	if got := strings.Join(capturePaneArgs("sess.1", -50, false), " "); got != "capture-pane -t sess.1 -p -S -50" {
+		t.Fatalf("negative lines not normalized: %q", got)
+	}
+}
+
 func TestInTmux(t *testing.T) {
 	// This will be false in test environment
 	// Just verify the function doesn't panic
