@@ -1,5 +1,6 @@
 # Binaries (only at root, not cmd/ntm/)
 /ntm
+/closure-adapter
 *.exe
 dist/
 
@@ -51,6 +52,8 @@ storage.sqlite3-*
 .beads/.write.lock
 .beads/.sync.lock
 .beads/.migration-hint-ts
+.beads/embeddeddolt/
+.beads/backup/
 
 # Temporary/backup files
 *.bak
