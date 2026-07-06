@@ -465,6 +465,60 @@ func TestSetGetRedactionConfig(t *testing.T) {
 	}
 }
 
+// bd-oekc2: GetRedactionConfig must deep-copy redaction.Config's
+// reference-typed fields so a caller that takes the godoc's "copy"
+// promise at face value cannot leak mutations back into the running
+// server. Pre-fix, `cp := *s.redactionCfg` was a shallow copy and the
+// returned struct's Allowlist/ExtraPatterns/DisabledCategories aliased
+// the server's live state.
+func TestGetRedactionConfig_DeepCopiesReferenceFields(t *testing.T) {
+	s := &Server{}
+	cfg := &RedactionConfig{
+		Enabled: true,
+		Config: redaction.Config{
+			Mode:      redaction.ModeRedact,
+			Allowlist: []string{"original-allow-0", "original-allow-1"},
+			ExtraPatterns: map[redaction.Category][]string{
+				redaction.CategoryGenericAPIKey: {"original-extra-0"},
+			},
+			DisabledCategories: []redaction.Category{redaction.CategoryPassword},
+		},
+	}
+	s.SetRedactionConfig(cfg)
+
+	first := s.GetRedactionConfig()
+	if first == nil {
+		t.Fatal("expected non-nil config")
+	}
+
+	// Mutate every reference-typed field on the returned "copy".
+	first.Config.Allowlist[0] = "MUTATED-ALLOW"
+	first.Config.Allowlist = append(first.Config.Allowlist, "appended-allow")
+	first.Config.ExtraPatterns[redaction.CategoryGenericAPIKey][0] = "MUTATED-EXTRA"
+	first.Config.ExtraPatterns[redaction.CategoryPassword] = []string{"injected"}
+	first.Config.DisabledCategories[0] = redaction.CategoryGenericAPIKey
+
+	// A subsequent fetch must reflect the original config — the
+	// godoc's "copy" promise means the server's live state is
+	// untouched even after the mutations above.
+	second := s.GetRedactionConfig()
+	if second == nil {
+		t.Fatal("expected non-nil config on second fetch")
+	}
+	if got := second.Config.Allowlist; len(got) != 2 || got[0] != "original-allow-0" || got[1] != "original-allow-1" {
+		t.Errorf("Allowlist leaked mutation: %#v", got)
+	}
+	if got := second.Config.ExtraPatterns[redaction.CategoryGenericAPIKey]; len(got) != 1 || got[0] != "original-extra-0" {
+		t.Errorf("ExtraPatterns[APIKey] leaked mutation: %#v", got)
+	}
+	if _, ok := second.Config.ExtraPatterns[redaction.CategoryPassword]; ok {
+		t.Errorf("ExtraPatterns leaked an injected key: %#v", second.Config.ExtraPatterns)
+	}
+	if got := second.Config.DisabledCategories; len(got) != 1 || got[0] != redaction.CategoryPassword {
+		t.Errorf("DisabledCategories leaked mutation: %#v", got)
+	}
+}
+
 func TestRedactingResponseWriter(t *testing.T) {
 	t.Log("TEST: TestRedactingResponseWriter - starting")
 

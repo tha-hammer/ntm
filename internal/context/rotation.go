@@ -254,6 +254,10 @@ func (s *DefaultPaneSpawner) getAgentCommand(agentType string) string {
 			if s.config.Agents.Gemini != "" {
 				return s.config.Agents.Gemini
 			}
+		case agent.AgentTypeAntigravity:
+			if s.config.Agents.Antigravity != "" {
+				return s.config.Agents.Antigravity
+			}
 		case agent.AgentTypeCursor:
 			if s.config.Agents.Cursor != "" {
 				return s.config.Agents.Cursor
@@ -280,6 +284,9 @@ func (s *DefaultPaneSpawner) getAgentCommand(agentType string) string {
 		return "codex"
 	case agent.AgentTypeGemini:
 		return "gemini"
+	case agent.AgentTypeAntigravity:
+		// The Antigravity launch binary is `agy`, not its long display name.
+		return "agy"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
@@ -322,6 +329,8 @@ func agentTypeShort(agentType string) string {
 		return "cod"
 	case agent.AgentTypeGemini:
 		return "gmi"
+	case agent.AgentTypeAntigravity:
+		return "agy"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
@@ -346,6 +355,8 @@ func agentTypeLong(shortType string) string {
 		return "codex"
 	case agent.AgentTypeGemini:
 		return "gemini"
+	case agent.AgentTypeAntigravity:
+		return "antigravity"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:

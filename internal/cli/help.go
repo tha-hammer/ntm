@@ -65,7 +65,7 @@ func PrintStunningHelp(w io.Writer) {
 			icon:  ic.Rocket,
 			color: t.Green,
 			commands: []commandHelp{
-				{"spawn", "sat", "<name> --cc=N --cod=N --gmi=N", "Create session and launch agents"},
+				{"spawn", "sat", "<name> --cc=N --cod=N --agy=N", "Create session and launch agents"},
 				{"create", "cnt", "<name> [panes]", "Create empty session with N panes"},
 				{"quick", "qps", "<name> [--template=go]", "Quick project setup with git, vscode"},
 			},
@@ -90,7 +90,7 @@ func PrintStunningHelp(w io.Writer) {
 				{"list", "lnt", "", "List all tmux sessions"},
 				{"status", "snt", "<session>", "Show detailed session status"},
 				{"view", "vnt", "<session>", "Tile all panes and attach"},
-				{"zoom", "znt", "<session> <pane|cc|cod|gmi>", "Zoom to specific pane"},
+				{"zoom", "znt", "<session> <pane|cc|cod|agy|gmi>", "Zoom to specific pane"},
 				{"dashboard", "", "<session>", "Interactive session dashboard"},
 			},
 		},
@@ -345,7 +345,7 @@ func PrintMinimalHelp(w io.Writer) {
 
 	// Essential commands: spawn, send, status, kill, help
 	essentialCommands := []commandHelp{
-		{"spawn", "sat", "<name> --cc=N --cod=N --gmi=N", "Create session and launch agents"},
+		{"spawn", "sat", "<name> --cc=N --cod=N --agy=N", "Create session and launch agents"},
 		{"send", "bp", "<session> <prompt> [--agents]", "Send prompt to agents"},
 		{"status", "snt", "<session>", "Show detailed session status"},
 		{"kill", "knt", "[-f] <session>", "Kill a session"},

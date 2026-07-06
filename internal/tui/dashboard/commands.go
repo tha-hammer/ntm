@@ -99,6 +99,9 @@ func newDashboardAddAgentsCommand(ctx context.Context, projectDir, session strin
 	if result.GmiCount > 0 {
 		args = append(args, fmt.Sprintf("--gmi=%d", result.GmiCount))
 	}
+	if result.AgyCount > 0 {
+		args = append(args, fmt.Sprintf("--agy=%d", result.AgyCount))
+	}
 	if len(args) == 2 {
 		return nil, fmt.Errorf("no agents requested")
 	}
@@ -251,7 +254,7 @@ func (m Model) openFileInEditor(change tracker.RecordedFileChange) tea.Cmd {
 func (m Model) runSpawnWizardAdd(result panels.SpawnWizardResult) tea.Cmd {
 	session := m.session
 	projectDir := m.projectDir
-	added := result.CCCount + result.CodCount + result.GmiCount
+	added := result.CCCount + result.CodCount + result.GmiCount + result.AgyCount
 
 	return func() tea.Msg {
 		if added <= 0 {

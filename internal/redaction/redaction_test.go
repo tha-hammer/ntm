@@ -689,3 +689,159 @@ func TestConfigError_Error(t *testing.T) {
 		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }
+
+// bd-pmdpn: Config.DeepCopy must produce a value whose reference-typed
+// fields (Allowlist, ExtraPatterns, DisabledCategories) do not alias
+// the original. Mutating the copy must not reach back into the source.
+func TestConfigDeepCopy_IndependentSlicesAndMaps(t *testing.T) {
+	src := Config{
+		Mode:               ModeRedact,
+		Allowlist:          []string{"^foo$", "^bar$"},
+		ExtraPatterns:      map[Category][]string{"api_key": {"^xyz$"}},
+		DisabledCategories: []Category{"email", "phone"},
+	}
+
+	cp := src.DeepCopy()
+
+	// Mutate every reference-typed field on the copy.
+	cp.Allowlist[0] = "MUTATED"
+	cp.Allowlist = append(cp.Allowlist, "extra")
+	cp.ExtraPatterns["api_key"][0] = "MUTATED"
+	cp.ExtraPatterns["new"] = []string{"new"}
+	cp.DisabledCategories[0] = "MUTATED"
+
+	// Source must be untouched.
+	if src.Allowlist[0] != "^foo$" {
+		t.Errorf("Allowlist[0] leaked: %q", src.Allowlist[0])
+	}
+	if len(src.Allowlist) != 2 {
+		t.Errorf("Allowlist length leaked: %d, want 2", len(src.Allowlist))
+	}
+	if got := src.ExtraPatterns["api_key"][0]; got != "^xyz$" {
+		t.Errorf("ExtraPatterns inner slice leaked: %q", got)
+	}
+	if _, ok := src.ExtraPatterns["new"]; ok {
+		t.Errorf("ExtraPatterns map gained key 'new' from copy mutation")
+	}
+	if src.DisabledCategories[0] != "email" {
+		t.Errorf("DisabledCategories[0] leaked: %q", src.DisabledCategories[0])
+	}
+	// Mode is a value type — should round-trip cleanly.
+	if cp.Mode != ModeRedact {
+		t.Errorf("Mode = %q, want %q", cp.Mode, ModeRedact)
+	}
+}
+
+// bd-ztb6a: ExtraPatterns flowed through every layer (config TOML
+// parse, Set/Get round-trip, DeepCopy) but ScanAndRedact silently
+// dropped them — the user's custom patterns never ran. These tests
+// pin that they participate in the same machinery as the built-in
+// patterns.
+func TestScanAndRedact_ExtraPatternsAreApplied(t *testing.T) {
+	resetPatternsForTest(t)
+	cfg := Config{
+		Mode: ModeRedact,
+		ExtraPatterns: map[Category][]string{
+			"CUSTOM_TOKEN": {`MYORG-[A-Z0-9]{16}`},
+		},
+	}
+	input := "user uploaded MYORG-AB12CD34EF56GH78 today"
+	result := ScanAndRedact(input, cfg)
+
+	if len(result.Findings) == 0 {
+		t.Fatalf("ExtraPatterns silently dropped: no findings on a string that matches the user pattern; input=%q", input)
+	}
+	found := false
+	for _, f := range result.Findings {
+		if f.Category == "CUSTOM_TOKEN" && f.Match == "MYORG-AB12CD34EF56GH78" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a CUSTOM_TOKEN finding, got %+v", result.Findings)
+	}
+	if !strings.Contains(result.Output, "[REDACTED:CUSTOM_TOKEN:") {
+		t.Errorf("Output not redacted with the user's category: %q", result.Output)
+	}
+}
+
+// DisabledCategories must suppress extras for the same category, just
+// like it does for built-ins.
+func TestScanAndRedact_ExtraPatternsRespectDisabledCategories(t *testing.T) {
+	resetPatternsForTest(t)
+	cfg := Config{
+		Mode: ModeRedact,
+		ExtraPatterns: map[Category][]string{
+			"CUSTOM_TOKEN": {`MYORG-[A-Z0-9]{16}`},
+		},
+		DisabledCategories: []Category{"CUSTOM_TOKEN"},
+	}
+	input := "user uploaded MYORG-AB12CD34EF56GH78 today"
+	result := ScanAndRedact(input, cfg)
+	for _, f := range result.Findings {
+		if f.Category == "CUSTOM_TOKEN" {
+			t.Errorf("DisabledCategories did not suppress extra: got %+v", f)
+		}
+	}
+}
+
+// Allowlist must filter out matches from extras too.
+func TestScanAndRedact_ExtraPatternsRespectAllowlist(t *testing.T) {
+	resetPatternsForTest(t)
+	cfg := Config{
+		Mode: ModeRedact,
+		ExtraPatterns: map[Category][]string{
+			"CUSTOM_TOKEN": {`MYORG-[A-Z0-9]{16}`},
+		},
+		Allowlist: []string{`^MYORG-AB12CD34EF56GH78$`},
+	}
+	input := "user uploaded MYORG-AB12CD34EF56GH78 today"
+	result := ScanAndRedact(input, cfg)
+	for _, f := range result.Findings {
+		if f.Category == "CUSTOM_TOKEN" {
+			t.Errorf("Allowlist did not suppress allowlisted extra match: got %+v", f)
+		}
+	}
+}
+
+// A malformed extra-pattern regex must not crash and must not disable
+// the user's other extras OR the built-ins.
+func TestScanAndRedact_ExtraPatternsMalformedDoesNotBlockOthers(t *testing.T) {
+	resetPatternsForTest(t)
+	cfg := Config{
+		Mode: ModeRedact,
+		ExtraPatterns: map[Category][]string{
+			"CUSTOM_TOKEN": {
+				`[unclosed-bracket`,  // malformed
+				`MYORG-[A-Z0-9]{16}`, // valid; should still run
+			},
+		},
+	}
+	input := "user uploaded MYORG-AB12CD34EF56GH78 today and bad sk-anth-mock"
+	result := ScanAndRedact(input, cfg)
+	// The valid extra should still match.
+	foundExtra := false
+	for _, f := range result.Findings {
+		if f.Category == "CUSTOM_TOKEN" {
+			foundExtra = true
+		}
+	}
+	if !foundExtra {
+		t.Errorf("malformed extra suppressed valid sibling extra: %+v", result.Findings)
+	}
+}
+
+// Symmetric: nil reference-typed fields stay nil on the copy.
+func TestConfigDeepCopy_NilFieldsStayNil(t *testing.T) {
+	src := Config{Mode: ModeWarn}
+	cp := src.DeepCopy()
+	if cp.Allowlist != nil {
+		t.Errorf("Allowlist became non-nil after deep-copy of zero value: %v", cp.Allowlist)
+	}
+	if cp.ExtraPatterns != nil {
+		t.Errorf("ExtraPatterns became non-nil after deep-copy of zero value: %v", cp.ExtraPatterns)
+	}
+	if cp.DisabledCategories != nil {
+		t.Errorf("DisabledCategories became non-nil after deep-copy of zero value: %v", cp.DisabledCategories)
+	}
+}

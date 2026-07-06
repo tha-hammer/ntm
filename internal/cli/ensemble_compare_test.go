@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -845,7 +846,7 @@ func TestRunEnsembleResume_InvalidMetadataReturnsStructuredFailure(t *testing.T)
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleResume(&buf, "resume-invalid-meta-run", "json", false, true); err != nil {
+	if err := runEnsembleResume(&buf, "resume-invalid-meta-run", "json", false, true); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleResume() error = %v", err)
 	}
 
@@ -877,7 +878,7 @@ func TestRunEnsembleResume_InvalidRunIDReturnsStructuredFailure(t *testing.T) {
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleResume(&buf, "../escape", "json", false, true); err != nil {
+	if err := runEnsembleResume(&buf, "../escape", "json", false, true); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleResume() error = %v", err)
 	}
 
@@ -989,7 +990,7 @@ func TestRunEnsembleRerunModeRejectsUnknownModeInCheckpointRun(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runEnsembleRerunMode(&buf, meta.RunID, "bayesian", "json", false); err != nil {
+	if err := runEnsembleRerunMode(&buf, meta.RunID, "bayesian", "json", false); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleRerunMode() error = %v", err)
 	}
 
@@ -1024,7 +1025,7 @@ func TestRunEnsembleRerunMode_InvalidMetadataReturnsStructuredFailure(t *testing
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleRerunMode(&buf, "rerun-invalid-meta-run", "deductive", "json", false); err != nil {
+	if err := runEnsembleRerunMode(&buf, "rerun-invalid-meta-run", "deductive", "json", false); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleRerunMode() error = %v", err)
 	}
 

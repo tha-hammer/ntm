@@ -98,13 +98,23 @@ func TestGetGitInfo_NonExistentDir(t *testing.T) {
 }
 
 func TestGetGitInfoWithTimeout_UsesIndependentCommandBudgets(t *testing.T) {
-	const perCommandBudget = 150 * time.Millisecond
+	// perCommandBudget needs to comfortably exceed the per-shell
+	// startup cost (which is significantly larger on macOS-latest
+	// runners than on Linux). The sleep is chosen so that three
+	// sequential commands still exceed perCommandBudget — that
+	// inequality is what proves the three calls did not share one
+	// timeout.
+	const perCommandBudget = 400 * time.Millisecond
+	const fakeGitSleep = "0.2" // seconds; 3 × 200ms > 400ms
 
 	tmpBin := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(tmpBin); err == nil {
+		tmpBin = resolved
+	}
 	logFile := filepath.Join(tmpBin, "git-invocations.log")
 	gitPath := filepath.Join(tmpBin, "git")
 	script := `#!/bin/sh
-sleep 0.07
+sleep ` + fakeGitSleep + `
 printf '%s\n' "$3 $4 $5" >> "$NTM_GITINFO_LOG"
 case "$3 $4 $5" in
   "rev-parse --abbrev-ref HEAD")

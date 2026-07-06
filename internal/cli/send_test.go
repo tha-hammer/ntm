@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -281,10 +284,10 @@ func TestGetSessionWorkingDirAllowsWorkspaceFallbackForInferredSession(t *testin
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
-	cwdRepo := t.TempDir()
+	cwdRepo := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(cwdRepo, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1064,25 +1067,27 @@ func TestBuildTargetDescription(t *testing.T) {
 		cc        bool
 		cod       bool
 		gmi       bool
+		agy       bool
 		all       bool
 		skipFirst bool
 		paneIdx   int
 		want      string
 	}{
-		{"specific pane", false, false, false, false, false, 2, "pane:2"},
-		{"all panes", false, false, false, true, false, -1, "all"},
-		{"claude only", true, false, false, false, false, -1, "cc"},
-		{"codex only", false, true, false, false, false, -1, "cod"},
-		{"gemini only", false, false, true, false, false, -1, "gmi"},
-		{"cc and cod", true, true, false, false, false, -1, "cc,cod"},
-		{"all types", true, true, true, false, false, -1, "cc,cod,gmi"},
-		{"no filter skip first", false, false, false, false, true, -1, "agents"},
-		{"no filter no skip", false, false, false, false, false, -1, "all-agents"},
+		{"specific pane", false, false, false, false, false, false, 2, "pane:2"},
+		{"all panes", false, false, false, false, true, false, -1, "all"},
+		{"claude only", true, false, false, false, false, false, -1, "cc"},
+		{"codex only", false, true, false, false, false, false, -1, "cod"},
+		{"gemini only", false, false, true, false, false, false, -1, "gmi"},
+		{"antigravity only", false, false, false, true, false, false, -1, "agy"},
+		{"cc and cod", true, true, false, false, false, false, -1, "cc,cod"},
+		{"all types", true, true, true, true, false, false, -1, "cc,cod,gmi,agy"},
+		{"no filter skip first", false, false, false, false, false, true, -1, "agents"},
+		{"no filter no skip", false, false, false, false, false, false, -1, "all-agents"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildTargetDescription(tt.cc, tt.cod, tt.gmi, tt.all, tt.skipFirst, tt.paneIdx, nil)
+			got := buildTargetDescription(tt.cc, tt.cod, tt.gmi, tt.agy, tt.all, tt.skipFirst, tt.paneIdx, nil)
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -1543,5 +1548,173 @@ func TestFilterPanesForBatchCanonicalizesAliasTypes(t *testing.T) {
 	}
 	if got[0].Index != 1 || got[1].Index != 2 {
 		t.Fatalf("filterPanesForBatch(alias types) = %+v, want pane indices [1 2]", got)
+	}
+}
+
+// TestSendForceNonInteractiveFlag verifies that --force-non-interactive is registered
+// and parses without consuming a positional argument.
+func TestSendForceNonInteractiveFlag(t *testing.T) {
+	cmd := newSendCmd()
+	flag := cmd.Flags().Lookup("force-non-interactive")
+	if flag == nil {
+		t.Fatal("--force-non-interactive flag is not registered on `ntm send`")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--force-non-interactive default = %q, want %q", flag.DefValue, "false")
+	}
+	// The flag is wrapper-friendly; the help text must call out which classes
+	// are bypassed and which fail closed so callers can audit the contract.
+	usage := flag.Usage
+	for _, want := range []string{"CASS", "fail closed", "non_interactive_forced"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("--force-non-interactive usage missing %q, got: %q", want, usage)
+		}
+	}
+
+	// Parse with the flag set; the prompt must still land in remaining args
+	// (i.e., the flag must not swallow a positional).
+	parsed := newSendCmd()
+	args := []string{"my-session", "--force-non-interactive", "do the thing"}
+	if err := parsed.ParseFlags(args); err != nil {
+		t.Fatalf("ParseFlags(%v) error = %v", args, err)
+	}
+	remaining := parsed.Flags().Args()
+	if len(remaining) < 2 || remaining[1] != "do the thing" {
+		t.Errorf("remaining args = %v, want prompt to be parsed positionally", remaining)
+	}
+}
+
+// TestSendResultJSONOmitsForceFieldByDefault asserts that the JSON output stays
+// backwards-compatible: the new `non_interactive_forced` field has `omitempty`,
+// so callers that don't set the flag never see it appear.
+func TestSendResultJSONOmitsForceFieldByDefault(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload any
+	}{
+		{"SendResult", SendResult{Success: true, Session: "s", Targets: []int{}}},
+		{"SendDryRunResult", SendDryRunResult{Success: true, DryRun: true, Session: "s"}},
+		{"BatchResult", BatchResult{Success: true, Session: "s"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.payload)
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			if strings.Contains(string(b), "non_interactive_forced") {
+				t.Errorf("default %s JSON includes the field; want omitempty: %s", tc.name, b)
+			}
+		})
+	}
+}
+
+// TestSendResultJSONEmitsForceFieldWhenSet asserts the inverse: when callers
+// pass --force-non-interactive, the JSON contract surfaces it for downstream
+// auditing/log analysis.
+func TestSendResultJSONEmitsForceFieldWhenSet(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload any
+	}{
+		{"SendResult", SendResult{Success: true, Session: "s", Targets: []int{}, NonInteractiveForced: true}},
+		{"SendDryRunResult", SendDryRunResult{Success: true, DryRun: true, Session: "s", NonInteractiveForced: true}},
+		{"BatchResult", BatchResult{Success: true, Session: "s", NonInteractiveForced: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.payload)
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			if !strings.Contains(string(b), `"non_interactive_forced":true`) {
+				t.Errorf("%s JSON missing non_interactive_forced=true: %s", tc.name, b)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// FIX D: ntm kill orphan reap
+// ============================================================================
+
+// TestOrphanReapExcluded verifies the exclusion predicate never lets the reap
+// target init, the running process, or its parent.
+func TestOrphanReapExcluded(t *testing.T) {
+	cases := []struct {
+		pid  int
+		want bool
+		desc string
+	}{
+		{0, true, "pid 0"},
+		{1, true, "init"},
+		{-5, true, "negative pid"},
+		{os.Getpid(), true, "self"},
+		{os.Getppid(), true, "parent"},
+		{1 << 30, false, "arbitrary high pid not excluded"},
+	}
+	for _, c := range cases {
+		if got := orphanReapExcluded(c.pid); got != c.want {
+			t.Errorf("orphanReapExcluded(%d) = %v, want %v (%s)", c.pid, got, c.want, c.desc)
+		}
+	}
+}
+
+// TestCollectPaneDescendants_RecursiveAndExclusion spawns a real two-level
+// process subtree (sh -> sleep) under the test process and verifies
+// collectPaneDescendants walks it recursively, while never returning self, the
+// parent, init, or the supplied pane-shell PID itself.
+func TestCollectPaneDescendants_RecursiveAndExclusion(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	// sh (level 1) execs a subshell that backgrounds a sleep and waits, giving
+	// us a deterministic shell-with-descendant tree rooted at cmd.Process.Pid.
+	cmd := exec.Command("sh", "-c", "sleep 30 & wait")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start subtree: %v", err)
+	}
+	root := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(root, syscall.SIGKILL)
+		// Reap the immediate child to avoid a lingering zombie.
+		_, _ = cmd.Process.Wait()
+	})
+
+	// Give the backgrounded sleep a moment to appear as a child of the shell.
+	deadline := time.Now().Add(2 * time.Second)
+	var got []int
+	for time.Now().Before(deadline) {
+		got = collectPaneDescendants([]int{root})
+		if len(got) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if len(got) == 0 {
+		t.Fatal("expected to collect at least one descendant of the spawned shell")
+	}
+
+	for _, pid := range got {
+		if pid == root {
+			t.Errorf("pane-shell PID %d must NOT be in the descendant set (the shell is reaped by kill-session)", root)
+		}
+		if orphanReapExcluded(pid) {
+			t.Errorf("collected PID %d is excluded (self/parent/init) and must never appear", pid)
+		}
+		if !process.IsAlive(pid) {
+			t.Errorf("collected PID %d should be alive while the subtree runs", pid)
+		}
+	}
+
+	// Excluding the inputs: passing self / parent / init as pane PIDs must
+	// collect nothing dangerous (their real children are not ntm agents, but
+	// the predicate guarantees self/parent/init are never returned either way).
+	for _, pid := range collectPaneDescendants([]int{os.Getpid(), os.Getppid(), 1, 0}) {
+		if orphanReapExcluded(pid) {
+			t.Errorf("collectPaneDescendants returned excluded PID %d", pid)
+		}
 	}
 }

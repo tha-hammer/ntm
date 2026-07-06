@@ -61,6 +61,9 @@ type Handoff struct {
 	TokensMax  int     `yaml:"tokens_max,omitempty"`
 	TokensPct  float64 `yaml:"tokens_pct,omitempty"`
 
+	// Machine-readable quality score for compacted handoff consumers.
+	Quality *QualityReport `yaml:"quality,omitempty"`
+
 	// File reservation transfer instructions (optional)
 	ReservationTransfer *ReservationTransfer `yaml:"reservation_transfer,omitempty"`
 }

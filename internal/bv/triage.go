@@ -25,6 +25,23 @@ var (
 	triageRunMu     sync.Mutex
 )
 
+func acquireTriageRunLock(deadline time.Time, timeout time.Duration) (func(), error) {
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("bv timed out after %v", timeout)
+		}
+		if triageRunMu.TryLock() {
+			return triageRunMu.Unlock, nil
+		}
+		sleep := 10 * time.Millisecond
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+	}
+}
+
 func normalizeTriageDir(dir string) (string, error) {
 	if dir == "" {
 		dir = util.ResolveProjectDir("")
@@ -48,10 +65,24 @@ func normalizeTriageDir(dir string) (string, error) {
 // GetTriage returns the complete triage analysis from bv --robot-triage.
 // Results are cached for TriageCacheTTL (default 30 seconds).
 func GetTriage(dir string) (*TriageResponse, error) {
+	return getTriageWithTimeout(dir, DefaultTimeout)
+}
+
+// GetTriageWithTimeout returns complete triage analysis with a caller-scoped
+// command timeout. Cached results are still reused when valid.
+func GetTriageWithTimeout(dir string, timeout time.Duration) (*TriageResponse, error) {
+	return getTriageWithTimeout(dir, timeout)
+}
+
+func getTriageWithTimeout(dir string, timeout time.Duration) (*TriageResponse, error) {
 	normalizedDir, err := normalizeTriageDir(dir)
 	if err != nil {
 		return nil, err
 	}
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	deadline := time.Now().Add(timeout)
 
 	triageCacheMu.RLock()
 	// Return cached result if still valid and for the same directory
@@ -63,8 +94,11 @@ func GetTriage(dir string) (*TriageResponse, error) {
 	triageCacheMu.RUnlock()
 
 	// Ensure only one runner fetches triage concurrently
-	triageRunMu.Lock()
-	defer triageRunMu.Unlock()
+	releaseRunLock, err := acquireTriageRunLock(deadline, timeout)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseRunLock()
 
 	// Double-check cache after acquiring run lock
 	triageCacheMu.RLock()
@@ -75,7 +109,11 @@ func GetTriage(dir string) (*TriageResponse, error) {
 	}
 	triageCacheMu.RUnlock()
 
-	output, err := run(normalizedDir, "--robot-triage")
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil, fmt.Errorf("bv timed out after %v", timeout)
+	}
+	output, err := runWithTimeout(normalizedDir, remaining, "--robot-triage")
 	if err != nil {
 		return nil, err
 	}
@@ -160,6 +198,121 @@ func GetTriageTopPicks(dir string, n int) ([]TriageTopPick, error) {
 		picks = picks[:n]
 	}
 	return picks, nil
+}
+
+// GetActionableRecommendations returns recommendations sourced from the FULL
+// dependency-aware actionable set (bv --robot-plan), ranked by triage scoring.
+//
+// bv --robot-triage is hardcoded to ≤10 recommendations (see beads_viewer
+// triage.TopN), so GetTriageRecommendations can never surface more than 10
+// candidates no matter what n is requested. On large or heavily-gated backlogs
+// whose top-ranked rows are epics/gated/blocked, that ceiling silently starves
+// the assigner: it reports the queue drained while dozens of beads below the
+// top-10 cut are actually actionable (issue #197).
+//
+// This helper removes the ceiling without losing triage ranking:
+//   - triage recommendations come first, in triage's scored order (they carry
+//     the rich BlockedBy/Labels/Status/Score fields downstream filters need);
+//   - every actionable plan item that triage did NOT surface is then appended
+//     as a synthesized recommendation, so beads beyond the top-10 are still
+//     dispatchable. Plan items are the dependency-aware actionable set, so they
+//     carry no BlockedBy — synthesized recs pass the blocked-by filter and are
+//     classified by status/active-assignment like any other. bv --robot-plan
+//     omits labels, so each synthesized rec is re-enriched with its bead's
+//     labels from `br` (readyBeadLabels) — otherwise an operator-gated bead
+//     below the top-10 cut would bypass the operator gate.
+//
+// n caps the merged result (≤0 means no cap). If the plan surface is
+// unavailable, it degrades to the (capped) triage set so callers never regress
+// below today's behavior; if triage itself fails, the error is returned.
+func GetActionableRecommendations(dir string, n int) ([]TriageRecommendation, error) {
+	triage, err := GetTriage(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	recs := make([]TriageRecommendation, 0, len(triage.Triage.Recommendations))
+	seen := make(map[string]struct{}, len(triage.Triage.Recommendations))
+	for _, rec := range triage.Triage.Recommendations {
+		if _, dup := seen[rec.ID]; dup {
+			continue
+		}
+		seen[rec.ID] = struct{}{}
+		recs = append(recs, rec)
+	}
+
+	// Best-effort: pull the uncapped actionable plan and append anything triage
+	// didn't already rank. A plan failure is non-fatal — fall back to triage.
+	if plan, planErr := GetPlan(dir); planErr == nil && plan != nil {
+		// bv --robot-plan omits per-item labels (PlanItem carries only
+		// id/title/status/priority/unblocks), yet the assignment classifier
+		// gates operator-gated beads by label. A synthesized rec with empty
+		// Labels would silently bypass that gate for any operator-gated bead
+		// surfaced below triage's top-10 cut, so restore label fidelity from
+		// `br ready` (#197). Best-effort: an empty map degrades to the prior
+		// permissive behavior, never worse.
+		labelsByID := readyBeadLabels(dir)
+		for _, track := range plan.Plan.Tracks {
+			for _, item := range track.Items {
+				if item.ID == "" {
+					continue
+				}
+				if _, dup := seen[item.ID]; dup {
+					continue
+				}
+				seen[item.ID] = struct{}{}
+				recs = append(recs, TriageRecommendation{
+					ID:          item.ID,
+					Title:       item.Title,
+					Status:      item.Status,
+					Priority:    item.Priority,
+					Labels:      labelsByID[item.ID],
+					UnblocksIDs: item.Unblocks,
+				})
+			}
+		}
+	}
+
+	if n > 0 && len(recs) > n {
+		recs = recs[:n]
+	}
+	return recs, nil
+}
+
+// readyBeadLabels returns a best-effort map of bead ID -> labels for the ready
+// (open, unblocked) work set, sourced from `br ready --json`.
+//
+// It exists to restore label fidelity on plan-sourced recommendations:
+// bv --robot-plan omits labels, yet the assignment classifier
+// (classifyTriageRecForAssignment) gates operator-gated beads by label. A bead
+// is only ever dispatched after it passes the "status is open/ready" check, and
+// every open/unblocked bead appears in `br ready`, so enriching from this set is
+// sufficient to keep the operator gate intact for candidates surfaced below
+// triage's top-10 cut.
+//
+// Failure modes degrade safely (never worse than the prior label-less behavior):
+// a br error or a parse failure yields an empty map. A large explicit --limit
+// keeps the map complete on br builds whose `ready` default limit is finite
+// (older builds treat --limit 0 as zero rows rather than "unlimited").
+func readyBeadLabels(dir string) map[string][]string {
+	labels := make(map[string][]string)
+	output, err := RunBd(dir, "ready", "--json", "--limit", "100000")
+	if err != nil {
+		return labels
+	}
+	items, err := UnmarshalBdList[struct {
+		ID     string   `json:"id"`
+		Labels []string `json:"labels"`
+	}](output)
+	if err != nil {
+		return labels
+	}
+	for _, it := range items {
+		if it.ID != "" && len(it.Labels) > 0 {
+			labels[it.ID] = it.Labels
+		}
+	}
+	return labels
 }
 
 // GetTriageRecommendations returns the top N recommendations

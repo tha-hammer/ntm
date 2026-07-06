@@ -1,11 +1,249 @@
 package pipeline
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestPrepareWorkflowVariablesPrecedenceAndTypes(t *testing.T) {
+	workflow := &Workflow{
+		Vars: map[string]VarDef{
+			"name":    {Default: "default-name", Type: VarTypeString},
+			"count":   {Default: 1, Type: VarTypeNumber},
+			"enabled": {Default: false, Type: VarTypeBoolean},
+			"items":   {Default: []interface{}{"default"}, Type: VarTypeArray},
+		},
+	}
+
+	got, err := PrepareWorkflowVariables(workflow, map[string]interface{}{
+		"name":    "cli-name",
+		"count":   "5",
+		"enabled": "yes",
+		"items":   "a,b,c",
+	})
+	if err != nil {
+		t.Fatalf("PrepareWorkflowVariables() error = %v", err)
+	}
+
+	if got["name"] != "cli-name" {
+		t.Fatalf("name = %v, want CLI override", got["name"])
+	}
+	if got["count"] != 5 {
+		t.Fatalf("count = %#v, want int 5", got["count"])
+	}
+	if got["enabled"] != true {
+		t.Fatalf("enabled = %#v, want true", got["enabled"])
+	}
+	wantItems := []string{"a", "b", "c"}
+	if !reflect.DeepEqual(got["items"], wantItems) {
+		t.Fatalf("items = %#v, want %#v", got["items"], wantItems)
+	}
+}
+
+func TestPrepareWorkflowVariablesNativeJSONTypes(t *testing.T) {
+	workflow := &Workflow{
+		Vars: map[string]VarDef{
+			"count": {Type: VarTypeNumber},
+			"items": {Type: VarTypeArray},
+		},
+	}
+
+	got, err := PrepareWorkflowVariables(workflow, map[string]interface{}{
+		"count": float64(2.5),
+		"items": []interface{}{"x", "y"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareWorkflowVariables() error = %v", err)
+	}
+	if got["count"] != float64(2.5) {
+		t.Fatalf("count = %#v, want native float64", got["count"])
+	}
+	if !reflect.DeepEqual(got["items"], []interface{}{"x", "y"}) {
+		t.Fatalf("items = %#v, want native array", got["items"])
+	}
+}
+
+func TestPrepareWorkflowVariablesDefaultReferences(t *testing.T) {
+	workflow := &Workflow{
+		Vars: map[string]VarDef{
+			"a": {Default: "${vars.b}", Type: VarTypeString},
+			"b": {Default: "hello", Type: VarTypeString},
+		},
+	}
+
+	got, err := PrepareWorkflowVariables(workflow, nil)
+	if err != nil {
+		t.Fatalf("PrepareWorkflowVariables() error = %v", err)
+	}
+	if got["a"] != "hello" {
+		t.Fatalf("a = %#v, want chained default", got["a"])
+	}
+}
+
+func TestPrepareWorkflowVariablesErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		workflow  *Workflow
+		overrides map[string]interface{}
+		want      string
+	}{
+		{
+			name: "number mismatch",
+			workflow: &Workflow{Vars: map[string]VarDef{
+				"n": {Type: VarTypeNumber},
+			}},
+			overrides: map[string]interface{}{"n": "abc"},
+			want:      "variable n: expected number, got 'abc'",
+		},
+		{
+			name: "cyclic defaults",
+			workflow: &Workflow{Vars: map[string]VarDef{
+				"a": {Default: "${vars.b}"},
+				"b": {Default: "${vars.a}"},
+			}},
+			want: "cyclic default reference",
+		},
+		{
+			// A typo'd reference must fail closed rather than passing through
+			// as the literal "${vars.projet_name}" placeholder. Otherwise the
+			// unresolved marker enters execution and dispatches to prompts.
+			name: "default with typo'd vars reference",
+			workflow: &Workflow{Vars: map[string]VarDef{
+				"name": {Type: VarTypeString, Default: "${vars.projet_name}"},
+			}},
+			want: "default \"${vars.projet_name}\"",
+		},
+		{
+			name: "default with missing env reference",
+			workflow: &Workflow{Vars: map[string]VarDef{
+				"endpoint": {Type: VarTypeString, Default: "${env.NTM_TEST_DEFINITELY_UNSET_VAR_4o0rn}"},
+			}},
+			want: "environment variable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := PrepareWorkflowVariables(tt.workflow, tt.overrides)
+			if err == nil {
+				t.Fatal("PrepareWorkflowVariables() error = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("PrepareWorkflowVariables() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrepareWorkflowVariablesDefaultWithExplicitFallback(t *testing.T) {
+	// An explicit | fallback in the default keeps the existing escape hatch:
+	// authors who intentionally reference a variable that may be undefined can
+	// still provide a literal fallback. This case must continue to succeed.
+	workflow := &Workflow{
+		Vars: map[string]VarDef{
+			"name": {Type: VarTypeString, Default: `${vars.projet_name | "fallback-name"}`},
+		},
+	}
+
+	got, err := PrepareWorkflowVariables(workflow, nil)
+	if err != nil {
+		t.Fatalf("PrepareWorkflowVariables() error = %v, want nil for default with explicit fallback", err)
+	}
+	if got["name"] != "fallback-name" {
+		t.Fatalf("name = %#v, want %q", got["name"], "fallback-name")
+	}
+}
+
+func TestValidateWorkflowVariablesWarningsAndHints(t *testing.T) {
+	workflow := &Workflow{
+		Vars: map[string]VarDef{
+			"n":        {Type: VarTypeNumber},
+			"flag":     {Type: VarTypeBoolean},
+			"items":    {Type: VarTypeArray},
+			"required": {Type: VarTypeString, Required: true},
+		},
+	}
+
+	result, parseErr := ValidateWorkflowVariables(workflow, map[string]interface{}{
+		"n":        "5",
+		"flag":     "true",
+		"items":    "a,b,c",
+		"required": "ok",
+		"extra":    "available",
+	})
+	if parseErr != nil {
+		t.Fatalf("ValidateWorkflowVariables() error = %v", parseErr)
+	}
+	if got := result.Variables["n"]; got != 5 {
+		t.Fatalf("n = %#v, want int 5", got)
+	}
+	if got := result.Variables["flag"]; got != true {
+		t.Fatalf("flag = %#v, want true", got)
+	}
+	if !reflect.DeepEqual(result.Variables["items"], []string{"a", "b", "c"}) {
+		t.Fatalf("items = %#v, want []string", result.Variables["items"])
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0].Message, "undeclared variable \"extra\"") {
+		t.Fatalf("warnings = %#v, want undeclared variable warning", result.Warnings)
+	}
+}
+
+func TestValidateWorkflowVariablesErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		workflow  *Workflow
+		overrides map[string]interface{}
+		wantMsg   string
+		wantHint  string
+	}{
+		{
+			name: "number mismatch",
+			workflow: &Workflow{Vars: map[string]VarDef{
+				"n": {Type: VarTypeNumber},
+			}},
+			overrides: map[string]interface{}{"n": "abc"},
+			wantMsg:   "variable n: expected number, got 'abc'",
+			wantHint:  "use --var n=5 or --var n=5.0",
+		},
+		{
+			name: "array mismatch",
+			workflow: &Workflow{Vars: map[string]VarDef{
+				"items": {Type: VarTypeArray},
+			}},
+			overrides: map[string]interface{}{"items": 12},
+			wantMsg:   "variable items: expected array",
+			wantHint:  "provide \"items\" as a JSON array",
+		},
+		{
+			name: "required missing",
+			workflow: &Workflow{Vars: map[string]VarDef{
+				"token": {Type: VarTypeString, Required: true},
+			}},
+			wantMsg:  "variable token: required value missing",
+			wantHint: "provide --var token=value",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, parseErr := ValidateWorkflowVariables(tt.workflow, tt.overrides)
+			if parseErr == nil {
+				t.Fatal("ValidateWorkflowVariables() error = nil, want error")
+			}
+			if !strings.Contains(parseErr.Message, tt.wantMsg) {
+				t.Fatalf("Message = %q, want %q", parseErr.Message, tt.wantMsg)
+			}
+			if !strings.Contains(parseErr.Hint, tt.wantHint) {
+				t.Fatalf("Hint = %q, want %q", parseErr.Hint, tt.wantHint)
+			}
+		})
+	}
+}
 
 func TestSubstitutor_Substitute(t *testing.T) {
 	state := &ExecutionState{
@@ -183,9 +421,7 @@ func TestSubstitutor_Substitute(t *testing.T) {
 }
 
 func TestSubstitutor_EnvVars(t *testing.T) {
-	// Set test env var
-	os.Setenv("TEST_VAR", "test_value")
-	defer os.Unsetenv("TEST_VAR")
+	t.Setenv("TEST_VAR", "test_value")
 
 	state := &ExecutionState{
 		Variables: map[string]interface{}{},
@@ -200,11 +436,104 @@ func TestSubstitutor_EnvVars(t *testing.T) {
 	if got != "Env: test_value" {
 		t.Errorf("Substitute() = %q, want %q", got, "Env: test_value")
 	}
+}
 
-	// Unset env var returns empty string
-	got2, _ := sub.Substitute("Missing: ${env.NONEXISTENT_VAR_123}")
-	if got2 != "Missing: " {
-		t.Errorf("Missing env var should return empty, got %q", got2)
+func TestSubstitutor_EnvHome(t *testing.T) {
+	t.Setenv("HOME", "/tmp/ntm-home")
+
+	state := &ExecutionState{
+		Variables: map[string]interface{}{},
+	}
+
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	got, err := sub.Substitute("Home: ${env.HOME}")
+	if err != nil {
+		t.Fatalf("Substitute() error = %v", err)
+	}
+	if got != "Home: /tmp/ntm-home" {
+		t.Errorf("Substitute() = %q, want %q", got, "Home: /tmp/ntm-home")
+	}
+}
+
+func TestSubstitutor_EnvMissingErrors(t *testing.T) {
+	t.Setenv("NONEXISTENT_VAR_123", "")
+	os.Unsetenv("NONEXISTENT_VAR_123")
+
+	state := &ExecutionState{
+		Variables: map[string]interface{}{},
+	}
+
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	got, err := sub.Substitute("Missing: ${env.NONEXISTENT_VAR_123}")
+	if err == nil {
+		t.Fatal("expected missing environment variable error")
+	}
+	if got != "Missing: ${env.NONEXISTENT_VAR_123}" {
+		t.Errorf("Substitute() = %q, want unresolved env reference", got)
+	}
+	subErr, ok := err.(*SubstitutionError)
+	if !ok {
+		t.Fatalf("error = %T, want *SubstitutionError", err)
+	}
+	if subErr.VarRef != "env.NONEXISTENT_VAR_123" {
+		t.Errorf("VarRef = %q, want env.NONEXISTENT_VAR_123", subErr.VarRef)
+	}
+	if !strings.Contains(subErr.Message, "environment variable NONEXISTENT_VAR_123 not set") {
+		t.Errorf("Message = %q, want missing env explanation", subErr.Message)
+	}
+}
+
+func TestSubstitutor_EnvMissingDefault(t *testing.T) {
+	t.Setenv("OPTIONAL_ENV_VAR_123", "")
+	os.Unsetenv("OPTIONAL_ENV_VAR_123")
+
+	state := &ExecutionState{
+		Variables: map[string]interface{}{},
+	}
+
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	got, err := sub.Substitute("Optional: ${env.OPTIONAL_ENV_VAR_123 | fallback}")
+	if err != nil {
+		t.Fatalf("Substitute() error = %v", err)
+	}
+	if got != "Optional: fallback" {
+		t.Errorf("Substitute() = %q, want %q", got, "Optional: fallback")
+	}
+}
+
+// bd-wwmo9: when a default fallback contains a variable reference, the
+// substitutor must recurse into it. Earlier the outer loop saw resolved == 0
+// after the fallback expanded and exited with the literal ${...} text in
+// place. Counting the default-replacement as progress lets the next pass
+// resolve the fallback.
+func TestSubstitutor_DefaultFallbackRecursesIntoVariable(t *testing.T) {
+	state := &ExecutionState{
+		Variables: map[string]interface{}{
+			"present": "ok",
+		},
+	}
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	got, err := sub.Substitute(`${vars.missing | ${vars.present}}`)
+	if err != nil {
+		t.Fatalf("Substitute() error = %v", err)
+	}
+	if got != "ok" {
+		t.Fatalf("Substitute() = %q, want %q", got, "ok")
+	}
+
+	// Nested two-deep default chain — outer fallback is itself a variable
+	// whose own default is yet another variable.
+	state.Variables["fallback_target"] = "ok"
+	got, err = sub.Substitute(`${vars.missing_a | ${vars.missing_b | ${vars.fallback_target}}}`)
+	if err != nil {
+		t.Fatalf("two-deep Substitute() error = %v", err)
+	}
+	if got != "ok" {
+		t.Fatalf("two-deep Substitute() = %q, want %q", got, "ok")
 	}
 }
 
@@ -594,6 +923,23 @@ func TestNavigateNested_EdgeCases(t *testing.T) {
 			name:    "[]string array - negative index",
 			value:   []string{"alpha", "beta"},
 			parts:   []string{"-1"},
+			wantErr: true,
+		},
+		{
+			name: "map[string]string - parallel collect output",
+			value: map[string]string{
+				"left":  "left output",
+				"right": "right output",
+			},
+			parts: []string{"left"},
+			want:  "left output",
+		},
+		{
+			name: "map[string]string - missing key",
+			value: map[string]string{
+				"left": "left output",
+			},
+			parts:   []string{"missing"},
 			wantErr: true,
 		},
 		{
@@ -1382,6 +1728,56 @@ func TestResolveSteps_OutputNestedField(t *testing.T) {
 	}
 }
 
+func TestResolveSteps_OutputBracketAccessOnDeeperSegment(t *testing.T) {
+	// bd-et0k5: bracket suffixes must work on every path segment, not just
+	// the first field. The documented shapes are
+	// ${steps.fetch.output.items[0].title} and
+	// ${steps.fetch.data[user][profile][name]}.
+	state := &ExecutionState{
+		Variables: map[string]interface{}{},
+		Steps: map[string]StepResult{
+			"fetch": {
+				StepID: "fetch",
+				Status: StatusCompleted,
+				ParsedData: map[string]interface{}{
+					"items": []interface{}{
+						map[string]interface{}{"title": "ok"},
+						map[string]interface{}{"title": "second"},
+					},
+					"user": map[string]interface{}{
+						"profile": map[string]interface{}{
+							"name": "Alice",
+						},
+					},
+					"list": []interface{}{"a", "b", "c", "d"},
+				},
+			},
+		},
+	}
+
+	sub := NewSubstitutor(state, "test-session", "test-workflow")
+
+	cases := []struct {
+		template string
+		want     string
+	}{
+		{"${steps.fetch.output.items[0].title}", "ok"},
+		{"${steps.fetch.output.items[1].title}", "second"},
+		{"${steps.fetch.data[user][profile][name]}", "Alice"},
+		{"${steps.fetch.parsed_data.list[3]}", "d"},
+	}
+	for _, tc := range cases {
+		got, err := sub.Substitute(tc.template)
+		if err != nil {
+			t.Errorf("Substitute(%q) error = %v", tc.template, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Substitute(%q) = %q, want %q", tc.template, got, tc.want)
+		}
+	}
+}
+
 func TestResolveSteps_OutputNestedNoParsedData(t *testing.T) {
 
 	state := &ExecutionState{
@@ -1723,5 +2119,361 @@ func TestResolveLoop_NestedAccess(t *testing.T) {
 	}
 	if result != "test_item" {
 		t.Errorf("got %q, want 'test_item'", result)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ${defaults.X} resolution tests (bd-6lkqr.2)
+// ---------------------------------------------------------------------------
+
+func TestSubstitute_DefaultsFlatString(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{
+		"model_mix": "cc:3,cod:1,gmi:1",
+	})
+
+	result, err := sub.Substitute("mix=${defaults.model_mix}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "mix=cc:3,cod:1,gmi:1" {
+		t.Errorf("got %q, want %q", result, "mix=cc:3,cod:1,gmi:1")
+	}
+}
+
+func TestSubstitute_DefaultsDottedPath(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{
+		"hard_caps": map[string]interface{}{
+			"phase_4_max_rounds": 6,
+		},
+	})
+
+	result, err := sub.Substitute("max=${defaults.hard_caps.phase_4_max_rounds}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "max=6" {
+		t.Errorf("got %q, want %q", result, "max=6")
+	}
+}
+
+func TestSubstitute_DefaultsDeepNested(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{
+		"a": map[string]interface{}{
+			"b": map[string]interface{}{
+				"c": "deep",
+			},
+		},
+	})
+
+	result, err := sub.Substitute("${defaults.a.b.c}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "deep" {
+		t.Errorf("got %q, want %q", result, "deep")
+	}
+}
+
+func TestSubstitute_DefaultsUnknownPathError(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{
+		"known": "yes",
+	})
+
+	_, err := sub.Substitute("${defaults.unknown}")
+	if err == nil {
+		t.Fatal("expected error for unknown default key")
+	}
+	subErr, ok := err.(*SubstitutionError)
+	if !ok {
+		t.Fatalf("expected SubstitutionError, got %T", err)
+	}
+	if subErr.VarRef != "defaults.unknown" {
+		t.Errorf("VarRef=%q, want %q", subErr.VarRef, "defaults.unknown")
+	}
+}
+
+func TestSubstitute_DefaultsNilMapError(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	_, err := sub.Substitute("${defaults.anything}")
+	if err == nil {
+		t.Fatal("expected error when defaults is nil")
+	}
+}
+
+func TestSubstitute_DefaultsIntValue(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{
+		"retries": 3,
+	})
+
+	result, err := sub.Substitute("retries=${defaults.retries}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "retries=3" {
+		t.Errorf("got %q, want %q", result, "retries=3")
+	}
+}
+
+func TestSubstitute_DefaultsFloatValue(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{
+		"threshold": 0.75,
+	})
+
+	result, err := sub.Substitute("t=${defaults.threshold}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "t=0.75" {
+		t.Errorf("got %q, want %q", result, "t=0.75")
+	}
+}
+
+func TestSubstitute_DefaultsBoolValue(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{
+		"verbose": true,
+	})
+
+	result, err := sub.Substitute("verbose=${defaults.verbose}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "verbose=true" {
+		t.Errorf("got %q, want %q", result, "verbose=true")
+	}
+}
+
+func TestSubstitute_DefaultsWithDefault(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{})
+
+	result, err := sub.Substitute(`${defaults.missing | "fallback"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "fallback" {
+		t.Errorf("got %q, want %q", result, "fallback")
+	}
+}
+
+func TestSubstitute_DefaultsNoKeyError(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	sub.SetDefaults(map[string]interface{}{"x": "y"})
+
+	_, err := sub.Substitute("${defaults}")
+	if err == nil {
+		t.Fatal("expected error for bare defaults reference")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ${item} / ${item.X} loop-local binding tests (bd-6lkqr.3)
+// ---------------------------------------------------------------------------
+
+func TestSubstitute_ItemScalarInForeach(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	items := []interface{}{1, 2, 3}
+
+	for i, item := range items {
+		SetLoopVars(state, "item", item, i, len(items))
+		sub := NewSubstitutor(state, "sess", "wf")
+		result, err := sub.Substitute("val=${item}")
+		if err != nil {
+			t.Fatalf("iteration %d: unexpected error: %v", i, err)
+		}
+		want := fmt.Sprintf("val=%d", item)
+		if result != want {
+			t.Errorf("iteration %d: got %q, want %q", i, result, want)
+		}
+	}
+	ClearLoopVars(state, "item")
+}
+
+func TestSubstitute_ItemStringScalar(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	SetLoopVars(state, "item", "hello", 0, 1)
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	result, err := sub.Substitute("${item}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "hello" {
+		t.Errorf("got %q, want %q", result, "hello")
+	}
+}
+
+func TestSubstitute_ItemMapFields(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	record := map[string]interface{}{
+		"id":    "bd-123",
+		"title": "Fix the thing",
+		"priority": map[string]interface{}{
+			"level": 1,
+		},
+	}
+	SetLoopVars(state, "item", record, 0, 1)
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	result, err := sub.Substitute("${item.id}: ${item.title} (P${item.priority.level})")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "bd-123: Fix the thing (P1)"
+	if result != want {
+		t.Errorf("got %q, want %q", result, want)
+	}
+}
+
+func TestSubstitute_ItemOutsideForeachError(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	_, err := sub.Substitute("${item}")
+	if err == nil {
+		t.Fatal("expected error for item reference outside foreach")
+	}
+	subErr, ok := err.(*SubstitutionError)
+	if !ok {
+		t.Fatalf("expected SubstitutionError, got %T", err)
+	}
+	if subErr.VarRef != "item" {
+		t.Errorf("VarRef=%q, want %q", subErr.VarRef, "item")
+	}
+}
+
+func TestSubstitute_ItemFieldOutsideForeachError(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	_, err := sub.Substitute("${item.id}")
+	if err == nil {
+		t.Fatal("expected error for item.id reference outside foreach")
+	}
+}
+
+func TestSubstitute_ItemNilStateError(t *testing.T) {
+	sub := NewSubstitutor(nil, "sess", "wf")
+
+	_, err := sub.Substitute("${item}")
+	if err == nil {
+		t.Fatal("expected error for item reference with nil state")
+	}
+}
+
+func TestSubstitute_ItemClearedAfterLoop(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	SetLoopVars(state, "item", "value", 0, 1)
+	ClearLoopVars(state, "item")
+
+	sub := NewSubstitutor(state, "sess", "wf")
+	_, err := sub.Substitute("${item}")
+	if err == nil {
+		t.Fatal("expected error after loop vars cleared")
+	}
+}
+
+func TestSubstitute_ItemWithAsAlias(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	SetLoopVars(state, "file", "/tmp/test.txt", 0, 1)
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	result, err := sub.Substitute("${item}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "/tmp/test.txt" {
+		t.Errorf("got %q, want %q", result, "/tmp/test.txt")
+	}
+}
+
+func TestSubstitute_ItemWithDefaultFallback(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	result, err := sub.Substitute(`${item | "none"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "none" {
+		t.Errorf("got %q, want %q", result, "none")
+	}
+}
+
+// TestNormalizeStringVar covers bd-q84t9: declared `type: string` must
+// reject non-string values from --var-file (which can be native JSON
+// booleans, numbers, arrays, or objects). Plain --var input is always a
+// string and passes through.
+func TestNormalizeStringVar(t *testing.T) {
+	t.Run("string passes", func(t *testing.T) {
+		got, err := normalizeStringVar("name", "hello")
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got != "hello" {
+			t.Errorf("got %v, want hello", got)
+		}
+	})
+
+	rejects := []struct {
+		name  string
+		value interface{}
+		want  string
+	}{
+		{"bool", true, "expected string, got boolean true"},
+		{"number_int", json.Number("42"), "expected string, got number 42"},
+		{"number_float", json.Number("3.14"), "expected string, got number 3.14"},
+		{"array", []interface{}{"a", "b"}, "expected string, got array of length 2"},
+		{"object", map[string]interface{}{"k": "v"}, "expected string, got object"},
+		{"nil", nil, "expected string, got null"},
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := normalizeStringVar("name", tc.value)
+			if err == nil {
+				t.Fatalf("normalizeStringVar(%v) err = nil, want %q", tc.value, tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %q, want substring %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateWorkflowVariables_RejectsNonStringForDeclaredString is a
+// higher-level bd-q84t9 regression: a workflow declaring vars.foo type
+// "string" must reject a JSON number override from a --var-file.
+func TestValidateWorkflowVariables_RejectsNonStringForDeclaredString(t *testing.T) {
+	wf := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "string-var-typed",
+		Vars: map[string]VarDef{
+			"label": {Type: VarTypeString, Default: "foo"},
+		},
+	}
+	overrides := map[string]interface{}{"label": json.Number("42")}
+	_, err := ValidateWorkflowVariables(wf, overrides)
+	if err == nil {
+		t.Fatal("ValidateWorkflowVariables() err = nil, want type-mismatch error")
+	}
+	if !strings.Contains(err.Message, "expected string") {
+		t.Errorf("err = %q, want type-mismatch", err.Message)
 	}
 }

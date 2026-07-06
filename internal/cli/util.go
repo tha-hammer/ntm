@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -109,6 +110,16 @@ func IsInteractive(w io.Writer) bool {
 	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
 }
 
+// IsInteractiveStdin reports whether standard input is a terminal. Interactive
+// selectors (the session/pane choosers) read keystrokes from stdin, so a prompt
+// is only safe when stdin is a TTY — checking the output writer alone is not
+// enough: if stdin is redirected from a pipe/heredoc while stdout is still a
+// terminal, the selector would start and then immediately read EOF and cancel.
+// This mirrors the prompt gate used by confirm_huh.go.
+func IsInteractiveStdin() bool {
+	return isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
+}
+
 // HasAnyTag checks if any of the pane's tags match any of the filter tags.
 // Comparison is case-insensitive.
 func HasAnyTag(paneTags, filterTags []string) bool {
@@ -208,15 +219,31 @@ func ResolveSessionWithOptions(session string, w io.Writer, opts SessionResolveO
 		}, nil
 	}
 
-	// If we cannot prompt, provide a helpful error.
-	allowPrompt := !opts.TreatAsJSON && !IsJSONOutput() && IsInteractive(w)
+	// A session selector reads keystrokes from stdin and renders to the output
+	// writer, so prompting is only safe when BOTH are an interactive terminal.
+	// (The historical gate checked only the output writer, which would attempt
+	// the selector even when stdin is a pipe/heredoc — there it reads EOF and
+	// cancels immediately.) When we cannot prompt, return an actionable error.
+	allowPrompt := !opts.TreatAsJSON && !IsJSONOutput() && IsInteractive(w) && IsInteractiveStdin()
 	if !allowPrompt {
 		var names []string
 		for _, s := range sessionList {
 			names = append(names, s.Name)
 		}
 		sort.Strings(names)
-		return SessionResolution{}, fmt.Errorf("session name required (multiple sessions: %s)", strings.Join(names, ", "))
+		// Prefer a "real-looking" session as the copy-paste example: names that
+		// start with "_" are typically internal/ephemeral (test fixtures, etc.)
+		// and would make a confusing suggestion. Fall back to the first name.
+		example := names[0]
+		for _, n := range names {
+			if !strings.HasPrefix(n, "_") {
+				example = n
+				break
+			}
+		}
+		return SessionResolution{}, fmt.Errorf(
+			"session name required: %d sessions are running and there's no interactive terminal to show a selector — specify one explicitly (e.g. `%s`). Available: %s",
+			len(names), example, strings.Join(names, ", "))
 	}
 
 	// Order sessions so the "best" default is at the top of the selector.
@@ -762,4 +789,35 @@ func resolveCreationProjectDirForSession(session string) (string, error) {
 		return "", fmt.Errorf("getting project root failed")
 	}
 	return projectDir, nil
+}
+
+// errJSONFailure is returned by JSON-mode commands after they have already
+// written a `success:false` envelope to stdout. The root Execute() handler
+// recognizes it, suppresses the usual stderr "Error: ..." line (the JSON
+// envelope is the canonical machine-readable error surface), and exits
+// non-zero so shell callers can gate on `$?`.
+//
+// Use this only AFTER a JSON encode of a failure result has succeeded.
+// Non-JSON paths should keep returning ordinary fmt.Errorf errors.
+var errJSONFailure = errors.New("ntm: command failed (JSON envelope written)")
+
+// jsonFailureExit returns errJSONFailure unconditionally. Encoding errors
+// from json.Encoder are surfaced as ordinary errors so they reach stderr;
+// any other failure path that wrote a `success:false` envelope must signal
+// non-zero exit through this helper.
+func jsonFailureExit() error { return errJSONFailure }
+
+// emitJSONFailureEnvelope encodes a `success:false` envelope to stdout and
+// signals a non-zero exit via errJSONFailure (bd-oqwmf). Use this in place
+// of `return json.NewEncoder(os.Stdout).Encode(envelope)` at sites that
+// emit a failure envelope — the bare-Encode form returns nil on success
+// and silently exits 0, defeating shell `$?` gating.
+//
+// On encode failure, the encoder error is returned as-is so it surfaces
+// on stderr with the usual "Error: ..." formatting.
+func emitJSONFailureEnvelope(v interface{}) error {
+	if encErr := json.NewEncoder(os.Stdout).Encode(v); encErr != nil {
+		return encErr
+	}
+	return errJSONFailure
 }

@@ -185,6 +185,10 @@ func TestOpenDefault(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
 	t.Setenv("XDG_CONFIG_HOME", "")
+	// bd-ev740: clear ambient NTM_CONFIG so DefaultPath does not route the
+	// state DB into a hostile or non-writable path that an outer
+	// CI/agent shell may have exported (e.g. /nonexistent/config.toml).
+	t.Setenv("NTM_CONFIG", "")
 
 	store, err := Open("")
 	if err != nil {
@@ -202,6 +206,10 @@ func TestOpenDefaultRespectsXDGConfigHome(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", filepath.Join(tmpDir, "home"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, "xdg-config"))
+	// bd-ev740: clear ambient NTM_CONFIG; otherwise the state path resolver
+	// honors NTM_CONFIG ahead of XDG_CONFIG_HOME and the test's XDG path
+	// expectation breaks.
+	t.Setenv("NTM_CONFIG", "")
 
 	store, err := Open("")
 	if err != nil {

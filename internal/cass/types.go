@@ -138,10 +138,16 @@ func (r SearchResponse) HasMore() bool {
 
 // IndexInfo provides details about the search index
 type IndexInfo struct {
-	DocCount    int64    `json:"doc_count"`
-	SizeBytes   int64    `json:"size_bytes"`
-	LastUpdated FlexTime `json:"last_updated"`
-	Healthy     bool     `json:"healthy"`
+	Exists        bool     `json:"exists"`
+	Status        string   `json:"status"`
+	Fresh         bool     `json:"fresh"`
+	Rebuilding    bool     `json:"rebuilding"`
+	DocCount      int64    `json:"doc_count"`
+	Documents     int64    `json:"documents"`
+	SizeBytes     int64    `json:"size_bytes"`
+	LastUpdated   FlexTime `json:"last_updated"`
+	LastIndexedAt FlexTime `json:"last_indexed_at"`
+	Healthy       bool     `json:"healthy"`
 }
 
 // SizeMB returns the index size in megabytes
@@ -149,17 +155,52 @@ func (i IndexInfo) SizeMB() float64 {
 	return float64(i.SizeBytes) / (1024 * 1024)
 }
 
+// IsReady returns true when either the legacy or current CASS status schema
+// reports that the lexical index is usable.
+func (i IndexInfo) IsReady() bool {
+	if i.Healthy {
+		return true
+	}
+	if i.Fresh && !i.Rebuilding {
+		return i.Status == "" || i.Status == "ready"
+	}
+	return false
+}
+
+// EffectiveLastIndexedAt returns the newest populated index timestamp.
+func (i IndexInfo) EffectiveLastIndexedAt(fallback FlexTime) time.Time {
+	if !i.LastIndexedAt.IsZero() {
+		return i.LastIndexedAt.Time
+	}
+	if !i.LastUpdated.IsZero() {
+		return i.LastUpdated.Time
+	}
+	return fallback.Time
+}
+
 // DBInfo provides details about the SQLite database
 type DBInfo struct {
-	Path         string `json:"path"`
-	SizeBytes    int64  `json:"size_bytes"`
-	Healthy      bool   `json:"healthy"`
-	SessionCount int64  `json:"session_count"`
+	Path          string `json:"path"`
+	Exists        bool   `json:"exists"`
+	Opened        bool   `json:"opened"`
+	OpenSkipped   bool   `json:"open_skipped"`
+	CountsSkipped bool   `json:"counts_skipped"`
+	SizeBytes     int64  `json:"size_bytes"`
+	Healthy       bool   `json:"healthy"`
+	SessionCount  int64  `json:"session_count"`
+	Conversations int64  `json:"conversations"`
+	Messages      int64  `json:"messages"`
 }
 
 // SizeMB returns the DB size in megabytes
 func (d DBInfo) SizeMB() float64 {
 	return float64(d.SizeBytes) / (1024 * 1024)
+}
+
+// IsUsable returns true when either the legacy or current CASS status schema
+// reports that the canonical database can be opened.
+func (d DBInfo) IsUsable() bool {
+	return d.Healthy || d.Opened || (d.Exists && d.Path != "")
 }
 
 // Pending tracks items waiting to be indexed
@@ -190,9 +231,49 @@ type StatusResponse struct {
 	StoragePath   string   `json:"storage_path,omitempty"`
 }
 
+// UnmarshalJSON accepts both the legacy CASS status schema and the current
+// status/health schema used by recent cass builds.
+func (s *StatusResponse) UnmarshalJSON(data []byte) error {
+	type statusResponse StatusResponse
+	var response statusResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return err
+	}
+
+	*s = StatusResponse(response)
+	if s.Index.IsReady() {
+		s.Index.Healthy = true
+	}
+	if s.Database.IsUsable() {
+		s.Database.Healthy = true
+	}
+	// Older/current CASS schemas can report open_skipped without the newer
+	// counts_skipped flag. In that case, counts are unknown and callers should
+	// omit conversations/messages rather than surfacing misleading zeros.
+	if s.Database.OpenSkipped {
+		s.Database.CountsSkipped = true
+	}
+	if s.LastIndexedAt.IsZero() {
+		s.LastIndexedAt = FlexTime{Time: s.Index.EffectiveLastIndexedAt(FlexTime{})}
+	}
+	s.Conversations = firstNonZero(s.Conversations, s.Database.Conversations, s.Database.SessionCount)
+	s.Messages = firstNonZero(s.Messages, s.Database.Messages, s.Index.Documents, s.Index.DocCount)
+
+	return nil
+}
+
 // IsHealthy returns true if the overall status is healthy
 func (s StatusResponse) IsHealthy() bool {
-	return s.Healthy && s.Index.Healthy && s.Database.Healthy
+	return s.Healthy && s.Index.IsReady() && s.Database.IsUsable()
+}
+
+func firstNonZero(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 // Limits defines API limits.

@@ -78,13 +78,15 @@ Examples:
 func setupBinding(key string) error {
 	t := theme.Current()
 
-	// The binding command
-	bindCmd := fmt.Sprintf(`bind-key -n %s display-popup -E -w 90%% -h 90%% "ntm palette"`, key)
+	// The binding command. The palette is a compact dialog (content-sized list +
+	// short target/agent pickers), so it uses a smaller popup than the full
+	// dashboard overlay to avoid blocking most of the screen behind it (#204).
+	bindCmd := fmt.Sprintf(`bind-key -n %s display-popup -E -w 80%% -h 70%% "ntm palette"`, key)
 
 	// Apply to current tmux server (if running)
 	inTmux := os.Getenv("TMUX") != ""
 	if inTmux {
-		cmd := exec.Command(tmux.BinaryPath(), "bind-key", "-n", key, "display-popup", "-E", "-w", "90%", "-h", "90%", "ntm palette")
+		cmd := exec.Command(tmux.BinaryPath(), "bind-key", "-n", key, "display-popup", "-E", "-w", "80%", "-h", "70%", "ntm palette")
 		if err := cmd.Run(); err != nil {
 			fmt.Printf("%s⚠%s Could not bind in current session: %v\n", colorize(t.Warning), colorize(t.Text), err)
 		} else {
@@ -238,14 +240,17 @@ func setupOverlayBindingWithWriter(key string, out io.Writer) error {
 }
 
 func overlayBindingCommand(key string) string {
-	return fmt.Sprintf(`bind-key -n %s display-popup -E -w 95%% -h 95%% "NTM_POPUP=1 ntm dashboard --popup #{session_name}"`, key)
+	return fmt.Sprintf(`bind-key -n %s display-popup -E -w 95%% -h 95%% "NTM_POPUP=1 ntm dashboard --popup --inferred #{session_name}"`, key)
 }
 
 func overlayBindingArgs(key string) []string {
 	return []string{
 		"bind-key", "-n", key,
 		"display-popup", "-E", "-w", "95%", "-h", "95%",
-		"NTM_POPUP=1 ntm dashboard --popup #{session_name}",
+		// --inferred keeps the lenient current-session resolution: #{session_name}
+		// is always the session the key was pressed in, so the overlay is a
+		// current-session view and must not fail closed for unregistered sessions.
+		"NTM_POPUP=1 ntm dashboard --popup --inferred #{session_name}",
 	}
 }
 
@@ -352,7 +357,10 @@ func showBinding(key string) error {
 }
 
 // isOverlayKeyBound checks if the given key already has an NTM overlay binding
-// in tmux.conf. Returns true if found.
+// in tmux.conf in its CURRENT form. Returns false when the binding is absent OR
+// when it is a stale pre-#201 binding (missing --inferred); in the stale case
+// the auto-setup path then replaces it in place (via isBindingLine), migrating
+// it to the lenient current-session resolution.
 func isOverlayKeyBound(key string) bool {
 	tmuxConf := filepath.Join(os.Getenv("HOME"), ".tmux.conf")
 	data, err := os.ReadFile(tmuxConf)
@@ -367,10 +375,18 @@ func isOverlayKeyBound(key string) bool {
 	return false
 }
 
+// isOverlayBindingLine reports whether line is an ntm overlay binding for key in
+// its CURRENT form. It requires the "--inferred" marker so a stale pre-#201
+// overlay binding (which lacks it) is reported as NOT current — that makes
+// isOverlayKeyBound return false and triggers setupOverlayBinding to replace the
+// old line in place (found via the broader isBindingLine), so existing F12
+// bindings are migrated to the fixed lenient resolution instead of silently
+// failing closed for unregistered sessions.
 func isOverlayBindingLine(line, key string) bool {
 	return isBindingLine(line, key) &&
 		strings.Contains(line, "display-popup") &&
-		strings.Contains(line, "dashboard --popup")
+		strings.Contains(line, "dashboard --popup") &&
+		strings.Contains(line, "--inferred")
 }
 
 // isBindingLine checks if a line is a tmux binding for the given key.

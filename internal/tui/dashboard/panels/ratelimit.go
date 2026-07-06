@@ -210,6 +210,8 @@ func (m *RateLimitPanel) shortAgentType(agentType string) string {
 		return "cod"
 	case "gemini":
 		return "gmi"
+	case "antigravity":
+		return "agy"
 	default:
 		agentType = robot.ResolveAgentType(agentType)
 		return agentType[:min(3, len(agentType))]

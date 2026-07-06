@@ -61,7 +61,7 @@ var OrderDiagram = []string{
 	"  |   You (shell)   |   Claude #1     |   Claude #2       |",
 	"  |   $ ntm send    |   [Working...]  |   [Ready]         |",
 	"  +-----------------+-----------------+-------------------+",
-	"  |   Codex #1      |   Codex #2      |   Gemini #1       |",
+	"  |   Codex #1      |   Codex #2      |   Antigravity #1  |",
 	"  |   [Testing...]  |   [Complete]    |   [Analyzing]     |",
 	"  +-----------------+-----------------+-------------------+",
 }
@@ -88,8 +88,8 @@ var AgentsDiagram = []string{
 	"     |                    AI AGENTS                       |",
 	"     +----------------------------------------------------+",
 	"",
-	"       [CC] Claude       [COD] Codex      [GMI] Gemini",
-	"       -----------       -----------      ------------",
+	"       [CC] Claude       [COD] Codex      [AGY] Antigravity",
+	"       -----------       -----------      -----------------",
 	"        Anthropic          OpenAI           Google",
 	"        Architecture       Implementation   Testing",
 	"        Design             Code Gen         Analysis",
@@ -105,7 +105,7 @@ var PaneLayoutDiagram = []string{
 	"   |  myproject__cc_1    ->  Claude agent #1             |",
 	"   |  myproject__cc_2    ->  Claude agent #2             |",
 	"   |  myproject__cod_1   ->  Codex agent #1              |",
-	"   |  myproject__gmi_1   ->  Gemini agent #1             |",
+	"   |  myproject__agy_1   ->  Antigravity agent #1        |",
 	"   |                                                     |",
 	"   +-----------------------------------------------------+",
 }
@@ -122,8 +122,8 @@ var CommandFlowDiagram = []string{
 	"             |             |             |",
 	"             v             v             v",
 	"        +--------+   +--------+   +--------+",
-	"        | Claude |   | Codex  |   | Gemini |",
-	"        |  (cc)  |   | (cod)  |   | (gmi)  |",
+	"        | Claude |   | Codex  |   |  agy   |",
+	"        |  (cc)  |   | (cod)  |   | (agy)  |",
 	"        +--------+   +--------+   +--------+",
 	"",
 }
@@ -177,7 +177,7 @@ var CelebrationBanner = []string{
 var QuickStartCommands = []string{
 	"# Create a new project with agents",
 	"$ ntm quick myproject --template=go",
-	"$ ntm spawn myproject --cc=3 --cod=2 --gmi=1",
+	"$ ntm spawn myproject --cc=3 --cod=2 --agy=1",
 	"",
 	"# Send prompts to your agents",
 	"$ ntm send myproject --all \"Build a REST API\"",
@@ -200,7 +200,7 @@ var TipsContent = [][]string{
 		"",
 		"Use Claude for architecture,",
 		"Codex for implementation,",
-		"Gemini for testing & docs.",
+		"Antigravity for testing & docs.",
 	},
 	{
 		"[Tip #3] Use the Palette",
@@ -326,7 +326,7 @@ func RenderAgentsDiagram(tick int, width int) string {
 			colored = styles.GradientText(line, claudeColor, "#cdd6f4")
 		} else if strings.Contains(line, "Codex") || strings.Contains(line, "OpenAI") || strings.Contains(line, "Implementation") || strings.Contains(line, "Code Gen") {
 			colored = styles.GradientText(line, codexColor, "#cdd6f4")
-		} else if strings.Contains(line, "Gemini") || strings.Contains(line, "Google") || strings.Contains(line, "Testing") || strings.Contains(line, "Analysis") {
+		} else if strings.Contains(line, "Antigravity") || strings.Contains(line, "Gemini") || strings.Contains(line, "Google") || strings.Contains(line, "Testing") || strings.Contains(line, "Analysis") {
 			colored = styles.GradientText(line, geminiColor, "#cdd6f4")
 		} else if strings.Contains(line, "AI AGENTS") {
 			colored = styles.Shimmer(line, tick, "#89b4fa", "#cba6f7", "#f5c2e7")
@@ -374,7 +374,7 @@ func RenderCommandFlowDiagram(tick int, step int, width int) string {
 			line = styles.GradientText(line, "#cba6f7", "#b4befe")
 		} else if strings.Contains(line, "Codex") {
 			line = styles.GradientText(line, "#89b4fa", "#74c7ec")
-		} else if strings.Contains(line, "Gemini") {
+		} else if strings.Contains(line, "Antigravity") || strings.Contains(line, "agy") || strings.Contains(line, "Gemini") {
 			line = styles.GradientText(line, "#f9e2af", "#fab387")
 		}
 

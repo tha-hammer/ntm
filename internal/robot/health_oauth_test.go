@@ -2,6 +2,7 @@ package robot
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
@@ -565,11 +566,117 @@ func TestOAuthHealthOutputJSONStructure(t *testing.T) {
 	if !ok {
 		t.Fatal("summary should be an object")
 	}
-	summaryFields := []string{"total", "oauth_valid", "oauth_expired", "oauth_error", "rate_limit_ok", "rate_limit_warn", "rate_limited"}
+	summaryFields := []string{"total", "oauth_valid", "oauth_expired", "oauth_error", "oauth_unknown", "rate_limit_ok", "rate_limit_warn", "rate_limited"}
 	for _, f := range summaryFields {
 		if _, ok := summary[f]; !ok {
 			t.Errorf("summary JSON missing field %q", f)
 		}
+	}
+}
+
+// TestExitCodeForResponse is the ntm#207 unit guard for the shared exit-code
+// mapping: a robot envelope that reports success:false must map to a nonzero
+// process exit code so agents branching on the shell status don't treat a
+// failure as success.
+func TestExitCodeForResponse(t *testing.T) {
+	tests := []struct {
+		name string
+		resp RobotResponse
+		want int
+	}{
+		{"success", NewRobotResponse(true), 0},
+		{
+			"session_not_found",
+			NewErrorResponse(errors.New("no session"), ErrCodeSessionNotFound, ""),
+			1,
+		},
+		{
+			"internal_error",
+			NewErrorResponse(errors.New("boom"), ErrCodeInternalError, ""),
+			1,
+		},
+		{
+			"not_implemented",
+			NewErrorResponse(errors.New("later"), ErrCodeNotImplemented, ""),
+			2,
+		},
+		{
+			"failure_without_code",
+			RobotResponse{Success: false},
+			1,
+		},
+		{
+			"meta_exit_code_wins",
+			NewRobotResponseWithMeta(true, NewResponseMeta("x").WithExitCode(2)),
+			2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExitCodeForResponse(tt.resp); got != tt.want {
+				t.Errorf("ExitCodeForResponse(%s) = %d, want %d", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPrintHealthOAuthFailingCallExitsNonzero is the ntm#207 regression guard.
+// A failing --robot-health-oauth call (here: an unknown session) must (a) still
+// print the JSON envelope carrying success:false + an error_code, and (b) make
+// PrintHealthOAuth return a nonzero exit code so the process exits nonzero. It
+// also proves the negative: a synthetic success envelope maps to exit 0.
+func TestPrintHealthOAuthFailingCallExitsNonzero(t *testing.T) {
+	// A session name that cannot exist in the test environment.
+	session := "ntm-207-nonexistent-session-xyz"
+
+	var code int
+	out, _ := captureStdout(t, func() error {
+		code = PrintHealthOAuth(session)
+		return nil
+	})
+
+	if code == 0 {
+		t.Errorf("PrintHealthOAuth returned exit code 0 for a failing call; want nonzero")
+	}
+
+	// The JSON payload must still be emitted with success:false.
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatalf("PrintHealthOAuth did not print valid JSON: %v\noutput=%q", err, out)
+	}
+	if s, ok := m["success"].(bool); !ok || s {
+		t.Errorf("expected success=false in failing-call JSON, got %v", m["success"])
+	}
+	if _, ok := m["error_code"]; !ok {
+		t.Errorf("expected error_code in failing-call JSON, got keys %v", m)
+	}
+
+	// Positive control: a success envelope maps to exit 0.
+	if got := ExitCodeForResponse(NewRobotResponse(true)); got != 0 {
+		t.Errorf("passing call exit code = %d, want 0", got)
+	}
+}
+
+// TestOAuthHealthSummaryCountsUnknownDistinctly guards the ntm#207 secondary:
+// an "unknown" OAuth status must be counted in its own summary bucket and never
+// folded into oauth_valid, so the summary invariant
+// total == valid+expired+error+unknown holds and a live-but-indeterminate agent
+// never reads as healthy.
+func TestOAuthHealthSummaryCountsUnknownDistinctly(t *testing.T) {
+	s := OAuthHealthSummary{
+		Total:        3,
+		OAuthValid:   1,
+		OAuthExpired: 0,
+		OAuthError:   1,
+		OAuthUnknown: 1,
+	}
+	if s.OAuthValid+s.OAuthExpired+s.OAuthError+s.OAuthUnknown != s.Total {
+		t.Errorf("summary buckets %d+%d+%d+%d != total %d",
+			s.OAuthValid, s.OAuthExpired, s.OAuthError, s.OAuthUnknown, s.Total)
+	}
+	// oauthIcon must render unknown distinctly from valid.
+	if oauthIcon(OAuthUnknown) == oauthIcon(OAuthValid) {
+		t.Errorf("unknown OAuth icon must differ from valid icon")
 	}
 }
 

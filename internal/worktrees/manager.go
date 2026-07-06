@@ -144,6 +144,23 @@ func (m *WorktreeManager) CreateForAgent(agentName string) (*WorktreeInfo, error
 			info.Error = "invalid or stale worktree"
 			return info, fmt.Errorf("worktree path exists but is not a valid git worktree: %s", worktreePath)
 		}
+		// Defend against the silent-contamination scenario from #145: the
+		// worktree path already exists, but a *different* prior spawn
+		// created it under a different branch. Returning Created=false
+		// here would silently hand the second spawn the first spawn's
+		// checkout — that's exactly the cross-contamination the issue
+		// reports. Compare the checked-out branch against what we'd have
+		// created (`ntm/<session>/<agent>`); on mismatch, refuse loudly
+		// so the caller has to either reuse the same agent name or pick
+		// a non-colliding path. See ntm#145.
+		if currentBranch, branchErr := worktreeCurrentBranch(worktreePath); branchErr == nil &&
+			currentBranch != "" && currentBranch != info.BranchName {
+			info.Error = fmt.Sprintf(
+				"worktree path %s already exists on branch %q; would collide with the new branch %q (likely cross-contamination — see ntm#145; pass --worktree-name to disambiguate)",
+				worktreePath, currentBranch, info.BranchName,
+			)
+			return info, fmt.Errorf("%s", info.Error)
+		}
 		info.Created = false
 		return info, nil
 	} else if !os.IsNotExist(err) {
@@ -317,8 +334,29 @@ func (m *WorktreeManager) isValidWorktree(worktreePath string) bool {
 	return worktreeListed(output, worktreePath)
 }
 
+// worktreeCurrentBranch reads the checked-out branch name for the worktree
+// at the given path. Returns "" with no error for detached HEAD or when
+// the path isn't a git worktree. Used by CreateForAgent to detect
+// cross-contamination on path collision (see ntm#145).
+func worktreeCurrentBranch(worktreePath string) (string, error) {
+	output, err := gitOutput(worktreePath, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		// `symbolic-ref --quiet` exits non-zero (without writing) on
+		// detached HEAD; treat as "no branch" rather than an error.
+		if len(strings.TrimSpace(string(output))) == 0 {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 func worktreeListed(output []byte, worktreePath string) bool {
-	target := filepath.Clean(worktreePath)
+	// macOS resolves /var/folders/... to /private/var/folders/... when
+	// git emits worktree paths; the caller usually passes the
+	// pre-resolved form. Normalise both sides via EvalSymlinks so the
+	// comparison survives the substitution.
+	target := canonicalisePath(worktreePath)
 	for _, line := range strings.Split(string(output), "\n") {
 		if !strings.HasPrefix(line, "worktree ") {
 			continue
@@ -327,11 +365,45 @@ func worktreeListed(output []byte, worktreePath string) bool {
 		if listed == "" {
 			continue
 		}
-		if filepath.Clean(listed) == target {
+		if canonicalisePath(listed) == target {
 			return true
 		}
 	}
 	return false
+}
+
+// canonicalisePath returns filepath.Clean(p) with all existing symlinks
+// resolved. If the path or an ancestor doesn't exist, it canonicalises
+// the deepest ancestor that does and re-attaches the missing tail —
+// this keeps comparisons stable across the macOS /var → /private/var
+// substitution even for not-yet-created worktree paths.
+func canonicalisePath(p string) string {
+	clean := filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(resolved)
+	}
+	dir := clean
+	missing := ""
+	for {
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err == nil {
+			if missing == "" {
+				return filepath.Clean(resolved)
+			}
+			return filepath.Clean(filepath.Join(resolved, missing))
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return clean
+		}
+		base := filepath.Base(dir)
+		if missing == "" {
+			missing = base
+		} else {
+			missing = filepath.Join(base, missing)
+		}
+		dir = parent
+	}
 }
 
 // GetWorktreeForAgent returns worktree information for a specific agent

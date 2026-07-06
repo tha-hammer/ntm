@@ -359,6 +359,10 @@ func outputAgentBadgeColor(agentType string, th theme.Theme) lipgloss.Color {
 		return th.Codex
 	case agent.AgentTypeGemini:
 		return th.Gemini
+	case agent.AgentTypeAntigravity:
+		// Antigravity (agy) gets its own lavender accent, matching the semantic
+		// theme palette, to distinguish it from the legacy Gemini CLI.
+		return th.Lavender
 	case agent.AgentTypeCursor:
 		return th.Cursor
 	case agent.AgentTypeWindsurf:

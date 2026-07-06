@@ -1158,3 +1158,239 @@ func TestSelectorKeyMapBindings(t *testing.T) {
 		t.Error("Enter key should match Select in selector")
 	}
 }
+
+// --- #204: command list box fits its content instead of a fixed oversized box ---
+
+func TestCommandListBoxFitsContentWhenShort(t *testing.T) {
+	m := New("test-session", testCommands)
+	// Tall terminal: the list box must NOT expand to fill it when there are only
+	// a handful of commands - it should size to its content (#204).
+	m.width = 100
+	m.height = 100
+	m.syncListViewport()
+
+	maxHeight := m.height - 14
+	got := m.commandListBoxHeight()
+	if got >= maxHeight {
+		t.Fatalf("expected list box to fit content (< maxHeight %d), got %d", maxHeight, got)
+	}
+	if got < 5 {
+		t.Fatalf("expected a sensible minimum height, got %d", got)
+	}
+}
+
+func TestCommandListBoxCapsAndScrollsWhenLong(t *testing.T) {
+	var many []config.PaletteCmd
+	for i := 0; i < 100; i++ {
+		many = append(many, config.PaletteCmd{
+			Key:      fmtKey(i),
+			Label:    fmtKey(i),
+			Category: "Quick Actions",
+			Prompt:   "do a thing",
+		})
+	}
+	m := New("test-session", many)
+	m.width = 100
+	m.height = 40
+	m.syncListViewport()
+
+	maxHeight := m.height - 14
+	if got := m.commandListBoxHeight(); got != maxHeight {
+		t.Fatalf("expected long list to cap at maxHeight %d, got %d", maxHeight, got)
+	}
+	if m.listViewport.TotalLineCount() <= m.listViewport.Height {
+		t.Fatalf("expected content to overflow the viewport so it scrolls")
+	}
+}
+
+func fmtKey(i int) string {
+	return "cmd-" + string(rune('a'+(i%26))) + string(rune('0'+(i/26)))
+}
+
+// --- #206: compose a free-text custom message from scratch ---
+
+func TestComposeCustomMessageShortcut(t *testing.T) {
+	m := New("test-session", testCommands)
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+	m = newModel.(Model)
+
+	if m.phase != PhaseEdit {
+		t.Fatalf("expected ctrl+n to open the editor (PhaseEdit), got phase %v", m.phase)
+	}
+	if m.selected == nil || m.selected.Key != customMessageKey {
+		t.Fatalf("expected a synthetic custom-message selection, got %+v", m.selected)
+	}
+	if strings.TrimSpace(m.editInput.Value()) != "" {
+		t.Fatalf("expected an empty editor for a from-scratch message, got %q", m.editInput.Value())
+	}
+
+	// Type a message and confirm; it should land in the target picker with the
+	// composed text captured as the draft.
+	m.editInput.SetValue("please run the tests")
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = newModel.(Model)
+	if m.phase != PhaseTarget {
+		t.Fatalf("expected ctrl+s to advance to PhaseTarget, got %v", m.phase)
+	}
+	if m.editDraft != "please run the tests" {
+		t.Fatalf("expected composed text to be captured, got %q", m.editDraft)
+	}
+}
+
+// TestSendRefusesEmptyMessage guards the #206 regression: a compose (or an
+// edited-to-empty command) confirmed with nothing typed must NOT be dispatched.
+// send() would otherwise fire a double-Enter with no text at every target pane,
+// submitting whatever half-typed input already sits in each agent's prompt.
+func TestSendRefusesEmptyMessage(t *testing.T) {
+	m := New("test-session", testCommands)
+
+	// Enter the compose flow (empty prompt) and confirm without typing.
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+	m = newModel.(Model)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlS}) // ConfirmEdit with empty draft
+	m = newModel.(Model)
+	if m.phase != PhaseTarget {
+		t.Fatalf("expected PhaseTarget after confirming, got %v", m.phase)
+	}
+
+	// Attempt to send. It must refuse: bounce back to the editor with a notice,
+	// and NOT mark the message as sent (no tmux dispatch).
+	model, _ := m.send()
+	m = model.(Model)
+	if m.sent {
+		t.Fatalf("empty message must not be sent")
+	}
+	if m.phase != PhaseEdit {
+		t.Fatalf("expected send() to bounce empty message back to PhaseEdit, got %v", m.phase)
+	}
+	if strings.TrimSpace(m.editNotice) == "" {
+		t.Fatalf("expected an editNotice explaining the empty message was refused")
+	}
+
+	// A whitespace-only draft is likewise refused.
+	m.editDraft = "   \n\t "
+	m.phase = PhaseTarget
+	model, _ = m.send()
+	m = model.(Model)
+	if m.sent || m.phase != PhaseEdit {
+		t.Fatalf("whitespace-only message must be refused too (sent=%v phase=%v)", m.sent, m.phase)
+	}
+}
+
+// --- #205: granular per-agent multi-select ---
+
+func newAgentSelectModel() Model {
+	m := New("test-session", testCommands)
+	m.phase = PhaseSelectAgents
+	m.selected = &testCommands[0]
+	m.agentPanes = []tmux.Pane{
+		{ID: "%1", Index: 1, Title: "test-session__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 2, Title: "test-session__cod_1", Type: tmux.AgentCodex},
+	}
+	m.agentChecked = map[string]bool{"%1": true, "%2": true}
+	m.agentCursor = 0
+	return m
+}
+
+func TestSelectAgentsToggleAllNone(t *testing.T) {
+	m := newAgentSelectModel()
+
+	// Space toggles the pane under the cursor off.
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = newModel.(Model)
+	if m.agentChecked["%1"] {
+		t.Fatalf("expected space to uncheck pane under cursor")
+	}
+	if !m.agentChecked["%2"] {
+		t.Fatalf("expected other pane to stay checked")
+	}
+
+	// 'n' clears all.
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(Model)
+	if m.agentChecked["%1"] || m.agentChecked["%2"] {
+		t.Fatalf("expected 'n' to deselect all")
+	}
+
+	// 'a' selects all.
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = newModel.(Model)
+	if !m.agentChecked["%1"] || !m.agentChecked["%2"] {
+		t.Fatalf("expected 'a' to select all")
+	}
+}
+
+func TestSelectAgentsNavigation(t *testing.T) {
+	m := newAgentSelectModel()
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = newModel.(Model)
+	if m.agentCursor != 1 {
+		t.Fatalf("expected cursor to move down to 1, got %d", m.agentCursor)
+	}
+	// Down at the bottom should clamp.
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = newModel.(Model)
+	if m.agentCursor != 1 {
+		t.Fatalf("expected cursor to clamp at last index, got %d", m.agentCursor)
+	}
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = newModel.(Model)
+	if m.agentCursor != 0 {
+		t.Fatalf("expected cursor to move back to 0, got %d", m.agentCursor)
+	}
+}
+
+func TestSelectAgentsBackReturnsToTarget(t *testing.T) {
+	m := newAgentSelectModel()
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(Model)
+	if m.phase != PhaseTarget {
+		t.Fatalf("expected esc to return to PhaseTarget, got %v", m.phase)
+	}
+}
+
+func TestSelectAgentsEnterWithNoSelectionStays(t *testing.T) {
+	m := newAgentSelectModel()
+	m.agentChecked = map[string]bool{"%1": false, "%2": false}
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(Model)
+	if m.phase != PhaseSelectAgents {
+		t.Fatalf("expected enter with nothing checked to stay in PhaseSelectAgents, got %v", m.phase)
+	}
+	if m.quitting {
+		t.Fatalf("expected no send/quit when nothing is checked")
+	}
+}
+
+func TestSelectAgentsView(t *testing.T) {
+	m := newAgentSelectModel()
+	m.width = 100
+	m.height = 40
+	view := stripANSI(m.viewSelectAgentsPhase())
+	if !strings.Contains(view, "Select Agents") {
+		t.Fatalf("expected title, got: %q", view)
+	}
+	if !strings.Contains(view, "test-session__cc_1") || !strings.Contains(view, "test-session__cod_1") {
+		t.Fatalf("expected pane titles in view, got: %q", view)
+	}
+	if !strings.Contains(view, "[x]") {
+		t.Fatalf("expected checked markers in view, got: %q", view)
+	}
+	if !strings.Contains(view, "2 of 2 selected") {
+		t.Fatalf("expected selection count, got: %q", view)
+	}
+}
+
+func TestTargetPhaseOffersSelectAgents(t *testing.T) {
+	m := New("test-session", testCommands)
+	m.phase = PhaseTarget
+	m.selected = &testCommands[0]
+	m.width = 100
+	m.height = 40
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Select agents") {
+		t.Fatalf("expected target phase to offer granular selection, got: %q", view)
+	}
+}

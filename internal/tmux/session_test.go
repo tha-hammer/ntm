@@ -67,6 +67,18 @@ func TestValidateSessionName(t *testing.T) {
 	}
 }
 
+func TestCreateSessionRejectsInvalidNameBeforeInvokingTmux(t *testing.T) {
+	client := NewClient("")
+
+	err := client.CreateSessionWithHistoryLimit("bad/session", t.TempDir(), 0)
+	if err == nil {
+		t.Fatal("CreateSessionWithHistoryLimit() error = nil, want invalid session name error")
+	}
+	if !strings.Contains(err.Error(), "invalid session name") {
+		t.Fatalf("CreateSessionWithHistoryLimit() error = %v, want invalid session name", err)
+	}
+}
+
 func TestAgentTypeFromTitle(t *testing.T) {
 	tests := []struct {
 		title    string
@@ -239,8 +251,11 @@ func TestListSessions(t *testing.T) {
 func TestGetAllPanes_NoServerReturnsEmpty(t *testing.T) {
 	skipIfNoTmux(t)
 
-	// Point tmux at an empty socket directory so no server exists.
+	// Point tmux at an empty socket directory so no server exists. Also
+	// neutralize TMUX so a CI/agent shell that already lives inside a tmux
+	// server cannot leak its panes into list-panes -a (bd-wt9d4).
 	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX", "")
 
 	panes, err := GetAllPanes()
 	if err != nil {
@@ -1551,6 +1566,43 @@ func TestNeedsBufferSend(t *testing.T) {
 			name:      "claude long content",
 			agentType: AgentClaude,
 			content:   strings.Repeat("x", 1000),
+			want:      false,
+		},
+		// Claude single-line autocomplete-trigger tokens — must buffer (#198)
+		{
+			name:      "claude single line with filename",
+			agentType: AgentClaude,
+			content:   "open README.md and summarize",
+			want:      true,
+		},
+		{
+			name:      "claude single line with path",
+			agentType: AgentClaude,
+			content:   "read .orch-dispatch/x.txt then start",
+			want:      true,
+		},
+		{
+			name:      "claude single line with leading slash path",
+			agentType: AgentClaude,
+			content:   "look at src/main.go",
+			want:      true,
+		},
+		{
+			name:      "claude single line with at mention",
+			agentType: AgentClaude,
+			content:   "review @internal/tmux/session.go",
+			want:      true,
+		},
+		{
+			name:      "claude single line plain prose no submit risk",
+			agentType: AgentClaude,
+			content:   "Reply with one word: ALIVE",
+			want:      false,
+		},
+		{
+			name:      "claude single line prose with sentence period",
+			agentType: AgentClaude,
+			content:   "Say hello. Then stop",
 			want:      false,
 		},
 		{

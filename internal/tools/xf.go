@@ -115,42 +115,27 @@ func (a *XFAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 		}, nil
 	}
 
-	// Version compatibility: require a parseable X.Y.Z substring.
-	// This avoids silently treating unparseable versions as "compatible".
+	// Tool health = xf is installed and responds with a parseable version.
+	// Whether an archive is *indexed* is operational readiness, NOT tool health:
+	// a freshly-installed xf, or one whose archive lives at a non-default path
+	// (XF_DB / XF_INDEX), is perfectly healthy but has nothing at the canonical
+	// ~/.xf/archive location. Previously `ntm doctor` HARD-FAILED on a missing
+	// default archive AND probed an index via the removed `xf stats --output json`
+	// flag, so a healthy xf permanently reported "health check failed" (#202).
+	// Archive/index state is now surfaced as advisory context only.
 	versionOK := VersionRegex.MatchString(ver.Raw)
 
-	// Validate default archive location existence. This isn't guaranteed to be
-	// the only possible archive location, but it is the canonical default and
-	// the integration won't function usefully without *some* indexed archive.
+	// Archive presence is a cheap filesystem stat (no exec). Advisory only.
 	archivePath := util.ExpandPath(defaultXFArchivePath)
 	archiveOK, archiveErr := isDir(archivePath)
 
-	// Check index validity via xf stats (best-effort).
-	// If stats returns empty, treat as "not indexed" rather than hard error.
-	stats, statsErr := a.GetStats(ctx)
-	indexValid := false
-	tweetCount := 0
-	indexStatus := ""
-	dbPath := ""
-	if stats != nil {
-		tweetCount = stats.TweetCount
-		indexStatus = stats.IndexStatus
-		dbPath = stats.DatabasePath
-		indexValid = xfIndexValid(*stats)
-	}
-
-	// If we have a database path, ensure it exists (tighten index validity).
-	if indexValid && dbPath != "" {
-		if _, err := os.Stat(util.ExpandPath(dbPath)); err != nil {
-			indexValid = false
-		}
-	}
-
-	healthy := versionOK && archiveOK && indexValid
-	msg := xfHealthMessage(ver, versionOK, archivePath, archiveOK, archiveErr, indexValid, indexStatus, tweetCount, statsErr)
+	// indexValid/indexStatus/tweetCount/statsErr are not probed here anymore
+	// (they required the removed stats JSON flag); pass zero-values so the
+	// advisory message reflects "archive presence" without a stale exec.
+	msg := xfHealthMessage(ver, versionOK, archivePath, archiveOK, archiveErr, false, "", 0, nil)
 
 	return &HealthStatus{
-		Healthy:     healthy,
+		Healthy:     versionOK,
 		Message:     msg,
 		LastChecked: time.Now(),
 		Latency:     latency,

@@ -73,7 +73,7 @@ type SummarySection struct {
 
     // Agent state breakdown
     AgentsByState map[string]int `json:"agents_by_state"` // idle, busy, error, compacting
-    AgentsByType  map[string]int `json:"agents_by_type"`  // claude, codex, gemini
+    AgentsByType  map[string]int `json:"agents_by_type"`  // claude, codex, antigravity, gemini (legacy)
 
     // Work state
     ReadyWork     int    `json:"ready_work"`      // Beads ready to claim
@@ -134,7 +134,7 @@ type AgentSection struct {
     // Identity
     PaneID    string `json:"pane_id"`     // window.pane format
     PaneIndex int    `json:"pane_index"`
-    Type      string `json:"type"`        // claude, codex, gemini, user
+    Type      string `json:"type"`        // claude, codex, antigravity, gemini (legacy), user
 
     // State
     State       string `json:"state"`       // idle, busy, error, compacting, unknown

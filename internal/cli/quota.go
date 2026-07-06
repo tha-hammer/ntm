@@ -107,7 +107,8 @@ func quotaProviderForAgentType(agentType tmux.AgentType) (quota.Provider, bool) 
 		return quota.ProviderClaude, true
 	case tmux.AgentCodex:
 		return quota.ProviderCodex, true
-	case tmux.AgentGemini:
+	case tmux.AgentGemini, tmux.AgentAntigravity:
+		// Antigravity (agy) shares Google's quota/auth with the Gemini CLI.
 		return quota.ProviderGemini, true
 	default:
 		return "", false

@@ -852,6 +852,8 @@ func TestAgentBadge(t *testing.T) {
 		{"cursor", "cursor", "Cursor"},
 		{"windsurf", "windsurf", "Windsurf"},
 		{"aider", "aider", "Aider"},
+		{"opencode short", "oc", "Opencode"},
+		{"opencode long", "opencode", "Opencode"},
 		{"ollama", "ollama", "Ollama"},
 		{"user", "user", "User"},
 		// Default/unknown
@@ -901,6 +903,13 @@ func TestOutputAgentBadgeColor(t *testing.T) {
 		{"aider", "aider", string(current.Aider)},
 		{"ollama", "ollama", string(current.Ollama)},
 		{"user", "user", string(current.User)},
+		// Opencode currently has no dedicated theme color, so it falls
+		// through to current.Overlay (same as the unknown bucket). This
+		// test pins that behavior — if a future change adds a theme.Opencode
+		// color and an explicit case, this test will fail and should be
+		// updated to expect the new color.
+		{"opencode short", "oc", string(current.Overlay)},
+		{"opencode long", "opencode", string(current.Overlay)},
 		{"unknown", "other", string(current.Overlay)},
 	}
 

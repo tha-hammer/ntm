@@ -78,6 +78,8 @@ func TestAgentColor(t *testing.T) {
 		{"gmi", string(p.AgentGemini)},
 		{"google-gemini", string(p.AgentGemini)},
 		{"ws", string(p.AgentWindsurf)},
+		{"oc", string(p.AgentOpencode)},
+		{"opencode", string(p.AgentOpencode)},
 		{"user", string(p.AgentUser)},
 		{"unknown", string(p.AgentUnknown)},
 		{"other", string(p.AgentUnknown)},

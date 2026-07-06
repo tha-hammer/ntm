@@ -29,6 +29,111 @@ func TestCAAMAdapterImplementsInterface(t *testing.T) {
 	var _ Adapter = (*CAAMAdapter)(nil)
 }
 
+// writeFakeCAAM installs a fake `caam` on PATH that mimics the real cobra CLI:
+// the version string is exposed via the `version` SUBCOMMAND, while `--version`
+// is rejected as an unknown flag (matching caam 0.1.x). This is the exact
+// contract that regressed in acfs#296.
+func writeFakeCAAM(t *testing.T, versionLine string) {
+	t.Helper()
+	dir := t.TempDir()
+	fakeCAAM := filepath.Join(dir, "caam")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"version\" ]; then\n" +
+		"  echo \"" + versionLine + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"--version\" ]; then\n" +
+		"  echo \"Error: unknown flag: --version\" 1>&2\n" +
+		"  echo \"Usage:\" 1>&2\n" +
+		"  echo \"  caam [flags]\" 1>&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"--help\" ]; then\n" +
+		"  echo \"Usage:\"\n" +
+		"  echo \"  caam [flags]\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo \"Error: could not open a new TTY\" 1>&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(fakeCAAM, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake caam: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestCAAMAdapterVersionUsesVersionSubcommand is the acfs#296 regression guard:
+// caam exposes its version via `caam version`, not `caam --version`. ntm must
+// parse the real 0.1.x line and never report a 0.0.0 sentinel.
+func TestCAAMAdapterVersionUsesVersionSubcommand(t *testing.T) {
+	writeFakeCAAM(t, "caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2")
+
+	v, err := NewCAAMAdapter().Version(context.Background())
+	if err != nil {
+		t.Fatalf("Version() error: %v", err)
+	}
+	if v.Major != 0 || v.Minor != 1 || v.Patch != 11 {
+		t.Fatalf("Version() = %d.%d.%d, want 0.1.11", v.Major, v.Minor, v.Patch)
+	}
+	if !strings.Contains(v.String(), "0.1.11") {
+		t.Fatalf("Version().String() = %q, want it to contain 0.1.11", v.String())
+	}
+	// Guard against the old 0.0.0 sentinel regression.
+	if v.Major == 0 && v.Minor == 0 && v.Patch == 0 {
+		t.Fatal("Version() returned 0.0.0 sentinel; --version vs version regression")
+	}
+}
+
+// TestCAAMAdapterHealthHealthyViaVersionSubcommand verifies caam is reported
+// healthy (not "not responding") when only the `version` subcommand works.
+func TestCAAMAdapterHealthHealthyViaVersionSubcommand(t *testing.T) {
+	writeFakeCAAM(t, "caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2")
+
+	health, err := NewCAAMAdapter().Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health() error: %v", err)
+	}
+	if !health.Healthy {
+		t.Fatalf("Health() Healthy = false, want true; message=%q", health.Message)
+	}
+	if strings.Contains(health.Message, "not responding") {
+		t.Fatalf("Health() message = %q, should not say not responding", health.Message)
+	}
+}
+
+// TestCAAMAdapterHealthResilientToVersionSkew verifies that even if the version
+// command surface changes (no parseable version), a binary that still answers
+// `--help` is treated as responsive rather than "not responding".
+func TestCAAMAdapterHealthResilientToVersionSkew(t *testing.T) {
+	dir := t.TempDir()
+	fakeCAAM := filepath.Join(dir, "caam")
+	// `version` prints a banner with NO X.Y.Z; `--help` still works.
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"version\" ]; then\n" +
+		"  echo \"caam (development build)\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"--help\" ]; then\n" +
+		"  echo \"Usage: caam [flags]\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	if err := os.WriteFile(fakeCAAM, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake caam: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	health, err := NewCAAMAdapter().Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health() error: %v", err)
+	}
+	if !health.Healthy {
+		t.Fatalf("Health() Healthy = false, want true under version skew; message=%q", health.Message)
+	}
+	if strings.Contains(health.Message, "not responding") {
+		t.Fatalf("Health() message = %q, should not say not responding under version skew", health.Message)
+	}
+}
+
 func TestCAAMAdapterDetect(t *testing.T) {
 	adapter := NewCAAMAdapter()
 

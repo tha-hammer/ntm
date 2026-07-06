@@ -299,6 +299,47 @@ func TestGetFieldValue_MapMissingKey(t *testing.T) {
 	}
 }
 
+// Regression for #209: a map keyed by a named string type (e.g.
+// robot.EventCategory, `type EventCategory string`) must not panic in
+// reflect.Value.MapIndex — the string field name has to be converted to the
+// map's actual key type first.
+func TestGetFieldValue_MapNamedStringKey(t *testing.T) {
+	enc := &toonEncoder{delimiter: ","}
+
+	m := map[EventCategory]int{EventCategory("alpha"): 1, EventCategory("beta"): 2}
+	val, err := enc.getFieldValue(reflect.ValueOf(m), "alpha")
+	if err != nil {
+		t.Fatalf("getFieldValue error: %v", err)
+	}
+	if !val.IsValid() || val.Int() != 1 {
+		t.Errorf("getFieldValue(EventCategory-keyed map, alpha) = %v, want 1", val)
+	}
+
+	// A missing named-string key returns an invalid (absent) value, not a panic.
+	missing, err := enc.getFieldValue(reflect.ValueOf(m), "missing")
+	if err != nil {
+		t.Fatalf("getFieldValue error: %v", err)
+	}
+	if missing.IsValid() {
+		t.Errorf("expected invalid value for missing EventCategory key, got %v", missing)
+	}
+}
+
+// A map whose key is not a string type has no string field to look up; the
+// lookup must return an absent value rather than panicking.
+func TestGetFieldValue_MapNonStringKey(t *testing.T) {
+	enc := &toonEncoder{delimiter: ","}
+
+	m := map[int]string{1: "one"}
+	val, err := enc.getFieldValue(reflect.ValueOf(m), "1")
+	if err != nil {
+		t.Fatalf("getFieldValue error: %v", err)
+	}
+	if val.IsValid() {
+		t.Errorf("expected invalid value for non-string-keyed map, got %v", val)
+	}
+}
+
 func TestGetFieldValue_Struct(t *testing.T) {
 	enc := &toonEncoder{delimiter: ","}
 

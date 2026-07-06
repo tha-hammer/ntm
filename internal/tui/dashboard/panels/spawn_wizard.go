@@ -29,6 +29,7 @@ type SpawnWizardResult struct {
 	CCCount   int
 	CodCount  int
 	GmiCount  int
+	AgyCount  int
 	Confirmed bool
 }
 
@@ -56,6 +57,7 @@ type SpawnWizard struct {
 	ccStr      string
 	codStr     string
 	gmiStr     string
+	agyStr     string
 
 	// Step 3: Confirmation
 	confirmForm *huh.Form
@@ -134,7 +136,8 @@ func (sw *SpawnWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cc := parseCount(sw.ccStr)
 			cod := parseCount(sw.codStr)
 			gmi := parseCount(sw.gmiStr)
-			if cc+cod+gmi == 0 {
+			agy := parseCount(sw.agyStr)
+			if cc+cod+gmi+agy == 0 {
 				sw.err = fmt.Errorf("at least one agent is required")
 				sw.initCountsForm() // Reset form
 				return sw, sw.countsForm.Init()
@@ -155,6 +158,7 @@ func (sw *SpawnWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				CCCount:   parseCount(sw.ccStr),
 				CodCount:  parseCount(sw.codStr),
 				GmiCount:  parseCount(sw.gmiStr),
+				AgyCount:  parseCount(sw.agyStr),
 				Confirmed: sw.confirmed,
 			}
 			return sw, func() tea.Msg {
@@ -294,11 +298,13 @@ func (sw *SpawnWizard) initCountsForm() {
 	case "quick":
 		sw.ccStr = "2"
 		sw.codStr = "1"
-		sw.gmiStr = "1"
+		sw.gmiStr = "0"
+		sw.agyStr = "1"
 	case "minimal":
 		sw.ccStr = "1"
 		sw.codStr = "0"
 		sw.gmiStr = "0"
+		sw.agyStr = "0"
 	default:
 		// Manual - keep existing values or defaults
 		if sw.ccStr == "" {
@@ -309,6 +315,9 @@ func (sw *SpawnWizard) initCountsForm() {
 		}
 		if sw.gmiStr == "" {
 			sw.gmiStr = "0"
+		}
+		if sw.agyStr == "" {
+			sw.agyStr = "0"
 		}
 	}
 
@@ -327,10 +336,16 @@ func (sw *SpawnWizard) initCountsForm() {
 				Value(&sw.codStr).
 				Validate(validateAgentCount),
 			huh.NewInput().
-				Title("Gemini agents (gmi)").
+				Title("Gemini agents (gmi) (legacy)").
 				Description("Number of Google Gemini agents").
 				Placeholder("0").
 				Value(&sw.gmiStr).
+				Validate(validateAgentCount),
+			huh.NewInput().
+				Title("Antigravity agents (agy)").
+				Description("Number of Google Antigravity agents (model pinned to Gemini 3.1 Pro (High))").
+				Placeholder("0").
+				Value(&sw.agyStr).
 				Validate(validateAgentCount),
 		),
 	).WithTheme(theme.HuhTheme()).WithWidth(sw.modalContentWidth())
@@ -340,10 +355,11 @@ func (sw *SpawnWizard) initConfirmForm() {
 	cc := parseCount(sw.ccStr)
 	cod := parseCount(sw.codStr)
 	gmi := parseCount(sw.gmiStr)
-	total := cc + cod + gmi
+	agy := parseCount(sw.agyStr)
+	total := cc + cod + gmi + agy
 
-	summary := fmt.Sprintf("Spawn %d agent(s):\n  Claude: %d, Codex: %d, Gemini: %d",
-		total, cc, cod, gmi)
+	summary := fmt.Sprintf("Spawn %d agent(s):\n  Claude: %d, Codex: %d, Gemini: %d, Antigravity: %d",
+		total, cc, cod, gmi, agy)
 
 	sw.confirmForm = huh.NewForm(
 		huh.NewGroup(

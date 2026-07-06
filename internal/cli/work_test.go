@@ -14,7 +14,7 @@ func TestWorkCmd(t *testing.T) {
 	cmd := newWorkCmd()
 
 	// Test that the command has expected subcommands
-	expectedSubs := []string{"triage", "alerts", "search", "impact", "next"}
+	expectedSubs := []string{"triage", "alerts", "search", "impact", "next", "queue-dry"}
 	for _, sub := range expectedSubs {
 		found := false
 		for _, c := range cmd.Commands() {
@@ -89,6 +89,13 @@ func TestWorkNextCmd(t *testing.T) {
 	cmd := newWorkNextCmd()
 	if cmd.Use != "next" {
 		t.Errorf("expected Use to be 'next', got %q", cmd.Use)
+	}
+}
+
+func TestWorkQueueDryCmd(t *testing.T) {
+	cmd := newWorkQueueDryCmd()
+	if cmd.Use != "queue-dry" {
+		t.Errorf("expected Use to be 'queue-dry', got %q", cmd.Use)
 	}
 }
 

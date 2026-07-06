@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS runtime_agents (
     pane TEXT NOT NULL,  -- "0.1", "0.2", etc.
 
     -- Type detection
-    agent_type TEXT NOT NULL,  -- claude, codex, gemini, user, unknown
+    agent_type TEXT NOT NULL,  -- claude, codex, antigravity, gemini (legacy), user, unknown
     variant TEXT,  -- Model alias
     type_confidence REAL NOT NULL DEFAULT 0.0,
     type_method TEXT NOT NULL DEFAULT 'unknown',  -- process, title, output, manual

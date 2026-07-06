@@ -3,10 +3,12 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +31,7 @@ with dependencies, conditionals, and variable substitution.
 
 Subcommands:
   run      Run a workflow from a YAML/TOML file
+  lint     Parse, normalize, and validate a workflow file
   resume   Resume a workflow from saved state
   status   Check the status of a running pipeline
   list     List all tracked pipelines
@@ -44,6 +47,9 @@ Examples:
 
   # Run with variables
   ntm pipeline run workflow.yaml --session proj --var env=prod --var debug=true
+
+  # Lint without requiring a tmux session
+  ntm pipeline lint workflow.yaml
 
   # Check status
   ntm pipeline status run-20241230-123456-abcd
@@ -63,6 +69,7 @@ Examples:
 
 	cmd.AddCommand(
 		newPipelineRunCmd(),
+		newPipelineLintCmd(),
 		newPipelineStatusCmd(),
 		newPipelineListCmd(),
 		newPipelineCancelCmd(),
@@ -74,14 +81,170 @@ Examples:
 	return cmd
 }
 
+type pipelineLintOutput struct {
+	Success            bool                    `json:"success"`
+	WorkflowFile       string                  `json:"workflow_file"`
+	Workflow           string                  `json:"workflow,omitempty"`
+	Valid              bool                    `json:"valid"`
+	StepCount          int                     `json:"step_count,omitempty"`
+	Error              string                  `json:"error,omitempty"`
+	ErrorCode          string                  `json:"error_code,omitempty"`
+	Errors             []pipeline.ParseError   `json:"errors,omitempty"`
+	Warnings           []pipeline.ParseError   `json:"warnings,omitempty"`
+	NormalizedWorkflow *pipeline.Workflow      `json:"normalized_workflow,omitempty"`
+	Summary            pipelineLintSummaryJSON `json:"summary"`
+}
+
+type pipelineLintSummaryJSON struct {
+	Errors   int `json:"errors"`
+	Warnings int `json:"warnings"`
+}
+
+// newPipelineLintCmd creates the "pipeline lint" subcommand.
+func newPipelineLintCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:           "lint <workflow-file>",
+		Short:         "Parse, normalize, and validate a workflow file",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		Long: `Parse, normalize, and validate a workflow file without requiring a
+tmux session or dispatching any work.
+
+The --json flag includes the normalized workflow so authoring tools can inspect
+the canonical form that ntm would execute.
+
+Examples:
+  ntm pipeline lint workflow.yaml
+  ntm --json pipeline lint workflow.yaml`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPipelineLint(args[0], cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	}
+
+	return cmd
+}
+
+func runPipelineLint(workflowFile string, out io.Writer, errOut io.Writer) error {
+	workflowPath := workflowFile
+	if abs, err := filepath.Abs(workflowFile); err == nil {
+		workflowPath = abs
+	}
+
+	workflow, result, err := pipeline.LoadAndValidate(workflowPath)
+	if err != nil {
+		lintResult := pipelineLintOutput{
+			Success:      false,
+			WorkflowFile: workflowPath,
+			Valid:        false,
+			Error:        err.Error(),
+			ErrorCode:    "PARSE_FAILED",
+			Summary: pipelineLintSummaryJSON{
+				Errors: 1,
+			},
+		}
+
+		var parseErr *pipeline.ParseError
+		if errors.As(err, &parseErr) {
+			lintResult.Errors = []pipeline.ParseError{*parseErr}
+		}
+
+		if jsonOutput {
+			if encodeErr := json.NewEncoder(out).Encode(lintResult); encodeErr != nil {
+				return encodeErr
+			}
+		} else {
+			fmt.Fprintf(errOut, "Pipeline lint failed: %s\n", workflowPath)
+			printPipelineLintErrors(errOut, lintResult.Errors)
+			if len(lintResult.Errors) == 0 {
+				fmt.Fprintf(errOut, "  %s\n", err)
+			}
+		}
+		return fmt.Errorf("pipeline lint failed")
+	}
+
+	lintResult := pipelineLintOutput{
+		Success:            result.Valid,
+		WorkflowFile:       workflowPath,
+		Workflow:           workflow.Name,
+		Valid:              result.Valid,
+		StepCount:          len(workflow.Steps),
+		Errors:             result.Errors,
+		Warnings:           result.Warnings,
+		NormalizedWorkflow: workflow,
+		Summary: pipelineLintSummaryJSON{
+			Errors:   len(result.Errors),
+			Warnings: len(result.Warnings),
+		},
+	}
+	if !result.Valid {
+		lintResult.Error = "workflow validation failed"
+		lintResult.ErrorCode = "VALIDATION_FAILED"
+	}
+
+	if jsonOutput {
+		if err := json.NewEncoder(out).Encode(lintResult); err != nil {
+			return err
+		}
+		if !result.Valid {
+			return fmt.Errorf("workflow validation failed")
+		}
+		return nil
+	}
+
+	fmt.Fprintf(out, "Pipeline lint: %s\n", workflowPath)
+	fmt.Fprintf(out, "Workflow: %s\n", workflow.Name)
+	fmt.Fprintf(out, "Steps: %d\n", len(workflow.Steps))
+	fmt.Fprintf(out, "Warnings: %d\n", len(result.Warnings))
+
+	if len(result.Warnings) > 0 {
+		fmt.Fprintln(out, "\nWarnings:")
+		printPipelineLintErrors(out, result.Warnings)
+	}
+
+	if !result.Valid {
+		fmt.Fprintln(errOut, "\nValidation failed:")
+		printPipelineLintErrors(errOut, result.Errors)
+		return fmt.Errorf("workflow validation failed")
+	}
+
+	fmt.Fprintln(out, "Validation: ok")
+	return nil
+}
+
+func printPipelineLintErrors(w io.Writer, errs []pipeline.ParseError) {
+	for _, e := range errs {
+		location := e.Field
+		if e.File != "" {
+			location = e.File
+			if e.Line > 0 {
+				location = fmt.Sprintf("%s:%d", location, e.Line)
+			}
+			if e.Field != "" {
+				location = fmt.Sprintf("%s:%s", location, e.Field)
+			}
+		}
+		if location != "" {
+			fmt.Fprintf(w, "  - %s: %s\n", location, e.Message)
+		} else {
+			fmt.Fprintf(w, "  - %s\n", e.Message)
+		}
+		if e.Hint != "" {
+			fmt.Fprintf(w, "    Hint: %s\n", e.Hint)
+		}
+	}
+}
+
 // newPipelineRunCmd creates the "pipeline run" subcommand
 func newPipelineRunCmd() *cobra.Command {
 	var (
-		session    string
-		varsFlag   []string
-		varsFile   string
-		dryRun     bool
-		background bool
+		session       string
+		varsFlag      []string
+		varsFile      string
+		dryRun        bool
+		background    bool
+		startFromStep string
+		fromState     string
 	)
 
 	cmd := &cobra.Command{
@@ -132,38 +295,22 @@ Examples:
 				return err
 			}
 
-			// Parse variables
-			vars := make(map[string]interface{})
-
-			// Load from file first
-			if varsFile != "" {
-				data, err := os.ReadFile(varsFile)
-				if err != nil {
-					return fmt.Errorf("failed to read var file: %w", err)
-				}
-				if err := json.Unmarshal(data, &vars); err != nil {
-					return fmt.Errorf("failed to parse var file: %w", err)
-				}
-			}
-
-			// Override with command-line vars
-			for _, v := range varsFlag {
-				parts := strings.SplitN(v, "=", 2)
-				if len(parts) != 2 {
-					return fmt.Errorf("invalid variable format: %q (expected key=value)", v)
-				}
-				vars[parts[0]] = parts[1]
+			vars, err := parsePipelineRunVariables(varsFile, varsFlag)
+			if err != nil {
+				return err
 			}
 
 			// JSON mode
 			if jsonOutput {
 				opts := pipeline.PipelineRunOptions{
-					WorkflowFile: workflowPath,
-					Session:      session,
-					ProjectDir:   projectDir,
-					Variables:    vars,
-					DryRun:       dryRun,
-					Background:   background,
+					WorkflowFile:  workflowPath,
+					Session:       session,
+					ProjectDir:    projectDir,
+					Variables:     vars,
+					DryRun:        dryRun,
+					Background:    background,
+					StartFromStep: startFromStep,
+					FromState:     fromState,
 				}
 				exitCode := pipeline.PrintPipelineRun(opts)
 				if exitCode != 0 {
@@ -203,17 +350,50 @@ Examples:
 				return fmt.Errorf("workflow validation failed")
 			}
 
+			varValidation, varErr := pipeline.ValidateWorkflowVariables(workflow, vars)
+			if varErr != nil {
+				fmt.Fprintln(os.Stderr, "Variable validation failed:")
+				fmt.Printf("  ❌ %s\n", varErr.Message)
+				if varErr.Hint != "" {
+					fmt.Printf("     💡 %s\n", varErr.Hint)
+				}
+				return fmt.Errorf("variable validation failed")
+			}
+			vars = varValidation.Variables
+
 			for _, w := range result.Warnings {
 				fmt.Printf("  ⚠️  %s\n", w.Message)
 			}
+			for _, w := range varValidation.Warnings {
+				fmt.Printf("  ⚠️  %s\n", w.Message)
+			}
 
-			fmt.Printf("✓ Validated workflow: %s (%d steps)\n\n", workflow.Name, len(workflow.Steps))
+			fmt.Printf("✓ Validated workflow: %s (%d steps)\n", workflow.Name, len(workflow.Steps))
+			if desc := pipeline.SanitizeDescriptionForTerminal(strings.TrimSpace(workflow.Description)); desc != "" {
+				fmt.Printf("   Description: %s\n", desc)
+			}
+			if dryRun {
+				fmt.Print(pipeline.RenderSideEffectManifestText(pipeline.BuildSideEffectManifest(workflow)))
+			}
+			fmt.Println()
 
 			// Create executor
 			execCfg := pipeline.DefaultExecutorConfig(session)
 			execCfg.DryRun = dryRun
 			execCfg.ProjectDir = projectDir
 			execCfg.WorkflowFile = workflowPath
+			if startFromStep != "" {
+				execCfg.StartFromStep = startFromStep
+				if fromState != "" {
+					prior, err := pipeline.LoadState(projectDir, fromState)
+					if err != nil {
+						return fmt.Errorf("--from-state: load run %q: %w", fromState, err)
+					}
+					execCfg.StartFromState = prior
+				}
+			} else if fromState != "" {
+				return fmt.Errorf("--from-state requires --start-from")
+			}
 			executor := pipeline.NewExecutor(execCfg)
 
 			// Create progress channel
@@ -286,8 +466,47 @@ Examples:
 	cmd.Flags().StringVar(&varsFile, "var-file", "", "JSON file with variables")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Validate without executing")
 	cmd.Flags().BoolVarP(&background, "background", "b", false, "Run in background")
+	cmd.Flags().StringVar(&startFromStep, "start-from", "", "Begin execution at the given step ID; transitive dependencies are marked Skipped")
+	cmd.Flags().StringVar(&fromState, "from-state", "", "Run ID whose persisted outputs should be reused for steps skipped by --start-from")
 
 	return cmd
+}
+
+func parsePipelineRunVariables(varsFile string, varsFlag []string) (map[string]interface{}, error) {
+	vars := make(map[string]interface{})
+
+	if varsFile != "" {
+		data, err := os.ReadFile(varsFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read var file: %w", err)
+		}
+		// json.Unmarshal of a top-level "null" decodes into a nil map without
+		// returning an error, which would panic on subsequent --var writes.
+		// Decode into an interface{} first so we can validate the shape and
+		// surface a user-facing error for null/non-object var files.
+		var raw interface{}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, fmt.Errorf("failed to parse var file: %w", err)
+		}
+		if raw == nil {
+			return nil, fmt.Errorf("var file %q decoded to null; expected a JSON object of variable names to values", varsFile)
+		}
+		obj, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("var file %q decoded to %T; expected a JSON object of variable names to values", varsFile, raw)
+		}
+		vars = obj
+	}
+
+	for _, v := range varsFlag {
+		parts := strings.SplitN(v, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid variable format: %q (expected key=value)", v)
+		}
+		vars[parts[0]] = parts[1]
+	}
+
+	return vars, nil
 }
 
 // newPipelineStatusCmd creates the "pipeline status" subcommand
@@ -381,7 +600,15 @@ func newPipelineCancelCmd() *cobra.Command {
 
 // newPipelineResumeCmd creates the "pipeline resume" subcommand
 func newPipelineResumeCmd() *cobra.Command {
-	var session string
+	var (
+		session        string
+		mode           string
+		keepState      bool
+		maxResumeAge   string
+		onRosterChange string
+		stepID         string
+		iteration      int
+	)
 
 	cmd := &cobra.Command{
 		Use:   "resume <run-id>",
@@ -399,6 +626,20 @@ Examples:
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runID := args[0]
+			resumeOpts := pipeline.ResumeOptions{
+				Mode:           pipeline.ResumeMode(mode),
+				KeepState:      keepState,
+				OnRosterChange: pipeline.ResumeRosterChangePolicy(onRosterChange),
+				StepID:         stepID,
+				Iteration:      iteration,
+			}
+			if maxResumeAge != "" {
+				age, err := parseDuration(maxResumeAge)
+				if err != nil {
+					return fmt.Errorf("--max-resume-age: %w", err)
+				}
+				resumeOpts.MaxResumeAge = age
+			}
 
 			resolvedSession := strings.TrimSpace(session)
 			if resolvedSession != "" {
@@ -503,9 +744,9 @@ Examples:
 			execCfg.RunID = state.RunID
 			execCfg.ProjectDir = projectDir
 			execCfg.WorkflowFile = workflowFile
+			execCfg.ResumeOptions = resumeOpts
 			executor := pipeline.NewExecutor(execCfg)
 
-			state.Session = session
 			state.WorkflowFile = workflowFile
 
 			ctx := context.Background()
@@ -534,12 +775,16 @@ Examples:
 					"status":   string(finalState.Status),
 					"workflow": workflow.Name,
 					"session":  session,
+					"mode":     string(resumeOpts.Mode),
 				}
 				return json.NewEncoder(os.Stdout).Encode(result)
 			}
 
 			fmt.Printf("📋 Resuming pipeline: %s\n", runID)
 			fmt.Printf("   Session: %s\n", session)
+			if resumeOpts.Mode != "" {
+				fmt.Printf("   Mode: %s\n", resumeOpts.Mode)
+			}
 			fmt.Printf("   Status: %s\n", state.Status)
 			if state.CurrentStep != "" {
 				fmt.Printf("   Current step: %s\n", state.CurrentStep)
@@ -597,6 +842,12 @@ Examples:
 	}
 
 	cmd.Flags().StringVarP(&session, "session", "s", "", "Tmux session name (uses saved session if not specified)")
+	cmd.Flags().StringVar(&mode, "mode", string(pipeline.ResumeModeContinue), "Resume mode: continue, restart-failed, force-iter")
+	cmd.Flags().BoolVar(&keepState, "keep-state", true, "Preserve completed step outputs while resuming")
+	cmd.Flags().StringVar(&maxResumeAge, "max-resume-age", "", "Refuse to resume state older than this duration (for example 7d, 24h)")
+	cmd.Flags().StringVar(&onRosterChange, "on-roster-change", string(pipeline.ResumeRosterAbort), "Roster-change policy: abort or proceed")
+	cmd.Flags().StringVar(&stepID, "step-id", "", "Step ID used with --mode=force-iter")
+	cmd.Flags().IntVar(&iteration, "iteration", 0, "Iteration index used with --mode=force-iter")
 
 	return cmd
 }
@@ -893,6 +1144,18 @@ func showPipelineStatus(runID string) error {
 		exec.Progress.Total,
 		exec.Progress.Percent)
 
+	if len(exec.Progress.SkipKindCounts) > 0 {
+		kinds := make([]string, 0, len(exec.Progress.SkipKindCounts))
+		for k := range exec.Progress.SkipKindCounts {
+			kinds = append(kinds, string(k))
+		}
+		sort.Strings(kinds)
+		fmt.Println("\nSkipped by kind:")
+		for _, k := range kinds {
+			fmt.Printf("  %-32s %d\n", k, exec.Progress.SkipKindCounts[pipeline.SkipKind(k)])
+		}
+	}
+
 	if len(exec.Steps) > 0 {
 		fmt.Println("\nSteps:")
 		for id, step := range exec.Steps {
@@ -907,7 +1170,14 @@ func showPipelineStatus(runID string) error {
 			case "skipped":
 				status = "⊘ skipped"
 			}
-			fmt.Printf("  [%s] %s\n", id, status)
+			line := fmt.Sprintf("  [%s] %s", id, status)
+			if step.SkipKind != "" {
+				line += fmt.Sprintf(" (%s)", step.SkipKind)
+			}
+			if step.SkipReason != "" {
+				line += fmt.Sprintf(": %s", step.SkipReason)
+			}
+			fmt.Println(line)
 		}
 	}
 

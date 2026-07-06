@@ -106,12 +106,13 @@ func (a *RanoAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 		}, nil
 	}
 
-	// Also check if rano has required permissions
-	hasPerms := a.checkPermissions(ctx)
-	if !hasPerms {
+	// Confirm rano is actually operational by running its status command.
+	// A failure here (other than a genuine permission error) means rano cannot
+	// function on this host.
+	if !a.checkOperational(ctx) {
 		return &HealthStatus{
 			Healthy:     false,
-			Message:     "rano lacks required capabilities (CAP_NET_ADMIN)",
+			Message:     "rano status check failed",
 			LastChecked: time.Now(),
 			Latency:     latency,
 		}, nil
@@ -198,12 +199,18 @@ func (a *RanoAdapter) GetAvailability(ctx context.Context) (*RanoAvailability, e
 	}
 	ranoAvailabilityMutex.RUnlock()
 
+	ranoAvailabilityMutex.Lock()
+	defer ranoAvailabilityMutex.Unlock()
+
+	if time.Now().Before(ranoAvailabilityExpiry) {
+		availability := ranoAvailabilityCache
+		return &availability, nil
+	}
+
 	availability := a.fetchAvailability(ctx)
 
-	ranoAvailabilityMutex.Lock()
 	ranoAvailabilityCache = *availability
 	ranoAvailabilityExpiry = time.Now().Add(ranoAvailabilityTTL)
-	ranoAvailabilityMutex.Unlock()
 
 	return availability, nil
 }
@@ -263,12 +270,16 @@ func (a *RanoAdapter) fetchAvailability(ctx context.Context) *RanoAvailability {
 
 	availability.Compatible = true
 
-	// Check permissions
-	availability.HasCapability = a.checkPermissions(ctx)
+	// Confirm rano is operational. rano's default observation mode enumerates
+	// sockets via /proc and needs no elevated capabilities for same-user
+	// processes, so a successful `rano status` is the correct availability
+	// signal. (HasCapability is retained for API compatibility and now means
+	// "rano is operational".)
+	availability.HasCapability = a.checkOperational(ctx)
 	availability.CanReadProc = a.checkProcAccess()
 
 	if !availability.HasCapability {
-		ranoLogger.Warn("rano lacks required capabilities", "path", path)
+		ranoLogger.Warn("rano status check failed", "path", path)
 	}
 
 	return availability
@@ -278,12 +289,20 @@ func ranoCompatible(version Version) bool {
 	return version.AtLeast(ranoMinVersion)
 }
 
-// checkPermissions checks if rano has the required CAP_NET_ADMIN capability
-func (a *RanoAdapter) checkPermissions(ctx context.Context) bool {
+// checkOperational verifies rano is functional by running its status command.
+//
+// The current rano CLI exposes `rano status` (a one-line prompt-integration
+// status). The older `rano status --json` form was removed: passing --json now
+// errors with "Unknown status flag: --json" (exit 1), which previously made
+// every availability/health check fail — silently disabling rano integration
+// fleet-wide and surfacing a false "lacks CAP_NET_ADMIN" warning in
+// `ntm doctor` (issue #202). `rano status` exits 0 on a healthy host even with
+// no observer running, so its success is the correct operational signal.
+func (a *RanoAdapter) checkOperational(ctx context.Context) bool {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "status", "--json")
+	cmd := exec.CommandContext(ctx, a.BinaryName(), "status")
 	cmd.WaitDelay = time.Second
 	stdout := NewLimitedBuffer(10 * 1024 * 1024)
 	var stderr bytes.Buffer
@@ -291,17 +310,17 @@ func (a *RanoAdapter) checkPermissions(ctx context.Context) bool {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		// Surface genuine permission failures distinctly for logging, but the
+		// return value is the same: rano is not operational here.
 		errStr := stderr.String()
-		// Check for permission-related errors
 		if strings.Contains(errStr, "permission") ||
 			strings.Contains(errStr, "CAP_NET") ||
 			strings.Contains(errStr, "Operation not permitted") ||
 			strings.Contains(errStr, "EPERM") {
+			ranoLogger.Debug("rano status blocked by permissions", "stderr", errStr)
 			return false
 		}
-		// Other errors might not be permission-related
 		ranoLogger.Debug("rano status check failed", "error", err, "stderr", errStr)
-		// Still return false as we can't confirm it works
 		return false
 	}
 

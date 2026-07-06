@@ -243,7 +243,7 @@ func TestLoadRecoveryCheckpoint_NoCheckpointsReturnsNil(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	cp, err := loadRecoveryCheckpoint("recovery-empty-session")
+	cp, err := loadRecoveryCheckpoint("recovery-empty-session", "")
 	if err != nil {
 		t.Fatalf("loadRecoveryCheckpoint() error = %v, want nil", err)
 	}
@@ -266,7 +266,7 @@ func TestLoadRecoveryCheckpoint_InvalidLatestCheckpointReturnsError(t *testing.T
 		t.Fatalf("WriteFile(metadata) failed: %v", err)
 	}
 
-	cp, err := loadRecoveryCheckpoint(sessionName)
+	cp, err := loadRecoveryCheckpoint(sessionName, "")
 	if err == nil {
 		t.Fatal("loadRecoveryCheckpoint() error = nil, want invalid checkpoint error")
 	}
@@ -275,6 +275,104 @@ func TestLoadRecoveryCheckpoint_InvalidLatestCheckpointReturnsError(t *testing.T
 	}
 	if !strings.Contains(err.Error(), "checkpoint selection blocked by invalid checkpoint") {
 		t.Fatalf("loadRecoveryCheckpoint() error = %v, want invalid checkpoint context", err)
+	}
+}
+
+// TestCheckpointWorkingDirMatches verifies the working-directory match rule
+// used by loadRecoveryCheckpoint to reject checkpoints from a different repo
+// when the same session name is used in two working directories (#131).
+func TestCheckpointWorkingDirMatches(t *testing.T) {
+	tests := []struct {
+		name          string
+		checkpointDir string
+		spawnDir      string
+		want          bool
+	}{
+		{name: "both empty (legacy)", checkpointDir: "", spawnDir: "", want: true},
+		{name: "checkpoint empty, spawn set (legacy data)", checkpointDir: "", spawnDir: "/path/to/repoA", want: true},
+		{name: "spawn empty, checkpoint set (caller did not supply context)", checkpointDir: "/path/to/repoA", spawnDir: "", want: true},
+		{name: "exact match", checkpointDir: "/path/to/repoA", spawnDir: "/path/to/repoA", want: true},
+		{name: "match after Clean", checkpointDir: "/path/to/repoA/", spawnDir: "/path/to/./repoA", want: true},
+		{name: "different repos rejected", checkpointDir: "/path/to/repoA", spawnDir: "/path/to/repoB", want: false},
+		{name: "trim whitespace then match", checkpointDir: "  /path/to/repoA  ", spawnDir: "/path/to/repoA", want: true},
+		{name: "trim whitespace then mismatch", checkpointDir: "  /path/to/repoA  ", spawnDir: "/path/to/repoB", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := checkpointWorkingDirMatches(tt.checkpointDir, tt.spawnDir); got != tt.want {
+				t.Errorf("checkpointWorkingDirMatches(%q, %q) = %v, want %v", tt.checkpointDir, tt.spawnDir, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCheckpointWorkingDirMatches_ResolvesSymlinks covers bd-5n28k: the
+// same physical directory reached via two different paths (symlink, bind
+// mount, macOS /Users vs /private/var/Users, container workspace volumes)
+// must compare equal so a legitimate recovery checkpoint isn't silently
+// rejected when the checkpoint's pane_current_path was recorded through
+// one alias and the spawn dir was supplied via the other.
+func TestCheckpointWorkingDirMatches_ResolvesSymlinks(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("os.Symlink unsupported on this platform: %v", err)
+	}
+
+	if !checkpointWorkingDirMatches(real, link) {
+		t.Errorf("checkpointWorkingDirMatches(%q, %q) = false, want true (symlink should resolve to same dir)", real, link)
+	}
+	if !checkpointWorkingDirMatches(link, real) {
+		t.Errorf("checkpointWorkingDirMatches(%q, %q) = false, want true (symlink direction should not matter)", link, real)
+	}
+
+	// Sanity: a stale symlink target (EvalSymlinks errors) must still fall
+	// back to abs+clean so the symlink-free contract isn't regressed.
+	stale := filepath.Join(t.TempDir(), "stale")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "does-not-exist"), stale); err != nil {
+		t.Skipf("os.Symlink unsupported on this platform: %v", err)
+	}
+	if checkpointWorkingDirMatches(stale, real) {
+		t.Errorf("checkpointWorkingDirMatches(stale-symlink, real) = true, want false (stale should fall back to abs+clean and mismatch)")
+	}
+}
+
+// TestLoadRecoveryCheckpoint_RejectsCheckpointFromDifferentWorkingDir verifies
+// that a checkpoint recorded against /path/to/repoA is not surfaced as recovery
+// context for a spawn in /path/to/repoB even when the session name matches.
+func TestLoadRecoveryCheckpoint_RejectsCheckpointFromDifferentWorkingDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	storage := checkpoint.NewStorage()
+	sessionName := "shared-session-name"
+
+	cp := &checkpoint.Checkpoint{
+		ID:          "20260507-120000-abcd",
+		SessionName: sessionName,
+		Name:        "test-checkpoint",
+		Description: "checkpoint recorded against repoA",
+		CreatedAt:   time.Now(),
+		WorkingDir:  "/path/to/repoA",
+	}
+	if err := storage.Save(cp); err != nil {
+		t.Fatalf("Save(checkpoint) failed: %v", err)
+	}
+
+	matched, err := loadRecoveryCheckpoint(sessionName, "/path/to/repoA")
+	if err != nil {
+		t.Fatalf("matching working dir: error = %v, want nil", err)
+	}
+	if matched == nil {
+		t.Fatal("matching working dir: returned nil, want checkpoint")
+	}
+
+	rejected, err := loadRecoveryCheckpoint(sessionName, "/path/to/repoB")
+	if err != nil {
+		t.Fatalf("mismatched working dir: error = %v, want nil", err)
+	}
+	if rejected != nil {
+		t.Fatalf("mismatched working dir: returned %#v, want nil (checkpoint should be rejected)", rejected)
 	}
 }
 

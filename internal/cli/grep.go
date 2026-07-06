@@ -122,6 +122,7 @@ func newGrepCmd() *cobra.Command {
 		ccFlag          bool
 		codFlag         bool
 		gmiFlag         bool
+		agyFlag         bool
 	)
 
 	cmd := &cobra.Command{
@@ -155,9 +156,10 @@ Examples:
 			}
 
 			filter := AgentFilter{
-				Claude: ccFlag,
-				Codex:  codFlag,
-				Gemini: gmiFlag,
+				Claude:      ccFlag,
+				Codex:       codFlag,
+				Gemini:      gmiFlag,
+				Antigravity: agyFlag,
 			}
 
 			opts := GrepOptions{
@@ -187,6 +189,7 @@ Examples:
 	cmd.Flags().BoolVar(&ccFlag, "cc", false, "Search Claude panes only")
 	cmd.Flags().BoolVar(&codFlag, "cod", false, "Search Codex panes only")
 	cmd.Flags().BoolVar(&gmiFlag, "gmi", false, "Search Gemini panes only")
+	cmd.Flags().BoolVar(&agyFlag, "agy", false, "Search Antigravity panes only")
 	cmd.ValidArgsFunction = completeSessionSecondArg
 
 	return cmd

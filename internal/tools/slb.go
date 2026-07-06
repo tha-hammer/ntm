@@ -36,7 +36,11 @@ func (a *SLBAdapter) Version(ctx context.Context) (Version, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "--version")
+	// slb exposes version via the `version` SUBCOMMAND, not a `--version` flag.
+	// `slb --version` errors with "unknown flag: --version" (exit 1) on current
+	// releases, which previously made both `ntm doctor`'s version display AND its
+	// health check fail for a perfectly healthy slb (issue #202).
+	cmd := exec.CommandContext(ctx, a.BinaryName(), "version")
 	cmd.WaitDelay = time.Second
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout

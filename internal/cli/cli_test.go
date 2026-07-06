@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -101,11 +102,86 @@ func resetFlags() {
 	robotFormat = ""
 }
 
+func TestShouldInitializeRobotPersistenceSkipsStatelessOverlay(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = origArgs
+	})
+
+	cmd := &cobra.Command{Use: "ntm"}
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "overlay only",
+			args: []string{"ntm", "--robot-overlay"},
+			want: false,
+		},
+		{
+			name: "overlay with value spelling",
+			args: []string{"ntm", "--robot-overlay=true"},
+			want: false,
+		},
+		{
+			name: "stateful robot flag",
+			args: []string{"ntm", "--robot-status"},
+			want: true,
+		},
+		{
+			name: "stateful flag still wins when mixed",
+			args: []string{"ntm", "--robot-overlay", "--robot-status"},
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			os.Args = tc.args
+			if got := shouldInitializeRobotPersistence(cmd); got != tc.want {
+				t.Fatalf("shouldInitializeRobotPersistence() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func isolateSessionAgentStorage(t *testing.T) {
 	t.Helper()
 	home := t.TempDir()
+	// Resolve symlinks so production code that canonicalizes paths
+	// (os.Getwd, git rev-parse) matches what tests pass back in.
+	// On macOS, t.TempDir() returns /var/folders/... but os.Getwd
+	// after chdir returns /private/var/folders/... — keep them aligned.
+	if resolved, err := filepath.EvalSymlinks(home); err == nil {
+		home = resolved
+	}
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	// bd-ev740 / bd-jba66 precedent: clear ambient NTM_CONFIG so
+	// state.DefaultPath does not route the state DB into a hostile or
+	// non-writable path that an outer CI/agent shell may have exported
+	// (e.g. /nonexistent/config.toml).
+	t.Setenv("NTM_CONFIG", "")
+}
+
+// canonicalTempDir wraps t.TempDir with EvalSymlinks so the returned
+// path matches what production code sees via os.Getwd() or
+// `git rev-parse --show-toplevel`. On macOS, t.TempDir() returns
+// "/var/folders/..." but those calls return the canonical
+// "/private/var/folders/..." form; comparing the two fails only on
+// macOS-latest CI.
+//
+// Use this in any test that constructs a tempdir path and then compares
+// it to a path emitted by code that may have canonicalized it.
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", dir, err)
+	}
+	return resolved
 }
 
 func createCLIWorkspaceProjectRoot(t *testing.T) (string, string) {
@@ -280,7 +356,7 @@ func TestResolveMessageScopeRejectsWorkspaceFallbackForExplicitSession(t *testin
 func TestResolveMessageScopeFallsBackToProjectRoot(t *testing.T) {
 	isolateSessionAgentStorage(t)
 
-	projectDir := t.TempDir()
+	projectDir := canonicalTempDir(t)
 
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(projectDir); err != nil {
@@ -305,7 +381,7 @@ func TestResolveMessageScopeInfersLabeledSessionFromCurrentProject(t *testing.T)
 	testutil.RequireTmuxThrottled(t)
 	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectDir := filepath.Join(projectsBase, "messageproject")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -546,7 +622,7 @@ func TestResolvePipelineProjectDirForSessionRejectsWorkspaceFallbackForExplicitS
 }
 
 func TestResolvePipelineProjectDirForSessionFallsBackToProjectRoot(t *testing.T) {
-	projectDir := t.TempDir()
+	projectDir := canonicalTempDir(t)
 
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(projectDir); err != nil {
@@ -571,6 +647,97 @@ func TestResolvePipelineProjectDirForSessionRejectsInvalidSessionName(t *testing
 	if !strings.Contains(err.Error(), "invalid session name") {
 		t.Fatalf("expected invalid session error, got %v", err)
 	}
+}
+
+func TestPipelineLintCmdValidWorkflowDoesNotRequireSession(t *testing.T) {
+	oldJSON := jsonOutput
+	jsonOutput = false
+	t.Cleanup(func() { jsonOutput = oldJSON })
+
+	path := writePipelineLintWorkflow(t, `
+schema_version: "2.0"
+name: lint-workflow
+steps:
+  - id: step1
+    agent: claude
+    prompt: Do something
+`)
+
+	cmd := newPipelineCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"lint", path})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("pipeline lint returned error: %v; stderr=%q", err, errOut.String())
+	}
+	if got := out.String(); !strings.Contains(got, "Validation: ok") || !strings.Contains(got, "Workflow: lint-workflow") {
+		t.Fatalf("unexpected lint output: %q", got)
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("unexpected stderr: %q", errOut.String())
+	}
+}
+
+func TestPipelineLintCmdJSONIncludesNormalizedWorkflowOnValidationFailure(t *testing.T) {
+	oldJSON := jsonOutput
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = oldJSON })
+
+	path := writePipelineLintWorkflow(t, `
+schema_version: "2.0"
+steps:
+  - id: step1
+    agent: claude
+    prompt: Do something
+`)
+
+	cmd := newPipelineCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"lint", path})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("pipeline lint returned nil error for invalid workflow")
+	}
+
+	var result struct {
+		Success            bool            `json:"success"`
+		ErrorCode          string          `json:"error_code"`
+		Errors             []any           `json:"errors"`
+		NormalizedWorkflow json.RawMessage `json:"normalized_workflow"`
+	}
+	if decodeErr := json.Unmarshal(out.Bytes(), &result); decodeErr != nil {
+		t.Fatalf("json.Unmarshal() error = %v; output=%q", decodeErr, out.String())
+	}
+	if result.Success {
+		t.Fatalf("success = true, want false; result=%+v", result)
+	}
+	if result.ErrorCode != "VALIDATION_FAILED" {
+		t.Fatalf("error_code = %q, want VALIDATION_FAILED", result.ErrorCode)
+	}
+	if len(result.NormalizedWorkflow) == 0 || string(result.NormalizedWorkflow) == "null" {
+		t.Fatal("normalized_workflow is empty")
+	}
+	if len(result.Errors) == 0 {
+		t.Fatal("expected validation errors")
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("unexpected stderr in json mode: %q", errOut.String())
+	}
+}
+
+func writePipelineLintWorkflow(t *testing.T, content string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "workflow.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	return path
 }
 
 func TestResolveRobotSessionProjectScopeNormalizesExplicitPrefix(t *testing.T) {
@@ -841,7 +1008,7 @@ func TestResolveWorktreeScopeRejectsWorkspaceFallbackForExplicitSession(t *testi
 }
 
 func TestResolveWorktreeScopeFallsBackToProjectRoot(t *testing.T) {
-	projectDir := t.TempDir()
+	projectDir := canonicalTempDir(t)
 
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(projectDir); err != nil {
@@ -864,7 +1031,7 @@ func TestResolveWorktreeScopeFallsBackToProjectRoot(t *testing.T) {
 func TestResolveWorktreeScopeInfersLabeledSessionFromCurrentProject(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectDir := filepath.Join(projectsBase, "scopeproject")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -964,7 +1131,7 @@ func TestResolveContextBuildScopeRejectsWorkspaceFallbackForExplicitSession(t *t
 }
 
 func TestResolveContextBuildScopeFallsBackToProjectRoot(t *testing.T) {
-	projectDir := t.TempDir()
+	projectDir := canonicalTempDir(t)
 
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(projectDir); err != nil {
@@ -987,7 +1154,7 @@ func TestResolveContextBuildScopeFallsBackToProjectRoot(t *testing.T) {
 func TestResolveContextBuildScopeInfersLabeledSessionFromCurrentProject(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectDir := filepath.Join(projectsBase, "contextscope")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1159,7 +1326,7 @@ func TestResolveEnsembleProjectDirForSessionRejectsInvalidSessionName(t *testing
 }
 
 func TestResolveEnsembleProjectDirForSessionFallsBackToProjectRoot(t *testing.T) {
-	projectDir := t.TempDir()
+	projectDir := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(projectDir, ".ntm"), 0o755); err != nil {
 		t.Fatalf("mkdir ntm dir: %v", err)
 	}
@@ -1645,7 +1812,7 @@ func TestRunEnsembleProvenance_UsesSavedOutputsWhenSessionOffline(t *testing.T) 
 }
 
 func TestResolvePipelineProjectDirForSessionFallsBackToProjectRootFromNestedDir(t *testing.T) {
-	projectDir := t.TempDir()
+	projectDir := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(projectDir, ".ntm"), 0755); err != nil {
 		t.Fatalf("mkdir ntm root: %v", err)
 	}
@@ -1843,6 +2010,53 @@ func TestProjectDirFromHandoffPathSupportsArchive(t *testing.T) {
 	}
 	if got != projectDir {
 		t.Fatalf("project dir = %q, want %q", got, projectDir)
+	}
+}
+
+func TestAddDataToBundleSanitizesArchivePath(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	file, err := addDataToBundle(zw, `dir\test.txt`, []byte("content"))
+	if err != nil {
+		t.Fatalf("addDataToBundle() error = %v", err)
+	}
+	if file.Path != "dir/test.txt" {
+		t.Fatalf("manifest path = %q, want dir/test.txt", file.Path)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("read zip: %v", err)
+	}
+	if len(zr.File) != 1 {
+		t.Fatalf("zip entries = %d, want 1", len(zr.File))
+	}
+	if zr.File[0].Name != "dir/test.txt" {
+		t.Fatalf("zip entry = %q, want dir/test.txt", zr.File[0].Name)
+	}
+}
+
+func TestSupportBundleSessionPathRejectsTraversal(t *testing.T) {
+	if _, err := supportBundleSessionPath("../escape", "snapshot.json"); err == nil {
+		t.Fatal("expected unsafe session path error")
+	}
+}
+
+func TestAddDataToBundleRejectsUnsafeArchivePath(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	t.Cleanup(func() {
+		if err := zw.Close(); err != nil {
+			t.Logf("close zip: %v", err)
+		}
+	})
+
+	if _, err := addDataToBundle(zw, "../escape.txt", []byte("content")); err == nil {
+		t.Fatal("expected unsafe archive path error")
 	}
 }
 
@@ -2638,7 +2852,7 @@ func TestDepsCmdSmoke(t *testing.T) {
 			depsByName[dep.Name] = dep
 		}
 
-		for _, name := range []string{"tmux", "Claude Code", "OpenAI Codex", "Gemini CLI", "fzf", "git"} {
+		for _, name := range []string{"tmux", "Claude Code", "OpenAI Codex", "Gemini CLI (legacy)", "fzf", "git"} {
 			dep, ok := depsByName[name]
 			if !ok {
 				t.Fatalf("missing dependency %q in response: %+v", name, resp.Dependencies)

@@ -23,7 +23,9 @@ func GetProvider(agentType string) Provider {
 		return &ClaudeProvider{}
 	case agent.AgentTypeCodex:
 		return &CodexProvider{}
-	case agent.AgentTypeGemini:
+	case agent.AgentTypeGemini, agent.AgentTypeAntigravity:
+		// Antigravity (agy) is the Gemini CLI's successor and shares Google's
+		// auth/quota path, so it reuses the Gemini rotation provider.
 		return &GeminiProvider{}
 	default:
 		if strings.EqualFold(strings.TrimSpace(agentType), "anthropic") {

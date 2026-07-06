@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,7 +18,19 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/cass"
 )
+
+const (
+	defaultCASSLimit   = 5
+	defaultCASSTimeout = 3 * time.Second
+)
+
+// CASSSearcher defines the minimal CASS client surface needed for handoff enrichment.
+type CASSSearcher interface {
+	IsInstalled() bool
+	Search(ctx context.Context, opts cass.SearchOptions) (*cass.SearchResponse, error)
+}
 
 // Generator creates handoff content from various sources.
 type Generator struct {
@@ -91,6 +104,7 @@ func (g *Generator) GenerateFromOutput(sessionName string, output []byte) (*Hand
 		"blocker_count", len(h.Blockers),
 	)
 
+	h.UpdateQuality(time.Now())
 	return h, nil
 }
 
@@ -221,6 +235,7 @@ func (g *Generator) GenerateFromTranscript(sessionName, transcriptPath string) (
 		g.logger.Warn("git enrichment failed", "error", err)
 	}
 
+	h.UpdateQuality(time.Now())
 	return h, nil
 }
 
@@ -548,6 +563,7 @@ func (g *Generator) GenerateAutoHandoff(sessionName, agentType, paneID string, o
 		"goal", truncateGen(h.Goal, 50),
 	)
 
+	h.UpdateQuality(time.Now())
 	return h, nil
 }
 
@@ -593,11 +609,26 @@ type GenerateHandoffOptions struct {
 	// IncludeAgentMail enables Agent Mail integration (default: true if agentmail available)
 	IncludeAgentMail *bool
 
+	// IncludeCASS enables CASS context enrichment (default: true if cass is installed)
+	IncludeCASS *bool
+
 	// BVClient is an optional pre-configured BV client
 	BVClient *bv.BVClient
 
 	// AgentMailClient is an optional pre-configured Agent Mail client
 	AgentMailClient *agentmail.Client
+
+	// CASSClient is an optional pre-configured CASS client
+	CASSClient CASSSearcher
+
+	// CASSLimit caps context snippets pulled from CASS (default: 5, max: 20)
+	CASSLimit int
+
+	// CASSSince scopes CASS search recency (default: 30d)
+	CASSSince string
+
+	// CASSTimeout bounds CASS search time when creating a default client (default: 3s).
+	CASSTimeout time.Duration
 
 	// TransferTTLSeconds refreshes reservation TTL when preparing transfer instructions.
 	TransferTTLSeconds int
@@ -611,6 +642,7 @@ type GenerateHandoffOptions struct {
 //   - Git state (uncommitted changes, branch, recent commits)
 //   - Active beads from BV (in-progress tasks assigned to this agent)
 //   - Agent Mail state (inbox messages, file reservations)
+//   - CASS context snippets with source provenance
 //
 // All integrations are optional and fail gracefully if unavailable.
 func (g *Generator) GenerateHandoff(ctx context.Context, opts GenerateHandoffOptions) (*Handoff, error) {
@@ -678,6 +710,15 @@ func (g *Generator) GenerateHandoff(ctx context.Context, opts GenerateHandoffOpt
 		}
 	}
 
+	// Enrich with CASS context snippets (provenance-aware; graceful degradation)
+	includeCASS := opts.IncludeCASS == nil || *opts.IncludeCASS
+	if includeCASS {
+		if err := g.enrichWithCASS(ctx, h, opts); err != nil {
+			g.logger.Warn("CASS enrichment failed", "error", err)
+			// Non-fatal - continue without CASS context
+		}
+	}
+
 	// Infer status if not set
 	if h.Status == "" {
 		if len(h.Blockers) > 0 {
@@ -703,6 +744,7 @@ func (g *Generator) GenerateHandoff(ctx context.Context, opts GenerateHandoffOpt
 		"status", h.Status,
 	)
 
+	h.UpdateQuality(time.Now())
 	return h, nil
 }
 
@@ -940,4 +982,200 @@ func buildReservationTransfer(opts GenerateHandoffOptions, projectKey string, re
 		})
 	}
 	return transfer
+}
+
+// enrichWithCASS adds recent relevant CASS context snippets (with provenance) to the handoff.
+func (g *Generator) enrichWithCASS(ctx context.Context, h *Handoff, opts GenerateHandoffOptions) error {
+	query := buildCASSQuery(h)
+	if query == "" {
+		return nil
+	}
+
+	client := opts.CASSClient
+	if client == nil {
+		client = cass.NewClient(cass.WithTimeout(resolveCASSTimeout(opts.CASSTimeout)))
+	}
+	if client == nil || !client.IsInstalled() {
+		g.logger.Debug("CASS not installed, skipping enrichment")
+		return nil
+	}
+
+	projectKey := strings.TrimSpace(opts.ProjectKey)
+	if projectKey == "" {
+		projectKey = g.projectDir
+	}
+
+	limit := opts.CASSLimit
+	if limit <= 0 {
+		limit = defaultCASSLimit
+	}
+	if limit > 20 {
+		limit = 20
+	}
+
+	since := strings.TrimSpace(opts.CASSSince)
+	if since == "" {
+		since = "30d"
+	}
+
+	resp, err := client.Search(ctx, cass.SearchOptions{
+		Query:     query,
+		Workspace: projectKey,
+		Since:     since,
+		Limit:     limit,
+		Fields:    "summary",
+	})
+	if err != nil {
+		if errors.Is(err, cass.ErrNotInstalled) || errors.Is(err, cass.ErrNotInitialized) {
+			g.logger.Debug("CASS unavailable or uninitialized, skipping enrichment", "error", err)
+			return nil
+		}
+		return err
+	}
+	if resp == nil || len(resp.Hits) == 0 {
+		return nil
+	}
+
+	entries := buildCASSMemoryEntries(resp.Hits, limit)
+	if len(entries) == 0 {
+		return nil
+	}
+
+	h.CMMemories = uniqueStrings(append(h.CMMemories, entries...))
+	h.AddFinding("cass_query", truncateGen(query, 120))
+	h.AddFinding("cass_hit_count", fmt.Sprintf("%d", len(entries)))
+
+	g.logger.Debug("enriched with CASS context",
+		"query", truncateGen(query, 80),
+		"entries", len(entries),
+	)
+
+	return nil
+}
+
+func resolveCASSTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return defaultCASSTimeout
+	}
+	return timeout
+}
+
+func buildCASSQuery(h *Handoff) string {
+	if h == nil {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		parts = append(parts, value)
+	}
+
+	add(h.Now)
+	add(h.Goal)
+	if len(h.Next) > 0 {
+		add(h.Next[0])
+	}
+	if len(h.ActiveBeads) > 0 {
+		bead := strings.TrimSpace(h.ActiveBeads[0])
+		if idx := strings.Index(bead, ":"); idx > 0 {
+			bead = strings.TrimSpace(bead[:idx])
+		}
+		add(bead)
+	}
+
+	query := strings.Join(parts, " ")
+	query = strings.Join(strings.Fields(query), " ")
+	return truncateGen(query, 240)
+}
+
+func buildCASSMemoryEntries(hits []cass.SearchHit, limit int) []string {
+	if len(hits) == 0 || limit == 0 {
+		return nil
+	}
+	if limit < 0 {
+		limit = 0
+	}
+
+	ordered := append([]cass.SearchHit(nil), hits...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Score != ordered[j].Score {
+			return ordered[i].Score > ordered[j].Score
+		}
+		iTime := ordered[i].CreatedAtTime()
+		jTime := ordered[j].CreatedAtTime()
+		if !iTime.Equal(jTime) {
+			return iTime.After(jTime)
+		}
+		if ordered[i].SourcePath != ordered[j].SourcePath {
+			return ordered[i].SourcePath < ordered[j].SourcePath
+		}
+		iLine := 0
+		jLine := 0
+		if ordered[i].LineNumber != nil {
+			iLine = *ordered[i].LineNumber
+		}
+		if ordered[j].LineNumber != nil {
+			jLine = *ordered[j].LineNumber
+		}
+		if iLine != jLine {
+			return iLine < jLine
+		}
+		return ordered[i].SessionID < ordered[j].SessionID
+	})
+
+	seen := make(map[string]struct{}, len(ordered))
+	out := make([]string, 0, min(limit, len(ordered)))
+	for _, hit := range ordered {
+		loc := strings.TrimSpace(hit.SourcePath)
+		if loc == "" {
+			continue
+		}
+		if hit.LineNumber != nil && *hit.LineNumber > 0 {
+			loc = fmt.Sprintf("%s#L%d", loc, *hit.LineNumber)
+		}
+		content := strings.TrimSpace(hit.Snippet)
+		if content == "" {
+			content = strings.TrimSpace(hit.Content)
+		}
+		content = strings.Join(strings.Fields(content), " ")
+		key := strings.Join([]string{
+			loc,
+			strings.TrimSpace(hit.SessionID),
+			strings.TrimSpace(hit.Agent),
+			content,
+		}, "|")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		meta := make([]string, 0, 3)
+		if agent := strings.TrimSpace(hit.Agent); agent != "" {
+			meta = append(meta, "agent="+agent)
+		}
+		if session := strings.TrimSpace(hit.SessionID); session != "" {
+			meta = append(meta, "session="+session)
+		}
+		if hit.Score > 0 {
+			meta = append(meta, fmt.Sprintf("score=%.2f", hit.Score))
+		}
+
+		entry := "cass:" + loc
+		if len(meta) > 0 {
+			entry += " [" + strings.Join(meta, ", ") + "]"
+		}
+		if content != "" {
+			entry += " " + truncateGen(content, 140)
+		}
+
+		out = append(out, entry)
+		if len(out) >= limit {
+			break
+		}
+	}
+
+	return out
 }

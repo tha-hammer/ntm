@@ -244,29 +244,30 @@ func TestNormalizeCommandLine(t *testing.T) {
 func TestResolveSpawnAssignAgentType(t *testing.T) {
 
 	tests := []struct {
-		name                     string
-		agent                    string
-		ccOnly, codOnly, gmiOnly bool
-		want                     string
+		name                              string
+		agent                             string
+		ccOnly, codOnly, gmiOnly, agyOnly bool
+		want                              string
 	}{
-		{"explicit agent", "Claude", false, false, false, "claude"},
-		{"explicit short code", "CC", false, false, false, "claude"},
-		{"explicit cli alias", "codex-cli", false, false, false, "codex"},
-		{"explicit spaced alias", " google-gemini ", false, false, false, "gemini"},
-		{"cc only flag", "", true, false, false, "claude"},
-		{"cod only flag", "", false, true, false, "codex"},
-		{"gmi only flag", "", false, false, true, "gemini"},
-		{"no agent no flags", "", false, false, false, ""},
-		{"agent takes precedence", "codex", true, false, false, "codex"},
-		{"whitespace agent", "  ", false, false, false, ""},
+		{"explicit agent", "Claude", false, false, false, false, "claude"},
+		{"explicit short code", "CC", false, false, false, false, "claude"},
+		{"explicit cli alias", "codex-cli", false, false, false, false, "codex"},
+		{"explicit spaced alias", " google-gemini ", false, false, false, false, "gemini"},
+		{"cc only flag", "", true, false, false, false, "claude"},
+		{"cod only flag", "", false, true, false, false, "codex"},
+		{"gmi only flag", "", false, false, true, false, "gemini"},
+		{"agy only flag", "", false, false, false, true, "antigravity"},
+		{"no agent no flags", "", false, false, false, false, ""},
+		{"agent takes precedence", "codex", true, false, false, false, "codex"},
+		{"whitespace agent", "  ", false, false, false, false, ""},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveSpawnAssignAgentType(tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly)
+			got := resolveSpawnAssignAgentType(tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly, tc.agyOnly)
 			if got != tc.want {
-				t.Errorf("resolveSpawnAssignAgentType(%q, %v, %v, %v) = %q; want %q",
-					tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly, got, tc.want)
+				t.Errorf("resolveSpawnAssignAgentType(%q, %v, %v, %v, %v) = %q; want %q",
+					tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly, tc.agyOnly, got, tc.want)
 			}
 		})
 	}

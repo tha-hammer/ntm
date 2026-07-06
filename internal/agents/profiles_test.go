@@ -10,10 +10,10 @@ import (
 func TestNewProfileMatcher(t *testing.T) {
 	pm := NewProfileMatcher()
 
-	// Should have all three default profiles
+	// Should have all default profiles (claude, codex, gemini, antigravity)
 	profiles := pm.AllProfiles()
-	if len(profiles) != 3 {
-		t.Errorf("expected 3 profiles, got %d", len(profiles))
+	if len(profiles) != 4 {
+		t.Errorf("expected 4 profiles, got %d", len(profiles))
 	}
 
 	// Check Claude profile
@@ -343,6 +343,7 @@ func TestNormalizeAgentType(t *testing.T) {
 		{"openai", "codex"},
 		{"openai-codex", "codex"},
 		{"GPT", "codex"},
+		{"gpt-5.5", "codex"},
 		{"gpt-5.3-codex", "codex"},
 		{"gemini", "gemini"},
 		{"gmi", "gemini"},

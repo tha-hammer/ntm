@@ -258,6 +258,9 @@ func buildControllerResponse(opts ControllerInput) (*ControllerResponse, error) 
 	case "gemini":
 		agentTypeFull = "gemini"
 		agentCmdTemplate = cfg.Agents.Gemini
+	case "antigravity":
+		agentTypeFull = "antigravity"
+		agentCmdTemplate = cfg.Agents.Antigravity
 	case "cursor":
 		agentTypeFull = "cursor"
 		agentCmdTemplate = cfg.Agents.Cursor
@@ -267,6 +270,11 @@ func buildControllerResponse(opts ControllerInput) (*ControllerResponse, error) 
 	case "aider":
 		agentTypeFull = "aider"
 		agentCmdTemplate = cfg.Agents.Aider
+	case "oc":
+		agentTypeFull = "opencode"
+		// Mirror the spawn/add dispatch fallback so model injection works on
+		// restart too. See ntm#193.
+		agentCmdTemplate = opencodeCommandOrDefault(cfg.Agents.Opencode)
 	case "ollama":
 		agentTypeFull = "ollama"
 		agentCmdTemplate = cfg.Agents.Ollama
@@ -372,7 +380,7 @@ func controllerAgentList(panes []tmux.Pane) ([]string, int) {
 	for _, p := range panes {
 		canonical := p.Type.Canonical()
 		switch canonical {
-		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOllama:
+		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
 			count++
 			list = append(list, fmt.Sprintf("- Pane %d: %s", p.Index, canonical))
 		}

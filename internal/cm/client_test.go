@@ -60,7 +60,7 @@ func TestGetContext(t *testing.T) {
 		client:  ts.Client(),
 	}
 
-	res, err := client.GetContext(context.Background(), "test task")
+	res, err := client.GetContext(context.Background(), "test task", "")
 	if err != nil {
 		t.Fatalf("GetContext() error = %v", err)
 	}
@@ -149,7 +149,7 @@ func TestCLIClientGetContextNotInstalled(t *testing.T) {
 	client := NewCLIClient(WithCLIBinaryPath("/nonexistent/cm"))
 
 	// Should return nil, nil for graceful degradation
-	result, err := client.GetContext(context.Background(), "test task")
+	result, err := client.GetContext(context.Background(), "test task", "")
 	if err != nil {
 		t.Errorf("GetContext() error = %v, want nil for graceful degradation", err)
 	}
@@ -165,7 +165,7 @@ func TestCLIClientGetRecoveryContext(t *testing.T) {
 		t.Skip("CM_CLI_TEST: Skipping - cm not installed")
 	}
 
-	result, err := client.GetRecoveryContext(context.Background(), "ntm", 5, 3)
+	result, err := client.GetRecoveryContext(context.Background(), "ntm", "", 5, 3)
 	if err != nil {
 		t.Logf("CM_CLI_TEST: GetRecoveryContext error (may be expected): %v", err)
 		return
@@ -343,7 +343,7 @@ func TestGetContext_ServerError500(t *testing.T) {
 		client:  ts.Client(),
 	}
 
-	_, err := client.GetContext(context.Background(), "test task")
+	_, err := client.GetContext(context.Background(), "test task", "")
 	if err == nil {
 		t.Error("[CM-ERROR] GetContext: expected error for 500 response, got nil")
 	}
@@ -369,7 +369,7 @@ func TestGetContext_ServerError503(t *testing.T) {
 		client:  ts.Client(),
 	}
 
-	_, err := client.GetContext(context.Background(), "test task")
+	_, err := client.GetContext(context.Background(), "test task", "")
 	if err == nil {
 		t.Error("[CM-ERROR] GetContext: expected error for 503 response, got nil")
 	}
@@ -393,7 +393,7 @@ func TestGetContext_InvalidJSONResponse(t *testing.T) {
 		client:  ts.Client(),
 	}
 
-	_, err := client.GetContext(context.Background(), "test task")
+	_, err := client.GetContext(context.Background(), "test task", "")
 	if err == nil {
 		t.Error("[CM-ERROR] GetContext: expected error for invalid JSON response, got nil")
 	}
@@ -417,7 +417,7 @@ func TestGetContext_EmptyResponse(t *testing.T) {
 		client:  ts.Client(),
 	}
 
-	_, err := client.GetContext(context.Background(), "test task")
+	_, err := client.GetContext(context.Background(), "test task", "")
 	if err == nil {
 		t.Error("[CM-ERROR] GetContext: expected error for empty response, got nil")
 	}
@@ -444,7 +444,7 @@ func TestGetContext_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, err := client.GetContext(ctx, "test task")
+	_, err := client.GetContext(ctx, "test task", "")
 	if err == nil {
 		t.Error("[CM-ERROR] GetContext: expected error for cancelled context, got nil")
 	}
@@ -507,7 +507,7 @@ func TestCLIClient_GracefulDegradation(t *testing.T) {
 	}
 
 	// Verify GetContext returns nil, nil (graceful degradation)
-	result, err := client.GetContext(context.Background(), "test task")
+	result, err := client.GetContext(context.Background(), "test task", "")
 	if err != nil {
 		t.Errorf("[CM-DEGRADE] GetContext: expected nil error for graceful degradation, got: %v", err)
 	}
@@ -516,7 +516,7 @@ func TestCLIClient_GracefulDegradation(t *testing.T) {
 	}
 
 	// Verify GetRecoveryContext also degrades gracefully
-	result, err = client.GetRecoveryContext(context.Background(), "test-project", 5, 3)
+	result, err = client.GetRecoveryContext(context.Background(), "test-project", "", 5, 3)
 	if err != nil {
 		t.Errorf("[CM-DEGRADE] GetRecoveryContext: expected nil error, got: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestGetRecoveryContext_LimitsApplied(t *testing.T) {
 	client := NewCLIClient(WithCLIBinaryPath("/nonexistent/cm"))
 
 	// Test with gracefully degraded client - should return nil
-	result, err := client.GetRecoveryContext(context.Background(), "test", 2, 1)
+	result, err := client.GetRecoveryContext(context.Background(), "test", "", 2, 1)
 	if err != nil {
 		t.Errorf("[CM-ERROR] GetRecoveryContext: unexpected error: %v", err)
 	}
@@ -665,7 +665,7 @@ func TestGetContext_RequestBodyValidation(t *testing.T) {
 	}
 
 	testTask := "Test task with special chars: <>&\""
-	_, err := client.GetContext(context.Background(), testTask)
+	_, err := client.GetContext(context.Background(), testTask, "")
 	if err != nil {
 		t.Fatalf("[CM-ERROR] GetContext: unexpected error: %v", err)
 	}
@@ -797,7 +797,7 @@ func TestGetContext_ConnectionRefused(t *testing.T) {
 		client:  &http.Client{Timeout: 1 * time.Second},
 	}
 
-	_, err := client.GetContext(context.Background(), "test task")
+	_, err := client.GetContext(context.Background(), "test task", "")
 	if err == nil {
 		t.Error("[CM-ERROR] GetContext: expected error for connection refused, got nil")
 	}
@@ -824,7 +824,7 @@ func TestCLIClient_SubprocessCrash(t *testing.T) {
 	// Force the client to believe it's "installed" by overriding the binary path
 	// We're using 'sh' which exists but will fail with the CM args
 	ctx := context.Background()
-	result, err := client.GetContext(ctx, "test task")
+	result, err := client.GetContext(ctx, "test task", "")
 
 	// Should return nil, nil due to graceful degradation when binary doesn't behave as expected
 	// or should return an error - either is acceptable for crash handling
@@ -843,7 +843,7 @@ func TestCLIClient_TimeoutDuringExecution(t *testing.T) {
 	)
 
 	ctx := context.Background()
-	result, err := client.GetContext(ctx, "5") // Try to sleep for 5 seconds
+	result, err := client.GetContext(ctx, "5", "") // Try to sleep for 5 seconds
 
 	// Either returns nil (graceful) or error due to timeout
 	t.Logf("[CM-ERROR] Operation=TimeoutDuringExec | Result=%v | Error=%v | Duration=%v",
@@ -871,7 +871,7 @@ func TestGetContext_CASSUnavailable(t *testing.T) {
 		client:  ts.Client(),
 	}
 
-	res, err := client.GetContext(context.Background(), "test task")
+	res, err := client.GetContext(context.Background(), "test task", "")
 	if err != nil {
 		t.Errorf("[CM-ERROR] GetContext: unexpected error when CASS unavailable: %v", err)
 	}
@@ -904,7 +904,7 @@ func TestGetContext_PartialResponse(t *testing.T) {
 		client:  ts.Client(),
 	}
 
-	res, err := client.GetContext(context.Background(), "test task")
+	res, err := client.GetContext(context.Background(), "test task", "")
 	if err != nil {
 		t.Errorf("[CM-ERROR] GetContext: unexpected error for partial response: %v", err)
 	}
@@ -957,7 +957,7 @@ func TestGetContext_MalformedRuleData(t *testing.T) {
 				client:  ts.Client(),
 			}
 
-			res, err := client.GetContext(context.Background(), "test task")
+			res, err := client.GetContext(context.Background(), "test task", "")
 			// Either error or partial success is acceptable - just shouldn't panic
 			t.Logf("[CM-ERROR] Operation=MalformedRuleData_%s | Error=%v | Result=%+v | Duration=%v",
 				tc.name, err, res, time.Since(start))
@@ -1005,7 +1005,7 @@ func TestGetContext_MalformedGuardData(t *testing.T) {
 				client:  ts.Client(),
 			}
 
-			res, err := client.GetContext(context.Background(), "test task")
+			res, err := client.GetContext(context.Background(), "test task", "")
 			// Log but don't fail - we're testing resilience
 			t.Logf("[CM-ERROR] Operation=MalformedGuardData_%s | Error=%v | HasResult=%v | Duration=%v",
 				tc.name, err, res != nil, time.Since(start))
@@ -1076,7 +1076,7 @@ func TestFallback_SpawnWithoutCM(t *testing.T) {
 	}
 
 	// GetContext should return nil, nil (graceful degradation)
-	result, err := client.GetContext(context.Background(), "spawn task")
+	result, err := client.GetContext(context.Background(), "spawn task", "")
 	if err != nil {
 		t.Errorf("[CM-FALLBACK] Expected nil error for graceful degradation, got: %v", err)
 	}
@@ -1085,7 +1085,7 @@ func TestFallback_SpawnWithoutCM(t *testing.T) {
 	}
 
 	// GetRecoveryContext should also degrade gracefully
-	recovery, err := client.GetRecoveryContext(context.Background(), "project", 5, 3)
+	recovery, err := client.GetRecoveryContext(context.Background(), "project", "", 5, 3)
 	if err != nil {
 		t.Errorf("[CM-FALLBACK] GetRecoveryContext: expected nil error, got: %v", err)
 	}
@@ -1128,7 +1128,7 @@ func TestFallback_PartialCMFunctionality(t *testing.T) {
 	}
 
 	// Context should work
-	res, err := client.GetContext(context.Background(), "test task")
+	res, err := client.GetContext(context.Background(), "test task", "")
 	if err != nil {
 		t.Errorf("[CM-ERROR] GetContext: unexpected error: %v", err)
 	}
@@ -1162,7 +1162,7 @@ func TestFallback_HTTPToCliDegradation(t *testing.T) {
 	cliClient := NewCLIClient()
 
 	// CLI client degrades gracefully if not installed
-	result, err := cliClient.GetContext(context.Background(), "test task")
+	result, err := cliClient.GetContext(context.Background(), "test task", "")
 	// Result depends on whether cm is installed, but should never panic
 
 	t.Logf("[CM-DEGRADE] Operation=HTTPToCLI | HTTPError=%v | CLIResult=%v | CLIError=%v | Duration=%v",
@@ -1196,13 +1196,13 @@ func TestFallback_CachedContextOnError(t *testing.T) {
 	}
 
 	// First call should succeed
-	res1, err1 := client.GetContext(context.Background(), "test task")
+	res1, err1 := client.GetContext(context.Background(), "test task", "")
 	if err1 != nil {
 		t.Errorf("[CM-ERROR] First call failed: %v", err1)
 	}
 
 	// Second call should fail
-	res2, err2 := client.GetContext(context.Background(), "test task")
+	res2, err2 := client.GetContext(context.Background(), "test task", "")
 	if err2 == nil {
 		t.Error("[CM-ERROR] Expected second call to fail")
 	}
@@ -1336,6 +1336,50 @@ func TestCLIContextResponse_Serialization(t *testing.T) {
 
 			t.Logf("[CM-ERROR] Operation=CLISerialization_%s | Bytes=%d | Duration=%v",
 				tc.name, len(data), time.Since(start))
+		})
+	}
+}
+
+// TestGetContextSendsWorkspace verifies the #132 fix: when callers pass a
+// non-empty workspace, the HTTP client puts it on the request body so the
+// daemon can scope retrieval. Empty workspace must be elided so older
+// daemons that don't understand the field aren't confused by a "" value.
+func TestGetContextSendsWorkspace(t *testing.T) {
+	cases := []struct {
+		name      string
+		workspace string
+		wantField bool
+		wantValue string
+	}{
+		{name: "non-empty workspace forwarded", workspace: "/path/to/repoA/app", wantField: true, wantValue: "/path/to/repoA/app"},
+		{name: "empty workspace elided", workspace: "", wantField: false},
+		{name: "whitespace-only workspace elided", workspace: "   ", wantField: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				var got map[string]string
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatalf("decode body: %v", err)
+				}
+				gotWs, present := got["workspace"]
+				if present != tc.wantField {
+					t.Errorf("workspace field present=%v, want %v (body=%s)", present, tc.wantField, string(body))
+				}
+				if tc.wantField && gotWs != tc.wantValue {
+					t.Errorf("workspace=%q, want %q", gotWs, tc.wantValue)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"relevant_bullets":[]}`))
+			}))
+			defer ts.Close()
+
+			client := &Client{baseURL: ts.URL, client: ts.Client()}
+			if _, err := client.GetContext(context.Background(), "test task", tc.workspace); err != nil {
+				t.Fatalf("GetContext: %v", err)
+			}
 		})
 	}
 }

@@ -18,7 +18,7 @@ var codexUsagePatterns = struct {
 }{
 	Usage:   regexp.MustCompile(`(?i)usage[:\s]+(\d+(?:\.\d+)?)\s*%`),
 	Limit:   regexp.MustCompile(`(?i)limit[:\s]+(\d+(?:\.\d+)?)\s*%`),
-	Limited: regexp.MustCompile(`(?i)(?:rate\s*limit|limited|exceeded|quota)`),
+	Limited: regexp.MustCompile(`(?i)\b(?:rate[\s-]*limit(?:ed)?|limit[\s-]*(?:exceeded|reached)|quota[\s-]*(?:exceeded|exhausted|reached)|exceeded\s+quota)\b`),
 }
 
 var codexStatusPatterns = struct {
@@ -27,6 +27,16 @@ var codexStatusPatterns = struct {
 }{
 	Account: regexp.MustCompile(`(?i)(?:account|user)[:\s]+(\S+)`),
 	Org:     regexp.MustCompile(`(?i)(?:organization|org|workspace)[:\s]+(.+?)(?:\n|$)`),
+}
+
+// DetectUsageLimit reports whether captured Codex output indicates the account
+// has hit a usage / rate / quota limit. It reuses the single grounded
+// rate-limit regex (codexUsagePatterns.Limited) that drives parseCodexUsage, so
+// callers outside the quota package (e.g. the codex preflight classifier) do not
+// have to re-derive the pattern. Keeping the regex in one place means a future
+// refinement of the limit copy updates every consumer at once.
+func DetectUsageLimit(output string) bool {
+	return codexUsagePatterns.Limited.MatchString(output)
 }
 
 // parseCodexUsage parses Codex usage output

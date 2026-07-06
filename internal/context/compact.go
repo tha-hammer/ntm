@@ -105,14 +105,14 @@ func GetAgentCapabilities(agentType string) AgentCapabilities {
 			BuiltinCompactCommand:  "",
 			HistoryClearCommand:    "",
 		}
-	case agent.AgentTypeGemini:
+	case agent.AgentTypeGemini, agent.AgentTypeAntigravity:
 		return AgentCapabilities{
-			SupportsBuiltinCompact: false, // Gemini CLI doesn't have /compact
+			SupportsBuiltinCompact: false, // Gemini/Antigravity CLI doesn't have /compact
 			SupportsHistoryClear:   true,
 			BuiltinCompactCommand:  "",
 			HistoryClearCommand:    "/clear",
 		}
-	case agent.AgentTypeCursor, agent.AgentTypeWindsurf, agent.AgentTypeAider, agent.AgentTypeOllama:
+	case agent.AgentTypeCursor, agent.AgentTypeWindsurf, agent.AgentTypeAider, agent.AgentTypeOpencode, agent.AgentTypeOllama:
 		// These IDE-based agents typically manage their own context or don't support explicit compaction commands yet
 		return AgentCapabilities{
 			SupportsBuiltinCompact: false,

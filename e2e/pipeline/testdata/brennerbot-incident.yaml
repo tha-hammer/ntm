@@ -1,0 +1,70 @@
+schema_version: "2.0"
+name: brennerbot-incident
+description: Small deterministic brennerbot incident pipeline for mocked E2E coverage.
+
+settings:
+  timeout: 5s
+  on_error: fail
+
+steps:
+  - id: phase_0_scope
+    command: |
+      test -f .brenner_workspace/phase0_scope_decision.md
+      printf 'scope_ok\n'
+    output_var: phase0_scope
+    output_parse: first_line
+
+  - id: phase_1_prepare_workspace
+    command: |
+      mkdir -p .ntm .beads .brenner_workspace deliverables
+      printf 'workspace_ready\n'
+    depends_on: [phase_0_scope]
+
+  - id: phase_2_hypothesis_roster
+    command: |
+      printf '%s\n' H-001 H-002 > .brenner_workspace/hypotheses.txt
+      printf '["H-001","H-002"]\n'
+    output_var: hypotheses
+    output_parse: json
+    depends_on: [phase_1_prepare_workspace]
+
+  - id: phase_3_complete
+    command: |
+      test -s .brenner_workspace/hypotheses.txt
+      printf 'ready\n' > .brenner_workspace/phase_3_complete.flag
+      printf 'phase3_ready\n'
+    depends_on: [phase_2_hypothesis_roster]
+
+  - id: phase_4_inline_dispatch
+    wait: none
+    foreach:
+      items: "${vars.hypotheses_parsed}"
+      as: hypothesis
+      pane_assignment_strategy: round_robin
+      template: templates/MO-04a-investigate.md
+      params:
+        H_ID: "${hypothesis}"
+        INCIDENT_ID: INC-2026-05-07
+    depends_on: [phase_3_complete]
+
+  - id: phase_5_collect_agent_notes
+    command: |
+      printf 'agent_notes_collected\n' > .brenner_workspace/phase_5_collect.log
+      printf 'collected\n'
+    depends_on: [phase_4_inline_dispatch]
+
+  - id: phase_6_render_incident_verdict
+    command: |
+      cat > deliverables/INCIDENT-VERDICT.md <<'EOF'
+      # Incident Verdict
+
+      INC-2026-05-07 investigated H-001 and H-002 via MO-04a.
+      EOF
+      printf 'verdict_rendered\n'
+    depends_on: [phase_5_collect_agent_notes]
+
+  - id: phase_7_done
+    command: |
+      test -f deliverables/INCIDENT-VERDICT.md
+      printf 'incident_complete\n'
+    depends_on: [phase_6_render_incident_verdict]

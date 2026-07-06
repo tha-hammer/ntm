@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"fmt"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -69,6 +70,65 @@ func TestWindowSizeMsg_UpdatesDimensionsAndPanels(t *testing.T) {
 	if updated.focusedPanel != PanelBeads {
 		t.Fatalf("expected focus to remain on PanelBeads, got %v", updated.focusedPanel)
 	}
+}
+
+// TestWindowSizeMsg_ForcesFullClearRepaint is a regression test for #186
+// ("UI occasionally becomes corrupted/scrambled after terminal resize").
+//
+// In alt-screen mode the bubbletea renderer repaints the new frame's lines on
+// resize but does not reliably erase cells left behind by a previous,
+// differently sized frame (it only erases each line to the right, and the area
+// below only when the new frame has fewer lines). Growing the window - or
+// shrinking then growing - can therefore leave stale glyphs on screen. To
+// guarantee a clean repaint, handleWindowSize must return tea.ClearScreen,
+// which emits a hard EraseEntireScreen before the next render.
+func TestWindowSizeMsg_ForcesFullClearRepaint(t *testing.T) {
+	m := New("test", "")
+
+	_, cmd := m.Update(tea.WindowSizeMsg{Width: 200, Height: 50})
+	if cmd == nil {
+		t.Fatal("expected a command from WindowSizeMsg (tea.ClearScreen), got nil")
+	}
+
+	if !cmdEmitsClearScreen(cmd) {
+		t.Fatal("expected WindowSizeMsg to emit a tea.ClearScreen message for a full repaint")
+	}
+
+	// A subsequent resize (e.g. grow after shrink) must also force a repaint.
+	_, cmd2 := m.Update(tea.WindowSizeMsg{Width: 340, Height: 60})
+	if cmd2 == nil || !cmdEmitsClearScreen(cmd2) {
+		t.Fatal("expected a follow-up resize to also emit tea.ClearScreen")
+	}
+}
+
+// cmdEmitsClearScreen reports whether running cmd (possibly a tea.Batch)
+// produces a clear-screen message. tea.ClearScreen's message type is
+// unexported, so we compare against the message tea.ClearScreen itself emits.
+func cmdEmitsClearScreen(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	want := tea.ClearScreen()
+	msg := cmd()
+	if msgsEqual(msg, want) {
+		return true
+	}
+	// Unwrap a tea.BatchMsg ([]tea.Cmd) if the resize batched commands together.
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, c := range batch {
+			if c == nil {
+				continue
+			}
+			if msgsEqual(c(), want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func msgsEqual(a, b tea.Msg) bool {
+	return fmt.Sprintf("%T", a) == fmt.Sprintf("%T", b)
 }
 
 func TestWindowSizeMsg_NormalizesFocusWhenPanelHidden(t *testing.T) {

@@ -496,8 +496,10 @@ func TestInferSessionFromCWD_LabelDisambiguation(t *testing.T) {
 	// Ensure we are not in "remote" mode.
 	tmux.DefaultClient.Remote = ""
 
-	// Create a temp directory tree: projectsBase/myproject/
-	projectsBase := t.TempDir()
+	// Create a temp directory tree: projectsBase/myproject/.
+	// canonicalTempDir resolves macOS /var → /private/var so paths
+	// returned by os.Getwd() after chdir match those built from this base.
+	projectsBase := canonicalTempDir(t)
 	projectDir := filepath.Join(projectsBase, "myproject")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -644,14 +646,14 @@ func TestResolveProjectDirForSession_PrefersCWDForInferredSession(t *testing.T) 
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	configProject := filepath.Join(projectsBase, "ntm")
 	if err := os.MkdirAll(configProject, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
-	cwdRepo := t.TempDir()
+	cwdRepo := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(cwdRepo, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -713,14 +715,14 @@ func TestResolveProjectDirForSession_ExplicitFallsBackToUsableWorkspace(t *testi
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	configProject := filepath.Join(projectsBase, "ntm")
 	if err := os.MkdirAll(configProject, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
-	cwdRepo := t.TempDir()
+	cwdRepo := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(cwdRepo, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -912,10 +914,10 @@ func TestResolveCommandProjectDirForSession_InferredAllowsWorkspaceFallback(t *t
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
-	cwdRepo := t.TempDir()
+	cwdRepo := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(cwdRepo, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}

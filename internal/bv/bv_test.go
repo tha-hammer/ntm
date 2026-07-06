@@ -749,3 +749,76 @@ func TestContainsString(t *testing.T) {
 		})
 	}
 }
+
+// TestHasLocalBeadsDB verifies the recovery-list gating predicate. When the
+// directory has no local .beads/ directory, recovery list reads must short-
+// circuit empty rather than letting br walk up into a parent repo (#130).
+func TestHasLocalBeadsDB(t *testing.T) {
+	t.Run("missing_beads_dir_returns_false", func(t *testing.T) {
+		dir := t.TempDir()
+		if got := HasLocalBeadsDB(dir); got != false {
+			t.Errorf("HasLocalBeadsDB(%q) = true, want false (no .beads/)", dir)
+		}
+	})
+
+	t.Run("present_beads_dir_returns_true", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(.beads) failed: %v", err)
+		}
+		if got := HasLocalBeadsDB(dir); got != true {
+			t.Errorf("HasLocalBeadsDB(%q) = false, want true", dir)
+		}
+	})
+
+	t.Run("beads_is_a_file_returns_false", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".beads"), []byte("not a dir"), 0o600); err != nil {
+			t.Fatalf("WriteFile(.beads) failed: %v", err)
+		}
+		if got := HasLocalBeadsDB(dir); got != false {
+			t.Errorf("HasLocalBeadsDB(%q) = true, want false (.beads is a regular file)", dir)
+		}
+	})
+
+	t.Run("child_without_local_db_does_not_inherit_parent", func(t *testing.T) {
+		// Reproduces #130's repro shape: parent has a .beads/ directory, child
+		// does not. The child must report no local DB even though the parent has one.
+		parent := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(parent, ".beads"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(parent/.beads) failed: %v", err)
+		}
+		child := filepath.Join(parent, "child")
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatalf("MkdirAll(child) failed: %v", err)
+		}
+		if got := HasLocalBeadsDB(child); got != false {
+			t.Errorf("HasLocalBeadsDB(%q) = true, want false (child has no .beads/, must not inherit parent's)", child)
+		}
+	})
+}
+
+// TestHasLocalBeadsDBChildDoesNotInheritParent is a focused regression on
+// the recovery-gating predicate: a child directory of a beads-rooted parent
+// must report no local DB so trust-sensitive callers refuse to surface the
+// parent's rows (#130). The generic GetInProgressList / GetRecentlyCompleted
+// / GetBlocked helpers intentionally preserve br's walk-up behavior for
+// non-recovery callers — recovery enforcement happens at the call site
+// (cli/spawn.go::loadRecoveryBeads), not in these helpers.
+func TestHasLocalBeadsDBChildDoesNotInheritParent(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(parent, ".beads"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(parent/.beads) failed: %v", err)
+	}
+	child := filepath.Join(parent, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child) failed: %v", err)
+	}
+
+	if HasLocalBeadsDB(child) {
+		t.Errorf("HasLocalBeadsDB(%q) = true, want false (child has no .beads/, must not inherit parent's for recovery callers)", child)
+	}
+	if !HasLocalBeadsDB(parent) {
+		t.Errorf("HasLocalBeadsDB(%q) = false, want true (parent has .beads/)", parent)
+	}
+}

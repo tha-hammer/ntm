@@ -132,14 +132,15 @@ type Model struct {
 	statusFetchErr      error
 
 	// Stats
-	claudeCount   int
-	codexCount    int
-	geminiCount   int
-	cursorCount   int
-	windsurfCount int
-	aiderCount    int
-	ollamaCount   int
-	userCount     int
+	claudeCount      int
+	codexCount       int
+	geminiCount      int
+	antigravityCount int
+	cursorCount      int
+	windsurfCount    int
+	aiderCount       int
+	ollamaCount      int
+	userCount        int
 
 	// Theme
 	theme theme.Theme
@@ -224,6 +225,12 @@ type Model struct {
 
 	// Local agent performance (best-effort; derived from output deltas + prompt history)
 	localPerfByPaneID map[string]*localPerfTracker // keyed by pane ID
+
+	// Per-pane token-velocity state. Velocity is a genuine fresh-token RATE
+	// computed from the delta in token count over a wall-clock window between
+	// successive samples (see paneTokenVelocity), so an idle swarm reads ~0
+	// instead of (snapshot size / repaint age), which spikes on every redraw.
+	velocityByPaneID map[string]velocitySample // keyed by pane ID
 
 	// Ollama /api/ps cache (best-effort)
 	ollamaModelMemory map[string]int64 // model name -> bytes
@@ -532,6 +539,7 @@ func New(session, projectDir string) Model {
 		paneStatus:                 make(map[int]PaneStatus),
 		detector:                   status.NewDetector(),
 		agentStatuses:              make(map[string]status.AgentStatus),
+		velocityByPaneID:           make(map[string]velocitySample),
 		costInputTokens:            make(map[string]int),
 		costOutputTokens:           make(map[string]int),
 		costModels:                 make(map[string]string),

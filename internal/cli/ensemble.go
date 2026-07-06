@@ -80,12 +80,16 @@ func normalizeEnsembleAgentType(value string) string {
 		return "cod"
 	case agentpkg.AgentTypeGemini:
 		return "gmi"
+	case agentpkg.AgentTypeAntigravity:
+		return "agy"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:
 		return "windsurf"
 	case agentpkg.AgentTypeAider:
 		return "aider"
+	case agentpkg.AgentTypeOpencode:
+		return "oc"
 	case agentpkg.AgentTypeOllama:
 		return "ollama"
 	default:
@@ -2858,7 +2862,17 @@ func runEnsembleResume(w io.Writer, runID, format string, quiet, skipDone bool) 
 func renderCheckpointResumeOutput(w io.Writer, payload checkpointResumeOutput, format string, quiet bool) error {
 	switch format {
 	case "json":
-		return output.WriteJSON(w, payload, true)
+		if err := output.WriteJSON(w, payload, true); err != nil {
+			return err
+		}
+		// bd-oqwmf: surface non-zero exit when the rendered payload
+		// signals failure, mirroring bd-usgfy / #125 for the
+		// checkpoint-resume JSON path. All nine ensemble.go failure
+		// sites funnel through this renderer with payload.Success=false.
+		if !payload.Success {
+			return jsonFailureExit()
+		}
+		return nil
 	case "yaml":
 		data, err := yaml.Marshal(payload)
 		if err != nil {

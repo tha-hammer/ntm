@@ -23,12 +23,13 @@ import (
 
 func newActivityCmd() *cobra.Command {
 	var (
-		filterClaude bool
-		filterCodex  bool
-		filterGemini bool
-		filterPane   string
-		watchMode    bool
-		interval     int
+		filterClaude      bool
+		filterCodex       bool
+		filterGemini      bool
+		filterAntigravity bool
+		filterPane        string
+		watchMode         bool
+		interval          int
 	)
 
 	cmd := &cobra.Command{
@@ -64,12 +65,13 @@ Examples:
 			}
 
 			opts := activityOptions{
-				filterClaude: filterClaude,
-				filterCodex:  filterCodex,
-				filterGemini: filterGemini,
-				filterPane:   filterPane,
-				watchMode:    watchMode,
-				interval:     time.Duration(interval) * time.Millisecond,
+				filterClaude:      filterClaude,
+				filterCodex:       filterCodex,
+				filterGemini:      filterGemini,
+				filterAntigravity: filterAntigravity,
+				filterPane:        filterPane,
+				watchMode:         watchMode,
+				interval:          time.Duration(interval) * time.Millisecond,
 			}
 
 			return runActivity(session, opts)
@@ -79,6 +81,7 @@ Examples:
 	cmd.Flags().BoolVar(&filterClaude, "cc", false, "Only show Claude agents")
 	cmd.Flags().BoolVar(&filterCodex, "cod", false, "Only show Codex agents")
 	cmd.Flags().BoolVar(&filterGemini, "gmi", false, "Only show Gemini agents")
+	cmd.Flags().BoolVar(&filterAntigravity, "agy", false, "Only show Antigravity agents")
 	cmd.Flags().StringVar(&filterPane, "pane", "", "Show specific pane (by name or index)")
 	cmd.Flags().BoolVarP(&watchMode, "watch", "w", false, "Auto-refresh display")
 	cmd.Flags().IntVar(&interval, "interval", 2000, "Refresh interval in milliseconds (with --watch)")
@@ -89,21 +92,31 @@ Examples:
 }
 
 type activityOptions struct {
-	filterClaude bool
-	filterCodex  bool
-	filterGemini bool
-	filterPane   string
-	watchMode    bool
-	interval     time.Duration
+	filterClaude      bool
+	filterCodex       bool
+	filterGemini      bool
+	filterAntigravity bool
+	filterPane        string
+	watchMode         bool
+	interval          time.Duration
 }
 
 func runActivity(session string, opts activityOptions) error {
+	// bd-ixy2t: emit a JSON envelope on early-fail when --json is set so
+	// automation pipelines (`ntm activity --json | jq ...`) always see a
+	// parseable failure on stdout instead of a stderr "Error:" line.
 	if err := tmux.EnsureInstalled(); err != nil {
+		if jsonOutput {
+			return outputActivityError(session, err)
+		}
 		return err
 	}
 
 	res, err := ResolveSession(session, os.Stdout)
 	if err != nil {
+		if jsonOutput {
+			return outputActivityError(session, err)
+		}
 		return err
 	}
 	if res.Session == "" {
@@ -298,12 +311,16 @@ func detectAgentTypeFromPane(pane tmux.Pane) string {
 		return "codex"
 	case tmux.AgentGemini:
 		return "gemini"
+	case tmux.AgentAntigravity:
+		return "antigravity"
 	case tmux.AgentCursor:
 		return "cursor"
 	case tmux.AgentWindsurf:
 		return "windsurf"
 	case tmux.AgentAider:
 		return "aider"
+	case tmux.AgentOpencode:
+		return "oc"
 	case tmux.AgentOllama:
 		return "ollama"
 	case tmux.AgentUser:
@@ -330,7 +347,7 @@ func passesFilter(agentType string, pane tmux.Pane, opts activityOptions) bool {
 	}
 
 	// If no type filters, allow all
-	if !opts.filterClaude && !opts.filterCodex && !opts.filterGemini {
+	if !opts.filterClaude && !opts.filterCodex && !opts.filterGemini && !opts.filterAntigravity {
 		return true
 	}
 
@@ -342,6 +359,9 @@ func passesFilter(agentType string, pane tmux.Pane, opts activityOptions) bool {
 		return true
 	}
 	if opts.filterGemini && agentType == "gemini" {
+		return true
+	}
+	if opts.filterAntigravity && agentType == "antigravity" {
 		return true
 	}
 
@@ -410,7 +430,13 @@ func outputActivityError(session string, err error) error {
 
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	if encErr := encoder.Encode(output); encErr != nil {
+		return encErr
+	}
+	// bd-usgfy: signal non-zero exit after writing the success:false envelope so
+	// `ntm activity --json` automation can gate on $? without re-parsing JSON
+	// (parity with #125).
+	return jsonFailureExit()
 }
 
 func renderActivityTUI(result *activityResult, watchMode bool) error {
@@ -571,12 +597,16 @@ func activityAgentTypeColor(agentType string, t theme.Theme) lipgloss.Color {
 		return t.Codex
 	case agent.AgentTypeGemini:
 		return t.Gemini
+	case agent.AgentTypeAntigravity:
+		return t.Lavender
 	case agent.AgentTypeCursor:
 		return t.Cursor
 	case agent.AgentTypeWindsurf:
 		return t.Windsurf
 	case agent.AgentTypeAider:
 		return t.Aider
+	case agent.AgentTypeOpencode:
+		return t.Opencode
 	case agent.AgentTypeOllama:
 		return t.Ollama
 	case agent.AgentTypeUser:

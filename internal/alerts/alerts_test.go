@@ -159,6 +159,32 @@ func TestTrackerResolution(t *testing.T) {
 	}
 }
 
+func TestTrackerUpdate_AgentWideFailurePreservesSessionScopedAlerts(t *testing.T) {
+	cfg := DefaultConfig()
+	tracker := NewTracker(cfg)
+
+	tracker.Update([]Alert{
+		{ID: "agent-pane", Source: "agents:proj", Type: AlertAgentError, Severity: SeverityError, Message: "pane error"},
+		{ID: "disk", Source: "disk", Type: AlertDiskLow, Severity: SeverityWarning, Message: "disk low"},
+	}, nil)
+
+	tracker.Update(nil, []string{"agents"})
+
+	active, resolved := tracker.GetAll()
+	if len(active) != 1 {
+		t.Fatalf("expected only the session-scoped agent alert to stay active, got %d active: %+v", len(active), active)
+	}
+	if active[0].ID != "agent-pane" {
+		t.Fatalf("active alert = %q, want agent-pane", active[0].ID)
+	}
+	if len(resolved) != 1 {
+		t.Fatalf("expected unrelated disk alert to resolve, got %d resolved: %+v", len(resolved), resolved)
+	}
+	if resolved[0].ID != "disk" {
+		t.Fatalf("resolved alert = %q, want disk", resolved[0].ID)
+	}
+}
+
 func TestTrackerRefresh(t *testing.T) {
 	cfg := DefaultConfig()
 	tracker := NewTracker(cfg)
@@ -431,6 +457,46 @@ func TestTrackerManualResolve(t *testing.T) {
 	ok = tracker.ManualResolve("nonexistent")
 	if ok {
 		t.Error("expected manual resolve of non-existent to fail")
+	}
+}
+
+func TestTrackerResolveIfUnchangedSkipsRefreshedAlert(t *testing.T) {
+	cfg := DefaultConfig()
+	tracker := NewTracker(cfg)
+
+	alert := Alert{
+		ID:       "auto-resolve",
+		Type:     AlertRotationComplete,
+		Severity: SeverityInfo,
+		Message:  "rotation complete",
+		Source:   "context_rotation",
+	}
+
+	tracker.AddAlert(alert)
+	stored, ok := tracker.GetByID(alert.ID)
+	if !ok {
+		t.Fatal("expected alert to be active")
+	}
+
+	tracker.AddAlert(alert)
+	if tracker.resolveIfUnchanged(alert.ID, stored.LastSeenAt, stored.Count) {
+		t.Fatal("old resolver should not resolve a refreshed alert")
+	}
+
+	active := tracker.GetActive()
+	if len(active) != 1 || active[0].ID != alert.ID {
+		t.Fatalf("expected refreshed alert to remain active, got %+v", active)
+	}
+
+	refreshed, ok := tracker.GetByID(alert.ID)
+	if !ok {
+		t.Fatal("expected refreshed alert to be active")
+	}
+	if !tracker.resolveIfUnchanged(alert.ID, refreshed.LastSeenAt, refreshed.Count) {
+		t.Fatal("current resolver should resolve unchanged alert")
+	}
+	if active := tracker.GetActive(); len(active) != 0 {
+		t.Fatalf("expected alert to resolve, got active=%+v", active)
 	}
 }
 
@@ -1032,9 +1098,114 @@ func TestGeneratorDetectRateLimit_Last20Lines(t *testing.T) {
 	}
 }
 
+func TestBuildDiskSpaceAlert(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		freeGB       float64
+		thresholdGB  float64
+		checkPath    string
+		wantNilAlert bool
+		wantSeverity Severity
+	}{
+		{
+			name:         "healthy_above_threshold",
+			freeGB:       50.0,
+			thresholdGB:  10.0,
+			checkPath:    "/data",
+			wantNilAlert: true,
+		},
+		{
+			name:         "healthy_at_threshold",
+			freeGB:       10.0,
+			thresholdGB:  10.0,
+			checkPath:    "/data",
+			wantNilAlert: true,
+		},
+		{
+			name:         "warning_below_threshold",
+			freeGB:       5.0,
+			thresholdGB:  10.0,
+			checkPath:    "/data",
+			wantNilAlert: false,
+			wantSeverity: SeverityWarning,
+		},
+		{
+			name:         "critical_below_one_gb",
+			freeGB:       0.5,
+			thresholdGB:  10.0,
+			checkPath:    "C:\\",
+			wantNilAlert: false,
+			wantSeverity: SeverityCritical,
+		},
+		{
+			name:         "critical_zero_free",
+			freeGB:       0.0,
+			thresholdGB:  10.0,
+			checkPath:    "/",
+			wantNilAlert: false,
+			wantSeverity: SeverityCritical,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := DefaultConfig()
+			cfg.DiskLowThresholdGB = tt.thresholdGB
+			gen := NewGenerator(cfg)
+
+			alert := gen.buildDiskSpaceAlert(tt.freeGB, tt.checkPath)
+
+			if tt.wantNilAlert {
+				if alert != nil {
+					t.Fatalf("expected nil alert for free=%.1f threshold=%.1f, got %+v", tt.freeGB, tt.thresholdGB, *alert)
+				}
+				return
+			}
+
+			if alert == nil {
+				t.Fatalf("expected alert for free=%.1f threshold=%.1f, got nil", tt.freeGB, tt.thresholdGB)
+			}
+			if alert.Severity != tt.wantSeverity {
+				t.Errorf("severity = %q, want %q", alert.Severity, tt.wantSeverity)
+			}
+			if alert.Type != AlertDiskLow {
+				t.Errorf("type = %q, want %q", alert.Type, AlertDiskLow)
+			}
+			if alert.Source != "disk" {
+				t.Errorf("source = %q, want %q", alert.Source, "disk")
+			}
+			if !strings.Contains(alert.Message, tt.checkPath) {
+				t.Errorf("message %q does not contain checkPath %q", alert.Message, tt.checkPath)
+			}
+			gotPath, ok := alert.Context["path"].(string)
+			if !ok || gotPath != tt.checkPath {
+				t.Errorf("context.path = %v (%T), want %q", alert.Context["path"], alert.Context["path"], tt.checkPath)
+			}
+			gotFree, ok := alert.Context["free_gb"].(float64)
+			if !ok || gotFree != tt.freeGB {
+				t.Errorf("context.free_gb = %v (%T), want %.1f", alert.Context["free_gb"], alert.Context["free_gb"], tt.freeGB)
+			}
+			gotThreshold, ok := alert.Context["threshold_gb"].(float64)
+			if !ok || gotThreshold != tt.thresholdGB {
+				t.Errorf("context.threshold_gb = %v (%T), want %.1f", alert.Context["threshold_gb"], alert.Context["threshold_gb"], tt.thresholdGB)
+			}
+		})
+	}
+}
+
 func TestGeneratorCheckDiskSpace_ThresholdAndFallbackPath(t *testing.T) {
-	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" || runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
-		t.Skip("disk space checks are unix-only")
+	if runtime.GOOS == "plan9" || runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
+		t.Skip("disk space checks not supported on this platform")
+	}
+	if runtime.GOOS == "windows" {
+		// Windows uses different fallback paths (C:\) and quota semantics;
+		// covered indirectly via TestBuildDiskSpaceAlert. The Unix-style
+		// path assertions below ("/" fallback) don't apply here.
+		t.Skip("Windows disk-space path semantics differ; see TestBuildDiskSpaceAlert")
 	}
 
 	cfg := DefaultConfig()

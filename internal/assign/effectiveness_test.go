@@ -136,9 +136,9 @@ func TestRankAgentsForTask(t *testing.T) {
 		t.Errorf("expected task_type=bug, got %s", ranking.TaskType)
 	}
 
-	// Should have 7 agent types
-	if len(ranking.Rankings) != 7 {
-		t.Errorf("expected 7 rankings, got %d", len(ranking.Rankings))
+	// Should have 9 agent types (cc, cod, gmi, agy, cursor, windsurf, aider, oc, ollama)
+	if len(ranking.Rankings) != 9 {
+		t.Errorf("expected 9 rankings, got %d", len(ranking.Rankings))
 	}
 
 	// Rankings should be ordered (rank 1, 2, 3)
@@ -516,8 +516,8 @@ func TestRankAgentsForTaskWithEffectivenessData(t *testing.T) {
 		t.Error("expected HasData=true when effectiveness data exists")
 	}
 
-	if len(ranking.Rankings) != 7 {
-		t.Fatalf("expected 7 rankings, got %d", len(ranking.Rankings))
+	if len(ranking.Rankings) != 9 {
+		t.Fatalf("expected 9 rankings, got %d", len(ranking.Rankings))
 	}
 
 	// With exploitation weight=0.6 and confidence=1.0:

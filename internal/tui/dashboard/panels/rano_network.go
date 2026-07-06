@@ -285,7 +285,7 @@ func providerFromAgentType(agentType string) string {
 		return "anthropic"
 	case agent.AgentTypeCodex:
 		return "openai"
-	case agent.AgentTypeGemini:
+	case agent.AgentTypeGemini, agent.AgentTypeAntigravity:
 		return "google"
 	default:
 		return "unknown"

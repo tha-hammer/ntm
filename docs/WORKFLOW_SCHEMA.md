@@ -101,7 +101,16 @@ vars:
 ```bash
 ntm pipeline run workflow.yaml --var project_name=myapp --var max_files=50
 ntm pipeline run workflow.yaml --var-file vars.yaml
+ntm pipeline run workflow.yaml --var file_patterns=internal,cmd,docs
 ```
+
+Variable precedence is deterministic. Loop-local values such as `${item.X}` and
+`${pane.X}` are innermost during foreach execution. Runtime `--var` values
+override `--var-file` values, and both override `vars:` defaults. Defaults are
+applied only when no runtime value was provided, and defaults may reference
+other defaults with `${vars.X}` as long as they do not form a cycle. Declared
+types are validated before execution; array-typed `--var` values use
+comma-separated input.
 
 ## Settings
 
@@ -184,7 +193,8 @@ Three ways to specify which agent should execute a step:
 Agent types:
 - `claude` / `cc` / `claude-code`
 - `codex` / `cod` / `openai`
-- `gemini` / `gmi` / `google`
+- `antigravity` / `agy` / `google-antigravity`
+- `gemini` / `gmi` / `google` (legacy)
 
 ### By Pane Index
 
@@ -271,7 +281,7 @@ Run multiple steps concurrently using the `parallel` block:
       prompt: Write initial code
 
     - id: review
-      agent: gemini
+      agent: antigravity
       prompt: Review architecture
 
 - id: combine
@@ -282,6 +292,26 @@ Run multiple steps concurrently using the `parallel` block:
     - Prototype: ${steps.prototype.output}
     - Review: ${steps.review.output}
 ```
+
+TOML workflows must use array-of-tables for nested parallel steps:
+
+```toml
+[[steps]]
+id = "parallel_work"
+
+[[steps.parallel.steps]]
+id = "research"
+agent = "claude"
+prompt = "Research the problem"
+
+[[steps.parallel.steps]]
+id = "prototype"
+agent = "codex"
+prompt = "Write initial code"
+```
+
+Inline TOML table arrays such as `parallel = [{ id = "research", prompt = "..." }]`
+are rejected so unknown-field validation can stay strict.
 
 ### Parallel Execution Rules
 
@@ -373,6 +403,10 @@ Variables can be referenced throughout the workflow using `${...}` syntax.
 | `${timestamp}` | `2025-01-15T10:00:00Z` | Current time |
 | `${run_id}` | `abc123` | Pipeline run ID |
 | `${workflow}` | `my-workflow` | Workflow name |
+
+Environment variables expose the runner's process environment to the pipeline.
+Missing environment variables are substitution errors unless a default is supplied,
+for example `${env.OPTIONAL_TOKEN | ""}`.
 
 ### Default Values
 
@@ -495,7 +529,7 @@ steps:
         prompt: Check git history for changes related to: ${vars.issue}
 
       - id: log_search
-        agent: gemini
+        agent: antigravity
         prompt: Search logs for errors related to: ${vars.issue}
 
   - id: synthesize

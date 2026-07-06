@@ -96,6 +96,7 @@ func GetHistory(opts HistoryOptions) (*HistoryOutput, error) {
 	var sinceTime time.Time
 	normalizedAgentType := normalizeAgentType(opts.AgentType)
 	livePaneTypes := make(map[string]string)
+	paneFilterAliases := historyPaneFilterAliases(opts)
 
 	if opts.Since != "" {
 		var parseErr error
@@ -125,18 +126,8 @@ func GetHistory(opts HistoryOptions) (*HistoryOutput, error) {
 		}
 
 		// Filter by pane/targets
-		if opts.Pane != "" {
-			// e.Targets contains pane indices or names
-			found := false
-			for _, t := range e.Targets {
-				if t == opts.Pane {
-					found = true
-					break
-				}
-			}
-			if !found {
-				continue
-			}
+		if len(paneFilterAliases) > 0 && !historyEntryMatchesPaneFilter(e, paneFilterAliases) {
+			continue
 		}
 
 		if normalizedAgentType != "" && !historyEntryMatchesAgentType(e, normalizedAgentType, livePaneTypes) {
@@ -197,6 +188,82 @@ func historyEntryMatchesAgentType(entry history.HistoryEntry, want string, liveP
 		}
 	}
 	return false
+}
+
+func historyPaneFilterAliases(opts HistoryOptions) map[string]struct{} {
+	filter := strings.TrimSpace(opts.Pane)
+	if filter == "" {
+		return nil
+	}
+
+	aliases := map[string]struct{}{filter: {}}
+	if opts.Session == "" || !tmux.SessionExists(opts.Session) {
+		return aliases
+	}
+
+	panes, err := tmux.GetPanes(opts.Session)
+	if err != nil {
+		return aliases
+	}
+	for _, pane := range panes {
+		if historyPaneMatchesFilter(pane, filter) {
+			addHistoryPaneTargetAliases(aliases, pane)
+		}
+	}
+	return aliases
+}
+
+func historyPaneMatchesFilter(pane tmux.Pane, filter string) bool {
+	if filter == "" {
+		return false
+	}
+	for alias := range historyPaneAliases(pane) {
+		if alias == filter {
+			return true
+		}
+	}
+	return false
+}
+
+func historyEntryMatchesPaneFilter(entry history.HistoryEntry, aliases map[string]struct{}) bool {
+	for _, target := range entry.Targets {
+		if _, ok := aliases[target]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func historyPaneAliases(pane tmux.Pane) map[string]struct{} {
+	aliases := make(map[string]struct{}, 5)
+	addHistoryPaneFilterAliases(aliases, pane)
+	return aliases
+}
+
+func addHistoryPaneFilterAliases(aliases map[string]struct{}, pane tmux.Pane) {
+	if pane.ID != "" {
+		aliases[pane.ID] = struct{}{}
+	}
+	if pane.Title != "" {
+		aliases[pane.Title] = struct{}{}
+	}
+	aliases[fmt.Sprintf("%d", pane.Index)] = struct{}{}
+	aliases[fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index)] = struct{}{}
+	if pane.NTMIndex > 0 {
+		aliases[fmt.Sprintf("%d", pane.NTMIndex)] = struct{}{}
+		aliases[fmt.Sprintf("%d.%d", pane.WindowIndex, pane.NTMIndex)] = struct{}{}
+	}
+}
+
+func addHistoryPaneTargetAliases(aliases map[string]struct{}, pane tmux.Pane) {
+	if pane.ID != "" {
+		aliases[pane.ID] = struct{}{}
+	}
+	if pane.Title != "" {
+		aliases[pane.Title] = struct{}{}
+	}
+	aliases[fmt.Sprintf("%d", pane.Index)] = struct{}{}
+	aliases[fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index)] = struct{}{}
 }
 
 // PrintHistory outputs command history as JSON.

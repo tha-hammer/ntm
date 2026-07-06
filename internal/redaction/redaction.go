@@ -30,8 +30,16 @@ func ScanAndRedact(input string, cfg Config) Result {
 	// Compile allowlist if provided.
 	allowlist := compileAllowlist(cfg.Allowlist)
 
+	// bd-ztb6a: also compile any user-configured ExtraPatterns so they
+	// participate in the scan alongside the built-in defaultPatterns.
+	// Pre-fix this slice was silently dropped — Config.ExtraPatterns
+	// flowed through every layer (TOML config, deep-copy Get/Set) but
+	// never reached the matcher. They share the existing
+	// deduplicate / allowlist / DisabledCategories machinery.
+	extra := compileExtraPatterns(cfg.ExtraPatterns)
+
 	// Scan for all matches.
-	matches := scan(input, allowlist, cfg.DisabledCategories)
+	matches := scan(input, allowlist, cfg.DisabledCategories, extra)
 
 	// No findings: return input unchanged.
 	if len(matches) == 0 {
@@ -75,8 +83,16 @@ type match struct {
 }
 
 // scan finds all sensitive content in input.
-func scan(input string, allowlist []*regexp.Regexp, disabled []Category) []match {
-	patterns := getPatterns()
+func scan(input string, allowlist []*regexp.Regexp, disabled []Category, extra []pattern) []match {
+	// bd-ztb6a: built-in defaults + user-configured extras share the
+	// same scan pipeline. Iterating over the joined slice keeps the
+	// deduplicate / allowlist filters identical for both — extras are
+	// not a second-class scanner.
+	builtin := getPatterns()
+	patterns := make([]pattern, 0, len(builtin)+len(extra))
+	patterns = append(patterns, builtin...)
+	patterns = append(patterns, extra...)
+
 	var allMatches []match
 	var lowerInput string
 	lowerReady := false

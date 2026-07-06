@@ -155,6 +155,9 @@ func TestParseCodexUsage_FailClosed_NearMissPatterns(t *testing.T) {
 		{"usage without percentage", "Usage: high"},
 		{"numeric without context", "12.5"},
 		{"html-like", "<usage>50</usage>"},
+		{"neutral quota prose", "Quota remaining is healthy"},
+		{"unlimited plan prose", "This account has unlimited quota"},
+		{"quota without codex limit label", "Quota: 80%"},
 	}
 
 	for _, nm := range nearMisses {
@@ -169,6 +172,25 @@ func TestParseCodexUsage_FailClosed_NearMissPatterns(t *testing.T) {
 				t.Errorf("expected found=false for near-miss %q (fail-closed)", nm.input)
 			}
 		})
+	}
+}
+
+func TestParseCodexUsage_NeutralQuotaTextDoesNotLookLimited(t *testing.T) {
+	t.Parallel()
+
+	info := &QuotaInfo{}
+	found, err := parseCodexUsage(info, "Limit: 60%\nQuota remaining is healthy\nThis account has unlimited quota")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true from Limit percentage")
+	}
+	if info.WeeklyUsage != 60 {
+		t.Fatalf("WeeklyUsage = %v, want 60", info.WeeklyUsage)
+	}
+	if info.IsLimited {
+		t.Fatal("neutral quota/unlimited text must not set IsLimited")
 	}
 }
 

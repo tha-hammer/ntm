@@ -39,21 +39,53 @@ func (a *CAAMAdapter) Detect() (string, bool) {
 	return path, true
 }
 
-// Version returns the installed caam version
+// Version returns the installed caam version.
+//
+// caam is a cobra-based Go CLI: it exposes a `version` SUBCOMMAND
+// (`caam version` -> "caam 0.1.11 (7c604c4) built on ... with go1.26.2")
+// and explicitly rejects a `--version` flag with "unknown flag: --version".
+// ntm historically called `--version`, which always failed and made caam
+// look like a 0.0.0 / "not responding" tool even when it was perfectly
+// healthy (acfs#296). We invoke the `version` subcommand and stay tolerant
+// of version skew: any output containing a parseable X.Y.Z is accepted,
+// including when caam exits non-zero or prints to stderr.
 func (a *CAAMAdapter) Version(ctx context.Context) (Version, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "--version")
+	cmd := exec.CommandContext(ctx, a.BinaryName(), "version")
 	cmd.WaitDelay = time.Second
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+
+	// Prefer stdout; fall back to stderr (older/newer caam builds, or a
+	// usage banner, may route the version string there). A parseable
+	// version in either stream is good enough — don't hard-fail on a
+	// non-zero exit if we still recovered a usable version.
+	out := strings.TrimSpace(stdout.String())
+	if out == "" {
+		out = strings.TrimSpace(stderr.String())
+	}
+
+	if out != "" {
+		if v, perr := ParseStandardVersion(out); perr == nil && (v.Major != 0 || v.Minor != 0 || v.Patch != 0) {
+			return v, nil
+		}
+	}
+
+	if err != nil {
 		return Version{}, fmt.Errorf("failed to get caam version: %w", err)
 	}
 
-	return ParseStandardVersion(stdout.String())
+	// Command succeeded but we could not extract an X.Y.Z. Return whatever
+	// raw text we have rather than a misleading 0.0.0 with no provenance.
+	if out != "" {
+		return ParseStandardVersion(out)
+	}
+	return Version{}, fmt.Errorf("caam version produced no output")
 }
 
 // Capabilities returns the list of caam capabilities
@@ -97,26 +129,62 @@ func (a *CAAMAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 		}, nil
 	}
 
-	// Try to get version as a basic health check
-	_, err := a.Version(ctx)
-	latency := time.Since(start)
-
-	if err != nil {
+	// Try to get version as a basic health check. caam responds to
+	// `caam version`; a successful read proves the binary is alive.
+	_, verr := a.Version(ctx)
+	if verr == nil {
 		return &HealthStatus{
-			Healthy:     false,
-			Message:     fmt.Sprintf("caam at %s not responding", path),
-			Error:       err.Error(),
+			Healthy:     true,
+			Message:     "caam is healthy",
 			LastChecked: time.Now(),
-			Latency:     latency,
+			Latency:     time.Since(start),
+		}, nil
+	}
+
+	// Version probe failed. Before declaring caam unresponsive, fall back
+	// to a liveness check that does not depend on the exact version
+	// command surface: if the binary runs at all and emits its usage
+	// banner, it is responding (just version-skewed), so we must not
+	// report a misleading "not responding" (acfs#296).
+	if a.isResponsive(ctx) {
+		return &HealthStatus{
+			Healthy:     true,
+			Message:     "caam is healthy (version unavailable)",
+			LastChecked: time.Now(),
+			Latency:     time.Since(start),
 		}, nil
 	}
 
 	return &HealthStatus{
-		Healthy:     true,
-		Message:     "caam is healthy",
+		Healthy:     false,
+		Message:     fmt.Sprintf("caam at %s not responding", path),
+		Error:       verr.Error(),
 		LastChecked: time.Now(),
-		Latency:     latency,
+		Latency:     time.Since(start),
 	}, nil
+}
+
+// isResponsive performs a version-agnostic liveness probe: it runs
+// `caam --help` and treats any captured output (cobra prints its usage to
+// stdout, but routes it to stderr on an error exit) as proof the binary is
+// alive. This keeps the health verdict robust to changes in caam's version
+// command surface.
+func (a *CAAMAdapter) isResponsive(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, a.BinaryName(), "--help")
+	cmd.WaitDelay = time.Second
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	_ = cmd.Run() // cobra may exit non-zero; we only care about output.
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return false
+	}
+	return stdout.Len() > 0 || stderr.Len() > 0
 }
 
 // HasCapability checks if caam has a specific capability

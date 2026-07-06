@@ -75,6 +75,8 @@ func gradientAgent(agent string) []string {
 		return []string{string(t.Blue), string(t.Sapphire), string(t.Sky)}
 	case "gemini":
 		return []string{string(t.Yellow), string(t.Peach), string(t.Red)}
+	case "antigravity":
+		return []string{string(t.Lavender), string(t.Mauve), string(t.Blue)}
 	default:
 		return gradientPrimary()
 	}
@@ -188,6 +190,8 @@ func renderAgentBadgeStyle(agentType string, t theme.Theme, ic icons.IconSet) (s
 		return string(t.Codex), ic.Codex
 	case agent.AgentTypeGemini:
 		return string(t.Gemini), ic.Gemini
+	case agent.AgentTypeAntigravity:
+		return string(t.Lavender), ic.Gemini
 	case agent.AgentTypeCursor:
 		return string(t.Cursor), ic.Cursor
 	case agent.AgentTypeWindsurf:

@@ -14,6 +14,42 @@ import (
 	"time"
 )
 
+// attachTokenFromField adds a cached token to an MCP tool arg map.
+// Different Agent Mail tools use different token parameter names:
+// send_message/reply_message use sender_token, most agent-scoped read
+// and reservation tools use registration_token, and handshake macros
+// use requester_registration_token / target_registration_token.
+func (c *Client) attachTokenFromField(args map[string]interface{}, tokenField, agentField string) {
+	if c == nil || args == nil {
+		return
+	}
+	if _, ok := args[tokenField]; ok {
+		return // caller supplied it explicitly; do not clobber
+	}
+	projectKey, _ := args["project_key"].(string)
+	if projectKey == "" {
+		projectKey, _ = args["human_key"].(string)
+	}
+	if projectKey == "" {
+		return
+	}
+	agentName, _ := args[agentField].(string)
+	if agentName == "" {
+		return
+	}
+	if token := c.RegistrationToken(projectKey, agentName); token != "" {
+		args[tokenField] = token
+	}
+}
+
+func (c *Client) attachRegistrationToken(args map[string]interface{}) {
+	c.attachTokenFromField(args, "registration_token", "agent_name")
+}
+
+func (c *Client) attachSenderToken(args map[string]interface{}) {
+	c.attachTokenFromField(args, "sender_token", "sender_name")
+}
+
 // EnsureProject ensures a project exists for the given path.
 func (c *Client) EnsureProject(ctx context.Context, projectKey string) (*Project, error) {
 	args := map[string]interface{}{
@@ -49,6 +85,12 @@ func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (
 		args["task_description"] = opts.TaskDescription
 	}
 
+	// Re-claim path: include the agent's registration token when known so
+	// the server can authenticate us as the existing identity instead of
+	// rejecting the call. New registrations leave it empty and the
+	// server returns a fresh token in the response.
+	c.attachTokenFromField(args, "registration_token", "name")
+
 	result, err := c.callToolWithBusyRetry(ctx, "register_agent", args, 3*time.Second, 3)
 	if err != nil {
 		return nil, err
@@ -58,6 +100,7 @@ func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (
 	if err := json.Unmarshal(result, &agent); err != nil {
 		return nil, NewAPIError("register_agent", 0, err)
 	}
+	c.rememberRegistrationToken(opts.ProjectKey, &agent)
 
 	return &agent, nil
 }
@@ -85,6 +128,7 @@ func (c *Client) CreateAgentIdentity(ctx context.Context, opts RegisterAgentOpti
 	if err := json.Unmarshal(result, &agent); err != nil {
 		return nil, NewAPIError("create_agent_identity", 0, err)
 	}
+	c.rememberRegistrationToken(opts.ProjectKey, &agent)
 
 	return &agent, nil
 }
@@ -138,6 +182,7 @@ func (c *Client) SendMessage(ctx context.Context, opts SendMessageOptions) (*Sen
 		args["convert_images"] = *opts.ConvertImages
 	}
 
+	c.attachSenderToken(args)
 	result, err := c.callTool(ctx, "send_message", args)
 	if err != nil {
 		return nil, err
@@ -172,6 +217,7 @@ func (c *Client) ReplyMessage(ctx context.Context, opts ReplyMessageOptions) (*M
 		args["subject_prefix"] = opts.SubjectPrefix
 	}
 
+	c.attachSenderToken(args)
 	result, err := c.callTool(ctx, "reply_message", args)
 	if err != nil {
 		return nil, err
@@ -204,6 +250,7 @@ func (c *Client) FetchInbox(ctx context.Context, opts FetchInboxOptions) ([]Inbo
 		args["include_bodies"] = true
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "fetch_inbox", args)
 	if err != nil {
 		return nil, err
@@ -245,6 +292,7 @@ func (c *Client) MarkMessageRead(ctx context.Context, projectKey, agentName stri
 		"message_id":  messageID,
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "mark_message_read", args)
 	if err != nil {
 		return nil, err
@@ -266,6 +314,7 @@ func (c *Client) AcknowledgeMessage(ctx context.Context, projectKey, agentName s
 		"message_id":  messageID,
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "acknowledge_message", args)
 	if err != nil {
 		return nil, err
@@ -310,6 +359,7 @@ func (c *Client) RequestContact(ctx context.Context, opts RequestContactOptions)
 		args["ttl_seconds"] = opts.TTLSeconds
 	}
 
+	c.attachTokenFromField(args, "registration_token", "from_agent")
 	result, err := c.callTool(ctx, "request_contact", args)
 	if err != nil {
 		return nil, err
@@ -335,6 +385,7 @@ func (c *Client) RespondContact(ctx context.Context, opts RespondContactOptions)
 		args["ttl_seconds"] = opts.TTLSeconds
 	}
 
+	c.attachTokenFromField(args, "registration_token", "to_agent")
 	result, err := c.callTool(ctx, "respond_contact", args)
 	if err != nil {
 		return nil, err
@@ -360,6 +411,7 @@ func (c *Client) ListContacts(ctx context.Context, projectKey, agentName string)
 		"agent_name":  agentName,
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "list_contacts", args)
 	if err != nil {
 		return nil, err
@@ -383,6 +435,7 @@ func (c *Client) SearchMessages(ctx context.Context, opts SearchOptions) ([]Sear
 		args["limit"] = opts.Limit
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callToolWithTimeout(ctx, "search_messages", args, LongTimeout)
 	if err != nil {
 		return nil, err
@@ -474,6 +527,7 @@ func (c *Client) ReservePaths(ctx context.Context, opts FileReservationOptions) 
 		args["reason"] = opts.Reason
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "file_reservation_paths", args)
 	if err != nil {
 		return nil, err
@@ -505,6 +559,7 @@ func (c *Client) ReleaseReservations(ctx context.Context, projectKey, agentName 
 		args["file_reservation_ids"] = ids
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "release_file_reservations", args)
 	if err != nil {
 		return nil, err
@@ -532,6 +587,7 @@ func (c *Client) RenewReservations(ctx context.Context, opts RenewReservationsOp
 		args["paths"] = opts.Paths
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "renew_file_reservations", args)
 	if err != nil {
 		return nil, err
@@ -569,6 +625,7 @@ func (c *Client) ListReservations(ctx context.Context, projectKey, agentName str
 			args["all_agents"] = true
 		}
 
+		c.attachRegistrationToken(args)
 		toolResult, toolErr := c.callTool(ctx, "list_file_reservations", args)
 		if toolErr != nil {
 			fallbackResult, fallbackErr := c.callTool(ctx, "list_reservations", args)
@@ -672,6 +729,7 @@ func (c *Client) StartSession(ctx context.Context, projectKey, program, model, t
 		args["task_description"] = taskDescription
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "macro_start_session", args)
 	if err != nil {
 		return nil, err
@@ -723,6 +781,7 @@ func (c *Client) PrepareThread(ctx context.Context, opts PrepareThreadOptions) (
 		args["register_if_missing"] = *opts.RegisterIfMissing
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "macro_prepare_thread", args)
 	if err != nil {
 		return nil, err
@@ -776,6 +835,8 @@ func (c *Client) ContactHandshake(ctx context.Context, opts ContactHandshakeOpti
 	args["auto_accept"] = opts.AutoAccept
 	args["register_if_missing"] = true // Always try to register
 
+	c.attachTokenFromField(args, "requester_registration_token", "agent_name")
+	c.attachTokenFromField(args, "target_registration_token", "to_agent")
 	result, err := c.callTool(ctx, "macro_contact_handshake", args)
 	if err != nil {
 		return nil, err
@@ -789,14 +850,112 @@ func (c *Client) ContactHandshake(ctx context.Context, opts ContactHandshakeOpti
 	return &handshakeResult, nil
 }
 
-// SendOverseerMessage sends a Human Overseer message via the HTTP REST API.
-// This bypasses contact policies and auto-injects a preamble telling agents
-// to prioritize the human's instructions. Messages are automatically marked
-// as high importance.
+// SendOverseerMessage sends a Human Overseer message. On mcp-agent-mail
+// >=2.13 (the current server line) this uses the MCP `send_message`
+// tool with a registered `HumanOverseer` agent — the legacy
+// `/mail/{slug}/overseer/send` HTTP endpoint is no longer exposed by
+// many deployments and was returning 404 (#146).
 //
-// Note: This uses the HTTP REST API, not the MCP tools API, because the
-// overseer functionality is specifically designed for human operators.
+// The MCP path:
+//
+//  1. Ensures the project exists.
+//  2. Registers a `HumanOverseer` agent (idempotent — re-registering
+//     just refreshes its activity timestamp on the server).
+//  3. Sends via `send_message` with `importance=high`, the configured
+//     thread id, and a `HumanOverseerPreamble` prepended to the body.
+//
+// As a back-compat fallback (older servers that still expose the HTTP
+// endpoint and don't accept `HumanOverseer` as an agent name), if MCP
+// send_message reports the special "human-overseer-not-supported"
+// error path we retry against the HTTP endpoint. Most callers will
+// never hit that branch.
 func (c *Client) SendOverseerMessage(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
+	// Prefer the MCP path. Need ProjectKey for the MCP tools (the
+	// server-side project_key is an absolute path, not the URL slug).
+	// Legacy callers that only have a ProjectSlug fall through to
+	// the HTTP route and the server validates recipients/subject
+	// shape there.
+	projectKey := opts.ProjectKey
+	if projectKey == "" {
+		return c.sendOverseerMessageHTTP(ctx, opts)
+	}
+
+	// 1. Ensure project — idempotent, cheap, and gets us a stable
+	//    handle the server understands even if this is the very first
+	//    overseer call against this project.
+	if _, err := c.EnsureProject(ctx, projectKey); err != nil {
+		// EnsureProject failure isn't fatal for the overseer flow on
+		// older servers that auto-create on first message, so we
+		// don't return here — but record it for diagnostics if MCP
+		// itself also fails below.
+		_ = err
+	}
+
+	// 2. Register / re-claim the HumanOverseer agent. This is
+	//    idempotent on the server and gives us a registration_token
+	//    (cached automatically via rememberRegistrationToken).
+	if _, err := c.RegisterAgent(ctx, RegisterAgentOptions{
+		ProjectKey:      projectKey,
+		Name:            HumanOverseerAgentName,
+		Program:         "ntm",
+		Model:           "human",
+		TaskDescription: "Out-of-band instructions from the human operator",
+	}); err != nil {
+		// Fall back to the legacy HTTP endpoint when MCP registration
+		// fails outright (e.g. older server without identity support).
+		return c.sendOverseerMessageHTTP(ctx, opts)
+	}
+
+	body := HumanOverseerPreamble + opts.BodyMD
+	send, err := c.SendMessage(ctx, SendMessageOptions{
+		ProjectKey: projectKey,
+		SenderName: HumanOverseerAgentName,
+		To:         opts.Recipients,
+		Subject:    opts.Subject,
+		BodyMD:     body,
+		Importance: "high",
+		ThreadID:   opts.ThreadID,
+	})
+	if err != nil {
+		// MCP route refused (e.g. server doesn't allow a Human-Overseer
+		// agent and there's no contact yet). Try the HTTP endpoint as
+		// a last resort — operators running newer servers won't take
+		// this branch.
+		if httpResult, httpErr := c.sendOverseerMessageHTTP(ctx, opts); httpErr == nil {
+			return httpResult, nil
+		}
+		return nil, err
+	}
+
+	// Map send_message's SendResult (per-recipient deliveries) onto
+	// OverseerSendResult so the CLI's output shape is unchanged.
+	result := &OverseerSendResult{
+		Success:    true,
+		Recipients: opts.Recipients,
+	}
+	for _, d := range send.Deliveries {
+		if d.Payload == nil {
+			continue
+		}
+		if result.MessageID == 0 {
+			result.MessageID = d.Payload.ID
+		}
+		if !d.Payload.CreatedTS.IsZero() && result.SentAt.IsZero() {
+			result.SentAt = d.Payload.CreatedTS
+		}
+	}
+	return result, nil
+}
+
+// sendOverseerMessageHTTP is the legacy HTTP REST path. Kept for
+// back-compat against older servers that still expose
+// `/mail/{slug}/overseer/send`. Newer deployments (the v2.13.x line
+// the #146 reporter is on) typically 404 here.
+func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
+	if opts.ProjectSlug == "" {
+		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("project_slug required for HTTP fallback path"))
+	}
+
 	// Build request body
 	reqBody := map[string]interface{}{
 		"recipients": opts.Recipients,
@@ -964,6 +1123,7 @@ func (c *Client) SetContactPolicy(ctx context.Context, projectKey, agentName, po
 		"policy":      policy,
 	}
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "set_contact_policy", args)
 	if err != nil {
 		return nil, err

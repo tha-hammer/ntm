@@ -152,6 +152,7 @@ func newSwarmCmd() *cobra.Command {
 		panesPerSession int
 		outputPath      string
 		autoRotate      bool
+		forceGlobalAuth bool
 		initialPrompt   string
 		promptFile      string
 		waitReady       bool
@@ -185,6 +186,7 @@ Examples:
 				PanesPerSession: panesPerSession,
 				OutputPath:      outputPath,
 				AutoRotate:      autoRotate,
+				ForceGlobalAuth: forceGlobalAuth,
 				InitialPrompt:   initialPrompt,
 				PromptFile:      promptFile,
 				WaitReady:       waitReady,
@@ -220,6 +222,7 @@ Examples:
 	cmd.Flags().BoolVar(&waitReady, "wait-ready", false, "Wait for all agents to reach idle/ready state before returning")
 	cmd.Flags().IntVar(&readyTimeout, "ready-timeout", 30, "Timeout in seconds for --wait-ready (default: 30)")
 	cmd.PersistentFlags().BoolVar(&autoRotate, "auto-rotate-accounts", defaultAutoRotate, "Automatically rotate accounts on usage limit hit (requires caam)")
+	cmd.PersistentFlags().BoolVar(&forceGlobalAuth, "force-global-auth-clobber", false, "DANGEROUS: permit automatic global ~/.codex/auth.json rotation even when live Codex panes share global auth or caam lacks the safe-restore capability; bypasses account pins (#194)")
 
 	// Add subcommands
 	cmd.AddCommand(newSwarmPlanCmd())
@@ -239,6 +242,7 @@ type swarmOptions struct {
 	PanesPerSession int
 	OutputPath      string
 	AutoRotate      bool
+	ForceGlobalAuth bool
 	InitialPrompt   string
 	PromptFile      string
 	WaitReady       bool
@@ -251,6 +255,7 @@ type SwarmPlanOutput struct {
 	TotalCC         int                `json:"total_cc"`
 	TotalCod        int                `json:"total_cod"`
 	TotalGmi        int                `json:"total_gmi"`
+	TotalAgy        int                `json:"total_agy"`
 	TotalAgents     int                `json:"total_agents"`
 	SessionsPerType int                `json:"sessions_per_type"`
 	PanesPerSession int                `json:"panes_per_session"`
@@ -268,6 +273,7 @@ type AllocationOutput struct {
 	CCAgents    int    `json:"cc_agents"`
 	CodAgents   int    `json:"cod_agents"`
 	GmiAgents   int    `json:"gmi_agents"`
+	AgyAgents   int    `json:"agy_agents"`
 	TotalAgents int    `json:"total_agents"`
 }
 
@@ -313,7 +319,10 @@ func runSwarm(ctx context.Context, opts swarmOptions) error {
 		return fmt.Errorf("swarm orchestration is disabled in config; set swarm.enabled=true or use --dry-run")
 	}
 	swarmCfg.AutoRotateAccounts = opts.AutoRotate
-	logger.Info("account rotation configuration", "auto_rotate_accounts", swarmCfg.AutoRotateAccounts)
+	swarmCfg.ForceGlobalAuthClobber = opts.ForceGlobalAuth
+	logger.Info("account rotation configuration",
+		"auto_rotate_accounts", swarmCfg.AutoRotateAccounts,
+		"force_global_auth_clobber", swarmCfg.ForceGlobalAuthClobber)
 
 	if opts.SessionsPerType < 1 {
 		return fmt.Errorf("--sessions-per-type must be at least 1, got %d", opts.SessionsPerType)
@@ -515,6 +524,7 @@ func buildSwarmPlanOutput(plan *swarm.SwarmPlan, dryRun bool) SwarmPlanOutput {
 		TotalCC:         plan.TotalCC,
 		TotalCod:        plan.TotalCod,
 		TotalGmi:        plan.TotalGmi,
+		TotalAgy:        plan.TotalAgy,
 		TotalAgents:     plan.TotalAgents,
 		SessionsPerType: plan.SessionsPerType,
 		PanesPerSession: plan.PanesPerSession,
@@ -532,6 +542,7 @@ func buildSwarmPlanOutput(plan *swarm.SwarmPlan, dryRun bool) SwarmPlanOutput {
 			CCAgents:    alloc.CCAgents,
 			CodAgents:   alloc.CodAgents,
 			GmiAgents:   alloc.GmiAgents,
+			AgyAgents:   alloc.AgyAgents,
 			TotalAgents: alloc.TotalAgents,
 		})
 	}
@@ -559,8 +570,8 @@ func buildSwarmPlanOutput(plan *swarm.SwarmPlan, dryRun bool) SwarmPlanOutput {
 func printSwarmPlan(out SwarmPlanOutput) {
 	printSwarmHeader("Swarm Plan")
 	fmt.Printf("  Scan Directory: %s\n", out.ScanDir)
-	fmt.Printf("  Total Agents:   %d (CC: %d, Codex: %d, Gemini: %d)\n",
-		out.TotalAgents, out.TotalCC, out.TotalCod, out.TotalGmi)
+	fmt.Printf("  Total Agents:   %d (CC: %d, Codex: %d, Gemini: %d, Antigravity: %d)\n",
+		out.TotalAgents, out.TotalCC, out.TotalCod, out.TotalGmi, out.TotalAgy)
 	fmt.Printf("  Sessions:       %d per type, %d panes max each\n",
 		out.SessionsPerType, out.PanesPerSession)
 	fmt.Println()
@@ -568,9 +579,9 @@ func printSwarmPlan(out SwarmPlanOutput) {
 	printSwarmHeader("Project Allocations")
 	for _, alloc := range out.Allocations {
 		tierStr := fmt.Sprintf("T%d", alloc.Tier)
-		fmt.Printf("  %-20s [%s] %d beads → CC:%d Cod:%d Gmi:%d\n",
+		fmt.Printf("  %-20s [%s] %d beads → CC:%d Cod:%d Gmi:%d Agy:%d\n",
 			alloc.Project, tierStr, alloc.OpenBeads,
-			alloc.CCAgents, alloc.CodAgents, alloc.GmiAgents)
+			alloc.CCAgents, alloc.CodAgents, alloc.GmiAgents, alloc.AgyAgents)
 	}
 	fmt.Println()
 
@@ -609,8 +620,9 @@ func writePlanToFile(plan *swarm.SwarmPlan, path string) error {
 		os.Remove(tmpPath) // best-effort cleanup
 		return err
 	}
+	defer os.Remove(tmpPath) // cleaned up if Rename fails or panics
+
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath) // best-effort cleanup
 		return err
 	}
 	return nil
@@ -652,7 +664,7 @@ func newSwarmPlanCmd() *cobra.Command {
 	return cmd
 }
 
-var swarmSessionRE = regexp.MustCompile(`^(cc|cod|gmi)_agents_[0-9]+$`)
+var swarmSessionRE = regexp.MustCompile(`^(cc|cod|gmi|agy)_agents_[0-9]+$`)
 
 // Subcommand: swarm status
 func newSwarmStatusCmd() *cobra.Command {
@@ -791,7 +803,7 @@ func newSwarmStopCmd() *cobra.Command {
 		Short: "Stop the swarm and destroy all sessions",
 		Long: `Gracefully stop swarm agent sessions.
 
-By default, discovers and stops all swarm sessions (cc_agents_*, cod_agents_*, gmi_agents_*).
+By default, discovers and stops all swarm sessions (cc_agents_*, cod_agents_*, gmi_agents_*, agy_agents_*).
 Optionally specify session name patterns to stop specific sessions.
 
 The graceful shutdown process:
@@ -818,7 +830,7 @@ Examples:
 
 			// If no patterns specified, use default swarm session patterns
 			if len(patterns) == 0 {
-				patterns = []string{"cc_agents_*", "cod_agents_*", "gmi_agents_*"}
+				patterns = []string{"cc_agents_*", "cod_agents_*", "gmi_agents_*", "agy_agents_*"}
 			}
 
 			// Discover matching sessions
@@ -970,6 +982,7 @@ var swarmAgentTypeToLong = map[string]string{
 	"cc":  "claude",
 	"cod": "codex",
 	"gmi": "gemini",
+	"agy": "antigravity",
 }
 
 // waitForSwarmAgentsReady polls all agent panes in the swarm plan until they
@@ -982,8 +995,8 @@ func waitForSwarmAgentsReady(ctx context.Context, plan *swarm.SwarmPlan, client 
 	// Collect all pane targets: "session:0.index"
 	type paneInfo struct {
 		target    string
-		shortType string // "cc", "cod", "gmi" (for status package)
-		longType  string // "claude", "codex", "gemini" (for robot patterns)
+		shortType string // "cc", "cod", "gmi", "agy" (for status package)
+		longType  string // "claude", "codex", "gemini", "antigravity" (for robot patterns)
 		ready     bool
 	}
 	var panes []paneInfo

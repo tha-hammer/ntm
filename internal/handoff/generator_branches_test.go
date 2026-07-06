@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/cass"
 )
 
 // ---------------------------------------------------------------------------
@@ -177,5 +178,92 @@ func TestBuildReservationTransfer_Success(t *testing.T) {
 	}
 	if got.CreatedAt.IsZero() {
 		t.Error("CreatedAt should be set")
+	}
+}
+
+func TestBuildCASSMemoryEntries_DedupAndOrder(t *testing.T) {
+	t.Parallel()
+
+	line := 12
+	hits := []cass.SearchHit{
+		{
+			SourcePath: "sessions/b.jsonl",
+			Agent:      "codex",
+			SessionID:  "sess-b",
+			Score:      0.70,
+			Snippet:    "second priority snippet",
+		},
+		{
+			SourcePath: "sessions/a.jsonl",
+			LineNumber: &line,
+			Agent:      "claude",
+			SessionID:  "sess-a",
+			Score:      0.90,
+			Snippet:    "top snippet",
+		},
+		{
+			SourcePath: "sessions/a.jsonl",
+			LineNumber: &line,
+			Agent:      "claude",
+			SessionID:  "sess-a",
+			Score:      0.80,
+			Snippet:    "top snippet",
+		},
+	}
+
+	entries := buildCASSMemoryEntries(hits, 5)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 deduped entries, got %d (%v)", len(entries), entries)
+	}
+	if !strings.HasPrefix(entries[0], "cass:sessions/a.jsonl#L12 [agent=claude, session=sess-a, score=0.90]") {
+		t.Fatalf("unexpected first entry: %q", entries[0])
+	}
+	if !strings.HasPrefix(entries[1], "cass:sessions/b.jsonl [agent=codex, session=sess-b, score=0.70]") {
+		t.Fatalf("unexpected second entry: %q", entries[1])
+	}
+}
+
+func TestBuildCASSQuery_PrefersNowGoalNextBead(t *testing.T) {
+	t.Parallel()
+
+	h := &Handoff{
+		Goal:        "Implement replay timeline",
+		Now:         "Wire CASS handoff synthesis",
+		Next:        []string{"Add deterministic tests"},
+		ActiveBeads: []string{"bd-2mb03.6.5: CASS-backed handoff generator"},
+	}
+
+	query := buildCASSQuery(h)
+	if !strings.Contains(query, "Wire CASS handoff synthesis") {
+		t.Fatalf("query missing now text: %q", query)
+	}
+	if !strings.Contains(query, "Implement replay timeline") {
+		t.Fatalf("query missing goal text: %q", query)
+	}
+	if !strings.Contains(query, "Add deterministic tests") {
+		t.Fatalf("query missing next text: %q", query)
+	}
+	if !strings.Contains(query, "bd-2mb03.6.5") {
+		t.Fatalf("query missing bead id: %q", query)
+	}
+}
+
+func TestResolveCASSTimeout_Default(t *testing.T) {
+	t.Parallel()
+
+	if got := resolveCASSTimeout(0); got != defaultCASSTimeout {
+		t.Fatalf("resolveCASSTimeout(0) = %v, want %v", got, defaultCASSTimeout)
+	}
+	if got := resolveCASSTimeout(-1 * time.Second); got != defaultCASSTimeout {
+		t.Fatalf("resolveCASSTimeout(-1s) = %v, want %v", got, defaultCASSTimeout)
+	}
+}
+
+func TestResolveCASSTimeout_Override(t *testing.T) {
+	t.Parallel()
+
+	want := 1500 * time.Millisecond
+	if got := resolveCASSTimeout(want); got != want {
+		t.Fatalf("resolveCASSTimeout(%v) = %v, want %v", want, got, want)
 	}
 }

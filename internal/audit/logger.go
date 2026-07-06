@@ -2,6 +2,7 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -125,7 +126,9 @@ func SetRedactionConfig(cfg *redaction.Config) {
 		redactionCfg = redaction.Config{}
 		return
 	}
-	redactionCfg = *cfg
+	// bd-pmdpn: deep-copy reference-typed fields so a caller
+	// mutating cfg after Set cannot reach into stored state.
+	redactionCfg = cfg.DeepCopy()
 	redactionCfgSet = true
 }
 
@@ -268,7 +271,14 @@ func getRedactionConfig() redaction.Config {
 	redactionMu.RLock()
 	defer redactionMu.RUnlock()
 	if redactionCfgSet {
-		return redactionCfg
+		// bd-ijgum: bd-pmdpn extracted DeepCopy and applied it to the
+		// Get path in checkpoint/events/history/session/serve, but the
+		// audit getter was overlooked and still returned redactionCfg
+		// directly — value-copying Mode but aliasing the reference-typed
+		// Allowlist / ExtraPatterns / DisabledCategories. Return a
+		// deep copy so the symmetric-Set/Get DeepCopy invariant holds
+		// for audit too.
+		return redactionCfg.DeepCopy()
 	}
 	return redaction.Config{Mode: redaction.ModeRedact}
 }
@@ -579,13 +589,21 @@ func VerifyIntegrity(logPath string) error {
 	var sequenceNum uint64
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+		line := scanner.Bytes()
+		if len(line) == 0 {
 			continue
 		}
 
 		var entry AuditEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(line))
+		decoder.UseNumber()
+		if err := decoder.Decode(&entry); err != nil {
+			return fmt.Errorf("invalid JSON in audit log: %w", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			if err == nil {
+				return fmt.Errorf("invalid JSON in audit log: trailing JSON value")
+			}
 			return fmt.Errorf("invalid JSON in audit log: %w", err)
 		}
 

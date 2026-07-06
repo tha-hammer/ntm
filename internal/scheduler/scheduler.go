@@ -717,6 +717,7 @@ func (s *Scheduler) processJobs(workerID int) {
 			if err := s.agentLimiters.Wait(s.ctx, job.AgentType); err != nil {
 				// Context cancelled, put job back and release cap
 				s.agentCaps.Release(job.AgentType)
+				s.queue.MarkComplete(job)
 				s.queue.Enqueue(job)
 				return
 			}
@@ -727,6 +728,7 @@ func (s *Scheduler) processJobs(workerID int) {
 			if job.AgentType != "" {
 				s.agentCaps.Release(job.AgentType)
 			}
+			s.queue.MarkComplete(job)
 			s.queue.Enqueue(job)
 			return
 		}

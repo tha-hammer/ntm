@@ -197,11 +197,19 @@ func readFileRange(spec FileSpec) (string, error) {
 	}
 	defer f.Close()
 
-	// If no line range, read entire file from the already-opened handle
+	// If no line range, read entire file from the already-opened handle.
+	// bd-4we2d: bound the read with io.LimitReader(f, MaxFileSize+1) so a
+	// file that grows or symlink-swaps between the caller's Stat() and
+	// this Open()+Read can't allocate unbounded memory before the
+	// post-read size check fires. Reading +1 lets us distinguish a file
+	// exactly at the cap from one that overflowed.
 	if spec.StartLine == 0 && spec.EndLine == 0 {
-		content, err := io.ReadAll(f)
+		content, err := io.ReadAll(io.LimitReader(f, MaxFileSize+1))
 		if err != nil {
 			return "", err
+		}
+		if int64(len(content)) > MaxFileSize {
+			return "", fmt.Errorf("file %s exceeds limit of %d bytes", spec.Path, MaxFileSize)
 		}
 		return strings.TrimSuffix(string(content), "\n"), nil
 	}

@@ -74,10 +74,16 @@ type OAuthHealthOutput struct {
 
 // OAuthHealthSummary contains aggregate OAuth/rate limit status.
 type OAuthHealthSummary struct {
-	Total         int `json:"total"`
-	OAuthValid    int `json:"oauth_valid"`
-	OAuthExpired  int `json:"oauth_expired"`
-	OAuthError    int `json:"oauth_error"`
+	Total        int `json:"total"`
+	OAuthValid   int `json:"oauth_valid"`
+	OAuthExpired int `json:"oauth_expired"`
+	OAuthError   int `json:"oauth_error"`
+	// OAuthUnknown counts agents whose OAuth status could not be determined
+	// from scraped pane output (no auth error, no confirming activity signal).
+	// It is surfaced explicitly so "unknown" is never conflated with a healthy
+	// "valid" agent: OAuthValid counts only confirmed-good agents, and
+	// Total == OAuthValid+OAuthExpired+OAuthError+OAuthUnknown holds (ntm#207).
+	OAuthUnknown  int `json:"oauth_unknown"`
 	RateLimitOK   int `json:"rate_limit_ok"`
 	RateLimitWarn int `json:"rate_limit_warn"`
 	RateLimited   int `json:"rate_limited"`
@@ -154,6 +160,8 @@ func GetHealthOAuthWithOptions(opts OAuthHealthOptions) (*OAuthHealthOutput, err
 			output.Summary.OAuthExpired++
 		case OAuthError:
 			output.Summary.OAuthError++
+		case OAuthUnknown:
+			output.Summary.OAuthUnknown++
 		}
 		switch agentHealth.RateLimitStatus {
 		case RateLimitOK:
@@ -266,7 +274,9 @@ func agentTypeToProvider(agentType string) string {
 		return "claude"
 	case agent.AgentTypeCodex:
 		return "openai"
-	case agent.AgentTypeGemini:
+	case agent.AgentTypeGemini, agent.AgentTypeAntigravity:
+		// Antigravity (agy) authenticates through Google's OAuth, the same
+		// provider as the legacy Gemini CLI.
 		return "gemini"
 	default:
 		return "unknown"
@@ -435,12 +445,19 @@ func formatLastActivity(sec int) string {
 	return fmt.Sprintf("%dh ago", sec/3600)
 }
 
-// PrintHealthOAuth outputs per-agent OAuth and rate limit status for a session.
-// This is a thin wrapper around GetHealthOAuth() for CLI output.
-func PrintHealthOAuth(session string) error {
+// PrintHealthOAuth outputs per-agent OAuth and rate limit status for a session
+// and returns the process exit code (0 on success, nonzero when the result
+// reports success:false — see ExitCodeForResponse and ntm#207). The failure
+// envelope is always emitted as JSON before returning so callers still receive
+// the machine-readable payload.
+func PrintHealthOAuth(session string) int {
 	output, err := GetHealthOAuth(session)
 	if err != nil {
-		return err
+		// GetHealthOAuth folds operational failures into the envelope and
+		// returns a nil error; a non-nil error is an unexpected internal fault.
+		outputJSON(NewErrorResponse(err, ErrCodeInternalError, ""))
+		return 1
 	}
-	return encodeJSON(output)
+	_ = encodeJSON(output)
+	return ExitCodeForResponse(output.RobotResponse)
 }

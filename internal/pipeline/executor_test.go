@@ -1,11 +1,14 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1340,6 +1343,172 @@ func TestExecutor_Run_DryRun(t *testing.T) {
 	}
 }
 
+func TestBuildSideEffectManifestExtractsStepKindsAndRollbackPreview(t *testing.T) {
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "manifest-workflow",
+		Outputs: []OutputDecl{
+			{Name: "report", Path: "artifacts/report.md"},
+		},
+		Steps: []Step{
+			{ID: "prompt", Prompt: "Draft report", Agent: "claude"},
+			{ID: "command", Command: "go test ./internal/pipeline"},
+			{ID: "template", Template: "MO-review.md", Pane: PaneSpec{Index: 2}},
+			{
+				ID: "notify",
+				MailSend: &MailSendStep{
+					ProjectKey: "/data/projects/ntm",
+					AgentName:  "YellowBluff",
+					To:         StringOrList{"TealCrane"},
+					Subject:    "[bd-fxj4f.6] dry-run",
+					ThreadID:   "bd-fxj4f.6",
+				},
+			},
+			{
+				ID: "reserve",
+				FileReservationPaths: &FileReservationPathsStep{
+					ProjectKey: "/data/projects/ntm",
+					AgentName:  "YellowBluff",
+					Paths:      StringOrList{"internal/pipeline/*.go"},
+					Exclusive:  true,
+				},
+			},
+		},
+		PostPipelineSteps: []Step{
+			{
+				ID: "release",
+				FileReservationRelease: &FileReservationReleaseStep{
+					ProjectKey: "/data/projects/ntm",
+					AgentName:  "YellowBluff",
+					Paths:      StringOrList{"internal/pipeline/*.go"},
+				},
+			},
+		},
+		Settings: WorkflowSettings{
+			OnCancel: []Step{
+				{ID: "cleanup", Command: "scripts/cleanup.sh"},
+			},
+		},
+	}
+
+	manifest := BuildSideEffectManifest(workflow)
+
+	expectedKinds := map[string]int{
+		sideEffectKindTmuxSend:             1,
+		sideEffectKindShellCommand:         2,
+		sideEffectKindTemplateDispatch:     1,
+		sideEffectKindAgentMailSend:        1,
+		sideEffectKindAgentMailReservation: 1,
+		sideEffectKindAgentMailRelease:     1,
+		sideEffectKindFilesystemWrite:      1,
+	}
+	if manifest.Summary.Total != 8 {
+		t.Fatalf("Summary.Total = %d, want 8; effects=%#v", manifest.Summary.Total, manifest.Effects)
+	}
+	for kind, want := range expectedKinds {
+		if got := manifest.Summary.ByKind[kind]; got != want {
+			t.Errorf("Summary.ByKind[%q] = %d, want %d", kind, got, want)
+		}
+	}
+
+	notify := findSideEffect(t, manifest.Effects, "notify", sideEffectKindAgentMailSend)
+	if notify.Target != "/data/projects/ntm" || notify.Subject != "[bd-fxj4f.6] dry-run" || notify.ThreadID != "bd-fxj4f.6" {
+		t.Fatalf("notify effect missing Agent Mail metadata: %#v", notify)
+	}
+	if len(notify.Recipients) != 1 || notify.Recipients[0] != "TealCrane" {
+		t.Fatalf("notify Recipients = %#v, want TealCrane", notify.Recipients)
+	}
+
+	report := findSideEffect(t, manifest.Effects, "report", sideEffectKindFilesystemWrite)
+	if report.Target != "artifacts/report.md" {
+		t.Fatalf("report Target = %q, want artifacts/report.md", report.Target)
+	}
+
+	release := findSideEffect(t, manifest.RollbackPreview, "release", sideEffectKindAgentMailRelease)
+	if !release.Cleanup || release.Rollback {
+		t.Fatalf("release cleanup/rollback flags = cleanup:%v rollback:%v, want cleanup only", release.Cleanup, release.Rollback)
+	}
+	cleanup := findSideEffect(t, manifest.RollbackPreview, "cleanup", sideEffectKindShellCommand)
+	if !cleanup.Cleanup || !cleanup.Rollback {
+		t.Fatalf("cleanup flags = cleanup:%v rollback:%v, want both true", cleanup.Cleanup, cleanup.Rollback)
+	}
+}
+
+func TestRenderSideEffectManifestTextConcise(t *testing.T) {
+	manifest := SideEffectManifest{}
+	manifest.add(SideEffectEntry{
+		StepID:      "build",
+		Phase:       sideEffectPhaseMain,
+		Kind:        sideEffectKindShellCommand,
+		Description: "Run build",
+		Command:     "go build ./cmd/ntm",
+	})
+	manifest.add(SideEffectEntry{
+		StepID:      "release",
+		Phase:       sideEffectPhasePostPipeline,
+		Kind:        sideEffectKindAgentMailRelease,
+		Description: "Release reservations",
+		Paths:       []string{"internal/pipeline/*.go"},
+		Cleanup:     true,
+	})
+
+	text := RenderSideEffectManifestText(manifest)
+	for _, want := range []string{
+		"Side effects: 2 planned",
+		"shell_command=1",
+		"[build] shell_command: go build ./cmd/ntm",
+		"Rollback/cleanup: 1 action(s)",
+		"[release] agent_mail_release: internal/pipeline/*.go",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("RenderSideEffectManifestText() missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+func findSideEffect(t *testing.T, entries []SideEffectEntry, stepID, kind string) SideEffectEntry {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.StepID == stepID && entry.Kind == kind {
+			return entry
+		}
+	}
+	t.Fatalf("missing side effect step_id=%q kind=%q in %#v", stepID, kind, entries)
+	return SideEffectEntry{}
+}
+
+func TestExecutor_Run_DryRun_RendersStepDescription(t *testing.T) {
+	cfg := DefaultExecutorConfig("test-session")
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "test-workflow",
+		Settings:      DefaultWorkflowSettings(),
+		Steps: []Step{
+			{
+				ID:          "step1",
+				Description: "Draft the release plan",
+				Prompt:      "Do task 1",
+			},
+		},
+	}
+
+	state, err := e.Run(context.Background(), workflow, nil, nil)
+	if err != nil {
+		t.Fatalf("Run() returned error in dry run mode: %v", err)
+	}
+
+	output := state.Steps["step1"].Output
+	if !strings.Contains(output, "▶ [step1] Draft the release plan") {
+		t.Fatalf("dry-run output = %q, want dispatch line with step description", output)
+	}
+	if !strings.Contains(output, "[DRY RUN] Would execute") {
+		t.Fatalf("dry-run output = %q, want dry-run action", output)
+	}
+}
+
 // TestExecutor_Run_DryRun_WithVariables tests variable substitution in dry run mode
 func TestExecutor_Run_DryRun_WithVariables(t *testing.T) {
 
@@ -1541,7 +1710,7 @@ func TestExecutor_selectPane_DryRun(t *testing.T) {
 	e := NewExecutor(cfg)
 
 	step := &Step{ID: "step1", Prompt: "test prompt"}
-	paneID, agentType, err := e.selectPane(step)
+	paneID, agentType, err := e.selectPane(context.Background(), step)
 
 	if err != nil {
 		t.Fatalf("selectPane() returned error: %v", err)
@@ -1564,9 +1733,10 @@ func TestExecutor_Run_DryRun_ProgressEvents(t *testing.T) {
 	workflow := &Workflow{
 		SchemaVersion: SchemaVersion,
 		Name:          "test-workflow",
+		Description:   "Coordinate the release",
 		Settings:      DefaultWorkflowSettings(),
 		Steps: []Step{
-			{ID: "step1", Prompt: "Task 1"},
+			{ID: "step1", Description: "Draft the release plan", Prompt: "Task 1"},
 		},
 	}
 
@@ -1598,6 +1768,23 @@ func TestExecutor_Run_DryRun_ProgressEvents(t *testing.T) {
 	// Last event should be workflow_complete
 	if len(events) > 0 && events[len(events)-1].Type != "workflow_complete" {
 		t.Errorf("last event type = %q, want workflow_complete", events[len(events)-1].Type)
+	}
+
+	var sawWorkflowDescription, sawStepDescription bool
+	for _, event := range events {
+		if event.Type == "workflow_start" && strings.Contains(event.Message, "Coordinate the release") {
+			sawWorkflowDescription = true
+		}
+		if (event.Type == "step_start" || event.Type == "step_complete") &&
+			strings.Contains(event.Message, "Draft the release plan") {
+			sawStepDescription = true
+		}
+	}
+	if !sawWorkflowDescription {
+		t.Fatalf("progress events = %+v, want workflow_start with description", events)
+	}
+	if !sawStepDescription {
+		t.Fatalf("progress events = %+v, want step progress with description", events)
 	}
 }
 
@@ -1792,10 +1979,10 @@ func TestExecutor_Run_DryRun_WithParallel(t *testing.T) {
 			{ID: "step1", Prompt: "Task 1"},
 			{
 				ID: "step2",
-				Parallel: []Step{
+				Parallel: ParallelSpec{Steps: []Step{
 					{ID: "parallel-a", Prompt: "Parallel task A"},
 					{ID: "parallel-b", Prompt: "Parallel task B"},
-				},
+				}},
 			},
 			{ID: "step3", Prompt: "Task 3", DependsOn: []string{"step2"}},
 		},
@@ -2274,7 +2461,7 @@ func TestExecutor_Run_DryRun_WithWhileLoop(t *testing.T) {
 				Prompt: "While loop iteration ${loop.index}",
 				Loop: &LoopConfig{
 					While:         "${vars.running}",
-					MaxIterations: 10,
+					MaxIterations: IntOrExpr{Value: 10},
 				},
 			},
 		},
@@ -2531,16 +2718,36 @@ func TestGenerateRunID_Format(t *testing.T) {
 	if !strings.HasPrefix(id, "run-") {
 		t.Errorf("GenerateRunID() = %q, should start with 'run-'", id)
 	}
+	// bd-rkwcw: the documented contract is run-<UTC-YYYYMMDD-HHMMSS>-<4-hex>
+	// with the trailing field being exactly 4 lowercase hex characters.
+	pattern := regexp.MustCompile(`^run-\d{8}-\d{6}-[0-9a-f]{4}$`)
+	if !pattern.MatchString(id) {
+		t.Errorf("GenerateRunID() = %q, want pattern %s", id, pattern)
+	}
 	parts := strings.Split(id, "-")
-	if len(parts) < 3 {
-		t.Errorf("GenerateRunID() = %q, expected at least 3 parts separated by '-'", id)
+	if len(parts) != 4 {
+		t.Errorf("GenerateRunID() = %q, expected exactly 4 dash-separated parts", id)
+	}
+
+	// Timestamp must parse back as UTC.
+	if len(parts) >= 4 {
+		stamp := parts[1] + "-" + parts[2]
+		parsed, err := time.ParseInLocation("20060102-150405", stamp, time.UTC)
+		if err != nil {
+			t.Errorf("GenerateRunID timestamp = %q, parse error: %v", stamp, err)
+		} else if delta := time.Since(parsed.UTC()); delta < -time.Minute || delta > 5*time.Minute {
+			t.Errorf("GenerateRunID timestamp drift = %s, want within a few minutes of now", delta)
+		}
 	}
 }
 
 func TestGenerateRunID_Unique(t *testing.T) {
-
+	// bd-rkwcw: with the documented 4-hex random suffix, 100 IDs generated
+	// in the same UTC second hit ~26% birthday-collision odds. Limit the
+	// in-second batch to a size where collision probability stays well
+	// below test-flake territory (8 IDs ≈ 0.04%).
 	ids := make(map[string]bool)
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 8; i++ {
 		id := GenerateRunID()
 		if ids[id] {
 			t.Fatalf("GenerateRunID() produced duplicate: %s", id)
@@ -2718,7 +2925,7 @@ func TestExecutor_Run_DryRun_OutputVar(t *testing.T) {
 		Name: "test-output-var",
 		Steps: []Step{
 			{ID: "step1", Prompt: "set output", Agent: "claude", OutputVar: "result1"},
-			{ID: "step2", Prompt: "${result1}", Agent: "codex", DependsOn: []string{"step1"}},
+			{ID: "step2", Prompt: "${vars.result1}", Agent: "codex", DependsOn: []string{"step1"}},
 		},
 	}
 
@@ -2974,5 +3181,1347 @@ func TestNormalizeAgentType_Aliases(t *testing.T) {
 				t.Errorf("normalizeAgentType(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// newCommandTestExecutor returns an executor pre-configured for command step tests.
+func newCommandTestExecutor(t *testing.T) *Executor {
+	t.Helper()
+	tmpDir := t.TempDir()
+	cfg := DefaultExecutorConfig("test-cmd")
+	cfg.ProjectDir = tmpDir
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-cmd-test",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+	return e
+}
+
+func TestExecuteCommand_EchoHello(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{ID: "echo-step", Command: "echo hello"}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if result.Output != "hello" {
+		t.Errorf("Output = %q, want %q", result.Output, "hello")
+	}
+	if result.AgentType != "command" {
+		t.Errorf("AgentType = %q, want %q", result.AgentType, "command")
+	}
+}
+
+func TestExecuteCommand_ExitCode(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{ID: "exit-step", Command: "exit 7"}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusFailed)
+	}
+	if result.Error == nil {
+		t.Fatal("Error is nil, want non-nil")
+	}
+	if result.Error.Type != "exit" {
+		t.Errorf("Error.Type = %q, want %q", result.Error.Type, "exit")
+	}
+	if !strings.Contains(result.Error.Message, `command step "exit-step" failed`) {
+		t.Errorf("Error.Message = %q, want structured command-step context", result.Error.Message)
+	}
+	for _, want := range []string{"kind=command", "step_id=exit-step", "reason=exit_code=7", "hint="} {
+		if !strings.Contains(result.Error.Details, want) {
+			t.Errorf("Error.Details = %q, want to contain %q", result.Error.Details, want)
+		}
+	}
+}
+
+// TestExecuteCommand_DryRun_IncludesStdinPayload covers bd-ziavr: a
+// dry-run command step that pipes meaningful Stdin must surface the
+// (substituted, truncated) stdin payload alongside the command line so
+// authors can verify substitution end-to-end without executing.
+func TestExecuteCommand_DryRun_IncludesStdinPayload(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.config.DryRun = true
+
+	step := &Step{
+		ID:      "dryrun-stdin",
+		Command: "tee /dev/null",
+		Stdin:   "hello-from-stdin-payload",
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if !strings.Contains(result.Output, "Would execute command:") {
+		t.Errorf("Output = %q, want to contain command line marker", result.Output)
+	}
+	if !strings.Contains(result.Output, "with stdin") {
+		t.Errorf("Output = %q, want to contain stdin marker", result.Output)
+	}
+	if !strings.Contains(result.Output, "hello-from-stdin-payload") {
+		t.Errorf("Output = %q, want to contain expanded stdin payload", result.Output)
+	}
+}
+
+// TestExecuteCommand_DryRun_OmitsStdinWhenEmpty covers the symmetric
+// case: a dry-run command step with no Stdin should produce only the
+// command line (no stale "with stdin:" header).
+func TestExecuteCommand_DryRun_OmitsStdinWhenEmpty(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.config.DryRun = true
+
+	step := &Step{ID: "dryrun-no-stdin", Command: "echo hi"}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusCompleted)
+	}
+	if strings.Contains(result.Output, "with stdin") {
+		t.Errorf("Output = %q, must not contain stdin marker when Stdin is empty", result.Output)
+	}
+}
+
+// TestExecuteCommand_DryRun_SanitizesControlBytes covers bd-82zsc: dry-run
+// banner output for command steps must scrub ANSI/OSC/C0 control bytes from
+// expandedCmd and expandedStdin. Both fields can carry attacker-controlled
+// substitution payloads (e.g. ${steps.X.output} where X is an upstream
+// agent), so unsanitized output would let a workflow hijack the operator's
+// terminal during --dry-run — the same attack class bd-lqz30 patched for
+// description fields. Each control byte must round-trip as '?'.
+func TestExecuteCommand_DryRun_SanitizesControlBytes(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.config.DryRun = true
+	// Pre-stage a prior step output containing an ANSI clear-screen +
+	// cursor-home sequence and a BEL — exactly what a malicious upstream
+	// agent might emit to derail the operator's terminal.
+	e.state.Steps["evil"] = StepResult{Output: "\x1b[2J\x1b[H\x07payload"}
+
+	step := &Step{
+		ID:      "dryrun-sanitize",
+		Command: "cat ${steps.evil.output}",
+		Stdin:   "${steps.evil.output}",
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error = %+v", result.Status, StatusCompleted, result.Error)
+	}
+	// No raw ESC, BEL, or other C0 controls (besides whitespace already
+	// folded by truncatePrompt) may survive into the dry-run output.
+	for _, b := range []byte(result.Output) {
+		if b == '\x1b' || b == '\x07' || b == '\x00' {
+			t.Fatalf("dry-run output contains unsanitized control byte 0x%02x: %q", b, result.Output)
+		}
+	}
+	if !strings.Contains(result.Output, "payload") {
+		t.Errorf("dry-run output dropped the trailing payload after sanitizing controls: %q", result.Output)
+	}
+}
+
+// TestExecuteStepOnce_DryRun_SanitizesAgentPrompt covers bd-g40ad: the
+// agent-prompt dry-run banner emitted by executeStepOnce must scrub
+// ANSI/OSC/C0 control bytes from the post-substitution prompt. Same
+// attack class as bd-82zsc — an upstream agent step's output can be
+// referenced via ${steps.X.output} in a downstream agent prompt and
+// printed verbatim during --dry-run unless sanitized first.
+func TestExecuteStepOnce_DryRun_SanitizesAgentPrompt(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.config.DryRun = true
+	e.state.Steps["evil"] = StepResult{Output: "\x1b[2J\x1b[H\x07payload"}
+
+	step := &Step{
+		ID:     "dryrun-agent",
+		Prompt: "${steps.evil.output}",
+	}
+	result := e.executeStepOnce(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error = %+v", result.Status, StatusCompleted, result.Error)
+	}
+	for _, b := range []byte(result.Output) {
+		if b == '\x1b' || b == '\x07' || b == '\x00' {
+			t.Fatalf("dry-run agent banner contains unsanitized control byte 0x%02x: %q", b, result.Output)
+		}
+	}
+	if !strings.Contains(result.Output, "payload") {
+		t.Errorf("dry-run agent banner dropped the trailing payload after sanitizing controls: %q", result.Output)
+	}
+}
+
+func TestExecuteCommand_Timeout(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{
+		ID:      "slow-step",
+		Command: "sleep 60",
+		Timeout: Duration{Duration: 200 * time.Millisecond},
+	}
+	start := time.Now()
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+	elapsed := time.Since(start)
+
+	if result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusFailed)
+	}
+	if result.Error == nil || result.Error.Type != "timeout" {
+		errType := ""
+		if result.Error != nil {
+			errType = result.Error.Type
+		}
+		t.Errorf("Error.Type = %q, want %q", errType, "timeout")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("took %s, expected timeout around 200ms", elapsed)
+	}
+}
+
+func TestExecuteCommand_CtxCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	e := newCommandTestExecutor(t)
+	step := &Step{
+		ID:      "cancel-step",
+		Command: "sleep 60",
+		Timeout: Duration{Duration: 30 * time.Second},
+	}
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	result := e.executeCommand(ctx, step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCancelled && result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want cancelled or failed", result.Status)
+	}
+}
+
+func TestExecuteCommand_VariableSubstitution(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.state.Variables["x"] = "world"
+	step := &Step{ID: "var-step", Command: "echo ${vars.x}"}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if result.Output != "world" {
+		t.Errorf("Output = %q, want %q", result.Output, "world")
+	}
+}
+
+func TestExecuteCommand_ArgsAsEnvVars(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{
+		ID:      "env-step",
+		Command: `printf '%s|%s|%s' "$MY_KEY" "$COUNT" "$FLAG"`,
+		Args: map[string]interface{}{
+			"MY_KEY": "my_value",
+			"COUNT":  5,
+			"FLAG":   true,
+		},
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if result.Output != "my_value|5|true" {
+		t.Errorf("Output = %q, want %q", result.Output, "my_value|5|true")
+	}
+}
+
+// bd-6xlxl: command Args string values must run through pipeline
+// substitution before they are exported as environment variables. Without
+// this, args: {NAME: "${vars.name}"} would ship the literal text
+// "${vars.name}" to the shell instead of the resolved value.
+func TestExecuteCommand_ArgsExpandPipelineVariables(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.varMu.Lock()
+	e.state.Variables["greeting"] = "hello"
+	e.varMu.Unlock()
+	step := &Step{
+		ID:      "expand-args",
+		Command: `printf '%s|%s' "$NAME" "$LIST"`,
+		Args: map[string]interface{}{
+			"NAME": "${vars.greeting}",
+			// Slice values: each string element should also expand.
+			"LIST": []interface{}{"raw", "${vars.greeting}"},
+		},
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	// NAME should be the resolved scalar; LIST should be the expanded JSON
+	// list (argValueString JSON-encodes slices). We only assert the resolved
+	// scalar is present — the JSON encoding format is internal.
+	if !strings.Contains(result.Output, "hello|") {
+		t.Fatalf("Output = %q, want to contain hello| (NAME expanded)", result.Output)
+	}
+	if !strings.Contains(result.Output, "hello") {
+		t.Fatalf("Output = %q, want list element to be expanded", result.Output)
+	}
+	if strings.Contains(result.Output, "${vars.greeting}") {
+		t.Fatalf("Output = %q, leaked literal variable reference", result.Output)
+	}
+}
+
+func TestExecuteCommand_InvalidArgEnvNameFailsValidation(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{
+		ID:      "bad-env-step",
+		Command: "true",
+		Args:    map[string]interface{}{"foo-bar": "bad"},
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusFailed)
+	}
+	if result.Error == nil || result.Error.Type != "validation" {
+		t.Fatalf("Error = %+v, want validation error", result.Error)
+	}
+	if !strings.Contains(result.Error.Message, "invalid env var name") {
+		t.Fatalf("Error.Message = %q, want invalid env var name", result.Error.Message)
+	}
+}
+
+func TestExecuteCommand_DryRun(t *testing.T) {
+	cfg := DefaultExecutorConfig("test-cmd")
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-dry",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+	step := &Step{ID: "dry-step", Command: "echo should-not-run"}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusCompleted)
+	}
+	if !strings.Contains(result.Output, "[DRY RUN]") {
+		t.Errorf("Output = %q, want to contain [DRY RUN]", result.Output)
+	}
+}
+
+// bd-l9o12: dry-run must validate command Args env names so authors get
+// fail-fast feedback. Previously the dry-run early-return shadowed the
+// argsToEnv check and the workflow only failed on a real run.
+func TestExecuteCommand_DryRunRejectsInvalidArgEnvName(t *testing.T) {
+	cfg := DefaultExecutorConfig("test-cmd")
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-dry-validate",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+	step := &Step{
+		ID:      "dry-bad-env",
+		Command: "true",
+		Args:    map[string]interface{}{"foo-bar": "bad"},
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q (dry-run should still fail validation)", result.Status, StatusFailed)
+	}
+	if result.Error == nil || result.Error.Type != "validation" {
+		t.Fatalf("Error = %+v, want validation error", result.Error)
+	}
+	if !strings.Contains(result.Error.Message, "invalid env var name") {
+		t.Fatalf("Error.Message = %q, want invalid env var name", result.Error.Message)
+	}
+}
+
+// TestExecuteCommand_HeartbeatEmittedForLongRunningCommand covers
+// bd-zfdjd.7: while a command is still executing the executor emits
+// pipeline.command.heartbeat events at commandHeartbeatInterval. The
+// production cadence is 30s; the test shrinks it via the package var so
+// a short sleep can verify ≥1 heartbeat lands.
+func TestExecuteCommand_HeartbeatEmittedForLongRunningCommand(t *testing.T) {
+	prev := commandHeartbeatInterval
+	commandHeartbeatInterval = 100 * time.Millisecond
+	t.Cleanup(func() { commandHeartbeatInterval = prev })
+
+	var buf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	e := newCommandTestExecutor(t)
+	step := &Step{
+		ID:      "long-runner",
+		Command: "sleep 0.4",
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error = %+v", result.Status, StatusCompleted, result.Error)
+	}
+
+	if !strings.Contains(buf.String(), EventCommandHeartbeat) {
+		t.Fatalf("no %q event in slog stream — heartbeat goroutine did not fire during the 0.4s sleep\nlog:\n%s", EventCommandHeartbeat, buf.String())
+	}
+}
+
+// TestExecuteCommand_HeartbeatStopsAfterCommandCompletes guards against a
+// goroutine leak: heartbeats must stop firing once waitCommand returns.
+// We disable the interval via the package var, run the command, and
+// confirm zero heartbeat events made it into the log.
+func TestExecuteCommand_HeartbeatStopsAfterCommandCompletes(t *testing.T) {
+	prev := commandHeartbeatInterval
+	commandHeartbeatInterval = 50 * time.Millisecond
+	t.Cleanup(func() { commandHeartbeatInterval = prev })
+
+	var buf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	e := newCommandTestExecutor(t)
+	step := &Step{ID: "fast", Command: "true"}
+	_ = e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	// Wait long enough that an unbounded heartbeat goroutine would have
+	// fired several times.
+	time.Sleep(200 * time.Millisecond)
+
+	if strings.Contains(buf.String(), EventCommandHeartbeat) {
+		t.Fatalf("%q emitted after command completed — heartbeat goroutine leaked\nlog:\n%s", EventCommandHeartbeat, buf.String())
+	}
+}
+
+// TestExecuteCommand_StdinPipesPayload covers bd-zfdjd.7: a command step
+// with Stdin set should receive the substituted payload on its standard
+// input. cat is the natural test target — its stdout is exactly its stdin,
+// so we can assert the captured Output round-trips the value.
+func TestExecuteCommand_StdinPipesPayload(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.state.Variables["greeting"] = "world"
+
+	step := &Step{
+		ID:      "stdin-cat",
+		Command: "cat",
+		Stdin:   "hello ${vars.greeting}",
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error = %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if result.Output != "hello world" {
+		t.Fatalf("Output = %q, want %q (stdin should round-trip with ${vars.greeting} substituted)", result.Output, "hello world")
+	}
+}
+
+// TestExecuteCommand_StdinEmptyPreservesNoStdin asserts that a step with no
+// Stdin set leaves cmd.Stdin alone (commands like `cat </dev/null` should
+// hit EOF immediately and produce empty output rather than blocking).
+func TestExecuteCommand_StdinEmptyPreservesNoStdin(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{
+		ID:      "no-stdin",
+		Command: "cat </dev/null",
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q (Stdin unset should not block); error = %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if result.Output != "" {
+		t.Fatalf("Output = %q, want empty (no stdin payload)", result.Output)
+	}
+}
+
+// TestExecuteCommand_StdinExceedsCap covers bd-1ka2t: when the
+// post-substitution stdin payload exceeds limits.max_command_stdin_bytes,
+// the step must fail with a clear "exceeds limits.max_command_stdin_bytes"
+// error rather than silently shovel the full payload through Go memory.
+func TestExecuteCommand_StdinExceedsCap(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.limits = LimitsConfig{MaxCommandStdinBytes: 16}.EffectiveLimits()
+	e.state.Steps["src"] = StepResult{Output: strings.Repeat("x", 32)}
+
+	step := &Step{
+		ID:      "stdin-overflow",
+		Command: "cat",
+		Stdin:   "${steps.src.output}",
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q (stdin payload should exceed cap); error = %+v", result.Status, StatusFailed, result.Error)
+	}
+	if result.Error == nil {
+		t.Fatalf("Error = nil, want a stdin-cap StepError")
+	}
+	if !strings.Contains(result.Error.Message, "max_command_stdin_bytes") {
+		t.Fatalf("Error.Message = %q, want it to mention max_command_stdin_bytes", result.Error.Message)
+	}
+	if result.Error.Type != "limit" {
+		t.Fatalf("Error.Type = %q, want %q", result.Error.Type, "limit")
+	}
+}
+
+// TestExecuteCommand_StdinAtCapSucceeds asserts the cap is inclusive: a
+// payload exactly at limits.max_command_stdin_bytes round-trips normally
+// rather than being rejected as overflow.
+func TestExecuteCommand_StdinAtCapSucceeds(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.limits = LimitsConfig{MaxCommandStdinBytes: 8}.EffectiveLimits()
+	step := &Step{
+		ID:      "stdin-at-cap",
+		Command: "cat",
+		Stdin:   "12345678",
+	}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q (payload at cap should succeed); error = %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if result.Output != "12345678" {
+		t.Fatalf("Output = %q, want %q", result.Output, "12345678")
+	}
+}
+
+func TestExecuteCommand_WaitNone(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{
+		ID:      "fire-forget",
+		Command: "sleep 10",
+		Wait:    WaitNone,
+	}
+	start := time.Now()
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+	elapsed := time.Since(start)
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusCompleted)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("WaitNone took %s, should return near-instantly", elapsed)
+	}
+}
+
+func TestExecuteCommand_ProjectDir(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{ID: "pwd-step", Command: "pwd"}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if !strings.Contains(result.Output, e.config.ProjectDir) {
+		t.Errorf("Output = %q, want to contain ProjectDir %q", result.Output, e.config.ProjectDir)
+	}
+}
+
+func TestExecuteCommand_MultilineOutput(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{ID: "multi-step", Command: "echo line1; echo line2; echo line3"}
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if !strings.Contains(result.Output, "line1") || !strings.Contains(result.Output, "line3") {
+		t.Errorf("Output = %q, want to contain line1 and line3", result.Output)
+	}
+}
+
+func TestExecuteTemplate_DryRun(t *testing.T) {
+	tmpDir := t.TempDir()
+	templateFile := filepath.Join(tmpDir, "test-template.md")
+	if err := os.WriteFile(templateFile, []byte("Hello <NAME>, this is a test."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultExecutorConfig("test-tpl")
+	cfg.ProjectDir = tmpDir
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-tpl-test",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+
+	step := &Step{
+		ID:       "tpl-step",
+		Template: "test-template.md",
+		Params:   map[string]interface{}{"NAME": "Alice"},
+		Pane:     PaneSpec{Index: 1},
+	}
+	result := e.executeTemplate(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+	if !strings.Contains(result.Output, "[DRY RUN]") {
+		t.Errorf("Output = %q, want [DRY RUN]", result.Output)
+	}
+}
+
+func TestExecuteTemplate_MissingFile(t *testing.T) {
+	cfg := DefaultExecutorConfig("test-tpl")
+	cfg.ProjectDir = t.TempDir()
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-tpl-test",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+
+	step := &Step{ID: "tpl-step", Template: "nonexistent.md"}
+	result := e.executeTemplate(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusFailed)
+	}
+	if result.Error == nil || result.Error.Type != "template" {
+		t.Errorf("expected template error, got %+v", result.Error)
+	}
+	if result.Error != nil {
+		if !strings.Contains(result.Error.Message, `template step "tpl-step" failed`) {
+			t.Errorf("Error.Message = %q, want structured template-step context", result.Error.Message)
+		}
+		for _, want := range []string{"kind=template", "step_id=tpl-step", "template file not found", "hint="} {
+			if !strings.Contains(result.Error.Details, want) {
+				t.Errorf("Error.Details = %q, want to contain %q", result.Error.Details, want)
+			}
+		}
+	}
+}
+
+func TestExecuteTemplate_UnresolvedDeclaredPlaceholder(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := "**Parameters:** <NAME>, <ROLE>\nHello <NAME>, role: <ROLE>"
+	if err := os.WriteFile(filepath.Join(tmpDir, "tpl.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultExecutorConfig("test-tpl")
+	cfg.ProjectDir = tmpDir
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-tpl-test",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+
+	step := &Step{
+		ID:       "tpl-step",
+		Template: "tpl.md",
+		Params:   map[string]interface{}{"NAME": "Alice"},
+		Pane:     PaneSpec{Index: 1},
+	}
+	result := e.executeTemplate(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusFailed {
+		t.Fatalf("Status = %q, want %q", result.Status, StatusFailed)
+	}
+	if result.Error == nil || !strings.Contains(result.Error.Message, "ROLE") {
+		t.Errorf("expected error mentioning ROLE, got %+v", result.Error)
+	}
+	if result.Error != nil {
+		for _, want := range []string{"kind=template", "step_id=tpl-step", "hint="} {
+			if !strings.Contains(result.Error.Details, want) {
+				t.Errorf("Error.Details = %q, want to contain %q", result.Error.Details, want)
+			}
+		}
+	}
+}
+
+func TestExecuteTemplate_ResolveFromWorkflowDir(t *testing.T) {
+	workflowDir := t.TempDir()
+	projectDir := t.TempDir()
+	templateFile := filepath.Join(workflowDir, "my-template.md")
+	if err := os.WriteFile(templateFile, []byte("Template content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultExecutorConfig("test-tpl")
+	cfg.ProjectDir = projectDir
+	cfg.WorkflowFile = filepath.Join(workflowDir, "workflow.yaml")
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-tpl-test",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+
+	step := &Step{
+		ID:       "tpl-step",
+		Template: "my-template.md",
+		Pane:     PaneSpec{Index: 1},
+	}
+	result := e.executeTemplate(context.Background(), step, &Workflow{Name: "test"})
+
+	if result.Status != StatusCompleted {
+		t.Fatalf("Status = %q, want %q; error: %+v", result.Status, StatusCompleted, result.Error)
+	}
+}
+
+func TestExecuteTemplate_DispatchLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "tpl.md"), []byte("rendered content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultExecutorConfig("test-tpl")
+	cfg.ProjectDir = tmpDir
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:      "run-tpl-test",
+		WorkflowID: "test-workflow",
+		Variables:  map[string]interface{}{},
+		Steps:      map[string]StepResult{},
+	}
+
+	e.writeDispatchLog("test-step", "rendered content here")
+
+	entries, err := os.ReadDir(filepath.Join(tmpDir, "session-logs"))
+	if err != nil {
+		t.Fatalf("session-logs dir not created: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 dispatch log, got %d", len(entries))
+	}
+	if !strings.HasPrefix(entries[0].Name(), "dispatch-") {
+		t.Errorf("log file name = %q, want prefix dispatch-", entries[0].Name())
+	}
+}
+
+func TestResolveTemplatePath(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "exists.md"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultExecutorConfig("test")
+	cfg.ProjectDir = tmpDir
+	e := NewExecutor(cfg)
+
+	tests := []struct {
+		name     string
+		template string
+		wantOK   bool
+	}{
+		{"relative found in project dir", "exists.md", true},
+		{"relative not found", "nope.md", false},
+		{"absolute found", filepath.Join(tmpDir, "exists.md"), true},
+		{"absolute not found", "/nonexistent/path.md", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := e.resolveTemplatePath(tt.template)
+			if tt.wantOK && got == "" {
+				t.Errorf("resolveTemplatePath(%q) = empty, want found", tt.template)
+			}
+			if !tt.wantOK && got != "" {
+				t.Errorf("resolveTemplatePath(%q) = %q, want empty", tt.template, got)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resource limits tests (bd-unxfp)
+// ---------------------------------------------------------------------------
+
+func TestExecuteCommand_StdoutTruncation(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.limits = LimitsConfig{MaxCommandStdoutBytes: 50}.EffectiveLimits()
+
+	step := &Step{
+		ID:      "big-output",
+		Command: "head -c 200 /dev/zero | tr '\\0' '-'",
+	}
+
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+	if result.Status != StatusCompleted {
+		t.Fatalf("status=%s, want completed; error=%v", result.Status, result.Error)
+	}
+	if !strings.Contains(result.Output, "[TRUNCATED at 50 bytes]") {
+		t.Errorf("expected truncation marker, got: %q", result.Output)
+	}
+	actualContent := strings.SplitN(result.Output, "\n[TRUNCATED", 2)[0]
+	if len(actualContent) != 50 {
+		t.Errorf("content before marker is %d bytes, want 50", len(actualContent))
+	}
+}
+
+func TestExecuteCommand_StdoutUnderLimit(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.limits = LimitsConfig{MaxCommandStdoutBytes: 1000}.EffectiveLimits()
+
+	step := &Step{
+		ID:      "small-output",
+		Command: "echo hello",
+	}
+
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+	if result.Status != StatusCompleted {
+		t.Fatalf("status=%s, want completed", result.Status)
+	}
+	if strings.Contains(result.Output, "TRUNCATED") {
+		t.Errorf("should not truncate small output: %q", result.Output)
+	}
+	if result.Output != "hello" {
+		t.Errorf("got %q, want %q", result.Output, "hello")
+	}
+}
+
+// bd-g7cu9: a stderr-heavy command with output_parse enabled (so stderr
+// goes to its own buffer) must not consume unbounded memory. The cappedWriter
+// drops bytes past MaxCommandStderrBytes during execution rather than after
+// cmd.Wait() has buffered everything.
+func TestExecuteCommand_StderrCappedWhenOutputParseEnabled(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.limits = LimitsConfig{
+		MaxCommandStdoutBytes: 1000,
+		MaxCommandStderrBytes: 100,
+	}.EffectiveLimits()
+
+	step := &Step{
+		ID:          "noisy-stderr",
+		Command:     "head -c 5000 /dev/zero | tr '\\0' 'E' >&2; echo done",
+		OutputParse: OutputParse{Type: "lines"},
+	}
+
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+	if result.Status != StatusCompleted {
+		t.Fatalf("status=%s, want completed; error=%v", result.Status, result.Error)
+	}
+	// stdout should still contain the small "done" line — stderr did not bleed
+	// into stdout because output_parse routes them separately.
+	if !strings.Contains(result.Output, "done") {
+		t.Fatalf("stdout missing expected 'done' line: %q", result.Output)
+	}
+	// stderr-side truncation does not surface in result.Output (which is
+	// stdout). Successful completion + a small stdout proves the cap held —
+	// without the cap the command's 5KB stderr would still be buffered.
+}
+
+// bd-g7cu9: when output_parse is disabled stdout and stderr share the
+// stdoutBuf cappedWriter; the existing stdout cap covers both streams and
+// the [TRUNCATED] marker still surfaces.
+func TestExecuteCommand_MergedStdoutStderrTruncatedAtStdoutCap(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	e.limits = LimitsConfig{MaxCommandStdoutBytes: 50}.EffectiveLimits()
+
+	step := &Step{
+		ID:      "merged-streams",
+		Command: "head -c 200 /dev/zero | tr '\\0' '-' >&2",
+	}
+
+	result := e.executeCommand(context.Background(), step, &Workflow{Name: "test"})
+	if result.Status != StatusCompleted {
+		t.Fatalf("status=%s, want completed; error=%v", result.Status, result.Error)
+	}
+	if !strings.Contains(result.Output, "[TRUNCATED at 50 bytes]") {
+		t.Errorf("expected truncation marker for merged stderr->stdout, got: %q", result.Output)
+	}
+}
+
+// bd-g7cu9 (unit): cappedWriter drops bytes past the cap and reports
+// total/truncated state regardless of whether the cap is hit by a single
+// large write or accumulated across many small writes.
+func TestCappedWriter_TruncationContract(t *testing.T) {
+	t.Run("single large write past cap", func(t *testing.T) {
+		w := newCappedWriter(10)
+		n, err := w.Write([]byte("0123456789ABCDEF"))
+		if err != nil {
+			t.Fatalf("Write err: %v", err)
+		}
+		if n != 16 {
+			t.Fatalf("Write returned %d, want 16 (full input length even when truncated)", n)
+		}
+		if w.Len() != 10 {
+			t.Fatalf("Len = %d, want 10", w.Len())
+		}
+		if !w.Truncated() {
+			t.Fatal("Truncated = false, want true")
+		}
+		if w.Total() != 16 {
+			t.Fatalf("Total = %d, want 16", w.Total())
+		}
+		if got := w.String(); got != "0123456789" {
+			t.Fatalf("String = %q, want first 10 bytes", got)
+		}
+	})
+
+	t.Run("accumulated writes past cap", func(t *testing.T) {
+		w := newCappedWriter(10)
+		for i := 0; i < 5; i++ {
+			if _, err := w.Write([]byte("ABCDE")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if w.Total() != 25 {
+			t.Fatalf("Total = %d, want 25", w.Total())
+		}
+		if w.Len() != 10 {
+			t.Fatalf("Len = %d, want 10", w.Len())
+		}
+		if !w.Truncated() {
+			t.Fatal("Truncated = false, want true")
+		}
+	})
+
+	t.Run("under cap not truncated", func(t *testing.T) {
+		w := newCappedWriter(100)
+		_, _ = w.Write([]byte("hello"))
+		if w.Truncated() {
+			t.Fatal("Truncated = true, want false")
+		}
+		if w.String() != "hello" {
+			t.Fatalf("String = %q, want hello", w.String())
+		}
+	})
+
+	t.Run("non-positive cap is unbounded", func(t *testing.T) {
+		w := newCappedWriter(0)
+		payload := strings.Repeat("X", 10000)
+		_, _ = w.Write([]byte(payload))
+		if w.Truncated() {
+			t.Fatal("non-positive cap should disable truncation")
+		}
+		if w.Len() != 10000 {
+			t.Fatalf("Len = %d, want 10000", w.Len())
+		}
+	})
+}
+
+func TestExecuteTemplate_SizeLimitExceeded(t *testing.T) {
+	tmpDir := t.TempDir()
+	bigContent := strings.Repeat("X", 1024)
+	if err := os.WriteFile(filepath.Join(tmpDir, "big.md"), []byte(bigContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := newCommandTestExecutor(t)
+	e.config.ProjectDir = tmpDir
+	e.limits = LimitsConfig{MaxTemplateBytes: 100}.EffectiveLimits()
+
+	step := &Step{
+		ID:       "big-template",
+		Template: "big.md",
+	}
+
+	result := e.executeTemplate(context.Background(), step, &Workflow{Name: "test"})
+	if result.Status != StatusFailed {
+		t.Fatalf("status=%s, want failed", result.Status)
+	}
+	if result.Error == nil || result.Error.Type != "limit_exceeded" {
+		t.Errorf("expected limit_exceeded error, got: %v", result.Error)
+	}
+}
+
+func TestExecuteTemplate_SizeUnderLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "small.md"), []byte("Hello <NAME>"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := newCommandTestExecutor(t)
+	e.config.ProjectDir = tmpDir
+	e.config.DryRun = true
+	e.limits = LimitsConfig{MaxTemplateBytes: 1024}.EffectiveLimits()
+
+	step := &Step{
+		ID:       "small-template",
+		Template: "small.md",
+		Params:   map[string]interface{}{"NAME": "World"},
+	}
+
+	result := e.executeTemplate(context.Background(), step, &Workflow{Name: "test"})
+	if result.Status != StatusCompleted {
+		t.Fatalf("status=%s, want completed; error=%v", result.Status, result.Error)
+	}
+}
+
+func TestLimitsConfig_EffectiveLimits_Defaults(t *testing.T) {
+	lc := LimitsConfig{}.EffectiveLimits()
+	if lc.MaxForeachIterations != DefaultMaxForeachIterations {
+		t.Errorf("MaxForeachIterations=%d, want %d", lc.MaxForeachIterations, DefaultMaxForeachIterations)
+	}
+	if lc.MaxCommandStdoutBytes != DefaultMaxCommandStdoutBytes {
+		t.Errorf("MaxCommandStdoutBytes=%d, want %d", lc.MaxCommandStdoutBytes, DefaultMaxCommandStdoutBytes)
+	}
+	if lc.MaxTemplateBytes != DefaultMaxTemplateBytes {
+		t.Errorf("MaxTemplateBytes=%d, want %d", lc.MaxTemplateBytes, DefaultMaxTemplateBytes)
+	}
+	if lc.MaxSubstitutionDepth != DefaultMaxSubstitutionDepth {
+		t.Errorf("MaxSubstitutionDepth=%d, want %d", lc.MaxSubstitutionDepth, DefaultMaxSubstitutionDepth)
+	}
+	if lc.SubstepParallelMax != DefaultSubstepParallelMax {
+		t.Errorf("SubstepParallelMax=%d, want %d", lc.SubstepParallelMax, DefaultSubstepParallelMax)
+	}
+}
+
+func TestLimitsConfig_EffectiveLimits_Override(t *testing.T) {
+	lc := LimitsConfig{
+		MaxForeachIterations:  50000,
+		MaxCommandStdoutBytes: 32 * 1024 * 1024,
+	}.EffectiveLimits()
+
+	if lc.MaxForeachIterations != 50000 {
+		t.Errorf("MaxForeachIterations=%d, want %d", lc.MaxForeachIterations, 50000)
+	}
+	if lc.MaxCommandStdoutBytes != 32*1024*1024 {
+		t.Errorf("MaxCommandStdoutBytes=%d, want %d", lc.MaxCommandStdoutBytes, 32*1024*1024)
+	}
+	if lc.MaxTemplateBytes != DefaultMaxTemplateBytes {
+		t.Errorf("other defaults should be preserved: MaxTemplateBytes=%d", lc.MaxTemplateBytes)
+	}
+}
+
+// bd-3uqce: outputs validation post-run.
+
+func TestExecutor_ValidateDeclaredOutputs_FoundAndMissing(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "present.md")
+	if err := os.WriteFile(present, []byte("ok"), 0o600); err != nil {
+		t.Fatalf("write present output: %v", err)
+	}
+	missing := filepath.Join(dir, "missing.md")
+
+	cfg := DefaultExecutorConfig("test-session")
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-validate-outputs",
+		Variables: map[string]interface{}{},
+		Steps:     map[string]StepResult{},
+	}
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "outputs-validation",
+		Outputs: []OutputDecl{
+			{Name: "present_output", Path: present},
+			{Name: "missing_output", Path: missing},
+			{Name: "name_only_skipped"}, // no path → skipped, not counted
+		},
+	}
+
+	e.validateDeclaredOutputs(workflow)
+
+	if e.state.OutputValidation == nil {
+		t.Fatal("OutputValidation should be populated")
+	}
+	got := e.state.OutputValidation
+	if len(got.Found) != 1 || got.Found[0] != present {
+		t.Errorf("Found = %v, want [%s]", got.Found, present)
+	}
+	if len(got.Missing) != 1 || got.Missing[0] != missing {
+		t.Errorf("Missing = %v, want [%s]", got.Missing, missing)
+	}
+}
+
+func TestExecutor_ValidateDeclaredOutputs_SubstitutesVariables(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "report.md")
+	if err := os.WriteFile(target, []byte("ok"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	cfg := DefaultExecutorConfig("test-session")
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-substitute",
+		Variables: map[string]interface{}{"workspace": dir},
+		Steps:     map[string]StepResult{},
+	}
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "outputs-subst",
+		Outputs: []OutputDecl{
+			{Name: "report", Path: "${vars.workspace}/report.md"},
+		},
+	}
+
+	e.validateDeclaredOutputs(workflow)
+
+	if e.state.OutputValidation == nil {
+		t.Fatal("OutputValidation should be populated")
+	}
+	if len(e.state.OutputValidation.Found) != 1 || e.state.OutputValidation.Found[0] != target {
+		t.Errorf("Found = %v, want [%s]", e.state.OutputValidation.Found, target)
+	}
+	if len(e.state.OutputValidation.Missing) != 0 {
+		t.Errorf("Missing = %v, want empty", e.state.OutputValidation.Missing)
+	}
+}
+
+func TestExecutor_ValidateDeclaredOutputs_NoOutputsLeavesStateNil(t *testing.T) {
+	cfg := DefaultExecutorConfig("test-session")
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-no-outputs",
+		Variables: map[string]interface{}{},
+		Steps:     map[string]StepResult{},
+	}
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "no-outputs",
+	}
+
+	e.validateDeclaredOutputs(workflow)
+
+	if e.state.OutputValidation != nil {
+		t.Errorf("OutputValidation should remain nil when workflow declares no outputs, got %+v", e.state.OutputValidation)
+	}
+}
+
+func TestExecutor_ValidateDeclaredOutputs_DryRunSkipped(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultExecutorConfig("test-session")
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-dryrun",
+		Variables: map[string]interface{}{},
+		Steps:     map[string]StepResult{},
+	}
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "outputs-dryrun",
+		Outputs: []OutputDecl{
+			{Name: "missing", Path: filepath.Join(dir, "never-written.md")},
+		},
+	}
+
+	e.validateDeclaredOutputs(workflow)
+
+	if e.state.OutputValidation != nil {
+		t.Errorf("OutputValidation should be nil in dry-run, got %+v", e.state.OutputValidation)
+	}
+}
+
+// bd-6lkqr.9: ${steps.X.parsed_data} + dotted-path access to structured outputs.
+
+func TestSubstituteVariables_ParsedDataDottedPath(t *testing.T) {
+	cfg := DefaultExecutorConfig("test-session")
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-parsed",
+		Variables: map[string]interface{}{},
+		Steps: map[string]StepResult{
+			"fetch": {
+				StepID: "fetch",
+				Status: StatusCompleted,
+				Output: `{"foo":"bar","items":[10,20,30]}`,
+				ParsedData: map[string]interface{}{
+					"foo": "bar",
+					"items": []interface{}{
+						10,
+						20,
+						30,
+					},
+					"user": map[string]interface{}{"name": "alice"},
+				},
+			},
+		},
+	}
+
+	cases := []struct {
+		template string
+		want     string
+	}{
+		{"${steps.fetch.parsed_data.foo}", "bar"},
+		{"${steps.fetch.parsed_data.items[1]}", "20"},
+		{"${steps.fetch.parsed_data.user.name}", "alice"},
+	}
+	for _, tc := range cases {
+		got := e.substituteVariables(tc.template)
+		if got != tc.want {
+			t.Errorf("substituteVariables(%q) = %q, want %q", tc.template, got, tc.want)
+		}
+	}
+}
+
+func TestSubstituteVariables_ParsedDataArrayIndex(t *testing.T) {
+	// bd-6lkqr.9 acceptance: array-index access ${steps.X.parsed_data[N]}
+	// when ParsedData itself is an array (not a field within an object).
+	cfg := DefaultExecutorConfig("test-session")
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-array",
+		Variables: map[string]interface{}{},
+		Steps: map[string]StepResult{
+			"list": {
+				StepID:     "list",
+				Status:     StatusCompleted,
+				ParsedData: []interface{}{"alpha", "beta", "gamma"},
+			},
+		},
+	}
+
+	cases := []struct {
+		template string
+		want     string
+	}{
+		{"${steps.list.parsed_data[0]}", "alpha"},
+		{"${steps.list.parsed_data[2]}", "gamma"},
+	}
+	for _, tc := range cases {
+		got := e.substituteVariables(tc.template)
+		if got != tc.want {
+			t.Errorf("substituteVariables(%q) = %q, want %q", tc.template, got, tc.want)
+		}
+	}
+}
+
+func TestSubstituteVariables_ParsedDataMissingErrors(t *testing.T) {
+	// bd-6lkqr.9 acceptance: missing parsed_data (step without output_parse)
+	// must surface a clear error rather than silently substituting the literal.
+	cfg := DefaultExecutorConfig("test-session")
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-missing-parsed",
+		Variables: map[string]interface{}{},
+		Steps: map[string]StepResult{
+			"raw": {
+				StepID:     "raw",
+				Status:     StatusCompleted,
+				Output:     "hello",
+				ParsedData: nil,
+			},
+		},
+	}
+
+	_, err := e.substituteVariablesStrict("${steps.raw.parsed_data}")
+	if err == nil {
+		t.Fatal("expected error for ${steps.raw.parsed_data} when ParsedData is nil")
+	}
+	if !strings.Contains(err.Error(), "parsed") && !strings.Contains(err.Error(), "data") {
+		t.Errorf("error %q should mention parsed/data", err.Error())
+	}
+}
+
+func TestSubstituteVariables_ParsedDataComplexJSONStringify(t *testing.T) {
+	// bd-6lkqr.9: arrays/maps stringify as JSON when used as a whole.
+	cfg := DefaultExecutorConfig("test-session")
+	e := NewExecutor(cfg)
+	e.state = &ExecutionState{
+		RunID:     "run-stringify",
+		Variables: map[string]interface{}{},
+		Steps: map[string]StepResult{
+			"step": {
+				StepID:     "step",
+				Status:     StatusCompleted,
+				ParsedData: []interface{}{"a", "b"},
+			},
+		},
+	}
+
+	got := e.substituteVariables("${steps.step.parsed_data}")
+	// formatValue JSON-encodes complex types.
+	if got != `["a","b"]` {
+		t.Errorf("substituteVariables = %q, want JSON array", got)
+	}
+}
+
+func TestExecutor_CommandStep_OutputParseJSON_DownstreamSubstitution(t *testing.T) {
+	// bd-6lkqr.9 acceptance: end-to-end — command step with output_parse: json
+	// produces ParsedData; downstream ${steps.X.parsed_data.foo} substitution
+	// resolves into the parsed structure.
+	cfg := DefaultExecutorConfig("test-session")
+	cfg.DryRun = false
+	e := NewExecutor(cfg)
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "json-pipeline",
+		Settings:      DefaultWorkflowSettings(),
+		Steps: []Step{
+			{
+				ID:          "produce",
+				Command:     `printf '{"foo":"bar","n":7}'`,
+				OutputParse: OutputParse{Type: "json"},
+				OutputVar:   "produced",
+			},
+			{
+				ID:        "consume",
+				DependsOn: []string{"produce"},
+				Command:   `echo got=${steps.produce.parsed_data.foo} n=${steps.produce.parsed_data.n}`,
+			},
+		},
+	}
+
+	state, err := e.Run(context.Background(), workflow, nil, nil)
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	consume, ok := state.Steps["consume"]
+	if !ok {
+		t.Fatalf("missing consume step result")
+	}
+	if !strings.Contains(consume.Output, "got=bar") {
+		t.Errorf("consume.Output=%q should contain got=bar", consume.Output)
+	}
+	if !strings.Contains(consume.Output, "n=7") {
+		t.Errorf("consume.Output=%q should contain n=7", consume.Output)
+	}
+}
+
+func TestExecutor_Run_PopulatesOutputValidation(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "deliverable.md")
+	if err := os.WriteFile(target, []byte("ok"), 0o600); err != nil {
+		t.Fatalf("write deliverable: %v", err)
+	}
+	missing := filepath.Join(dir, "absent.md")
+
+	cfg := DefaultExecutorConfig("test-session")
+	cfg.DryRun = false
+	e := NewExecutor(cfg)
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "run-output-validation",
+		Settings:      DefaultWorkflowSettings(),
+		Outputs: []OutputDecl{
+			{Name: "deliverable", Path: target},
+			{Name: "absent", Path: missing},
+		},
+		Steps: []Step{
+			{ID: "noop", Command: "true"},
+		},
+	}
+
+	state, err := e.Run(context.Background(), workflow, nil, nil)
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	if state.OutputValidation == nil {
+		t.Fatal("Run() should populate OutputValidation when workflow declares outputs")
+	}
+	if len(state.OutputValidation.Found) != 1 || state.OutputValidation.Found[0] != target {
+		t.Errorf("Found = %v, want [%s]", state.OutputValidation.Found, target)
+	}
+	if len(state.OutputValidation.Missing) != 1 || state.OutputValidation.Missing[0] != missing {
+		t.Errorf("Missing = %v, want [%s]", state.OutputValidation.Missing, missing)
 	}
 }

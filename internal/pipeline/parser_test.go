@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,6 +136,43 @@ steps:
 
 	if w.Name != "inline-test" {
 		t.Errorf("expected name 'inline-test', got %q", w.Name)
+	}
+}
+
+// bd-oqv4c: YAML with a foreach body step that uses loop_control as its
+// only kind (plus a when guard) must parse and validate. Earlier validation
+// rejected it with "step must have prompt, prompt_file, command, ...".
+func TestParseString_YAML_LoopControlOnlyForeachBody(t *testing.T) {
+	content := `
+schema_version: "2.0"
+name: loop-control-yaml
+steps:
+  - id: outer
+    foreach:
+      items: '["a","b","c"]'
+      as: row
+      steps:
+        - id: break_on_c
+          loop_control: break
+          when: '${item} == "c"'
+        - id: real_work
+          command: 'printf %s "${item}"'
+`
+	w, err := ParseString(content, "yaml")
+	if err != nil {
+		t.Fatalf("ParseString failed: %v", err)
+	}
+	result := Validate(w)
+	if !result.Valid {
+		t.Fatalf("Validate() rejected loop_control-only step: %+v", result.Errors)
+	}
+	// Sanity-check the parsed loop_control kind made it through round-trip.
+	body := w.Steps[0].Foreach.Steps
+	if len(body) != 2 {
+		t.Fatalf("expected 2 body steps, got %d", len(body))
+	}
+	if body[0].LoopControl != LoopControlBreak {
+		t.Fatalf("body[0].LoopControl = %q, want break", body[0].LoopControl)
 	}
 }
 
@@ -271,7 +310,7 @@ func TestValidate_BothPromptAndParallel(t *testing.T) {
 			{
 				ID:       "s1",
 				Prompt:   "test",
-				Parallel: []Step{{ID: "p1", Prompt: "parallel"}},
+				Parallel: ParallelSpec{Steps: []Step{{ID: "p1", Prompt: "parallel"}}},
 			},
 		},
 	}
@@ -280,6 +319,230 @@ func TestValidate_BothPromptAndParallel(t *testing.T) {
 	if result.Valid {
 		t.Error("expected validation to fail for both prompt and parallel")
 	}
+}
+
+func TestValidate_StepKindMutualExclusivityAndRequiredWork(t *testing.T) {
+	tests := []struct {
+		name          string
+		step          Step
+		wantValid     bool
+		wantErrSubstr string
+	}{
+		{
+			name:          "prompt and command conflict",
+			step:          Step{ID: "s1", Prompt: "ask an agent", Command: "echo no"},
+			wantErrSubstr: "both prompt and command",
+		},
+		{
+			name:          "prompt and template conflict",
+			step:          Step{ID: "s1", Prompt: "ask an agent", Template: "MO-test.md"},
+			wantErrSubstr: "both prompt and template",
+		},
+		{
+			name:          "command and template conflict",
+			step:          Step{ID: "s1", Command: "echo no", Template: "MO-test.md"},
+			wantErrSubstr: "both command and template",
+		},
+		{
+			name: "prompt and parallel steps conflict",
+			step: Step{
+				ID:     "s1",
+				Prompt: "ask an agent",
+				Parallel: ParallelSpec{Steps: []Step{
+					{ID: "parallel_inner", Prompt: "parallel work"},
+				}},
+			},
+			wantErrSubstr: "both prompt and parallel",
+		},
+		{
+			name:      "prompt only is valid",
+			step:      Step{ID: "s1", Prompt: "ask an agent"},
+			wantValid: true,
+		},
+		{
+			name:      "command only is valid",
+			step:      Step{ID: "s1", Command: "echo ok"},
+			wantValid: true,
+		},
+		{
+			name:      "template only is valid",
+			step:      Step{ID: "s1", Template: "MO-test.md"},
+			wantValid: true,
+		},
+		{
+			name: "foreach only is valid",
+			step: Step{
+				ID: "s1",
+				Foreach: &ForeachConfig{
+					Items: "[\"a\"]",
+					Steps: []Step{{ID: "foreach_inner", Prompt: "per item"}},
+				},
+			},
+			wantValid: true,
+		},
+		{
+			name: "branch with branches map is valid",
+			step: Step{
+				ID:     "s1",
+				Branch: "echo yes",
+				Branches: map[string]interface{}{
+					"yes": map[string]interface{}{"command": "echo selected"},
+				},
+			},
+			wantValid: true,
+		},
+		{
+			// bd-ytp3e: parallel foreach launches every iteration
+			// concurrently, so loop_control: break inside the body cannot
+			// reliably stop later iterations from completing with side
+			// effects. Lint must reject the combination.
+			name: "parallel foreach with loop_control break is invalid",
+			step: Step{
+				ID: "fanout",
+				Foreach: &ForeachConfig{
+					Items:    `["a","b"]`,
+					Parallel: true,
+					Steps: []Step{
+						{ID: "break_now", LoopControl: LoopControlBreak, When: `${item} == "a"`},
+						{ID: "work", Command: "echo ${item}"},
+					},
+				},
+			},
+			wantErrSubstr: "loop_control: break is not supported inside a parallel foreach",
+		},
+		{
+			// bd-ytp3e: sequential foreach is fine — break can short-circuit
+			// the per-iteration loop deterministically.
+			name: "sequential foreach with loop_control break is valid",
+			step: Step{
+				ID: "fanout",
+				Foreach: &ForeachConfig{
+					Items: `["a","b"]`,
+					Steps: []Step{
+						{ID: "break_now", LoopControl: LoopControlBreak, When: `${item} == "a"`},
+						{ID: "work", Command: "echo ${item}"},
+					},
+				},
+			},
+			wantValid: true,
+		},
+		{
+			// bd-nz63w: a branches map alone has no predicate so the runtime
+			// cannot pick a branch; lint must reject it instead of silently
+			// passing and failing later with a missing-prompt error.
+			name: "branches without branch predicate is invalid",
+			step: Step{
+				ID: "s1",
+				Branches: map[string]interface{}{
+					"default": map[string]interface{}{"command": "echo fallback"},
+				},
+			},
+			wantErrSubstr: "step has branches but no branch predicate",
+		},
+		{
+			// bd-nz63w: a branch predicate with no branches map has nothing
+			// to select and would error at runtime; lint should catch it.
+			name:          "branch predicate without branches map is invalid",
+			step:          Step{ID: "s1", Branch: "echo yes"},
+			wantErrSubstr: "step has branch predicate but no branches map",
+		},
+		{
+			name:          "empty step has no work",
+			step:          Step{ID: "s1"},
+			wantErrSubstr: "must have prompt, prompt_file, command, template, parallel, loop, foreach, branch, bead_query, or loop_control",
+		},
+		{
+			// bd-oqv4c: loop_control-only steps are valid; the runtime
+			// supports `{loop_control: break/continue, when: ...}` as
+			// pure control guards inside foreach/loop bodies.
+			name:      "loop_control break only is valid",
+			step:      Step{ID: "s1", LoopControl: LoopControlBreak},
+			wantValid: true,
+		},
+		{
+			name:      "loop_control continue only is valid",
+			step:      Step{ID: "s1", LoopControl: LoopControlContinue, When: `${item} == "skip"`},
+			wantValid: true,
+		},
+		{
+			name: "bead_query only is valid",
+			step: Step{
+				ID:        "s1",
+				BeadQuery: &BeadQueryStep{Label: StringOrList{"hypothesis"}},
+			},
+			wantValid: true,
+		},
+		{
+			name: "loop with until only is valid",
+			step: Step{
+				ID: "s1",
+				Loop: &LoopConfig{
+					Until: "test -f done",
+					Steps: []Step{{ID: "loop_inner", Prompt: "loop body"}},
+				},
+			},
+			wantValid: true,
+		},
+		{
+			name: "loop without items while until or times fails",
+			step: Step{
+				ID: "s1",
+				Loop: &LoopConfig{
+					Steps: []Step{{ID: "loop_inner", Prompt: "loop body"}},
+				},
+			},
+			wantErrSubstr: "loop must specify items, while, until, or times",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, logs := validateWithCapturedSlog(t, workflowWithSingleStep(tt.step))
+			if logs != "" {
+				t.Fatalf("Validate emitted slog output for parser-only validation: %s", logs)
+			}
+			if result.Valid != tt.wantValid {
+				t.Fatalf("Validate().Valid = %v, want %v; errors: %+v", result.Valid, tt.wantValid, result.Errors)
+			}
+			if tt.wantErrSubstr == "" {
+				return
+			}
+			if !validationErrorContains(result, tt.wantErrSubstr) {
+				t.Fatalf("Validate() errors = %+v, want message containing %q", result.Errors, tt.wantErrSubstr)
+			}
+		})
+	}
+}
+
+func workflowWithSingleStep(step Step) *Workflow {
+	return &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "test",
+		Steps:         []Step{step},
+	}
+}
+
+func validateWithCapturedSlog(t *testing.T, w *Workflow) (ValidationResult, string) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+	})
+
+	result := Validate(w)
+	return result, buf.String()
+}
+
+func validationErrorContains(result ValidationResult, substr string) bool {
+	for _, err := range result.Errors {
+		if strings.Contains(err.Message, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestValidate_MultipleAgentSelectionMethods(t *testing.T) {
@@ -291,7 +554,7 @@ func TestValidate_MultipleAgentSelectionMethods(t *testing.T) {
 			{
 				ID:     "s1",
 				Agent:  "claude",
-				Pane:   1,
+				Pane:   PaneSpec{Index: 1},
 				Prompt: "test",
 			},
 		},
@@ -545,10 +808,10 @@ func TestValidate_ParallelSteps(t *testing.T) {
 		Steps: []Step{
 			{
 				ID: "parallel_work",
-				Parallel: []Step{
+				Parallel: ParallelSpec{Steps: []Step{
 					{ID: "p1", Agent: "claude", Prompt: "Task 1"},
 					{ID: "p2", Agent: "codex", Prompt: "Task 2"},
-				},
+				}},
 			},
 			{
 				ID:        "combine",
@@ -634,7 +897,7 @@ func TestValidate_LoopNegativeMaxIterations(t *testing.T) {
 				Loop: &LoopConfig{
 					Items:         "${vars.list}",
 					As:            "item",
-					MaxIterations: -1,
+					MaxIterations: IntOrExpr{Value: -1},
 					Steps:         []Step{{ID: "inner", Prompt: "test"}},
 				},
 			},
@@ -747,9 +1010,9 @@ func TestValidate_VariableReferencesInParallelSubsteps(t *testing.T) {
 		Steps: []Step{
 			{
 				ID: "par_step",
-				Parallel: []Step{
+				Parallel: ParallelSpec{Steps: []Step{
 					{ID: "inner", Prompt: "Process ${unknown.ref}"},
-				},
+				}},
 			},
 		},
 	}
@@ -944,6 +1207,10 @@ func TestParseError_Error(t *testing.T) {
 			"test.yaml:line 10: line error",
 		},
 		{
+			ParseError{File: "test.yaml", Line: 10, Column: 7, Message: "column error"},
+			"test.yaml:line 10, column 7: column error",
+		},
+		{
 			ParseError{Field: "steps[0].id", Message: "field error"},
 			"steps[0].id: field error",
 		},
@@ -1130,6 +1397,12 @@ steps:
 	if !strings.Contains(pe.Message, "YAML parse error") {
 		t.Errorf("expected 'YAML parse error' in message, got %q", pe.Message)
 	}
+	if pe.Line == 0 {
+		t.Errorf("expected line number in YAML parse error, got %+v", pe)
+	}
+	if pe.Hint == "" || !strings.Contains(pe.Hint, "docs/WORKFLOW_SCHEMA.md") {
+		t.Errorf("expected schema-doc hint, got %q", pe.Hint)
+	}
 }
 
 func TestParseString_InvalidTOML(t *testing.T) {
@@ -1149,6 +1422,12 @@ invalid toml [here
 	}
 	if !strings.Contains(pe.Message, "TOML parse error") {
 		t.Errorf("expected 'TOML parse error' in message, got %q", pe.Message)
+	}
+	if pe.Line == 0 || pe.Column == 0 {
+		t.Errorf("expected line and column in TOML parse error, got %+v", pe)
+	}
+	if pe.Hint == "" {
+		t.Errorf("expected TOML parse hint, got empty")
 	}
 }
 
@@ -1198,9 +1477,9 @@ func TestValidate_StepWithPromptAndParallel(t *testing.T) {
 			{
 				ID:     "s1",
 				Prompt: "do something",
-				Parallel: []Step{
+				Parallel: ParallelSpec{Steps: []Step{
 					{ID: "p1", Agent: "cc", Prompt: "parallel task"},
-				},
+				}},
 			},
 		},
 	}
@@ -1312,7 +1591,7 @@ func TestValidate_StepWithMultipleAgentMethods(t *testing.T) {
 			{
 				ID:     "s1",
 				Agent:  "claude",
-				Pane:   1,
+				Pane:   PaneSpec{Index: 1},
 				Route:  "least-loaded",
 				Prompt: "test",
 			},
@@ -1497,6 +1776,15 @@ steps:
 	if !strings.Contains(pe.Message, "field legacy not found") {
 		t.Fatalf("expected unknown-field message, got %q", pe.Message)
 	}
+	if pe.Field != "legacy" {
+		t.Fatalf("expected field legacy, got %q", pe.Field)
+	}
+	if pe.Line == 0 {
+		t.Fatalf("expected line number for unknown YAML field, got %+v", pe)
+	}
+	if pe.Hint == "" || !strings.Contains(pe.Hint, "docs/WORKFLOW_SCHEMA.md") {
+		t.Fatalf("expected schema-doc hint, got %q", pe.Hint)
+	}
 }
 
 func TestParseFile_TOMLUnknownField(t *testing.T) {
@@ -1532,6 +1820,9 @@ prompt = "Do something"
 	if !strings.Contains(pe.Message, "unknown TOML field") {
 		t.Fatalf("expected unknown TOML field message, got %q", pe.Message)
 	}
+	if pe.Hint == "" || !strings.Contains(pe.Hint, "docs/WORKFLOW_SCHEMA.md") {
+		t.Fatalf("expected schema-doc hint, got %q", pe.Hint)
+	}
 }
 
 func TestParseString_YAMLUnknownField(t *testing.T) {
@@ -1557,6 +1848,15 @@ steps:
 	}
 	if !strings.Contains(pe.Message, "field legacy not found") {
 		t.Fatalf("expected unknown-field message, got %q", pe.Message)
+	}
+	if pe.Field != "legacy" {
+		t.Fatalf("expected field legacy, got %q", pe.Field)
+	}
+	if pe.Line == 0 {
+		t.Fatalf("expected line number for unknown YAML field, got %+v", pe)
+	}
+	if pe.Hint == "" || !strings.Contains(pe.Hint, "docs/WORKFLOW_SCHEMA.md") {
+		t.Fatalf("expected schema-doc hint, got %q", pe.Hint)
 	}
 }
 
@@ -1587,6 +1887,9 @@ prompt = "Do something"
 	}
 	if !strings.Contains(pe.Message, "unknown TOML field") {
 		t.Fatalf("expected unknown TOML field message, got %q", pe.Message)
+	}
+	if pe.Hint == "" || !strings.Contains(pe.Hint, "docs/WORKFLOW_SCHEMA.md") {
+		t.Fatalf("expected schema-doc hint, got %q", pe.Hint)
 	}
 }
 

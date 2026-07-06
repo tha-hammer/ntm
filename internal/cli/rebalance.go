@@ -112,7 +112,7 @@ Examples:
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show suggestions without prompting for confirmation")
 	cmd.Flags().BoolVar(&apply, "apply", false, "Prompt for confirmation before applying")
-	cmd.Flags().StringVar(&filter, "filter", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, cursor, windsurf|ws, aider, ollama)")
+	cmd.Flags().StringVar(&filter, "filter", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, antigravity|agy, cursor, windsurf|ws, aider, ollama)")
 	cmd.Flags().Float64Var(&threshold, "threshold", 0.0, "Only suggest if imbalance score exceeds threshold")
 	cmd.Flags().StringVar(&formatOut, "format", "", "Output format: json for robot mode")
 
@@ -305,7 +305,7 @@ func normalizeAgentTypeFilter(filter string) (string, error) {
 	}
 	normalized := normalizeAgentTypeLike(trimmed)
 	if normalized == "" {
-		return "", fmt.Errorf("invalid agent filter %q: must be one of claude|cc, codex|cod, gemini|gmi, cursor, windsurf|ws, aider, ollama", filter)
+		return "", fmt.Errorf("invalid agent filter %q: must be one of claude|cc, codex|cod, gemini|gmi, antigravity|agy, cursor, windsurf|ws, aider, ollama", filter)
 	}
 	return normalized, nil
 }
@@ -329,7 +329,8 @@ func normalizeAgentTypeLike(value string) string {
 func isSupportedWorkAgentType(agentType agentpkg.AgentType) bool {
 	switch agentType {
 	case agentpkg.AgentTypeClaudeCode, agentpkg.AgentTypeCodex, agentpkg.AgentTypeGemini,
-		agentpkg.AgentTypeCursor, agentpkg.AgentTypeWindsurf, agentpkg.AgentTypeAider, agentpkg.AgentTypeOllama:
+		agentpkg.AgentTypeAntigravity, agentpkg.AgentTypeCursor, agentpkg.AgentTypeWindsurf,
+		agentpkg.AgentTypeAider, agentpkg.AgentTypeOpencode, agentpkg.AgentTypeOllama:
 		return true
 	default:
 		return false
@@ -583,7 +584,10 @@ func outputRebalanceError(session, errMsg string) error {
 	}
 	data, _ := json.MarshalIndent(resp, "", "  ")
 	fmt.Println(string(data))
-	return fmt.Errorf("%s", errMsg)
+	// bd-oqwmf: signal non-zero exit AND suppress the duplicate stderr
+	// "Error: ..." line that fmt.Errorf would surface (the JSON envelope
+	// printed above is the canonical failure surface for `--json` mode).
+	return jsonFailureExit()
 }
 
 func outputRebalanceJSON(v interface{}) error {

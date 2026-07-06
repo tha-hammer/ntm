@@ -629,6 +629,85 @@
         ],
         "type": "object"
       },
+      "RobotPressure": {
+        "properties": {
+          "enforcing": {
+            "description": "Enforcing",
+            "type": "boolean"
+          },
+          "limiting": {
+            "description": "Limiting",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "description": "Mode",
+            "type": "string"
+          },
+          "overall": {
+            "description": "Overall",
+            "type": "string"
+          },
+          "recommended_action": {
+            "description": "Recommended action",
+            "type": "string"
+          },
+          "sources": {
+            "description": "Sources",
+            "items": {
+              "$ref": "#/definitions/RobotSource"
+            },
+            "type": "array"
+          },
+          "success": {
+            "description": "Success",
+            "type": "boolean"
+          },
+          "timestamp": {
+            "description": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "success",
+          "timestamp",
+          "mode",
+          "overall",
+          "limiting",
+          "recommended_action",
+          "enforcing",
+          "sources"
+        ],
+        "type": "object"
+      },
+      "RobotSource": {
+        "properties": {
+          "level": {
+            "description": "Level",
+            "type": "string"
+          },
+          "source": {
+            "description": "Source",
+            "type": "string"
+          },
+          "unit": {
+            "description": "Unit",
+            "type": "string"
+          },
+          "value": {
+            "description": "Value",
+            "type": "number"
+          }
+        },
+        "required": [
+          "source",
+          "value",
+          "level"
+        ],
+        "type": "object"
+      },
       "SnapshotAgent": {
         "properties": {
           "current_bead": {
@@ -1147,6 +1226,10 @@
             "description": "Alerts active",
             "type": "integer"
           },
+          "antigravity_count": {
+            "description": "Antigravity count",
+            "type": "integer"
+          },
           "attached_count": {
             "description": "Attached count",
             "type": "integer"
@@ -1191,6 +1274,10 @@
             "description": "Ollama count",
             "type": "integer"
           },
+          "opencode_count": {
+            "description": "Opencode count",
+            "type": "integer"
+          },
           "ready_work": {
             "description": "Ready work",
             "type": "integer"
@@ -1215,9 +1302,11 @@
           "claude_count",
           "codex_count",
           "gemini_count",
+          "antigravity_count",
           "cursor_count",
           "windsurf_count",
           "aider_count",
+          "opencode_count",
           "ollama_count",
           "agents_by_state",
           "agents_by_type",
@@ -1292,6 +1381,10 @@
       },
       "SwarmPlanAllocation": {
         "properties": {
+          "agy_agents": {
+            "description": "Agy agents",
+            "type": "integer"
+          },
           "cc_agents": {
             "description": "C c agents",
             "type": "integer"
@@ -1323,7 +1416,8 @@
           "open_beads",
           "cc_agents",
           "cod_agents",
-          "gmi_agents"
+          "gmi_agents",
+          "agy_agents"
         ],
         "type": "object"
       },
@@ -1870,6 +1964,10 @@
       "replay_window": {
         "$ref": "#/definitions/SnapshotReplayWindowInfo",
         "description": "Replay window"
+      },
+      "resource_pressure": {
+        "$ref": "#/definitions/RobotPressure",
+        "description": "Resource pressure"
       },
       "safety_profile": {
         "description": "Safety profile",

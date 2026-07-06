@@ -14,12 +14,334 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// PrepareWorkflowVariables applies runtime overrides and workflow defaults,
+// validating declared variable types as values enter the execution state.
+func PrepareWorkflowVariables(workflow *Workflow, overrides map[string]interface{}) (map[string]interface{}, error) {
+	if workflow == nil {
+		return nil, fmt.Errorf("workflow is nil")
+	}
+
+	vars := make(map[string]interface{}, len(workflow.Vars)+len(overrides))
+	for name, val := range overrides {
+		if def, ok := workflow.Vars[name]; ok {
+			normalized, err := normalizeWorkflowVar(name, def.Type, val)
+			if err != nil {
+				return nil, err
+			}
+			vars[name] = normalized
+			continue
+		}
+		vars[name] = val
+	}
+
+	resolving := make(map[string]bool)
+	resolved := make(map[string]bool)
+	var resolveDefault func(string) error
+	resolveDefault = func(name string) error {
+		if _, ok := vars[name]; ok || resolved[name] {
+			return nil
+		}
+		def, ok := workflow.Vars[name]
+		if !ok || def.Default == nil {
+			resolved[name] = true
+			return nil
+		}
+		if resolving[name] {
+			return fmt.Errorf("variable %s: cyclic default reference", name)
+		}
+		resolving[name] = true
+		defer delete(resolving, name)
+
+		value := def.Default
+		if s, ok := value.(string); ok {
+			for _, ref := range variableDefaultRefs(s) {
+				if err := resolveDefault(ref); err != nil {
+					return err
+				}
+			}
+			resolved, err := resolveDefaultString(s, vars)
+			if err != nil {
+				return fmt.Errorf("variable %s: default %q: %w", name, s, err)
+			}
+			value = resolved
+		}
+
+		normalized, err := normalizeWorkflowVar(name, def.Type, value)
+		if err != nil {
+			return err
+		}
+		vars[name] = normalized
+		resolved[name] = true
+		return nil
+	}
+
+	for name := range workflow.Vars {
+		if err := resolveDefault(name); err != nil {
+			return nil, err
+		}
+	}
+	for name, def := range workflow.Vars {
+		if _, ok := vars[name]; !ok && def.Required {
+			return nil, fmt.Errorf("variable %s: required value missing", name)
+		}
+	}
+
+	return vars, nil
+}
+
+// VariableValidationResult captures normalized runtime variables plus non-fatal
+// input warnings that callers can surface before execution starts.
+type VariableValidationResult struct {
+	Variables map[string]interface{}
+	Warnings  []ParseError
+}
+
+// ValidateWorkflowVariables checks runtime overrides against declared workflow
+// variable metadata. Undeclared overrides remain available but are reported as
+// warnings because they cannot receive VarType validation.
+func ValidateWorkflowVariables(workflow *Workflow, overrides map[string]interface{}) (*VariableValidationResult, *ParseError) {
+	result := &VariableValidationResult{}
+	if workflow != nil {
+		for name := range overrides {
+			if _, ok := workflow.Vars[name]; ok {
+				continue
+			}
+			result.Warnings = append(result.Warnings, ParseError{
+				Field:   fmt.Sprintf("vars.%s", name),
+				Message: fmt.Sprintf("undeclared variable %q; will be available but not validated", name),
+				Hint:    "Declare the variable under workflow vars to enable type validation.",
+			})
+		}
+	}
+
+	vars, err := PrepareWorkflowVariables(workflow, overrides)
+	if err != nil {
+		return result, workflowVariableParseError(err)
+	}
+	result.Variables = vars
+	return result, nil
+}
+
+func workflowVariableParseError(err error) *ParseError {
+	message := err.Error()
+	name := workflowVariableNameFromError(message)
+	field := "vars"
+	if name != "" {
+		field = fmt.Sprintf("vars.%s", name)
+	}
+	return &ParseError{
+		Field:   field,
+		Message: message,
+		Hint:    workflowVariableErrorHint(name, message),
+	}
+}
+
+func workflowVariableNameFromError(message string) string {
+	rest, ok := strings.CutPrefix(message, "variable ")
+	if !ok {
+		return ""
+	}
+	name, _, ok := strings.Cut(rest, ":")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(name)
+}
+
+func workflowVariableErrorHint(name, message string) string {
+	switch {
+	case strings.Contains(message, "expected number"):
+		if name == "" {
+			return "Use a parseable number such as 5 or 5.0."
+		}
+		return fmt.Sprintf("use --var %s=5 or --var %s=5.0", name, name)
+	case strings.Contains(message, "expected boolean"):
+		if name == "" {
+			return "Use true/false, 1/0, or yes/no."
+		}
+		return fmt.Sprintf("use --var %s=true or --var %s=false", name, name)
+	case strings.Contains(message, "expected array"):
+		if name == "" {
+			return "Use comma-separated CLI input or a JSON array in --var-file."
+		}
+		return fmt.Sprintf("use --var %s=a,b,c or provide %q as a JSON array in --var-file", name, name)
+	case strings.Contains(message, "required value missing"):
+		if name == "" {
+			return "Provide required variables with --var or --var-file."
+		}
+		return fmt.Sprintf("provide --var %s=value or include %q in --var-file", name, name)
+	case strings.Contains(message, "cyclic default reference"):
+		return "Remove the cycle between workflow var defaults."
+	case strings.Contains(message, "unknown declared type"):
+		return "Use one of: string, number, boolean, array."
+	default:
+		return "Fix the workflow variable value and retry."
+	}
+}
+
+func variableDefaultRefs(s string) []string {
+	matches := varPattern.FindAllStringSubmatch(s, -1)
+	refs := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		ref := strings.TrimSpace(match[1])
+		ref, _, _ = parseDefault(ref)
+		parts := strings.Split(ref, ".")
+		if len(parts) >= 2 && parts[0] == "vars" {
+			refs = append(refs, parts[1])
+		}
+	}
+	return refs
+}
+
+// resolveDefaultString substitutes variable references inside a string-typed
+// workflow var default. Returns an error when the default contains an
+// unresolved reference (typo, missing variable, missing env) without an
+// explicit | fallback. Without this, a default like ${vars.projet_name}
+// would pass through as the literal placeholder and silently dispatch
+// unresolved ${...} markers to prompts/commands at runtime.
+func resolveDefaultString(s string, vars map[string]interface{}) (interface{}, error) {
+	state := &ExecutionState{Variables: vars}
+	sub := NewSubstitutor(state, "", "")
+	trimmed := strings.TrimSpace(s)
+	if match := varPattern.FindStringSubmatch(trimmed); len(match) == 2 && match[0] == trimmed {
+		if value, err := sub.resolveVar(match[1]); err == nil {
+			return value, nil
+		}
+	}
+	resolved, err := sub.SubstituteStrict(s)
+	if err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
+func normalizeWorkflowVar(name string, typ VarType, value interface{}) (interface{}, error) {
+	switch typ {
+	case "":
+		// Untyped: accept any value verbatim. Used for legacy workflows
+		// without declared types.
+		return value, nil
+	case VarTypeString:
+		return normalizeStringVar(name, value)
+	case VarTypeNumber:
+		return normalizeNumberVar(name, value)
+	case VarTypeBoolean:
+		return normalizeBooleanVar(name, value)
+	case VarTypeArray:
+		return normalizeArrayVar(name, value)
+	default:
+		return nil, fmt.Errorf("variable %s: unknown declared type %q", name, typ)
+	}
+}
+
+// normalizeStringVar enforces the declared `type: string` contract. Values
+// from --var (CLI strings) and YAML/JSON var-files must round-trip as a
+// string; native JSON booleans, numbers, arrays, or objects are rejected
+// rather than silently coerced (bd-q84t9, paired with bd-t1fj5's existing
+// number/boolean/array enforcement).
+func normalizeStringVar(name string, value interface{}) (interface{}, error) {
+	switch v := value.(type) {
+	case nil:
+		return nil, fmt.Errorf("variable %s: expected string, got null", name)
+	case string:
+		return v, nil
+	case json.Number:
+		return nil, fmt.Errorf("variable %s: expected string, got number %s", name, v.String())
+	case bool:
+		return nil, fmt.Errorf("variable %s: expected string, got boolean %t", name, v)
+	case []interface{}:
+		return nil, fmt.Errorf("variable %s: expected string, got array of length %d", name, len(v))
+	case map[string]interface{}:
+		return nil, fmt.Errorf("variable %s: expected string, got object", name)
+	default:
+		return nil, fmt.Errorf("variable %s: expected string, got %T", name, value)
+	}
+}
+
+func normalizeNumberVar(name string, value interface{}) (interface{}, error) {
+	switch v := value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return value, nil
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, nil
+		}
+		f, err := v.Float64()
+		if err != nil {
+			return nil, fmt.Errorf("variable %s: expected number, got '%s'", name, v.String())
+		}
+		return f, nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return nil, fmt.Errorf("variable %s: expected number, got ''", name)
+		}
+		if !strings.ContainsAny(s, ".eE") {
+			if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return int(i), nil
+			}
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return nil, fmt.Errorf("variable %s: expected number, got '%s'", name, v)
+		}
+		return f, nil
+	default:
+		return nil, fmt.Errorf("variable %s: expected number, got %T", name, value)
+	}
+}
+
+func normalizeBooleanVar(name string, value interface{}) (interface{}, error) {
+	switch v := value.(type) {
+	case bool:
+		return v, nil
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "t", "1", "yes", "y":
+			return true, nil
+		case "false", "f", "0", "no", "n":
+			return false, nil
+		default:
+			return nil, fmt.Errorf("variable %s: expected boolean, got '%s'", name, v)
+		}
+	default:
+		return nil, fmt.Errorf("variable %s: expected boolean, got %T", name, value)
+	}
+}
+
+func normalizeArrayVar(name string, value interface{}) (interface{}, error) {
+	switch v := value.(type) {
+	case []interface{}:
+		return v, nil
+	case []string:
+		return v, nil
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return []string{}, nil
+		}
+		parts := strings.Split(v, ",")
+		items := make([]string, 0, len(parts))
+		for _, part := range parts {
+			items = append(items, strings.TrimSpace(part))
+		}
+		return items, nil
+	default:
+		return nil, fmt.Errorf("variable %s: expected array, got %T", name, value)
+	}
+}
+
 // Substitutor handles variable substitution in workflow prompts and conditions.
 // It supports multiple variable types: vars, steps, env, and context variables.
 type Substitutor struct {
-	state    *ExecutionState
-	session  string
-	workflow string
+	state          *ExecutionState
+	session        string
+	workflow       string
+	defaults       map[string]interface{}
+	maxDepth       int
+	localOverrides map[string]interface{}
 }
 
 // NewSubstitutor creates a new substitutor with the given execution context.
@@ -29,6 +351,37 @@ func NewSubstitutor(state *ExecutionState, session, workflow string) *Substituto
 		session:  session,
 		workflow: workflow,
 	}
+}
+
+// SetDefaults sets the workflow-level defaults map for ${defaults.X} resolution.
+func (s *Substitutor) SetDefaults(d map[string]interface{}) {
+	s.defaults = d
+}
+
+// SetLocalOverrides registers a per-call overlay map keyed by full variable
+// path (e.g. "round", "rounds_remaining", "loop.round"). Lookups consult this
+// map BEFORE state.Variables, so callers can supply per-goroutine values for
+// keys that would otherwise race on the shared state map. Used by foreach
+// max_rounds (bd-2ubxp.20) to bind ${round}/${loop.round} per-iteration
+// without writing to state.Variables.
+func (s *Substitutor) SetLocalOverrides(o map[string]interface{}) {
+	s.localOverrides = o
+}
+
+// SetMaxDepth sets the maximum recursion depth for nested substitutions.
+// A non-positive value falls back to DefaultMaxSubstitutionDepth at substitute
+// time. Callers should pass workflow.Settings.Limits.EffectiveLimits().MaxSubstitutionDepth
+// so user-configured `max_substitution_recursion` is honored.
+func (s *Substitutor) SetMaxDepth(d int) {
+	s.maxDepth = d
+}
+
+// effectiveMaxDepth returns the configured recursion bound or the package default.
+func (s *Substitutor) effectiveMaxDepth() int {
+	if s.maxDepth > 0 {
+		return s.maxDepth
+	}
+	return DefaultMaxSubstitutionDepth
 }
 
 // SubstitutionError represents an error during variable substitution
@@ -48,48 +401,54 @@ var varPattern = regexp.MustCompile(`(?s)\$\{([^}]+)\}`)
 // escapedPattern matches escaped variable references: \${...}
 var escapedPattern = regexp.MustCompile(`\\\$\{`)
 
-// placeholder for escaped sequences during substitution
+// escapedDollarPattern matches escaped literal dollar signs: \$.
+var escapedDollarPattern = regexp.MustCompile(`\\\$`)
+
+// placeholder for escaped variable starts during substitution
 const escapePlaceholder = "\x00ESC_VAR\x00"
 
-// Substitute replaces all ${...} variable references in the template string.
-// Returns the substituted string and any errors encountered.
-func (s *Substitutor) Substitute(template string) (string, error) {
-	// First, replace escaped \${...} with placeholder to preserve them
-	escaped := escapedPattern.ReplaceAllString(template, escapePlaceholder)
+// placeholder for escaped literal dollar signs during substitution
+const escapedDollarPlaceholder = "\x00ESC_DOLLAR\x00"
 
-	var firstErr error
+// SubstituteRetainingSeals is like Substitute but does not call
+// restoreEscapedSubstitutions on the final output. This allows the returned
+// string to be safely passed through another substitution pass (e.g. during
+// foreach materialization -> execution) without exposing sealed terminal values
+// to double-substitution.
+func (s *Substitutor) SubstituteRetainingSeals(template string) (string, error) {
+	result := protectEscapedSubstitutions(template)
+	maxDepth := s.effectiveMaxDepth()
 
-	result := varPattern.ReplaceAllStringFunc(escaped, func(match string) string {
-		// Extract expression between ${ and }
-		expr := match[2 : len(match)-1]
-
-		// Parse for default value: ${var | "default"} or ${var | default}
-		varPath, defaultVal, hasDefault := parseDefault(expr)
-
-		// Resolve the variable
-		value, err := s.resolveVar(varPath)
+	for depth := 0; depth < maxDepth; depth++ {
+		next, resolved, err := s.substituteOnce(result)
+		next = protectEscapedSubstitutions(next)
 		if err != nil {
-			if hasDefault {
-				return defaultVal
-			}
-			if firstErr == nil {
-				firstErr = &SubstitutionError{VarRef: varPath, Message: err.Error()}
-			}
-			return match // Leave unsubstituted if resolution fails
+			return next, err
 		}
 
-		return formatValue(value)
-	})
+		result = next
+		if !varPattern.MatchString(result) {
+			return result, nil
+		}
+		if resolved == 0 {
+			return result, nil
+		}
+	}
 
-	// Restore escaped ${...} sequences
-	result = strings.ReplaceAll(result, escapePlaceholder, "${")
-
-	return result, firstErr
+	match := varPattern.FindString(result)
+	varRef := match
+	if strings.HasPrefix(match, "${") && strings.HasSuffix(match, "}") {
+		varRef = strings.TrimSpace(match[2 : len(match)-1])
+	}
+	return result, &SubstitutionError{
+		VarRef:  varRef,
+		Message: fmt.Sprintf("substitution recursion depth exceeded after %d passes", maxDepth),
+	}
 }
 
-// SubstituteStrict is like Substitute but returns an error if any variable is undefined.
-func (s *Substitutor) SubstituteStrict(template string) (string, error) {
-	result, err := s.Substitute(template)
+// SubstituteRetainingSealsStrict is like SubstituteRetainingSeals but returns an error if any variable is undefined.
+func (s *Substitutor) SubstituteRetainingSealsStrict(template string) (string, error) {
+	result, err := s.SubstituteRetainingSeals(template)
 	if err != nil {
 		return "", err
 	}
@@ -104,6 +463,129 @@ func (s *Substitutor) SubstituteStrict(template string) (string, error) {
 	}
 
 	return result, nil
+}
+
+// Substitute replaces all ${...} variable references in the template string.
+// Returns the substituted string and any errors encountered.
+func (s *Substitutor) Substitute(template string) (string, error) {
+	res, err := s.SubstituteRetainingSeals(template)
+	return restoreEscapedSubstitutions(res), err
+}
+
+func (s *Substitutor) substituteOnce(template string) (string, int, error) {
+	var firstErr error
+	resolved := 0
+
+	result := varPattern.ReplaceAllStringFunc(template, func(match string) string {
+		// Extract expression between ${ and }
+		expr := match[2 : len(match)-1]
+
+		// Parse for default value: ${var | "default"} or ${var | default}
+		varPath, defaultVal, hasDefault := parseDefault(expr)
+
+		// Resolve the variable
+		value, err := s.resolveVar(varPath)
+		if err != nil {
+			if hasDefault {
+				// bd-wwmo9: count the default fallback as progress so the
+				// outer Substitute loop keeps recursing when the default
+				// itself contains a variable reference, e.g.
+				// ${vars.missing | ${vars.present}}. Without this the
+				// outer loop sees `resolved == 0` and exits early,
+				// returning the literal ${vars.present} instead of its
+				// resolved value.
+				if defaultVal != match {
+					resolved++
+				}
+				return defaultVal
+			}
+			if firstErr == nil {
+				firstErr = &SubstitutionError{VarRef: varPath, Message: err.Error()}
+			}
+			return match // Leave unsubstituted if resolution fails
+		}
+
+		resolved++
+		formatted := formatValue(value)
+		// bd-447se: values resolved from untrusted namespaces (step output,
+		// process env, bead_query) must not be re-processed by later passes
+		// of the substitution loop. Otherwise a step that prints
+		// `${env.GITHUB_TOKEN}` and a downstream `${steps.A.output}` form a
+		// secret-disclosure / control-flow injection vector. Replace any
+		// `${` sequences in the substituted value with the escape
+		// placeholder so the outer Substitute loop sees them as opaque
+		// data; restoreEscapedSubstitutions converts them back to literal
+		// `${` in the final output.
+		if isTerminalSubstitutionNamespace(varPath) {
+			formatted = sealTerminalValue(formatted)
+		}
+		return formatted
+	})
+
+	return result, resolved, firstErr
+}
+
+// isTerminalSubstitutionNamespace reports whether values resolved from this
+// variable path should be treated as opaque data rather than recursively
+// re-substituted. Author-controlled namespaces (vars, defaults, loop, pane,
+// runtime, session/timestamp/run_id/workflow) keep recursive expansion;
+// untrusted/external namespaces (step output, process env, bead query
+// records, agent output) are sealed to prevent
+// secret-disclosure / control-flow injection through external data
+// (bd-447se).
+func isTerminalSubstitutionNamespace(varPath string) bool {
+	path := strings.TrimSpace(varPath)
+	if path == "" {
+		return false
+	}
+	root := path
+	if idx := strings.IndexAny(path, ".["); idx >= 0 {
+		root = path[:idx]
+	}
+	switch root {
+	case "steps", "env", "bead_query", "agent":
+		return true
+	}
+	return false
+}
+
+// sealTerminalValue replaces every ${ in v with escapePlaceholder so the
+// next substitution pass treats it as data. Final restoreEscapedSubstitutions
+// reverts placeholders to literal ${ for output.
+func sealTerminalValue(v string) string {
+	if !strings.Contains(v, "${") {
+		return v
+	}
+	return strings.ReplaceAll(v, "${", escapePlaceholder)
+}
+
+func protectEscapedSubstitutions(template string) string {
+	result := escapedPattern.ReplaceAllString(template, escapePlaceholder)
+	return escapedDollarPattern.ReplaceAllString(result, escapedDollarPlaceholder)
+}
+
+func restoreEscapedSubstitutions(template string) string {
+	result := strings.ReplaceAll(template, escapePlaceholder, "${")
+	return strings.ReplaceAll(result, escapedDollarPlaceholder, "$")
+}
+
+// SubstituteStrict is like Substitute but returns an error if any variable is undefined.
+func (s *Substitutor) SubstituteStrict(template string) (string, error) {
+	result, err := s.SubstituteRetainingSeals(template)
+	if err != nil {
+		return restoreEscapedSubstitutions(result), err
+	}
+
+	// Check for any remaining unsubstituted variables
+	if varPattern.MatchString(result) {
+		matches := varPattern.FindAllString(result, -1)
+		return restoreEscapedSubstitutions(result), &SubstitutionError{
+			VarRef:  matches[0],
+			Message: "undefined variable (no default provided)",
+		}
+	}
+
+	return restoreEscapedSubstitutions(result), nil
 }
 
 // parseDefault extracts variable path and optional default value.
@@ -135,6 +617,7 @@ func parseDefault(expr string) (varPath, defaultVal string, hasDefault bool) {
 //   - steps.id.output, steps.id.data.field
 //   - steps.id.pane, steps.id.duration, steps.id.status, steps.id.agent
 //   - env.NAME
+//   - pane.role, pane.model, pane.domain, pane.index
 //   - session, timestamp, run_id, workflow
 //   - loop.item, loop.index, loop.count, loop.first, loop.last
 func (s *Substitutor) resolveVar(path string) (interface{}, error) {
@@ -143,6 +626,22 @@ func (s *Substitutor) resolveVar(path string) (interface{}, error) {
 
 	if len(parts) == 0 || parts[0] == "" {
 		return nil, fmt.Errorf("empty variable reference")
+	}
+
+	// bd-2ubxp.20: per-call overrides take precedence over state.Variables so
+	// parallel foreach iterations can each see their own ${round} value
+	// without racing on the shared map. Matches by full path first (so
+	// ${loop.round} hits "loop.round" in the overlay) and falls back to the
+	// bare top-level key for ${round}/${rounds_remaining}.
+	if s.localOverrides != nil {
+		if v, ok := s.localOverrides[path]; ok {
+			return v, nil
+		}
+		if len(parts) > 1 {
+			if v, ok := s.localOverrides[parts[0]]; ok {
+				return navigateNested(v, parts[1:])
+			}
+		}
 	}
 
 	switch parts[0] {
@@ -154,6 +653,12 @@ func (s *Substitutor) resolveVar(path string) (interface{}, error) {
 		return s.resolveEnv(parts[1:])
 	case "loop":
 		return s.resolveLoop(parts[1:])
+	case "defaults":
+		return s.resolveDefaults(parts[1:])
+	case "item":
+		return s.resolveItem(parts[1:])
+	case "pane":
+		return s.resolvePane(parts[1:])
 	case "session":
 		return s.session, nil
 	case "run_id":
@@ -165,6 +670,21 @@ func (s *Substitutor) resolveVar(path string) (interface{}, error) {
 		return time.Now().Format(time.RFC3339), nil
 	case "workflow":
 		return s.workflow, nil
+	case "round", "rounds_remaining":
+		// bd-2ubxp.14: top-level shortcut for foreach max_rounds bindings.
+		// The same values are also reachable via ${loop.round} /
+		// ${loop.rounds_remaining}; the bare form matches the spec.
+		if s.state == nil || s.state.Variables == nil {
+			return nil, fmt.Errorf("%s not set: foreach max_rounds binding only available inside an iteration body", parts[0])
+		}
+		v, ok := s.state.Variables[parts[0]]
+		if !ok {
+			return nil, fmt.Errorf("%s not set: foreach max_rounds binding only available inside an iteration body", parts[0])
+		}
+		if len(parts) > 1 {
+			return navigateNested(v, parts[1:])
+		}
+		return v, nil
 	default:
 		return nil, fmt.Errorf("unknown variable namespace: %s", parts[0])
 	}
@@ -205,14 +725,27 @@ func (s *Substitutor) resolveSteps(parts []string) (interface{}, error) {
 
 	stepID := parts[0]
 	field := parts[1]
+	rest := parts[2:]
+	if base, indexes, ok := splitBracketAccess(field); ok {
+		field = base
+		rest = append(indexes, rest...)
+	}
 
 	// First, check Variables for flat key lookup (backward compatible)
 	key := "steps." + stepID + "." + field
 	if val, exists := s.state.Variables[key]; exists {
-		if len(parts) > 2 {
-			return navigateNested(val, parts[2:])
+		if len(rest) > 0 {
+			return navigateNested(val, rest)
 		}
 		return val, nil
+	}
+	if field == "parsed_data" || field == "data" {
+		if val, exists := s.state.Variables[stepID+"_parsed"]; exists {
+			if len(rest) > 0 {
+				return navigateNested(val, rest)
+			}
+			return val, nil
+		}
 	}
 
 	// Then check Steps map if available
@@ -227,20 +760,20 @@ func (s *Substitutor) resolveSteps(parts []string) (interface{}, error) {
 
 	switch field {
 	case "output":
-		if len(parts) > 2 {
+		if len(rest) > 0 {
 			// Accessing parsed data field: steps.id.output.field
 			if result.ParsedData != nil {
-				return navigateNested(result.ParsedData, parts[2:])
+				return navigateNested(result.ParsedData, rest)
 			}
 			return nil, fmt.Errorf("step %s has no parsed data", stepID)
 		}
 		return result.Output, nil
-	case "data":
+	case "data", "parsed_data":
 		if result.ParsedData == nil {
 			return nil, fmt.Errorf("step %s has no parsed data", stepID)
 		}
-		if len(parts) > 2 {
-			return navigateNested(result.ParsedData, parts[2:])
+		if len(rest) > 0 {
+			return navigateNested(result.ParsedData, rest)
 		}
 		return result.ParsedData, nil
 	case "pane":
@@ -259,6 +792,31 @@ func (s *Substitutor) resolveSteps(parts []string) (interface{}, error) {
 	}
 }
 
+func splitBracketAccess(part string) (string, []string, bool) {
+	start := strings.IndexByte(part, '[')
+	if start < 0 {
+		return part, nil, false
+	}
+	base := part[:start]
+	if base == "" {
+		return part, nil, false
+	}
+	rest := part[start:]
+	var indexes []string
+	for rest != "" {
+		if !strings.HasPrefix(rest, "[") {
+			return part, nil, false
+		}
+		end := strings.IndexByte(rest, ']')
+		if end <= 1 {
+			return part, nil, false
+		}
+		indexes = append(indexes, strings.TrimSpace(rest[1:end]))
+		rest = rest[end+1:]
+	}
+	return base, indexes, true
+}
+
 // resolveEnv handles env.NAME references
 func (s *Substitutor) resolveEnv(parts []string) (interface{}, error) {
 	if len(parts) == 0 {
@@ -266,10 +824,10 @@ func (s *Substitutor) resolveEnv(parts []string) (interface{}, error) {
 	}
 
 	envName := parts[0]
-	value := os.Getenv(envName)
-
-	// Note: We return empty string if env var is not set.
-	// Use default syntax ${env.X | "fallback"} for required env vars.
+	value, ok := os.LookupEnv(envName)
+	if !ok {
+		return nil, fmt.Errorf("environment variable %s not set", envName)
+	}
 	return value, nil
 }
 
@@ -299,10 +857,69 @@ func (s *Substitutor) resolveLoop(parts []string) (interface{}, error) {
 	return value, nil
 }
 
+// resolveDefaults handles defaults.X and defaults.X.nested.field references.
+func (s *Substitutor) resolveDefaults(parts []string) (interface{}, error) {
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("defaults requires a key name")
+	}
+	if s.defaults == nil {
+		return nil, fmt.Errorf("no defaults defined in workflow")
+	}
+
+	root := parts[0]
+	value, ok := s.defaults[root]
+	if !ok {
+		return nil, fmt.Errorf("undefined default: %s", root)
+	}
+
+	if len(parts) > 1 {
+		return navigateNested(value, parts[1:])
+	}
+
+	return value, nil
+}
+
+// resolveItem handles ${item} and ${item.X} references inside foreach iterations.
+func (s *Substitutor) resolveItem(parts []string) (interface{}, error) {
+	if s.state == nil || s.state.Variables == nil {
+		return nil, fmt.Errorf("item is only available inside foreach iterations")
+	}
+
+	item, ok := s.state.Variables["loop.item"]
+	if !ok {
+		return nil, fmt.Errorf("item is only available inside foreach iterations")
+	}
+
+	if len(parts) == 0 {
+		return item, nil
+	}
+
+	return navigateNested(item, parts)
+}
+
+// expandBracketParts splits any path segment that ends in [N] / [key] /
+// [a][b] suffixes into separate tokens, so navigateNested can traverse
+// `items[0].title` / `data[user][profile][name]` as `items 0 title` /
+// `data user profile name`. This mirrors the splitBracketAccess pre-pass
+// resolveSteps already runs on its first field segment (bd-et0k5).
+func expandBracketParts(parts []string) []string {
+	expanded := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if base, indexes, ok := splitBracketAccess(part); ok {
+			expanded = append(expanded, base)
+			expanded = append(expanded, indexes...)
+			continue
+		}
+		expanded = append(expanded, part)
+	}
+	return expanded
+}
+
 // navigateNested traverses nested data structures using dot notation.
 // Supports maps and arrays (with numeric indices).
 func navigateNested(value interface{}, parts []string) (interface{}, error) {
 	current := value
+	parts = expandBracketParts(parts)
 
 	for _, part := range parts {
 		if current == nil {
@@ -330,6 +947,14 @@ func navigateNested(value interface{}, parts []string) (interface{}, error) {
 			if !found {
 				return nil, fmt.Errorf("field '%s' not found", part)
 			}
+
+		case map[string]string:
+			// Parallel collect-mode output_var groups store outputs as map[string]string keyed by step id.
+			val, ok := v[part]
+			if !ok {
+				return nil, fmt.Errorf("field '%s' not found", part)
+			}
+			current = val
 
 		case []interface{}:
 			// Array access with numeric index
@@ -664,7 +1289,7 @@ func ValidateVarRefs(template string, availableVars []string) []string {
 
 		// Valid namespaces that don't need to be pre-declared
 		switch parts[0] {
-		case "env", "session", "run_id", "timestamp", "workflow", "loop":
+		case "env", "session", "run_id", "timestamp", "workflow", "loop", "defaults", "item":
 			continue
 		case "vars":
 			if len(parts) > 1 && !varSet["vars."+parts[1]] && !varSet[parts[1]] {

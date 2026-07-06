@@ -3,6 +3,8 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -615,7 +617,7 @@ func TestCompressOldTimelines(t *testing.T) {
 	}
 }
 
-func TestCompressOldTimelines_DisabledWhenZero(t *testing.T) {
+func TestCompressOldTimelines_DisabledWhenNegative(t *testing.T) {
 	t.Parallel()
 	tmpDir := t.TempDir()
 	persister, err := NewTimelinePersister(&TimelinePersistConfig{
@@ -626,13 +628,33 @@ func TestCompressOldTimelines_DisabledWhenZero(t *testing.T) {
 		t.Fatalf("NewTimelinePersister: %v", err)
 	}
 
-	// Should return 0 immediately since compression is disabled
+	sessionID := "disabled-compression"
+	events := []AgentEvent{
+		{AgentID: "cc_1", SessionID: sessionID, State: TimelineWorking, Timestamp: time.Now().Add(-48 * time.Hour)},
+	}
+	if err := persister.SaveTimeline(sessionID, events); err != nil {
+		t.Fatalf("SaveTimeline: %v", err)
+	}
+
+	plainPath := filepath.Join(tmpDir, sessionID+".jsonl")
+	oldModTime := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(plainPath, oldModTime, oldModTime); err != nil {
+		t.Fatalf("age timeline file: %v", err)
+	}
+
+	// Should return 0 immediately since compression is disabled.
 	compressed, err := persister.CompressOldTimelines()
 	if err != nil {
 		t.Fatalf("CompressOldTimelines: %v", err)
 	}
 	if compressed != 0 {
 		t.Errorf("expected 0 compressed when disabled, got %d", compressed)
+	}
+	if _, err := os.Stat(plainPath); err != nil {
+		t.Fatalf("expected uncompressed file to remain: %v", err)
+	}
+	if _, err := os.Stat(plainPath + ".gz"); !os.IsNotExist(err) {
+		t.Fatalf("expected no compressed file when disabled, stat err=%v", err)
 	}
 }
 
@@ -1508,6 +1530,93 @@ func TestStartCheckpoint_DoesNotRacePastConcurrentStop(t *testing.T) {
 	persister.mu.RUnlock()
 	if exists {
 		t.Fatal("StartCheckpoint installed a runner after Stop completed")
+	}
+}
+
+// bd-uxf8h: concurrent StartCheckpoint calls for the same session must
+// serialize via lifecycleMu so the prior runner is fully stopped before
+// the new one is installed. Pre-fix, two concurrent calls could both see
+// an empty map (their stopCheckpointRunner found nothing), each install
+// a fresh runner, and the second's map insert would overwrite the first
+// — leaving the first goroutine running but un-trackable. Stop() then
+// couldn't drain the orphaned goroutine because it wasn't in the map.
+//
+// We catch the leak by snapshotting runtime.NumGoroutine() before
+// the bursts and after Stop. With the fix, post-Stop count returns to
+// (approximately) the baseline. Without the fix, every concurrent
+// StartCheckpoint that "lost" the map race leaks one goroutine that
+// keeps ticking until the test process exits.
+func TestStartCheckpoint_ConcurrentSameSessionDoesNotLeak(t *testing.T) {
+	tmpDir := t.TempDir()
+	persister, err := NewTimelinePersister(&TimelinePersistConfig{
+		BaseDir:            tmpDir,
+		CheckpointInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewTimelinePersister: %v", err)
+	}
+
+	tracker := NewTimelineTracker(&TimelineConfig{PruneInterval: 0})
+	defer tracker.Stop()
+
+	const concurrentStarters = 32
+	const sid = "leak-session"
+
+	// Baseline goroutine count before any StartCheckpoint fires. Allow a
+	// small tolerance for unrelated runtime/test goroutines.
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < concurrentStarters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			persister.StartCheckpoint(sid, tracker)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// Stop drains every runner the registry knows about and waits for
+	// each goroutine to exit. With the fix, the registry holds exactly
+	// the most-recently-installed runner and Stop drains it. Without
+	// the fix, the registry holds ONE runner but multiple goroutines
+	// are alive — Stop drains only the registered one and the others
+	// keep ticking past Stop.
+	stopped := make(chan struct{})
+	go func() {
+		persister.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not finish — possible leaked goroutine deadlock")
+	}
+
+	// Give any lingering goroutines a moment to be observed; in the
+	// leak case they keep ticking and won't exit.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		if runtime.NumGoroutine() <= baseline+2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	runtime.GC()
+	final := runtime.NumGoroutine()
+	// Allow a small slack for runtime goroutines that may legitimately
+	// exist (GC workers, test framework, etc.). The pre-fix leak grows
+	// linearly with concurrentStarters (here 32), so a tolerance of +2
+	// is plenty to distinguish "fixed" from "leaked".
+	if final > baseline+2 {
+		t.Fatalf("goroutine leak: baseline=%d final=%d (delta=%d). Pre-fix this test would show ≈%d extra goroutines (one per losing concurrent StartCheckpoint)",
+			baseline, final, final-baseline, concurrentStarters-1)
 	}
 }
 

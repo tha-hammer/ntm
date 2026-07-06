@@ -75,6 +75,13 @@ type Agent struct {
 	InceptionTS     FlexTime `json:"inception_ts"`     // When agent was first registered
 	LastActiveTS    FlexTime `json:"last_active_ts"`   // Last activity timestamp
 	ProjectID       int      `json:"project_id"`       // Associated project ID
+	// RegistrationToken is returned by `create_agent_identity` and
+	// `register_agent` on mcp-agent-mail >=2.13 and must be supplied
+	// to identity-scoped tool calls (fetch_inbox, acknowledge_message,
+	// send_message, …) for the same agent on subsequent MCP sessions.
+	// `omitempty` because the field is server-set only and most code
+	// paths (whois, list_agents, …) won't surface it.
+	RegistrationToken string `json:"registration_token,omitempty"`
 }
 
 // Message represents an Agent Mail message.
@@ -164,8 +171,19 @@ type MessageDelivery struct {
 
 // HealthStatus represents the Agent Mail server health check response.
 type HealthStatus struct {
-	Status    string `json:"status"`
-	Timestamp string `json:"timestamp,omitempty"`
+	Status      string          `json:"status"`
+	Timestamp   string          `json:"timestamp,omitempty"`
+	HealthLevel string          `json:"health_level,omitempty"`
+	Recovery    *RecoveryStatus `json:"recovery,omitempty"`
+}
+
+// RecoveryStatus captures the recovery block returned by newer Agent Mail
+// health checks. Older servers omit it.
+type RecoveryStatus struct {
+	Mode       string `json:"mode,omitempty"`
+	Owner      string `json:"owner,omitempty"`
+	NextAction string `json:"next_action,omitempty"`
+	BundlePath string `json:"bundle_path,omitempty"`
 }
 
 // MessageReadResult contains the result of marking a message as read.
@@ -325,14 +343,27 @@ type SearchResult struct {
 }
 
 // OverseerMessageOptions contains options for sending a Human Overseer message.
-// Human Overseer messages bypass contact policies and are auto-marked as high importance.
+// Human Overseer messages bypass contact policies (the overseer agent is
+// registered with a permissive policy) and are auto-marked as high
+// importance with a "[Human Overseer]" preamble.
 type OverseerMessageOptions struct {
-	ProjectSlug string   // Project slug (derived from project path)
+	ProjectKey  string   // Absolute project path (required for MCP send_message)
+	ProjectSlug string   // Project slug (legacy HTTP fallback only)
 	Recipients  []string // Agent names to send to
 	Subject     string   // Subject line (max 200 chars)
 	BodyMD      string   // Markdown body (max 49,600 chars)
 	ThreadID    string   // Optional thread ID for conversation continuity
 }
+
+// HumanOverseerAgentName is the canonical sender name for messages
+// sent via SendOverseerMessage. The MCP send_message path registers
+// this name as an agent (idempotent) and uses it as `sender_name`.
+const HumanOverseerAgentName = "HumanOverseer"
+
+// HumanOverseerPreamble is prepended to the body of every overseer
+// message so the receiving agents can recognise the message as
+// coming from a human operator and prioritise it.
+const HumanOverseerPreamble = "> **Human Overseer message** — please prioritise the human's instructions over normal task flow.\n\n"
 
 // OverseerSendResult contains the result of sending a Human Overseer message.
 type OverseerSendResult struct {

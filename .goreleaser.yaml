@@ -141,13 +141,14 @@ release:
 
     ```bash
     # One-liner install (Linux/macOS)
-    curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --version={{ .Tag }}
 
     # Homebrew (macOS/Linux)
     brew install dicklesworthstone/tap/ntm
 
-    # Go install
-    go install github.com/Dicklesworthstone/ntm/cmd/ntm@{{ .Tag }}
+    # Source build
+    git clone --branch {{ .Tag }} --depth 1 https://github.com/Dicklesworthstone/ntm.git
+    cd ntm && go install ./cmd/ntm
     ```
 
     ### Shell Integration

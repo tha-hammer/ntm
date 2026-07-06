@@ -44,10 +44,70 @@ type Client struct {
 	projectKey  string // Cached project path
 	requestID   atomic.Int64
 
+	// Per-agent registration tokens. Server-side mcp-agent-mail >=2.13
+	// requires identity-scoped tool calls (fetch_inbox, send_message,
+	// acknowledge_message, …) to include the agent's `registration_token`
+	// in the call args. Tokens are returned by `create_agent_identity` /
+	// `register_agent` and we cache them here so callers don't have to
+	// thread the token through every call site. Keyed by
+	// `<project_key>\x1f<agent_name>` (\x1f is unit separator — safe
+	// because neither component contains it).
+	registrationTokensMu sync.RWMutex
+	registrationTokens   map[string]string
+
 	// Availability cache (30s TTL)
 	healthCheckMu      sync.Mutex
 	availableCache     atomic.Bool
 	availableCacheTime atomic.Int64 // Unix timestamp in seconds
+}
+
+// tokenKey builds the cache key for the registration-token map. Using
+// a unit-separator (\x1f) between components avoids any chance of
+// `project:agent` ambiguity from paths that happen to contain colons.
+func tokenKey(projectKey, agentName string) string {
+	return projectKey + "\x1f" + agentName
+}
+
+// SetRegistrationToken stores the registration token for an agent so
+// later identity-scoped MCP calls can include it. Callers that load
+// agent metadata from disk (e.g. agent_registry.json) should populate
+// the cache via this method at startup. Empty token clears the entry.
+func (c *Client) SetRegistrationToken(projectKey, agentName, token string) {
+	if c == nil {
+		return
+	}
+	c.registrationTokensMu.Lock()
+	defer c.registrationTokensMu.Unlock()
+	if c.registrationTokens == nil {
+		c.registrationTokens = make(map[string]string)
+	}
+	if token == "" {
+		delete(c.registrationTokens, tokenKey(projectKey, agentName))
+		return
+	}
+	c.registrationTokens[tokenKey(projectKey, agentName)] = token
+}
+
+// RegistrationToken returns the cached token for (project, agent), or
+// the empty string if none is known. Safe for nil receiver.
+func (c *Client) RegistrationToken(projectKey, agentName string) string {
+	if c == nil {
+		return ""
+	}
+	c.registrationTokensMu.RLock()
+	defer c.registrationTokensMu.RUnlock()
+	return c.registrationTokens[tokenKey(projectKey, agentName)]
+}
+
+// rememberRegistrationToken caches the token returned by an identity
+// creation / registration call so subsequent identity-scoped MCP calls
+// for the same agent can succeed without the caller threading the
+// token through.
+func (c *Client) rememberRegistrationToken(projectKey string, agent *Agent) {
+	if c == nil || agent == nil || agent.RegistrationToken == "" || agent.Name == "" {
+		return
+	}
+	c.SetRegistrationToken(projectKey, agent.Name, agent.RegistrationToken)
 }
 
 // Option configures the Client.

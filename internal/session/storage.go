@@ -15,6 +15,7 @@ import (
 
 const (
 	sessionDirName = "sessions"
+	archiveDirName = "archived"
 	fileExtension  = ".json"
 )
 
@@ -29,6 +30,13 @@ func StorageDir() string {
 		return filepath.Join(os.TempDir(), "ntm", sessionDirName)
 	}
 	return filepath.Join(ntmDir, sessionDirName)
+}
+
+// ArchiveDir returns the path to the archived-session storage directory
+// (~/.ntm/sessions/archived). Archiving moves a saved session here so it no
+// longer appears in the active `ntm sessions list` while remaining restorable.
+func ArchiveDir() string {
+	return filepath.Join(StorageDir(), archiveDirName)
 }
 
 // Save writes a session state to disk.
@@ -326,6 +334,179 @@ func sanitizeFilename(name string) string {
 		"|", "_",
 	)
 	return replacer.Replace(name)
+}
+
+// Archive moves a saved session from the active store into the archived store.
+// The session remains restorable via ListArchived/Unarchive but no longer
+// appears in List(). Returns the new archived file path.
+func Archive(name string) (archivedPath string, err error) {
+	unlock, err := acquireLock()
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+
+	name, err = normalizeSavedSessionName(name)
+	if err != nil {
+		return "", err
+	}
+
+	src := filepath.Join(StorageDir(), name+fileExtension)
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("no saved session named '%s'", name)
+		}
+		return "", err
+	}
+
+	archiveDir := ArchiveDir()
+	if err := os.MkdirAll(archiveDir, 0700); err != nil {
+		return "", fmt.Errorf("failed to create archive directory: %w", err)
+	}
+
+	dst := filepath.Join(archiveDir, name+fileExtension)
+	if _, err := os.Stat(dst); err == nil {
+		return "", fmt.Errorf("session '%s' is already archived", name)
+	}
+
+	if err := moveFile(src, dst); err != nil {
+		return "", fmt.Errorf("archiving session: %w", err)
+	}
+	return dst, nil
+}
+
+// Unarchive moves an archived session back into the active store, making it
+// appear in List() again. Returns the restored active file path.
+func Unarchive(name string) (restoredPath string, err error) {
+	unlock, err := acquireLock()
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+
+	name, err = normalizeSavedSessionName(name)
+	if err != nil {
+		return "", err
+	}
+
+	src := filepath.Join(ArchiveDir(), name+fileExtension)
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("no archived session named '%s'", name)
+		}
+		return "", err
+	}
+
+	dir := StorageDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("failed to create sessions directory: %w", err)
+	}
+
+	dst := filepath.Join(dir, name+fileExtension)
+	if _, err := os.Stat(dst); err == nil {
+		return "", fmt.Errorf("an active session named '%s' already exists", name)
+	}
+
+	if err := moveFile(src, dst); err != nil {
+		return "", fmt.Errorf("unarchiving session: %w", err)
+	}
+	return dst, nil
+}
+
+// ListArchived returns all archived saved sessions.
+func ListArchived() ([]SavedSession, error) {
+	unlock, err := acquireLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	dir := ArchiveDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []SavedSession{}, nil
+		}
+		return nil, fmt.Errorf("failed to read archive directory: %w", err)
+	}
+
+	var sessions []SavedSession
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), fileExtension) {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), fileExtension)
+		path := filepath.Join(dir, entry.Name())
+
+		state, err := loadFrom(path)
+		if err != nil {
+			continue // Skip corrupted files
+		}
+
+		info, _ := entry.Info()
+		var size int64
+		if info != nil {
+			size = info.Size()
+		}
+
+		sessions = append(sessions, SavedSession{
+			Name:      name,
+			SavedAt:   state.SavedAt,
+			WorkDir:   state.WorkDir,
+			Agents:    state.Agents.Total(),
+			GitBranch: state.GitBranch,
+			FilePath:  path,
+			FileSize:  size,
+		})
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].SavedAt.After(sessions[j].SavedAt)
+	})
+
+	return sessions, nil
+}
+
+// IsArchived reports whether an archived session with the given name exists.
+func IsArchived(name string) bool {
+	name, err := normalizeSavedSessionName(name)
+	if err != nil {
+		return false
+	}
+	path := filepath.Join(ArchiveDir(), name+fileExtension)
+	_, err = os.Stat(path)
+	return err == nil
+}
+
+// loadFrom reads and parses a session state file at an explicit path. Unlike
+// Load, it does not assume the file lives in the active StorageDir, so it works
+// for archived sessions too.
+func loadFrom(path string) (*SessionState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var parsed SessionState
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse session file: %w", err)
+	}
+	return &parsed, nil
+}
+
+// moveFile relocates a file from src to dst, falling back to copy+remove when
+// the two paths are on different filesystems (cross-device rename).
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := util.AtomicWriteFile(dst, data, 0600); err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 func normalizeSavedSessionName(name string) (string, error) {

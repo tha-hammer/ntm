@@ -740,6 +740,25 @@ func buildRobotSurfaceMetadata() map[string]robotSurfaceMetadata {
 		"profile-show": {
 			Sections: []string{"command_catalog"},
 		},
+		"safety-simulate": {
+			Sections: []string{"source_health", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Preflight command plans against the NTM safety policy without executing them",
+				SummaryHint: "Check safe_to_run and steps[].decision before running any proposed command",
+			},
+			ActionHandoff: &ActionHandoffInfo{
+				SupportsActions:   true,
+				ActionTypes:       []string{"remediation"},
+				RemediationFormat: "steps[].safer_alternatives lists safer replacements for unsafe commands",
+			},
+			RequestSemantics: &RequestSemantics{
+				SupportsIdempotency: true,
+			},
+			Explainability: &ExplainabilityInfo{
+				HasEvidenceSummary:   true,
+				EvidenceSummaryField: "steps[].policy",
+			},
+		},
 		"xf-search": {
 			Sections: []string{"events"},
 		},

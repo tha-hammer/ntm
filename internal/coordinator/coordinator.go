@@ -397,13 +397,19 @@ func (c *SessionCoordinator) updateAgentStates() {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	// defer c.mu.Unlock() // Removed defer to allow manual unlock before emitting events
 
 	// Track which panes we've seen
 	seenPanes := make(map[string]bool, len(agentPanes))
 	for _, pane := range agentPanes {
 		seenPanes[pane.Pane.ID] = true
 	}
+
+	type transitionEvent struct {
+		agent      *AgentState
+		prevStatus robot.AgentState
+	}
+	var transitions []transitionEvent
 
 	for _, update := range updates {
 		// Get or create agent state
@@ -426,9 +432,14 @@ func (c *SessionCoordinator) updateAgentStates() {
 		agent.LastActivity = state.LastActivity
 		agent.Healthy = state.Healthy
 
-		// Emit events for state transitions
+		// Track events for state transitions
 		if exists && prevStatus != agent.Status {
-			c.emitEvent(agent, prevStatus)
+			// Copy agent state for safe event emission outside lock
+			agentCopy := *agent
+			transitions = append(transitions, transitionEvent{
+				agent:      &agentCopy,
+				prevStatus: prevStatus,
+			})
 		}
 	}
 
@@ -440,6 +451,13 @@ func (c *SessionCoordinator) updateAgentStates() {
 	}
 
 	c.lastUpdate = time.Now()
+	c.mu.Unlock()
+
+	// Emit events outside the lock to prevent deadlocks if the event bus
+	// applies backpressure and blocks on the handler semaphore.
+	for _, transition := range transitions {
+		c.emitEvent(transition.agent, transition.prevStatus)
+	}
 }
 
 // emitEvent sends a coordinator event based on state transition.

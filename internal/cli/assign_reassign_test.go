@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -188,7 +189,7 @@ func TestRunReassignment_ToPane_Success(t *testing.T) {
 	assignVerbose = false
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -351,7 +352,7 @@ func TestRunReassignment_AlreadyAssigned(t *testing.T) {
 	assignPrompt = "noop"
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -398,7 +399,7 @@ func TestRunReassignment_NoIdleAgentForType(t *testing.T) {
 	assignForce = true
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -450,7 +451,7 @@ func TestRunReassignment_TargetBusyWithoutForce(t *testing.T) {
 	assignForce = false
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -489,7 +490,7 @@ func TestRunReassignment_NotAssigned(t *testing.T) {
 	assignForce = true
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -538,7 +539,7 @@ func TestRunReassignment_ToPaneNotFound(t *testing.T) {
 	assignForce = true
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -594,7 +595,7 @@ func TestRunReassignment_CompletedBead(t *testing.T) {
 	assignForce = true
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -658,7 +659,7 @@ func TestRunReassignment_FailedBead(t *testing.T) {
 	assignForce = true
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 
@@ -721,7 +722,7 @@ func TestRunReassignment_FileReservationsGracefulDegradation(t *testing.T) {
 	assignQuiet = true
 
 	output, err := captureStdout(t, func() error { return runReassignment(nil, sessionName) })
-	if err != nil {
+	if err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runReassignment failed: %v", err)
 	}
 

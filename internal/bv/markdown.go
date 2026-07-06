@@ -239,16 +239,18 @@ func renderHealthSummary(sb *strings.Builder, health *ProjectHealth) {
 type AgentType string
 
 const (
-	AgentClaude AgentType = "claude"
-	AgentCodex  AgentType = "codex"
-	AgentGemini AgentType = "gemini"
+	AgentClaude      AgentType = "claude"
+	AgentCodex       AgentType = "codex"
+	AgentGemini      AgentType = "gemini"
+	AgentAntigravity AgentType = "antigravity"
 )
 
 // AgentContextBudget defines context window sizes per agent type.
 var AgentContextBudget = map[AgentType]int{
-	AgentClaude: 180000, // Claude has large context
-	AgentCodex:  120000, // Codex has medium context
-	AgentGemini: 100000, // Gemini has smaller context
+	AgentClaude:      180000, // Claude has large context
+	AgentCodex:       120000, // Codex has medium context
+	AgentGemini:      100000, // Gemini has smaller context
+	AgentAntigravity: 100000, // Antigravity (Gemini successor): mirrors Gemini
 }
 
 // TriageFormat represents the output format for triage.
@@ -265,7 +267,7 @@ func PreferredFormat(agent AgentType) TriageFormat {
 	switch agent {
 	case AgentClaude:
 		return FormatJSON
-	case AgentCodex, AgentGemini:
+	case AgentCodex, AgentGemini, AgentAntigravity:
 		return FormatMarkdown
 	default:
 		return FormatJSON

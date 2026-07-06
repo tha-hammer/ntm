@@ -48,15 +48,17 @@ type SemanticPalette struct {
 	StatusDisabled lipgloss.Color // Disabled/unavailable
 
 	// Agent identifiers
-	AgentClaude   lipgloss.Color // Claude Code (purple)
-	AgentCodex    lipgloss.Color // OpenAI Codex (blue)
-	AgentGemini   lipgloss.Color // Google Gemini (yellow)
-	AgentCursor   lipgloss.Color // Cursor (teal)
-	AgentWindsurf lipgloss.Color // Windsurf (flamingo)
-	AgentAider    lipgloss.Color // Aider (peach)
-	AgentOllama   lipgloss.Color // Ollama (green)
-	AgentUser     lipgloss.Color // User pane (green)
-	AgentUnknown  lipgloss.Color // Unknown agent type
+	AgentClaude      lipgloss.Color // Claude Code (purple)
+	AgentCodex       lipgloss.Color // OpenAI Codex (blue)
+	AgentGemini      lipgloss.Color // Google Gemini (yellow)
+	AgentAntigravity lipgloss.Color // Antigravity / agy (lavender)
+	AgentCursor      lipgloss.Color // Cursor (teal)
+	AgentWindsurf    lipgloss.Color // Windsurf (flamingo)
+	AgentAider       lipgloss.Color // Aider (peach)
+	AgentOpencode    lipgloss.Color // Opencode (lavender)
+	AgentOllama      lipgloss.Color // Ollama (green)
+	AgentUser        lipgloss.Color // User pane (green)
+	AgentUnknown     lipgloss.Color // Unknown agent type
 
 	// Accent colors for gradients and highlights
 	Accent1 lipgloss.Color // Primary accent
@@ -119,15 +121,17 @@ func (t Theme) Semantic() SemanticPalette {
 		StatusDisabled: t.Overlay,
 
 		// Agents
-		AgentClaude:   t.Claude,
-		AgentCodex:    t.Codex,
-		AgentGemini:   t.Gemini,
-		AgentCursor:   t.Cursor,
-		AgentWindsurf: t.Windsurf,
-		AgentAider:    t.Aider,
-		AgentOllama:   t.Ollama,
-		AgentUser:     t.User,
-		AgentUnknown:  t.Overlay,
+		AgentClaude:      t.Claude,
+		AgentCodex:       t.Codex,
+		AgentGemini:      t.Gemini,
+		AgentAntigravity: t.Lavender,
+		AgentCursor:      t.Cursor,
+		AgentWindsurf:    t.Windsurf,
+		AgentAider:       t.Aider,
+		AgentOpencode:    t.Opencode,
+		AgentOllama:      t.Ollama,
+		AgentUser:        t.User,
+		AgentUnknown:     t.Overlay,
 
 		// Accents
 		Accent1: t.Blue,
@@ -165,12 +169,16 @@ func (p SemanticPalette) AgentColor(agentType string) lipgloss.Color {
 		return p.AgentCodex
 	case agent.AgentTypeGemini:
 		return p.AgentGemini
+	case agent.AgentTypeAntigravity:
+		return p.AgentAntigravity
 	case agent.AgentTypeCursor:
 		return p.AgentCursor
 	case agent.AgentTypeWindsurf:
 		return p.AgentWindsurf
 	case agent.AgentTypeAider:
 		return p.AgentAider
+	case agent.AgentTypeOpencode:
+		return p.AgentOpencode
 	case agent.AgentTypeOllama:
 		return p.AgentOllama
 	case agent.AgentTypeUser:

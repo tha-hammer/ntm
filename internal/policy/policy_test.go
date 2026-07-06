@@ -770,3 +770,72 @@ func TestRecentBlocked(t *testing.T) {
 		t.Errorf("expected nil for nonexistent, got %v", recent)
 	}
 }
+
+// bd-dqpo3: a single malformed pattern in one slice must not silently
+// disable every rule that follows it in the same slice.
+func TestCompile_MalformedPatternDoesNotDisableLaterRules(t *testing.T) {
+	p := &Policy{
+		Blocked: []Rule{
+			{Pattern: `(unclosed`, Reason: "bad regex"},
+			{Pattern: `git\s+reset\s+--hard`, Reason: "still must block hard reset"},
+		},
+	}
+	err := p.compile()
+	if err == nil {
+		t.Fatal("expected compile error for malformed pattern")
+	}
+	// The good rule must still have its regex set.
+	if p.Blocked[1].regex == nil {
+		t.Fatal("good rule (Blocked[1]) regex was nil — early-return killed it")
+	}
+	// And Check must still match the good rule.
+	if got := p.Check("git reset --hard HEAD~1"); got == nil || got.Action != ActionBlock {
+		t.Errorf("Check on good rule = %+v, want a block match", got)
+	}
+}
+
+func TestCompile_AllErrorsJoinedAcrossSlices(t *testing.T) {
+	p := &Policy{
+		Allowed:          []Rule{{Pattern: `(bad-allowed`}},
+		Blocked:          []Rule{{Pattern: `(bad-blocked`}},
+		ApprovalRequired: []Rule{{Pattern: `(bad-approval`}},
+	}
+	err := p.compile()
+	if err == nil {
+		t.Fatal("expected compile error for all three malformed patterns")
+	}
+	msg := err.Error()
+	for _, kind := range []string{"allowed", "blocked", "approval_required"} {
+		if !strings.Contains(msg, kind) {
+			t.Errorf("joined error missing %q category: %v", kind, err)
+		}
+	}
+}
+
+// bd-9iknu: recompiling after policy edits must not keep stale regex
+// from a previous successful compile when the new pattern is malformed.
+func TestCompile_RecompileMalformedPatternClearsStaleRegex(t *testing.T) {
+	p := &Policy{
+		Blocked: []Rule{
+			{Pattern: `git\s+reset\s+--hard`, Reason: "block hard reset"},
+		},
+	}
+	if err := p.compile(); err != nil {
+		t.Fatalf("initial compile failed: %v", err)
+	}
+	if p.Blocked[0].regex == nil {
+		t.Fatal("initial compile did not set regex")
+	}
+
+	// Mutate to malformed and recompile.
+	p.Blocked[0].Pattern = `(bad`
+	if err := p.compile(); err == nil {
+		t.Fatal("expected compile error after malformed pattern update")
+	}
+	if p.Blocked[0].regex != nil {
+		t.Fatal("stale regex survived malformed recompile; want nil")
+	}
+	if got := p.Check("git reset --hard HEAD~1"); got != nil {
+		t.Fatalf("Check matched using stale regex: %+v", got)
+	}
+}

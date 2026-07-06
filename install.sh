@@ -522,7 +522,7 @@ install_ntm() {
 
     if [ -z "$asset_name" ]; then
         print_error "No pre-built binary found for $platform"
-        print_info "You can build from source with: go install github.com/${REPO_OWNER}/${REPO_NAME}/cmd/${BIN_NAME}@latest"
+        print_info "You can build this version from source with: git clone --branch ${version} --depth 1 https://github.com/${REPO_OWNER}/${REPO_NAME}.git && cd ${REPO_NAME} && go install ./cmd/${BIN_NAME}"
         exit 1
     fi
 

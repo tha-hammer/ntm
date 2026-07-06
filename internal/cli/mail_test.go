@@ -486,11 +486,17 @@ func TestMailMarkRequiresSelector(t *testing.T) {
 }
 
 func TestMailMarkRequiresAgentOrEnv(t *testing.T) {
+	// isolateSessionAgentStorage sets HOME *and* XDG_CONFIG_HOME, which is
+	// required on macOS (os.UserConfigDir ignores XDG_CONFIG_HOME and uses
+	// $HOME/Library/Application Support). Without HOME isolation, this
+	// test would write/read session registries in the real user home and
+	// leak state into / out of other tests in the same package.
+	isolateSessionAgentStorage(t)
+
 	inbox := []agentmail.InboxMessage{}
 	stub := newMailStub(t, inbox)
 	defer stub.Close()
 
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
 
 	_, err := execCommand(t, "mail", "ack", "mysession", "5")
@@ -500,11 +506,16 @@ func TestMailMarkRequiresAgentOrEnv(t *testing.T) {
 }
 
 func TestMailAckUsesSavedSessionAgentWhenEnvMissing(t *testing.T) {
+	// Isolate HOME (and XDG_CONFIG_HOME) so the session agent we save
+	// here lands in a sandboxed Application Support dir on macOS. Without
+	// this the registry was leaking to ~/Library/Application Support and
+	// poisoning every later TestRunMail* test in the same package.
+	isolateSessionAgentStorage(t)
+
 	inbox := []agentmail.InboxMessage{}
 	stub := newMailStub(t, inbox)
 	defer stub.Close()
 
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
 
 	projectKey := GetProjectRoot()
@@ -566,11 +577,12 @@ func TestResolveMailAgentIdentityUsesCurrentPaneRegistryIdentity(t *testing.T) {
 }
 
 func TestMailAckUsesEnvAgent(t *testing.T) {
+	isolateSessionAgentStorage(t)
+
 	inbox := []agentmail.InboxMessage{}
 	stub := newMailStub(t, inbox)
 	defer stub.Close()
 
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
 	t.Setenv("AGENT_NAME", "EnvAgent")
 
@@ -628,6 +640,67 @@ func TestMailSendOverseer_RedactModeScrubsBodyAndSubject(t *testing.T) {
 	}
 	if strings.Contains(call.Subject, "hunter2hunter2") {
 		t.Fatalf("expected subject to be redacted, got %q", call.Subject)
+	}
+}
+
+// TestMailSend_PreparedRedactionRequiresExplicitSubject pins the
+// regression for the leak that fresh-eyes review uncovered: when the
+// body source is a prepared-redaction handle, the auto-derived
+// subject (truncateSubject(body, 60)) would otherwise dump up to 60
+// chars of the raw token into the audit log and the JSON envelope
+// whenever the configured redaction patterns failed to match the
+// caller's specific token shape. The send must refuse without an
+// explicit `--subject`.
+func TestMailSend_PreparedRedactionRequiresExplicitSubject(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	handle, err := stashPreparedRedaction("aVeryLongSecretValueThatShouldNotLeakIntoTheSubject", "[REDACTED]", nil)
+	if err != nil {
+		t.Fatalf("stash: %v", err)
+	}
+
+	out, execErr := execCommand(t, "mail", "send", "mysession", "--to", "BlueLake", "--prepared-redaction", handle)
+	if execErr == nil {
+		t.Fatalf("expected refusal when --subject is missing; got out=%q", out)
+	}
+	if !strings.Contains(execErr.Error(), "explicit --subject") {
+		t.Fatalf("expected error to mention explicit --subject, got %q", execErr.Error())
+	}
+
+	gotRaw, _, _, err := consumePreparedRedaction(handle)
+	if err != nil {
+		t.Fatalf("missing-subject refusal should leave handle reusable, got consume error: %v", err)
+	}
+	if gotRaw != "aVeryLongSecretValueThatShouldNotLeakIntoTheSubject" {
+		t.Fatalf("unexpected raw handle body after refusal: %q", gotRaw)
+	}
+}
+
+func TestMailSend_LocalFlagsDoNotLeakBetweenExecutions(t *testing.T) {
+	stub := newMailStub(t, nil)
+	defer stub.Close()
+
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+	if _, err := execCommand(t, "mail", "send", "mysession", "--to", "BlueLake", "--subject", "prior subject", "ordinary body"); err != nil {
+		t.Fatalf("seed send: %v", err)
+	}
+
+	handle, err := stashPreparedRedaction("freshSecretBody", "[REDACTED]", nil)
+	if err != nil {
+		t.Fatalf("stash: %v", err)
+	}
+
+	out, execErr := execCommand(t, "mail", "send", "mysession", "--to", "BlueLake", "--prepared-redaction", handle)
+	if execErr == nil {
+		t.Fatalf("expected missing explicit subject to fail; out=%q", out)
+	}
+	if !strings.Contains(execErr.Error(), "explicit --subject") {
+		t.Fatalf("expected explicit subject error, got %v", execErr)
 	}
 }
 
@@ -773,7 +846,9 @@ func TestMailAckWithAllSkipsMessagesWithoutAckRequirement(t *testing.T) {
 
 func TestRunUnlockErrorsOnZeroSpecificRelease(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	// HOME isolation is required on macOS so the saved session registry
+	// does not leak into other tests that look up "unlock-zero".
+	isolateSessionAgentStorage(t)
 
 	projectKey := GetProjectRoot()
 	session := "unlock-zero"
@@ -786,7 +861,7 @@ func TestRunUnlockErrorsOnZeroSpecificRelease(t *testing.T) {
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
 
-	err := runUnlock(session, []string{"internal/cli/*.go"}, false)
+	err := runUnlock(session, []string{"internal/cli/*.go"}, false, -1, "")
 	if err == nil {
 		t.Fatal("expected unlock to fail when no requested reservations were released")
 	}
@@ -803,7 +878,7 @@ func TestRunUnlockErrorsOnZeroSpecificRelease(t *testing.T) {
 
 func TestRunRenewLocksUsesProjectRootFromSubdir(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
 	projectKey := GetProjectRoot()
 	session := "renew-root"
@@ -830,7 +905,7 @@ func TestRunRenewLocksUsesProjectRootFromSubdir(t *testing.T) {
 
 func TestRunRenewLocksErrorsOnZeroRenewed(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
 	projectKey := GetProjectRoot()
 	session := "renew-zero"
@@ -901,12 +976,16 @@ func TestMailReadUsesProjectRootFromSubdir(t *testing.T) {
 }
 
 func TestRunMailInboxUsesSessionProjectDir(t *testing.T) {
+	// Isolate session-agent storage so stale registries written by other
+	// tests under HOME (or macOS Application Support) cannot leak in and
+	// flip projectKey to a high-scoring git repo like /Users/runner/work.
+	isolateSessionAgentStorage(t)
 	stub := newMailStub(t, []agentmail.InboxMessage{
 		{ID: 11, Subject: "Scoped inbox", From: "BlueLake", CreatedTS: agentmail.FlexTime{Time: time.Now()}},
 	})
 	defer stub.Close()
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -917,7 +996,7 @@ func TestRunMailInboxUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	cmd := &cobra.Command{}
 	var out bytes.Buffer
@@ -980,10 +1059,11 @@ func TestRunMailInboxSanitizesDisplayFields(t *testing.T) {
 }
 
 func TestRunMailMarkUsesSessionProjectDir(t *testing.T) {
+	isolateSessionAgentStorage(t)
 	stub := newMailStub(t, nil)
 	defer stub.Close()
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -994,7 +1074,7 @@ func TestRunMailMarkUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	cmd := &cobra.Command{}
 	var out bytes.Buffer
@@ -1010,10 +1090,11 @@ func TestRunMailMarkUsesSessionProjectDir(t *testing.T) {
 }
 
 func TestRunMailSendOverseerUsesSessionProjectDir(t *testing.T) {
+	isolateSessionAgentStorage(t)
 	stub := newMailStub(t, nil)
 	defer stub.Close()
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1024,7 +1105,7 @@ func TestRunMailSendOverseerUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	cmd := &cobra.Command{}
 	var out bytes.Buffer
@@ -1034,8 +1115,18 @@ func TestRunMailSendOverseerUsesSessionProjectDir(t *testing.T) {
 	if err := runMailSendOverseer(cmd, "mysession", []string{"BlueLake"}, "Subject", "Body", "", false); err != nil {
 		t.Fatalf("runMailSendOverseer() error = %v", err)
 	}
-	if len(stub.ensureProjectKeys) != 1 || stub.ensureProjectKeys[0] != projectKey {
-		t.Fatalf("expected ensure_project for %q, got %v", projectKey, stub.ensureProjectKeys)
+	// SendOverseerMessage's MCP path now calls ensure_project defensively
+	// in addition to the caller (mail.go's runMailSendOverseer already
+	// calls EnsureProject before SendOverseerMessage). Calls are
+	// idempotent server-side, so accept >= 1 call all targeting the
+	// resolved session project dir (ntm#146).
+	if len(stub.ensureProjectKeys) < 1 {
+		t.Fatalf("expected at least one ensure_project for %q, got %v", projectKey, stub.ensureProjectKeys)
+	}
+	for i, got := range stub.ensureProjectKeys {
+		if got != projectKey {
+			t.Fatalf("ensure_project call %d = %q, want %q (full list: %v)", i, got, projectKey, stub.ensureProjectKeys)
+		}
 	}
 }
 
@@ -1050,6 +1141,11 @@ func TestResolveAgentMailProjectKeyRejectsInvalidSessionName(t *testing.T) {
 }
 
 func TestResolveAgentMailProjectKeyWithPreferenceUsesCWDForInferredSession(t *testing.T) {
+	// Isolate HOME so macOS Application Support session registries from
+	// other tests don't leak in (XDG_CONFIG_HOME alone is not honored by
+	// os.UserConfigDir on macOS).
+	isolateSessionAgentStorage(t)
+
 	origCfg := cfg
 	origDir, _ := os.Getwd()
 	t.Cleanup(func() {
@@ -1059,13 +1155,13 @@ func TestResolveAgentMailProjectKeyWithPreferenceUsesCWDForInferredSession(t *te
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	configProject := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(configProject, 0o755); err != nil {
 		t.Fatalf("mkdir configured project: %v", err)
 	}
 
-	cwdRepo := t.TempDir()
+	cwdRepo := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(cwdRepo, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir cwd repo: %v", err)
 	}
@@ -1085,6 +1181,10 @@ func TestResolveAgentMailProjectKeyWithPreferenceUsesCWDForInferredSession(t *te
 }
 
 func TestResolveAgentMailProjectKeyUsesSavedSessionAgentProjectKey(t *testing.T) {
+	// HOME isolation (not just XDG_CONFIG_HOME) so saved session registries
+	// land in a sandboxed location on macOS too.
+	isolateSessionAgentStorage(t)
+
 	origCfg := cfg
 	origDir, _ := os.Getwd()
 	t.Cleanup(func() {
@@ -1093,18 +1193,17 @@ func TestResolveAgentMailProjectKeyUsesSavedSessionAgentProjectKey(t *testing.T)
 			t.Errorf("restore working directory: %v", err)
 		}
 	})
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
-	cwdDir := t.TempDir()
+	cwdDir := canonicalTempDir(t)
 	if err := os.Chdir(cwdDir); err != nil {
 		t.Fatalf("chdir cwd: %v", err)
 	}
 
 	session := "mysession"
-	actualProject := filepath.Join(t.TempDir(), "actual-project")
+	actualProject := filepath.Join(canonicalTempDir(t), "actual-project")
 	if err := os.MkdirAll(actualProject, 0o755); err != nil {
 		t.Fatalf("mkdir actual project: %v", err)
 	}
@@ -1326,9 +1425,9 @@ func TestResolveAgentMailCommandScopeFallsBackToCurrentProjectRootForExplicitSes
 		_ = os.Chdir(origWd)
 	})
 
-	cfg = &config.Config{ProjectsBase: t.TempDir()}
+	cfg = &config.Config{ProjectsBase: canonicalTempDir(t)}
 
-	projectRoot := t.TempDir()
+	projectRoot := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(projectRoot, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir project root git: %v", err)
 	}
@@ -1402,9 +1501,9 @@ func TestRefineAgentMailProjectKeyIgnoresUnusableSavedProject(t *testing.T) {
 
 func TestRunLockUsesSessionProjectDir(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1422,7 +1521,7 @@ func TestRunLockUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	if err := runLock(session, []string{"internal/**/*.go"}, "scope test", "1h", false); err != nil {
 		t.Fatalf("runLock: %v", err)
@@ -1437,9 +1536,9 @@ func TestRunLockUsesSessionProjectDir(t *testing.T) {
 
 func TestRunLocksUsesSessionProjectDir(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1457,7 +1556,7 @@ func TestRunLocksUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	if err := runLocks(session, false); err != nil {
 		t.Fatalf("runLocks: %v", err)
@@ -1472,9 +1571,9 @@ func TestRunLocksUsesSessionProjectDir(t *testing.T) {
 
 func TestRunLocksRequiresSessionAgentUnlessAllAgents(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1488,7 +1587,7 @@ func TestRunLocksRequiresSessionAgentUnlessAllAgents(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	err := runLocks("mysession", false)
 	if err == nil {
@@ -1504,9 +1603,9 @@ func TestRunLocksRequiresSessionAgentUnlessAllAgents(t *testing.T) {
 
 func TestRunUnlockUsesSessionProjectDir(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1524,9 +1623,9 @@ func TestRunUnlockUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
-	if err := runUnlock(session, []string{"internal/cli/*.go"}, false); err != nil {
+	if err := runUnlock(session, []string{"internal/cli/*.go"}, false, -1, ""); err != nil {
 		t.Fatalf("runUnlock: %v", err)
 	}
 	if len(stub.releaseCalls) != 1 {
@@ -1539,15 +1638,15 @@ func TestRunUnlockUsesSessionProjectDir(t *testing.T) {
 
 func TestRunUnlockUsesSavedSessionAgentIdentityAndProjectKey(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	configuredProject := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(configuredProject, 0o755); err != nil {
 		t.Fatalf("mkdir configured project: %v", err)
 	}
 
-	actualProject := t.TempDir()
+	actualProject := canonicalTempDir(t)
 	session := "mysession"
 	saveSessionAgentForTest(t, session, actualProject, "GreenCastle")
 
@@ -1559,9 +1658,9 @@ func TestRunUnlockUsesSavedSessionAgentIdentityAndProjectKey(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
-	if err := runUnlock(session, []string{"internal/cli/*.go"}, false); err != nil {
+	if err := runUnlock(session, []string{"internal/cli/*.go"}, false, -1, ""); err != nil {
 		t.Fatalf("runUnlock: %v", err)
 	}
 	if len(stub.releaseCalls) != 1 {
@@ -1577,9 +1676,9 @@ func TestRunUnlockUsesSavedSessionAgentIdentityAndProjectKey(t *testing.T) {
 
 func TestRunForceReleaseUsesSessionProjectDir(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1597,7 +1696,7 @@ func TestRunForceReleaseUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	if err := runForceRelease(session, 42, "stale", true, true); err != nil {
 		t.Fatalf("runForceRelease: %v", err)
@@ -1612,9 +1711,9 @@ func TestRunForceReleaseUsesSessionProjectDir(t *testing.T) {
 
 func TestRunRenewLocksUsesSessionProjectDir(t *testing.T) {
 	resetFlags()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateSessionAgentStorage(t)
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	projectKey := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(projectKey, 0755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
@@ -1632,7 +1731,7 @@ func TestRunRenewLocksUsesSessionProjectDir(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
-	t.Chdir(t.TempDir())
+	t.Chdir(canonicalTempDir(t))
 
 	if err := runRenewLocks(session, 30); err != nil {
 		t.Fatalf("runRenewLocks: %v", err)

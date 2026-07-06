@@ -96,6 +96,10 @@ More text after conflict.`,
 }
 
 func TestResolveGitAgentMailProjectKeyUsesSavedSessionAgentProjectKey(t *testing.T) {
+	// HOME isolation so the saved session registry lands in a sandbox on
+	// macOS (and does not leak into other tests).
+	isolateSessionAgentStorage(t)
+
 	origCfg := cfg
 	origDir, _ := os.Getwd()
 	t.Cleanup(func() {
@@ -105,7 +109,7 @@ func TestResolveGitAgentMailProjectKeyUsesSavedSessionAgentProjectKey(t *testing
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
 	workDir := filepath.Join(projectsBase, "mysession")
@@ -113,12 +117,12 @@ func TestResolveGitAgentMailProjectKeyUsesSavedSessionAgentProjectKey(t *testing
 		t.Fatalf("mkdir work dir: %v", err)
 	}
 
-	cwdDir := t.TempDir()
+	cwdDir := canonicalTempDir(t)
 	if err := os.Chdir(cwdDir); err != nil {
 		t.Fatalf("chdir cwd: %v", err)
 	}
 
-	actualProject := filepath.Join(t.TempDir(), "actual-project")
+	actualProject := filepath.Join(canonicalTempDir(t), "actual-project")
 	if err := os.MkdirAll(filepath.Join(actualProject, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir actual project git dir: %v", err)
 	}
@@ -131,6 +135,8 @@ func TestResolveGitAgentMailProjectKeyUsesSavedSessionAgentProjectKey(t *testing
 }
 
 func TestResolveGitProjectDirUsesSavedSessionAgentProjectKey(t *testing.T) {
+	isolateSessionAgentStorage(t)
+
 	origCfg := cfg
 	origDir, _ := os.Getwd()
 	t.Cleanup(func() {
@@ -140,7 +146,7 @@ func TestResolveGitProjectDirUsesSavedSessionAgentProjectKey(t *testing.T) {
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
 	configuredDir := filepath.Join(projectsBase, "mysession")
@@ -148,12 +154,12 @@ func TestResolveGitProjectDirUsesSavedSessionAgentProjectKey(t *testing.T) {
 		t.Fatalf("mkdir configured dir: %v", err)
 	}
 
-	cwdDir := t.TempDir()
+	cwdDir := canonicalTempDir(t)
 	if err := os.Chdir(cwdDir); err != nil {
 		t.Fatalf("chdir cwd: %v", err)
 	}
 
-	actualProject := filepath.Join(t.TempDir(), "actual-project")
+	actualProject := filepath.Join(canonicalTempDir(t), "actual-project")
 	if err := os.MkdirAll(filepath.Join(actualProject, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir actual project git dir: %v", err)
 	}

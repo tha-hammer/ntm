@@ -12,7 +12,7 @@ permissions:
   attestations: write   # For artifact attestations
 
 env:
-  GO_VERSION: "1.25"
+  GO_VERSION: "1.26.3"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -333,13 +333,14 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
           echo "# Quick install" >> $GITHUB_STEP_SUMMARY
-          echo "curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash" >> $GITHUB_STEP_SUMMARY
+          echo "curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --version=${{ steps.release.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "# Homebrew" >> $GITHUB_STEP_SUMMARY
           echo "brew install dicklesworthstone/tap/ntm" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "# Go install" >> $GITHUB_STEP_SUMMARY
-          echo "go install github.com/Dicklesworthstone/ntm/cmd/ntm@${{ steps.release.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "# Source build" >> $GITHUB_STEP_SUMMARY
+          echo "git clone --branch ${{ steps.release.outputs.tag }} --depth 1 https://github.com/Dicklesworthstone/ntm.git" >> $GITHUB_STEP_SUMMARY
+          echo "cd ntm && go install ./cmd/ntm" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## Verification" >> $GITHUB_STEP_SUMMARY

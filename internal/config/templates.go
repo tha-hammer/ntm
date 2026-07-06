@@ -24,6 +24,11 @@ type AgentTemplateVars struct {
 	SystemPrompt     string // System prompt content (if any)
 	SystemPromptFile string // Path to system prompt file (if any)
 	PersonaName      string // Name of persona (if any)
+	// ReasoningEffort sets the model's reasoning budget. Currently
+	// consumed by the Codex template (passes `-c
+	// model_reasoning_effort=...`). Empty falls back to the
+	// template-level default. See ntm#140.
+	ReasoningEffort string
 }
 
 // ShellQuote safely quotes a string for use in shell commands.
@@ -224,12 +229,36 @@ func IsTemplateCommand(cmd string) bool {
 // System prompt injection is supported via SystemPromptFile for persona agents.
 func DefaultAgentTemplates() AgentConfig {
 	return AgentConfig{
-		Claude:   `{{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,
-		Codex:    `{{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT="$(cat {{shellQuote .SystemPromptFile}})" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "gpt-5.3-codex")}} -c model_reasoning_effort="xhigh" -c model_reasoning_summary_format=experimental --search`,
-		Gemini:   `gemini{{if .Model}} --model {{shellQuote .Model}}{{end}} --yolo`,
-		Ollama:   `ollama run {{shellQuote (.Model | default "codellama:latest")}}`,
-		Cursor:   `cursor{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
-		Windsurf: `windsurf{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
-		Aider:    `aider{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		Claude: `{{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .ReasoningEffort}} --effort {{shellQuote .ReasoningEffort}}{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,
+		Codex:  `{{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT="$(cat {{shellQuote .SystemPromptFile}})" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "gpt-5.5")}} -c model_reasoning_effort={{shellQuote (.ReasoningEffort | default "xhigh")}} -c model_reasoning_summary_format=experimental --search`,
+		Gemini: `gemini{{if .Model}} --model {{shellQuote .Model}}{{end}} --yolo`,
+		// Antigravity (agy): the model is hard-pinned to "Gemini 3.1 Pro (High)"
+		// by ResolveModel, so --model is always injected. --dangerously-skip-permissions
+		// is agy's autonomous (auto-approve) flag — the equivalent of gemini's --yolo —
+		// which the dcg agy guard (F5) backstops.
+		Antigravity: `agy --model {{shellQuote .Model}} --dangerously-skip-permissions`,
+		Ollama:      `ollama run {{shellQuote (.Model | default "codellama:latest")}}`,
+		Cursor:      `cursor{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		Windsurf:    `windsurf{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		Aider:       `aider{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		// Opencode (oc): the upstream `opencode` binary takes `-m/--model
+		// provider/model`. Without the {{.Model}} placeholder a
+		// `--oc=N:provider/model` spawn is rejected ("agent command has no
+		// template syntax") and Agent Mail registration fails ("model cannot
+		// be empty"). NOTE: `--variant` (reasoning effort) is NOT a flag on the
+		// root `opencode` TUI command an interactive pane launches — it exists
+		// only on the `opencode run` subcommand (anomalyco/opencode#7354, PR
+		// #7358 still open/unmerged), so injecting it here would make the pane
+		// fail to launch whenever an effort is supplied. See ntm#116, ntm#193.
+		Opencode: DefaultOpencodeCommand,
 	}
 }
+
+// DefaultOpencodeCommand is the launch command used when [agents] oc is not
+// configured. It mirrors DefaultAgentTemplates().Opencode so that the spawn,
+// add, and restart dispatch paths inject the model the same way a freshly
+// generated config does. Only `--model` is injected: it is the lone
+// model/reasoning flag the root `opencode` TUI command accepts (the
+// `--variant` effort flag lives on the `opencode run` subcommand only — see
+// the note in DefaultAgentTemplates). See ntm#193.
+const DefaultOpencodeCommand = `opencode{{if .Model}} --model {{shellQuote .Model}}{{end}}`

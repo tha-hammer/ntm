@@ -201,6 +201,21 @@ func (d *CompletionDetector) checkAll(ctx context.Context, events chan<- Complet
 		return
 	}
 
+	// Reload the store from disk before scanning. The detector is handed the
+	// watch loop's store instance at construction, but post-startup dispatches
+	// are recorded by a SEPARATE store instance in
+	// internal/cli/assign.go::executeAssignmentsEnhanced (which does its own
+	// LoadStore + Assign + Save). Without reloading, the detector's in-memory
+	// view is frozen at startup: it never observes anything dispatched later,
+	// so it never marks those beads completed and never releases their panes —
+	// stale `assigned` records pile up and permanently mark every pane busy,
+	// killing the autonomous loop after ~(pane count) dispatches. Reloading
+	// here makes each tick observe the current on-disk assignment state. A
+	// reload failure is non-fatal — fall back to the existing in-memory view.
+	if err := d.Store.Load(); err != nil {
+		slog.Warn("completion detector failed to reload assignment store; using in-memory view", "session", d.Session, "error", err)
+	}
+
 	assignments := d.Store.ListActive()
 	for _, a := range assignments {
 		select {
@@ -314,21 +329,53 @@ func (d *CompletionDetector) checkAssignment(ctx context.Context, a *assignment.
 		}
 	}
 
-	// 5. Check for completion patterns
+	// 5. Check for completion patterns — but ONLY as a SUCCESS when an
+	// authoritative bead-closed check confirms it. The completion patterns
+	// (e.g. `br\s+close`) also match the dispatch prompt's OWN ECHO: the
+	// prompt text tells the agent to run `br close <id>`, so a crashed or slow
+	// agent whose pane still shows the un-acted-on prompt would otherwise be
+	// declared complete — silently dropping its work and (because completed
+	// beads are suppressed from re-dispatch) stranding the bead forever. We
+	// require br to report the bead actually closed before trusting the
+	// pattern. When br is unavailable we cannot confirm, so we do NOT mark a
+	// pattern-only match complete (a false completion is far worse than a
+	// late one — the bead keeps getting watched and eventually times out).
 	if d.matchCompletionPatterns(output) {
-		return &CompletionEvent{
-			Pane:      a.Pane,
-			AgentType: a.AgentType,
-			BeadID:    a.BeadID,
-			Method:    MethodPatternMatch,
-			Timestamp: time.Now(),
-			Duration:  time.Since(startTime),
-			Output:    truncateOutput(output, 500),
+		if d.isBrAvailable() {
+			if closed, err := d.checkBeadClosed(ctx, a.BeadID); err == nil && closed {
+				return &CompletionEvent{
+					Pane:      a.Pane,
+					AgentType: a.AgentType,
+					BeadID:    a.BeadID,
+					Method:    MethodPatternMatch,
+					Timestamp: time.Now(),
+					Duration:  time.Since(startTime),
+					Output:    truncateOutput(output, 500),
+				}
+			}
 		}
+		// Pattern matched but the bead is not (yet) closed: treat as not-done.
+		// This is the prompt-echo case — keep watching rather than completing.
 	}
 
-	// 6. Check idle detection
+	// 6. Check idle detection. An idle/stalled timeout is NOT a success: it
+	// means the agent stopped producing output. If its bead is genuinely
+	// closed, step 2 (or step 5) would already have reported a success this
+	// tick, so reaching here with an idle timeout means the work is NOT done.
+	// Re-confirm against br to be safe (the bead may have closed between the
+	// step-2 check and now), then report FAILED so the pane is released and
+	// the bead can be reassigned instead of being silently marked complete.
 	if event := d.checkIdle(a, output, startTime); event != nil {
+		if d.isBrAvailable() {
+			if closed, err := d.checkBeadClosed(ctx, a.BeadID); err == nil && closed {
+				event.Method = MethodBeadClosed
+				event.IsFailed = false
+				event.FailReason = ""
+				return event
+			}
+		}
+		event.IsFailed = true
+		event.FailReason = fmt.Sprintf("agent idle for %s with bead %s still open (stalled or crashed)", d.Config.IdleThreshold, a.BeadID)
 		return event
 	}
 

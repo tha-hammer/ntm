@@ -65,40 +65,99 @@ func normalizeWriterSessionName(sessionName string) (string, error) {
 	return sessionName, nil
 }
 
+// ensureNoSymlinkComponents rejects paths whose canonical form differs
+// from the lexical absolute form anywhere except a known macOS-style
+// system-level prefix (e.g. /var → /private/var, /tmp → /private/tmp).
+//
+// Why this shape: the original implementation lstat'd every component
+// from "/" downward and refused any symlink it saw. That was correct
+// on Linux but unsound on macOS, where /var and /tmp are themselves
+// symlinks to /private/var and /private/tmp respectively — every
+// tempdir used by the tests would (and did) fail the check.
+//
+// The replacement compares the canonical form of `absPath` against the
+// path itself: any in-tree symlink (e.g. .ntm/handoffs/linked pointing
+// at /etc) causes the canonical to diverge below the system-level
+// prefix and the call rejects. macOS's /var ↔ /private/var (and
+// /tmp, /etc) substitutions are the only divergences we tolerate.
 func ensureNoSymlinkComponents(path string) error {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
 	}
+	absPath = filepath.Clean(absPath)
 
-	volume := filepath.VolumeName(absPath)
-	remainder := strings.TrimPrefix(absPath, volume)
+	canonical, err := canonicalPath(absPath)
+	if err != nil {
+		return err
+	}
+	canonical = filepath.Clean(canonical)
+
+	if canonical == absPath {
+		return nil
+	}
+
+	// macOS rewrites a leading /var, /tmp, or /etc to /private/var,
+	// /private/tmp, /private/etc. Recognise that exact substitution
+	// (in either direction) and accept the canonicalisation; anything
+	// else is project-controlled and must be rejected.
 	sep := string(filepath.Separator)
-	remainder = strings.TrimPrefix(remainder, sep)
-
-	current := volume + sep
-	if current == "" {
-		current = sep
+	systemPrefixes := []string{sep + "var", sep + "tmp", sep + "etc"}
+	for _, p := range systemPrefixes {
+		privatePrefix := sep + "private" + p
+		// absPath uses raw prefix, canonical uses /private + prefix.
+		if (absPath == p || strings.HasPrefix(absPath, p+sep)) &&
+			canonical == privatePrefix+strings.TrimPrefix(absPath, p) {
+			return nil
+		}
+		// absPath uses canonical prefix, canonical uses raw — the
+		// reverse case (the supplied path was already canonical and
+		// EvalSymlinks returned the same thing or a raw-prefix
+		// equivalent). Kept for symmetry; not expected in practice.
+		if (absPath == privatePrefix || strings.HasPrefix(absPath, privatePrefix+sep)) &&
+			canonical == p+strings.TrimPrefix(absPath, privatePrefix) {
+			return nil
+		}
 	}
 
-	for _, part := range strings.Split(remainder, sep) {
-		if part == "" || part == "." {
-			continue
-		}
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
+	// Report the divergence at the raw side so the error names
+	// something the caller actually passed in.
+	return fmt.Errorf("path %s traverses symlinked component %s", path, absPath)
+}
+
+// canonicalPath resolves all symlinks in absPath. If part of the path
+// does not yet exist, it canonicalises the deepest existing ancestor
+// and re-attaches the missing tail. Returns absPath unchanged if no
+// part of the path exists.
+func canonicalPath(absPath string) (string, error) {
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+		return resolved, nil
+	}
+	dir := absPath
+	missing := ""
+	for {
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err == nil {
+			if missing == "" {
+				return resolved, nil
 			}
-			return fmt.Errorf("lstat %s: %w", current, err)
+			return filepath.Join(resolved, missing), nil
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("path %s traverses symlinked component %s", path, current)
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("eval symlinks %s: %w", dir, err)
 		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return absPath, nil
+		}
+		base := filepath.Base(dir)
+		if missing == "" {
+			missing = base
+		} else {
+			missing = filepath.Join(base, missing)
+		}
+		dir = parent
 	}
-
-	return nil
 }
 
 func ensureSafeDir(path string) error {
@@ -674,13 +733,17 @@ func sanitizeDescription(desc string) string {
 
 // truncateLog truncates a string for logging purposes.
 func truncateLog(s string, max int) string {
-	if len(s) <= max {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
 	if max <= 3 {
 		return "" // Can't fit any content + "..."
 	}
-	return s[:max-3] + "..."
+	return string(runes[:max-3]) + "..."
 }
 
 // Delete removes a specific handoff file.

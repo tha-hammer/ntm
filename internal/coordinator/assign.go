@@ -512,8 +512,8 @@ func computeAgentTypeBonus(agentType string, rec *bv.TriageRecommendation) float
 		} else if taskComplexity >= 0.7 {
 			return -0.1 // Penalty for complex tasks
 		}
-	case agent.AgentTypeGemini:
-		// Gemini is balanced
+	case agent.AgentTypeGemini, agent.AgentTypeAntigravity:
+		// Gemini (and its successor Antigravity) are balanced
 		if taskComplexity >= 0.4 && taskComplexity <= 0.6 {
 			return 0.05 // Small bonus for medium complexity
 		}
@@ -995,9 +995,21 @@ func applyStrategySelection(
 
 // selectGreedy picks assignments greedily by score (fastest).
 func selectGreedy(pairs []scoredPair, numAgents, numBeads int) []scoredPair {
-	// Sort by score descending
-	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].score > pairs[j].score
+	// Sort by score descending with deterministic tie-breakers
+	sort.SliceStable(pairs, func(i, j int) bool {
+		if pairs[i].score != pairs[j].score {
+			return pairs[i].score > pairs[j].score
+		}
+		// Tie-breaker 1: Priority (lower is higher priority)
+		if pairs[i].bead.Priority != pairs[j].bead.Priority {
+			return pairs[i].bead.Priority < pairs[j].bead.Priority
+		}
+		// Tie-breaker 2: Bead ID
+		if pairs[i].bead.ID != pairs[j].bead.ID {
+			return pairs[i].bead.ID < pairs[j].bead.ID
+		}
+		// Tie-breaker 3: Agent Pane ID
+		return pairs[i].agent.PaneID < pairs[j].agent.PaneID
 	})
 
 	var selected []scoredPair
@@ -1105,41 +1117,38 @@ func selectBalanced(pairs []scoredPair, numAgents, numBeads int) []scoredPair {
 
 // selectQuality picks the highest-scoring agent for each task.
 func selectQuality(pairs []scoredPair, numAgents, numBeads int) []scoredPair {
-	// Group by bead, find best agent for each
-	beadBestAgent := make(map[string]scoredPair)
-
-	for _, p := range pairs {
-		existing, exists := beadBestAgent[p.bead.ID]
-		if !exists || p.score > existing.score {
-			beadBestAgent[p.bead.ID] = p
+	// Sort all pairs by score descending, with deterministic tie-breakers
+	sort.SliceStable(pairs, func(i, j int) bool {
+		if pairs[i].score != pairs[j].score {
+			return pairs[i].score > pairs[j].score
 		}
-	}
-
-	// Collect all best matches
-	var bestMatches []scoredPair
-	for _, p := range beadBestAgent {
-		bestMatches = append(bestMatches, p)
-	}
-
-	// Sort by score descending
-	sort.Slice(bestMatches, func(i, j int) bool {
-		return bestMatches[i].score > bestMatches[j].score
+		// Tie-breaker 1: Priority (lower is higher priority)
+		if pairs[i].bead.Priority != pairs[j].bead.Priority {
+			return pairs[i].bead.Priority < pairs[j].bead.Priority
+		}
+		// Tie-breaker 2: Bead ID
+		if pairs[i].bead.ID != pairs[j].bead.ID {
+			return pairs[i].bead.ID < pairs[j].bead.ID
+		}
+		// Tie-breaker 3: Agent Pane ID
+		return pairs[i].agent.PaneID < pairs[j].agent.PaneID
 	})
 
-	// Select ensuring no agent duplication
+	// Select ensuring no agent or bead duplication
 	var selected []scoredPair
 	assignedAgents := make(map[string]bool)
+	assignedBeads := make(map[string]bool)
 
-	for _, p := range bestMatches {
-		if assignedAgents[p.agent.PaneID] {
-			// Find next best agent for this bead
+	for _, p := range pairs {
+		if assignedAgents[p.agent.PaneID] || assignedBeads[p.bead.ID] {
 			continue
 		}
 
 		selected = append(selected, p)
 		assignedAgents[p.agent.PaneID] = true
+		assignedBeads[p.bead.ID] = true
 
-		if len(selected) >= numAgents {
+		if len(selected) >= numAgents || len(selected) >= numBeads {
 			break
 		}
 	}
@@ -1149,8 +1158,8 @@ func selectQuality(pairs []scoredPair, numAgents, numBeads int) []scoredPair {
 
 // selectDependency prioritizes blockers and critical path items.
 func selectDependency(pairs []scoredPair, numAgents, numBeads int) []scoredPair {
-	// Sort by: number of items unblocked, then by score
-	sort.Slice(pairs, func(i, j int) bool {
+	// Sort by: number of items unblocked, then by score, with deterministic tie-breakers
+	sort.SliceStable(pairs, func(i, j int) bool {
 		blocksI := len(pairs[i].bead.UnblocksIDs)
 		blocksJ := len(pairs[j].bead.UnblocksIDs)
 
@@ -1163,7 +1172,16 @@ func selectDependency(pairs []scoredPair, numAgents, numBeads int) []scoredPair 
 			return pairs[i].bead.Priority < pairs[j].bead.Priority
 		}
 
-		return pairs[i].score > pairs[j].score
+		if pairs[i].score != pairs[j].score {
+			return pairs[i].score > pairs[j].score
+		}
+
+		// Tie-breaker 1: Bead ID
+		if pairs[i].bead.ID != pairs[j].bead.ID {
+			return pairs[i].bead.ID < pairs[j].bead.ID
+		}
+		// Tie-breaker 2: Agent Pane ID
+		return pairs[i].agent.PaneID < pairs[j].agent.PaneID
 	})
 
 	// Greedy selection

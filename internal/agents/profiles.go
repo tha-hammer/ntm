@@ -18,9 +18,10 @@ import (
 type AgentType string
 
 const (
-	AgentTypeClaude AgentType = "claude"
-	AgentTypeCodex  AgentType = "codex"
-	AgentTypeGemini AgentType = "gemini"
+	AgentTypeClaude      AgentType = "claude"
+	AgentTypeCodex       AgentType = "codex"
+	AgentTypeGemini      AgentType = "gemini"
+	AgentTypeAntigravity AgentType = "antigravity"
 )
 
 // Specialization represents task types an agent excels at.
@@ -83,7 +84,7 @@ func NewProfileMatcher() *ProfileMatcher {
 func (pm *ProfileMatcher) loadDefaults() {
 	pm.profiles[AgentTypeClaude] = &AgentProfile{
 		Type:          AgentTypeClaude,
-		Model:         "claude-opus-4-6",
+		Model:         "claude-opus-4-8",
 		ContextBudget: models.GetTokenBudget("cc"),
 		Specializations: []Specialization{
 			SpecComplex,
@@ -103,7 +104,7 @@ func (pm *ProfileMatcher) loadDefaults() {
 
 	pm.profiles[AgentTypeCodex] = &AgentProfile{
 		Type:          AgentTypeCodex,
-		Model:         "gpt-5.3-codex",
+		Model:         "gpt-5.5",
 		ContextBudget: models.GetTokenBudget("cod"),
 		Specializations: []Specialization{
 			SpecQuick,
@@ -124,6 +125,27 @@ func (pm *ProfileMatcher) loadDefaults() {
 		Type:          AgentTypeGemini,
 		Model:         "gemini-3-pro-preview",
 		ContextBudget: models.GetTokenBudget("gmi"),
+		Specializations: []Specialization{
+			SpecResearch,
+			SpecDocs,
+			SpecAnalysis,
+		},
+		Preferences: Preferences{
+			PreferredFiles:  []string{"*.md", "docs/**", "README*", "*.txt"},
+			AvoidFiles:      []string{"*_test.go"},
+			PreferredLabels: []string{"docs", "research", "spike", "chore"},
+		},
+		Performance: Performance{
+			SuccessRate: 0.85,
+		},
+	}
+
+	// Antigravity (agy) is Gemini CLI's successor and shares Google's Gemini
+	// models, so its profile mirrors the Gemini entry.
+	pm.profiles[AgentTypeAntigravity] = &AgentProfile{
+		Type:          AgentTypeAntigravity,
+		Model:         "gemini-3-pro-preview",
+		ContextBudget: models.GetTokenBudget("agy"),
 		Specializations: []Specialization{
 			SpecResearch,
 			SpecDocs,
@@ -226,6 +248,9 @@ type ScoreResult struct {
 func (pm *ProfileMatcher) ScoreAssignment(agentType AgentType, task TaskInfo) ScoreResult {
 	pm.mu.RLock()
 	profile := pm.profiles[agentType]
+	if profile != nil {
+		profile = profile.copy()
+	}
 	pm.mu.RUnlock()
 
 	if profile == nil {
@@ -522,7 +547,7 @@ func NormalizeAgentType(t string) string {
 	switch normalized {
 	case "opus", "sonnet", "haiku":
 		return "claude"
-	case "gpt", "gpt-5", "gpt-5-codex", "gpt-5.3-codex":
+	case "gpt", "gpt-5", "gpt-5.5", "gpt-5-codex", "gpt-5.3-codex":
 		return "codex"
 	case "gemini-pro", "gemini-ultra", "gemini-3-pro-preview":
 		return "gemini"
@@ -535,6 +560,8 @@ func NormalizeAgentType(t string) string {
 		return "codex"
 	case agentpkg.AgentTypeGemini:
 		return "gemini"
+	case agentpkg.AgentTypeAntigravity:
+		return "antigravity"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:
@@ -560,6 +587,8 @@ func ParseAgentType(s string) AgentType {
 		return AgentTypeCodex
 	case "gemini":
 		return AgentTypeGemini
+	case "antigravity":
+		return AgentTypeAntigravity
 	default:
 		return AgentType(normalized)
 	}

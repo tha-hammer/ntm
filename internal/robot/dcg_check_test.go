@@ -241,11 +241,12 @@ func TestGetDCGCheckWithOptions_CombinedOptions(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeFakeDCG(t, tmpDir)
 	t.Setenv("PATH", tmpDir)
+	cwd := t.TempDir()
 
 	opts := DCGCheckOptions{
 		Command: "echo test",
 		Context: "Testing combined options",
-		CWD:     "/tmp/project",
+		CWD:     cwd,
 	}
 	out, err := GetDCGCheckWithOptions(opts)
 	if err != nil {
@@ -257,7 +258,7 @@ func TestGetDCGCheckWithOptions_CombinedOptions(t *testing.T) {
 	if out.Context != "Testing combined options" {
 		t.Fatalf("expected context echoed")
 	}
-	if out.CWD != "/tmp/project" {
+	if out.CWD != cwd {
 		t.Fatalf("expected cwd echoed")
 	}
 }
@@ -363,7 +364,11 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 
-if [ "${1:-}" = "check" ]; then
+if [ "${1:-}" = "--robot" ]; then
+  shift
+fi
+
+if [ "${1:-}" = "test" ]; then
   shift
   # Parse flags and find the command (last argument)
   cmd=""
@@ -371,6 +376,9 @@ if [ "${1:-}" = "check" ]; then
     case "$1" in
       --json)
         shift
+        ;;
+      --format)
+        shift 2
         ;;
       --context)
         shift 2
@@ -411,7 +419,7 @@ func writeFakeDCG(t *testing.T, dir string) {
 	t.Helper()
 
 	dcgPath := filepath.Join(dir, "dcg")
-	// Fake DCG script that handles --version, check (with --json, --context, --cwd), and status
+	// Fake DCG script that handles --version, robot test, and status.
 	script := `#!/bin/sh
 set -eu
 
@@ -420,7 +428,11 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 
-if [ "${1:-}" = "check" ]; then
+if [ "${1:-}" = "--robot" ]; then
+  shift
+fi
+
+if [ "${1:-}" = "test" ]; then
   shift
   # Parse flags and find the command (last argument)
   cmd=""
@@ -428,6 +440,9 @@ if [ "${1:-}" = "check" ]; then
     case "$1" in
       --json)
         shift
+        ;;
+      --format)
+        shift 2
         ;;
       --context)
         shift 2

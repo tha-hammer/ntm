@@ -3,12 +3,12 @@
 package bv
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -288,6 +288,15 @@ func (c *BVClient) getTriage() (*TriageResponse, error) {
 	}
 	c.mu.RUnlock()
 
+	// Lock for fetch to prevent stampeding
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Double-check cache
+	if c.triageCache != nil && c.triageCacheDir == dir && time.Since(c.triageCacheAt) < c.CacheTTL {
+		return c.triageCache, nil
+	}
+
 	// Fetch fresh data
 	resp, err := c.fetchTriage(dir)
 	if err != nil {
@@ -295,11 +304,9 @@ func (c *BVClient) getTriage() (*TriageResponse, error) {
 	}
 
 	// Update cache
-	c.mu.Lock()
 	c.triageCache = resp
 	c.triageCacheDir = dir
 	c.triageCacheAt = time.Now()
-	c.mu.Unlock()
 
 	return resp, nil
 }
@@ -310,35 +317,19 @@ func (c *BVClient) fetchTriage(dir string) (*TriageResponse, error) {
 		return nil, fmt.Errorf("%w: bv is not installed. Install it with: go install github.com/Dicklesworthstone/beads_viewer@latest", ErrNotInstalled)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "bv", "--robot-triage")
-	cmd.WaitDelay = 2 * time.Second
-	if dir != "" {
-		cmd.Dir = dir
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
+	output, err := runWithTimeout(dir, c.Timeout, "--robot-triage")
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("%w after %v", ErrTimeout, c.Timeout)
-		}
-		return nil, fmt.Errorf("bv --robot-triage failed: %w: %s", err, stderr.String())
+		return nil, fmt.Errorf("bv --robot-triage failed: %w", err)
 	}
 
 	// Validate and parse JSON
-	output := stdout.Bytes()
-	if !json.Valid(output) {
+	outputBytes := []byte(output)
+	if !json.Valid(outputBytes) {
 		return nil, fmt.Errorf("%w: bv returned non-JSON output", ErrInvalidJSON)
 	}
 
 	var resp TriageResponse
-	if err := json.Unmarshal(output, &resp); err != nil {
+	if err := json.Unmarshal(outputBytes, &resp); err != nil {
 		return nil, fmt.Errorf("parsing triage response: %w", err)
 	}
 
@@ -350,6 +341,37 @@ func (c *BVClient) workDir() (string, error) {
 	return normalizeTriageDir(c.WorkspacePath)
 }
 
+// actionableStatuses are the bead statuses considered ready to act on. This is
+// an allow-list mirroring the assignment-side classifier
+// (classifyTriageRecForAssignment in internal/cli/assign.go), which treats only
+// open/ready (and the empty default) as assignable and skips every other status
+// — including blocked/in_progress/closed and any unknown status — via its
+// `default` arm. Using the same allow-list keeps the serve API
+// (/api/v1/beads/recommend) and the FilterReady gate consistent with `ntm
+// assign`: a deny-list would report unknown statuses (e.g. "review", "todo") as
+// actionable here while assign skips them.
+var actionableStatuses = map[string]struct{}{
+	"":      {},
+	"open":  {},
+	"ready": {},
+}
+
+// isActionableRecommendation reports whether a triage recommendation is ready to
+// act on: it must have no dependency blockers AND an actionable status. bv's
+// --robot-triage output is permissive (it surfaces blocked/in_progress/closed
+// beads with non-zero scores), so the status is consulted in addition to the
+// blocker list, using the same allow-list as the assignment classifier.
+func isActionableRecommendation(rec TriageRecommendation) bool {
+	if len(rec.BlockedBy) > 0 {
+		return false
+	}
+	canonical := strings.ToLower(strings.TrimSpace(rec.Status))
+	canonical = strings.ReplaceAll(canonical, "-", "_")
+	canonical = strings.ReplaceAll(canonical, " ", "_")
+	_, ok := actionableStatuses[canonical]
+	return ok
+}
+
 // convertRecommendation converts a TriageRecommendation to our Recommendation format.
 func (c *BVClient) convertRecommendation(rec TriageRecommendation) Recommendation {
 	r := Recommendation{
@@ -359,7 +381,7 @@ func (c *BVClient) convertRecommendation(rec TriageRecommendation) Recommendatio
 		UnblocksCount: len(rec.UnblocksIDs),
 		UnblocksIDs:   rec.UnblocksIDs,
 		BlockedByIDs:  rec.BlockedBy,
-		IsActionable:  len(rec.BlockedBy) == 0,
+		IsActionable:  isActionableRecommendation(rec),
 		Tags:          rec.Labels,
 		Score:         rec.Score,
 		Action:        rec.Action,

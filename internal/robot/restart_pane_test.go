@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -332,6 +333,130 @@ func TestRestartErrorStructure(t *testing.T) {
 	}
 	if parsed["reason"] != "failed to respawn: pane not found" {
 		t.Errorf("reason = %q, want proper error message", parsed["reason"])
+	}
+}
+
+func TestRestartTargetIsAgent(t *testing.T) {
+	tests := []struct {
+		resolvedType string
+		want         bool
+	}{
+		{"claude", true},
+		{"codex", true},
+		{"gemini", true},
+		{"antigravity", true},
+		{"oc", true},
+		{"ollama", true},
+		{"user", false},
+		{"unknown", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		if got := restartTargetIsAgent(tt.resolvedType); got != tt.want {
+			t.Errorf("restartTargetIsAgent(%q) = %v, want %v", tt.resolvedType, got, tt.want)
+		}
+	}
+}
+
+func TestRestartAgentLaunchCommandNilConfigFallsBackToAlias(t *testing.T) {
+	// Without a config the canonical launch alias must be used (#187).
+	tests := []struct {
+		agentType string
+		want      string
+	}{
+		{"claude", "cc"},
+		{"codex", "cod"},
+		{"gemini", "gmi"},
+		{"antigravity", "agy"},
+	}
+
+	for _, tt := range tests {
+		if got := restartAgentLaunchCommand(nil, tt.agentType); got != tt.want {
+			t.Errorf("restartAgentLaunchCommand(nil, %q) = %q, want %q", tt.agentType, got, tt.want)
+		}
+	}
+}
+
+func TestRestartAgentLaunchCommandUsesConfiguredCommand(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Agents.Claude = "claude --dangerously-skip-permissions"
+	cfg.Agents.Codex = "codex --yolo"
+
+	if got := restartAgentLaunchCommand(cfg, "claude"); got != "claude --dangerously-skip-permissions" {
+		t.Errorf("restartAgentLaunchCommand(cfg, claude) = %q, want configured command", got)
+	}
+	if got := restartAgentLaunchCommand(cfg, "codex"); got != "codex --yolo" {
+		t.Errorf("restartAgentLaunchCommand(cfg, codex) = %q, want configured command", got)
+	}
+	// Unconfigured type falls back to the alias.
+	if got := restartAgentLaunchCommand(cfg, "gemini"); got != "gmi" {
+		t.Errorf("restartAgentLaunchCommand(cfg, gemini) = %q, want %q", got, "gmi")
+	}
+}
+
+func TestRestartAgentLaunchCommandRendersTemplate(t *testing.T) {
+	cfg := &config.Config{}
+	// Template with optional fields renders with empty vars — same as the
+	// robot-spawn pattern (spawn.go getAgentCommands).
+	cfg.Agents.Claude = "claude {{.Model}}"
+
+	if got := restartAgentLaunchCommand(cfg, "claude"); got != "claude" {
+		t.Errorf("restartAgentLaunchCommand template render = %q, want %q", got, "claude")
+	}
+}
+
+func TestRestartAgentLaunchCommandInvalidTemplateFallsBack(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Agents.Claude = "claude {{.Broken"
+
+	if got := restartAgentLaunchCommand(cfg, "claude"); got != "cc" {
+		t.Errorf("restartAgentLaunchCommand invalid template = %q, want fallback %q", got, "cc")
+	}
+}
+
+func TestRestartAgentLaunchCommandRejectsControlCharacters(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Agents.Claude = "claude\nrm -x"
+
+	if got := restartAgentLaunchCommand(cfg, "claude"); got != "cc" {
+		t.Errorf("restartAgentLaunchCommand control chars = %q, want fallback %q", got, "cc")
+	}
+}
+
+func TestRestartPaneOutputAgentRelaunchedJSON(t *testing.T) {
+	output := RestartPaneOutput{
+		RobotResponse:   NewRobotResponse(true),
+		Session:         "myproject",
+		Restarted:       []string{"1"},
+		Failed:          []RestartError{},
+		AgentRelaunched: map[string]bool{"1": true},
+	}
+
+	data, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	relaunched, ok := parsed["agent_relaunched"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("agent_relaunched missing or wrong type: %v", parsed["agent_relaunched"])
+	}
+	if relaunched["1"] != true {
+		t.Errorf("agent_relaunched[1] = %v, want true", relaunched["1"])
+	}
+
+	// And omitted when empty (e.g., only user panes were restarted).
+	output.AgentRelaunched = nil
+	data, err = json.Marshal(output)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	if strings.Contains(string(data), "agent_relaunched") {
+		t.Error("agent_relaunched should be omitted when empty")
 	}
 }
 

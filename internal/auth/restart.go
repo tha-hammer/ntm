@@ -1,9 +1,12 @@
 package auth
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"io"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -23,6 +26,7 @@ type Orchestrator struct {
 	sendInterrupt       func(string) error
 	buildPaneCommand    func(string, string) (string, error)
 	sanitizePaneCommand func(string) (string, error)
+	promptBrowserAuth   func(string) error
 	sleep               func(time.Duration)
 }
 
@@ -43,7 +47,10 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		sendInterrupt:       tmux.SendInterrupt,
 		buildPaneCommand:    tmux.BuildPaneCommand,
 		sanitizePaneCommand: tmux.SanitizePaneCommand,
-		sleep:               time.Sleep,
+		promptBrowserAuth: func(email string) error {
+			return promptBrowserAuth(os.Stdin, os.Stdout, email)
+		},
+		sleep: time.Sleep,
 	}
 }
 
@@ -54,8 +61,14 @@ func (o *Orchestrator) RegisterAuthFlow(provider string, flow AuthFlow) {
 
 // RestartContext holds context for restarting an agent
 type RestartContext struct {
-	PaneID      string
-	Provider    string
+	PaneID   string
+	Provider string
+	// AgentType is the canonical agent-type short form of the pane being
+	// restarted (cc/cod/gmi/agy/...). It is preferred over Provider when
+	// choosing the relaunch command, because several agent types can share a
+	// single auth provider — notably Antigravity (agy) and the legacy Gemini
+	// CLI both authenticate through Google. Optional; falls back to Provider.
+	AgentType   string
 	TargetEmail string
 	ModelAlias  string
 	SessionName string
@@ -75,8 +88,10 @@ func (o *Orchestrator) ExecuteRestartStrategy(ctx RestartContext) error {
 		return fmt.Errorf("session did not terminate: %w", err)
 	}
 
-	// 3. Prompt user for browser auth (simulated here, would interact with UI/TUI in real app)
-	o.PromptBrowserAuth(ctx.TargetEmail)
+	// 3. Prompt user for browser auth before starting the replacement agent.
+	if err := o.PromptBrowserAuth(ctx.TargetEmail); err != nil {
+		return fmt.Errorf("browser auth prompt: %w", err)
+	}
 
 	// 4. Start new agent session
 	return o.StartNewAgentSession(ctx)
@@ -137,11 +152,31 @@ func (o *Orchestrator) WaitForShellPrompt(paneID string, timeout time.Duration) 
 	}
 }
 
-// PromptBrowserAuth simulates prompting the user
-func (o *Orchestrator) PromptBrowserAuth(email string) {
-	// In a real CLI/TUI, this might print to the user pane or show a dialog.
-	// For now, we log the message - caller is expected to handle actual UI prompts.
-	log.Printf("Auth prompt: Please log into %s in your browser", email)
+// PromptBrowserAuth asks the user to switch browser accounts before restart.
+func (o *Orchestrator) PromptBrowserAuth(email string) error {
+	if o.promptBrowserAuth != nil {
+		return o.promptBrowserAuth(email)
+	}
+	return promptBrowserAuth(os.Stdin, os.Stdout, email)
+}
+
+func promptBrowserAuth(input io.Reader, output io.Writer, email string) error {
+	target := strings.TrimSpace(email)
+	if target == "" {
+		target = "the target account"
+	}
+
+	fmt.Fprintln(output, "Browser authentication required")
+	fmt.Fprintf(output, "  Switch your browser to: %s\n", target)
+	fmt.Fprintln(output, "  Press ENTER to continue after the browser account is ready.")
+
+	if _, err := bufio.NewReader(input).ReadString('\n'); err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("browser account confirmation not received")
+		}
+		return err
+	}
+	return nil
 }
 
 // StartNewAgentSession launches the agent command in the pane
@@ -154,18 +189,31 @@ func (o *Orchestrator) StartNewAgentSession(ctx RestartContext) error {
 	var agentCmdTemplate string
 	var agentType string
 
-	switch prov.Name() {
-	case "Claude":
-		agentCmdTemplate = o.cfg.Agents.Claude
-		agentType = "cc"
-	case "Codex":
-		agentCmdTemplate = o.cfg.Agents.Codex
-		agentType = "cod"
-	case "Gemini":
-		agentCmdTemplate = o.cfg.Agents.Gemini
-		agentType = "gmi"
+	// Prefer the explicit pane agent type for the relaunch command. Multiple
+	// agent types can share one auth provider (agy and gemini both map to the
+	// Google/Gemini provider), so selecting by prov.Name() alone would relaunch
+	// an Antigravity pane with the Gemini binary and model.
+	switch tmux.AgentType(ctx.AgentType).Canonical() {
+	case tmux.AgentClaude:
+		agentCmdTemplate, agentType = o.cfg.Agents.Claude, "cc"
+	case tmux.AgentCodex:
+		agentCmdTemplate, agentType = o.cfg.Agents.Codex, "cod"
+	case tmux.AgentGemini:
+		agentCmdTemplate, agentType = o.cfg.Agents.Gemini, "gmi"
+	case tmux.AgentAntigravity:
+		agentCmdTemplate, agentType = o.cfg.Agents.Antigravity, "agy"
 	default:
-		return fmt.Errorf("unsupported provider: %s", prov.Name())
+		// No usable agent type recorded — fall back to the auth provider name.
+		switch prov.Name() {
+		case "Claude":
+			agentCmdTemplate, agentType = o.cfg.Agents.Claude, "cc"
+		case "Codex":
+			agentCmdTemplate, agentType = o.cfg.Agents.Codex, "cod"
+		case "Gemini":
+			agentCmdTemplate, agentType = o.cfg.Agents.Gemini, "gmi"
+		default:
+			return fmt.Errorf("unsupported provider: %s", prov.Name())
+		}
 	}
 
 	// Resolve model
@@ -175,7 +223,7 @@ func (o *Orchestrator) StartNewAgentSession(ctx RestartContext) error {
 	agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, config.AgentTemplateVars{
 		Model:          resolvedModel,
 		ModelAlias:     ctx.ModelAlias,
-		ModelRequested: strings.TrimSpace(ctx.ModelAlias) != "",
+		ModelRequested: len(strings.TrimSpace(ctx.ModelAlias)) > 0,
 		SessionName:    ctx.SessionName,
 		PaneIndex:      ctx.PaneIndex,
 		AgentType:      agentType,

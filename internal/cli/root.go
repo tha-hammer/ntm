@@ -8,10 +8,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -126,7 +128,12 @@ Shell Integration:
 			cfg, err = startup.GetConfig()
 			endProfile()
 			if err != nil {
-				// Use defaults if config loading fails
+				// Config loading failed for a genuine reason (e.g. an invalid
+				// global config); an invalid project overlay no longer reaches
+				// here — it is skipped with its own warning inside LoadMerged.
+				// Warn loudly so the user sees the real cause instead of
+				// silently reverting to built-in defaults (issue #162).
+				fmt.Fprintf(os.Stderr, "ntm: warning: config load failed (%v); using built-in defaults\n", err)
 				cfg = config.Default()
 			}
 			activeTheme := theme.Current()
@@ -897,6 +904,41 @@ Shell Integration:
 			}
 			return
 		}
+		if robotCausality != "" {
+			session, err := resolveRobotOfflineCapableSession(robotCausality)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			projectDir := strings.TrimSpace(robotCausalityProject)
+			if projectDir == "" {
+				if resolvedProject, resolveErr := resolveExplicitProjectDirForSession(session); resolveErr == nil {
+					projectDir = strings.TrimSpace(resolvedProject)
+				}
+			}
+			if projectDir == "" {
+				if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+					projectDir = cwd
+				}
+			}
+			opts := robot.CausalityOptions{
+				Session:   session,
+				Project:   projectDir,
+				AgentName: strings.TrimSpace(robotCausalityAgent),
+				BeadID:    strings.TrimSpace(robotCausalityBead),
+				Pane:      strings.TrimSpace(robotCausalityPane),
+				Type:      strings.TrimSpace(robotCausalityType),
+				Chain:     strings.TrimSpace(robotCausalityChain),
+				Since:     strings.TrimSpace(robotCausalitySince),
+				Until:     strings.TrimSpace(robotCausalityUntil),
+				Limit:     robotCausalityLimit,
+			}
+			if err := robot.PrintCausality(opts); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 		if robotActivity != "" {
 			session, err := resolveRobotLiveSession(robotActivity)
 			if err != nil {
@@ -1007,13 +1049,24 @@ Shell Integration:
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(2)
 			}
+			// bd-9296v: --pipeline-from-state requires --pipeline-start-from
+			// (mirrors the `ntm pipeline run --from-state` validation in
+			// internal/cli/pipeline.go) so an operator does not silently
+			// reuse prior step state without telling the run where to
+			// start.
+			if robotPipelineFromState != "" && robotPipelineStartFrom == "" {
+				fmt.Fprintln(os.Stderr, "Error: --pipeline-from-state requires --pipeline-start-from")
+				os.Exit(2)
+			}
 			opts := pipeline.PipelineRunOptions{
-				WorkflowFile: robotPipelineRun,
-				Session:      session,
-				ProjectDir:   projectDir,
-				Variables:    vars,
-				DryRun:       resolveRobotPipelineDryRun(cmd),
-				Background:   robotPipelineBG,
+				WorkflowFile:  robotPipelineRun,
+				Session:       session,
+				ProjectDir:    projectDir,
+				Variables:     vars,
+				DryRun:        resolveRobotPipelineDryRun(cmd),
+				Background:    robotPipelineBG,
+				StartFromStep: robotPipelineStartFrom,
+				FromState:     robotPipelineFromState,
 			}
 			exitCode := pipeline.PrintPipelineRun(opts)
 			os.Exit(exitCode)
@@ -1136,6 +1189,15 @@ Shell Integration:
 				Panes:         panes,
 				LinesCaptured: robotIsWorkingLines(cmd),
 				Verbose:       robotIsWorkingVerbose,
+				Semantic:      robotSemantic,
+			}
+			if robotSemantic {
+				win, werr := resolveSemanticWindow(robotSemanticWindow)
+				if werr != nil {
+					fmt.Fprintf(os.Stderr, "Error: invalid --semantic-window: %v\n", werr)
+					os.Exit(3)
+				}
+				opts.SemanticWindow = win
 			}
 			if err := robot.PrintIsWorking(opts); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -1162,11 +1224,9 @@ Shell Integration:
 				IncludeCaut:   !robotAgentHealthNoCaut,
 				Verbose:       resolveRobotAgentHealthVerbose(cmd),
 			}
-			if err := robot.PrintAgentHealth(opts); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-			return
+			// PrintAgentHealth emits the JSON envelope and returns the process
+			// exit code; a success:false result must exit nonzero (ntm#207).
+			os.Exit(robot.PrintAgentHealth(opts))
 		}
 		if robotSmartRestart != "" {
 			session, err := resolveRobotLiveSession(robotSmartRestart)
@@ -1404,11 +1464,9 @@ Shell Integration:
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-			if err := robot.PrintHealthOAuth(session); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-			return
+			// PrintHealthOAuth emits the JSON envelope and returns the process
+			// exit code; a success:false result must exit nonzero (ntm#207).
+			os.Exit(robot.PrintHealthOAuth(session))
 		}
 		if robotHealthRestartStuck != "" {
 			session, err := resolveRobotLiveSession(robotHealthRestartStuck)
@@ -1465,7 +1523,7 @@ Shell Integration:
 				os.Exit(1)
 			}
 			if robotDiagnoseBrief {
-				if err := robot.PrintDiagnoseBrief(session); err != nil {
+				if err := robot.PrintDiagnoseBrief(cmd.Context(), session); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 					os.Exit(1)
 				}
@@ -1476,7 +1534,7 @@ Shell Integration:
 					Fix:     robotDiagnoseFix,
 					Brief:   robotDiagnoseBrief,
 				}
-				if err := robot.PrintDiagnose(opts); err != nil {
+				if err := robot.PrintDiagnose(cmd.Context(), opts); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 					os.Exit(1)
 				}
@@ -1594,6 +1652,13 @@ Shell Integration:
 				SkipPanes:          skipPanes,
 				PromptTemplatePath: robotBulkAssignTemplate,
 			}
+			// Project/user-level default dispatch template (#153). A per-invocation
+			// --bulk-assign-template still wins; these only fill the gap the built-in
+			// const used to occupy.
+			if cfg != nil {
+				opts.DefaultTemplate = cfg.Assign.PromptTemplate
+				opts.DefaultTemplatePath = cfg.Assign.PromptTemplateFile
+			}
 			if err := robot.PrintBulkAssign(opts); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
@@ -1613,6 +1678,7 @@ Shell Integration:
 				CCCount:        robotSpawnCC,
 				CodCount:       robotSpawnCod,
 				GmiCount:       robotSpawnGmi,
+				AgyCount:       robotSpawnAgy,
 				Preset:         robotSpawnPreset,
 				NoUserPane:     robotSpawnNoUser,
 				WorkingDir:     robotSpawnDir,
@@ -2257,6 +2323,17 @@ Shell Integration:
 			}
 			return
 		}
+		if robotSafetySimulate {
+			opts := robot.SafetySimulationOptions{
+				Command: robotDCGCmd,
+				Steps:   robotSafetySteps,
+			}
+			if err := robot.PrintSafetySimulation(opts); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 
 		// Robot-quota-status handler for caut quota status
 		if robotQuotaStatus {
@@ -2377,10 +2454,27 @@ Shell Integration:
 
 func Execute() error {
 	defer closeRobotPersistence()
-	err := rootCmd.Execute()
+	// Install a signal-cancellable context at the root so handlers using
+	// `cmd.Context()` (diagnose, swarm, openapi, support_bundle, …) see
+	// cancellation when the user presses Ctrl-C. Without this, `cmd.Context()`
+	// is a background context that never cancels, making any context-aware
+	// API plumbed through cobra effectively non-cancellable. Commands with
+	// their own `signal.Notify`-based shutdown loops (serve, watch, monitor,
+	// send, …) continue to receive the OS signal directly — Go delivers it
+	// to every registered consumer — so adding a root-level consumer does
+	// not interfere with their existing shutdown logic.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err := rootCmd.ExecuteContext(ctx)
 	logCommandAuditEnd(err)
 	_ = audit.CloseAll()
 	if err != nil {
+		// errJSONFailure means the command already wrote its failure envelope
+		// to stdout; the only remaining job is to exit non-zero. Don't decorate
+		// stderr — the JSON is the contract.
+		if errors.Is(err, errJSONFailure) {
+			return err
+		}
 		// If not in JSON mode, print the error to stderr
 		// (SilenceErrors is set to true to handle JSON mode properly)
 		if !jsonOutput {
@@ -2397,12 +2491,27 @@ func shouldInitializeRobotPersistence(cmd *cobra.Command) bool {
 	}
 
 	for _, arg := range os.Args[1:] {
-		if strings.HasPrefix(arg, "--robot-") || arg == "--schema" {
+		if arg == "--schema" {
+			return true
+		}
+		if strings.HasPrefix(arg, "--robot-") && !robotFlagSkipsPersistence(arg) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func robotFlagSkipsPersistence(arg string) bool {
+	if i := strings.IndexByte(arg, '='); i >= 0 {
+		arg = arg[:i]
+	}
+	switch arg {
+	case "--robot-overlay":
+		return true
+	default:
+		return false
+	}
 }
 
 func initializeRobotPersistence() error {
@@ -2758,6 +2867,7 @@ var (
 	robotSpawnCC         int    // number of Claude agents
 	robotSpawnCod        int    // number of Codex agents
 	robotSpawnGmi        int    // number of Gemini agents
+	robotSpawnAgy        int    // number of Antigravity agents
 	robotSpawnPreset     string // recipe/preset name
 	robotSpawnNoUser     bool   // don't create user pane
 	robotSpawnWait       bool   // wait for agents to be ready
@@ -2774,7 +2884,7 @@ var (
 
 	// Robot-controller-spawn flags for launching controller agents
 	robotControllerSpawn     string // session name for controller spawn
-	robotControllerAgentType string // agent type: cc, cod, gmi
+	robotControllerAgentType string // agent type: cc, cod, gmi, agy
 	robotControllerPrompt    string // custom prompt file
 	robotControllerNoPrompt  bool   // skip sending initial prompt
 
@@ -2868,6 +2978,18 @@ var (
 	robotHistorySince string // time-based filter
 	robotHistoryStats bool   // show statistics instead of entries
 
+	// Robot-causality flags for unified causality timeline queries
+	robotCausality        string // session name for causality query
+	robotCausalityProject string // project path for agent mail + pipeline state reads
+	robotCausalityAgent   string // Agent Mail agent name for inbox fetch
+	robotCausalityBead    string // bead/thread filter
+	robotCausalityPane    string // pane filter
+	robotCausalityType    string // normalized event type filter
+	robotCausalityChain   string // causal chain/correlation filter
+	robotCausalitySince   string // lower time bound
+	robotCausalityUntil   string // upper time bound
+	robotCausalityLimit   int    // max output events
+
 	// Robot-activity flags for agent activity detection
 	robotActivity     string // session name for activity query
 	robotActivityType string // filter by agent type (claude, codex, gemini)
@@ -2890,14 +3012,16 @@ var (
 	robotRouteExclude  string // comma-separated pane indices to exclude
 
 	// Robot-pipeline flags for workflow execution
-	robotPipelineRun     string // workflow file to run
-	robotPipelineStatus  string // run ID to check status
-	robotPipelineList    bool   // list all pipelines
-	robotPipelineCancel  string // run ID to cancel
-	robotPipelineSession string // session name for pipeline execution
-	robotPipelineVars    string // JSON variables for pipeline
-	robotPipelineDryRun  bool   // validate without executing
-	robotPipelineBG      bool   // run in background
+	robotPipelineRun       string // workflow file to run
+	robotPipelineStatus    string // run ID to check status
+	robotPipelineList      bool   // list all pipelines
+	robotPipelineCancel    string // run ID to cancel
+	robotPipelineSession   string // session name for pipeline execution
+	robotPipelineVars      string // JSON variables for pipeline
+	robotPipelineDryRun    bool   // validate without executing
+	robotPipelineBG        bool   // run in background
+	robotPipelineStartFrom string // bd-9296v: top-level step ID to start from (mirrors `ntm pipeline run --start-from`)
+	robotPipelineFromState string // bd-9296v: prior run ID whose persisted outputs feed steps skipped by --start-from
 
 	// TUI Parity robot flags - expose TUI dashboard functionality to AI agents
 	robotFiles           string // session name for file changes query
@@ -3002,6 +3126,11 @@ var (
 	robotIsWorking        string // session name to check
 	robotIsWorkingVerbose bool   // include raw sample output
 
+	// Semantic-progress signal flags (#199). Opt-in ground-truth signal layered
+	// on --robot-is-working; default off so the poll path is unchanged.
+	robotSemantic       bool   // enable the semantic_progress field
+	robotSemanticWindow string // look-back window (duration, e.g. "30m"); empty = config/default
+
 	// Robot-agent-health flags for comprehensive health check (bd-2pwzf)
 	robotAgentHealth        string // session name to check
 	robotAgentHealthNoCaut  bool   // skip caut provider query
@@ -3052,11 +3181,13 @@ var (
 	robotEnv string // --robot-env flag (session name or "global")
 
 	// Robot-dcg-status flag for DCG status
-	robotDCGStatus  bool   // --robot-dcg-status flag
-	robotDCGCheck   bool   // --robot-dcg-check / --robot-guard flag
-	robotDCGCmd     string // --command / --cmd flag (required with --robot-dcg-check / --robot-guard)
-	robotDCGContext string // --context flag (intent/context for the command)
-	robotDCGCwd     string // --cwd flag (working directory context)
+	robotDCGStatus      bool     // --robot-dcg-status flag
+	robotDCGCheck       bool     // --robot-dcg-check / --robot-guard flag
+	robotDCGCmd         string   // --command / --cmd flag (required with --robot-dcg-check / --robot-guard)
+	robotDCGContext     string   // --context flag (intent/context for the command)
+	robotDCGCwd         string   // --cwd flag (working directory context)
+	robotSafetySimulate bool     // --robot-safety-simulate flag
+	robotSafetySteps    []string // repeated --step values for --robot-safety-simulate
 
 	// Robot-slb flags for SLB approvals
 	robotSLBPending bool   // --robot-slb-pending flag
@@ -3159,6 +3290,8 @@ func init() {
 	rootCmd.Flags().StringVar(&robotPanes, "panes", "", "Filter to specific pane indices. Optional with --robot-tail, --robot-watch-bead, --robot-errors, --robot-send, --robot-ack, --robot-interrupt, --robot-wait, --robot-is-working, --robot-agent-health, --robot-smart-restart, --robot-restart-pane, and --robot-monitor. Example: --panes=1,2")
 	rootCmd.Flags().StringVar(&robotIsWorking, "robot-is-working", "", "Check if agents are working. Returns work state with recommendations. Required: SESSION. Example: ntm --robot-is-working=myproject --panes=2,3")
 	rootCmd.Flags().BoolVar(&robotIsWorkingVerbose, "is-working-verbose", false, "Include raw sample output in --robot-is-working response. Example: --is-working-verbose")
+	rootCmd.Flags().BoolVar(&robotSemantic, "semantic", false, "Add an optional ground-truth semantic_progress field to --robot-is-working (token-attributed git commits / bead claims). Advisory only; never flips is_working. Off by default (no git/br calls). Example: ntm --robot-is-working=myproject --semantic")
+	rootCmd.Flags().StringVar(&robotSemanticWindow, "semantic-window", "", "Look-back window for --semantic (Go duration, e.g. 30m, 2h). Defaults to [robot.semantic].window_minutes or 30m. Example: --semantic --semantic-window=1h")
 	rootCmd.Flags().StringVar(&robotAgentHealth, "robot-agent-health", "", "Comprehensive agent health check combining local state and provider usage. Required: SESSION. Example: ntm --robot-agent-health=myproject --panes=2,3")
 	rootCmd.Flags().BoolVar(&robotAgentHealthNoCaut, "no-caut", false, "Skip caut provider query for faster local-only health check. Optional with --robot-agent-health")
 	rootCmd.Flags().BoolVar(&robotAgentHealthVerbose, "agent-health-verbose", false, "Include raw sample output in --robot-agent-health response. Example: --agent-health-verbose")
@@ -3199,7 +3332,7 @@ func init() {
 	rootCmd.Flags().StringVar(&robotEnsemblePreset, "preset", "", "Ensemble preset name. Required with --robot-ensemble-spawn unless --modes is set")
 	rootCmd.Flags().StringVar(&robotEnsembleModes, "modes", "", "Explicit mode IDs or codes (comma-separated). Used with --robot-ensemble-spawn")
 	rootCmd.Flags().StringVar(&robotEnsembleQuestion, "question", "", "Question for ensemble spawn. Required with --robot-ensemble-spawn")
-	rootCmd.Flags().StringVar(&robotEnsembleAgents, "agents", "", "Agent mix for ensemble spawn (e.g., cc=2,cod=1,gmi=1)")
+	rootCmd.Flags().StringVar(&robotEnsembleAgents, "agents", "", "Agent mix for ensemble spawn (e.g., cc=2,cod=1,agy=1)")
 	rootCmd.Flags().StringVar(&robotEnsembleAssignment, "assignment", "affinity", "Assignment strategy for ensemble spawn: round-robin, affinity, category, explicit")
 	rootCmd.Flags().BoolVar(&robotEnsembleAllowAdvanced, "allow-advanced", false, "Allow advanced/experimental modes with --robot-ensemble-spawn")
 	rootCmd.Flags().IntVar(&robotEnsembleBudgetTotal, "budget-total", 0, "Override total token budget for ensemble spawn")
@@ -3251,7 +3384,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&robotSendEnter, "enter", true, "Send Enter after pasting message (default: true). Use --enter=false to paste without submitting")
 	rootCmd.Flags().BoolVar(&robotSendEnter, "submit", true, "Alias for --enter")
 	rootCmd.Flags().BoolVar(&robotSendAll, "all", false, "Include user pane (default: agents only). Optional with --robot-send, --robot-interrupt, --robot-restart-pane, and --robot-support-bundle")
-	rootCmd.Flags().StringVar(&robotSendType, "type", "", "Filter by agent type: claude|cc, codex|cod, gemini|gmi, cursor, windsurf, aider. Works with --robot-history, --robot-wait, --robot-route, --robot-send, --robot-ack, --robot-interrupt, --robot-errors, and --robot-restart-pane")
+	rootCmd.Flags().StringVar(&robotSendType, "type", "", "Filter by agent type: claude|cc, codex|cod, antigravity|agy, gemini|gmi (legacy), cursor, windsurf, aider. Works with --robot-history, --robot-wait, --robot-route, --robot-send, --robot-ack, --robot-interrupt, --robot-errors, and --robot-restart-pane")
 	rootCmd.Flags().StringVar(&robotSendExclude, "exclude", "", "Exclude pane indices (comma-separated). Optional with --robot-send and --robot-route. Example: --exclude=0,3")
 	rootCmd.Flags().IntVar(&robotSendDelay, "delay-ms", 0, "Delay between sends (ms). Optional with --robot-send. Example: --delay-ms=500 for 0.5s between panes")
 
@@ -3315,6 +3448,7 @@ func init() {
 	rootCmd.Flags().IntVar(&robotSpawnCC, "spawn-cc", 0, "Claude Code agents to spawn. Use with --robot-spawn. Example: --spawn-cc=2")
 	rootCmd.Flags().IntVar(&robotSpawnCod, "spawn-cod", 0, "Codex CLI agents to spawn. Use with --robot-spawn. Example: --spawn-cod=1")
 	rootCmd.Flags().IntVar(&robotSpawnGmi, "spawn-gmi", 0, "Gemini CLI agents to spawn. Use with --robot-spawn. Example: --spawn-gmi=1")
+	rootCmd.Flags().IntVar(&robotSpawnAgy, "spawn-agy", 0, "Antigravity CLI agents to spawn. Use with --robot-spawn. Example: --spawn-agy=1")
 	rootCmd.Flags().StringVar(&robotSpawnPreset, "spawn-preset", "", "Use recipe preset instead of counts. See --robot-recipes. Example: --spawn-preset=standard")
 	rootCmd.Flags().BoolVar(&robotSpawnNoUser, "spawn-no-user", false, "Skip user pane creation. Optional with --robot-spawn. For headless/automation")
 	rootCmd.Flags().BoolVar(&robotSpawnWait, "spawn-wait", false, "Wait for agents to show ready state before returning. Recommended for automation")
@@ -3332,7 +3466,7 @@ func init() {
 
 	// Robot-controller-spawn flags for launching controller agent
 	rootCmd.Flags().StringVar(&robotControllerSpawn, "robot-controller-spawn", "", "Launch controller agent in session. Required: SESSION. Example: ntm --robot-controller-spawn=proj")
-	rootCmd.Flags().StringVar(&robotControllerAgentType, "controller-agent-type", "cc", "Agent type for controller: cc, cod, gmi, cursor, windsurf|ws, aider, or ollama. Use with --robot-controller-spawn")
+	rootCmd.Flags().StringVar(&robotControllerAgentType, "controller-agent-type", "cc", "Agent type for controller: cc, cod, gmi, agy, cursor, windsurf|ws, aider, or ollama. Use with --robot-controller-spawn")
 	rootCmd.Flags().StringVar(&robotControllerPrompt, "controller-prompt", "", "Custom prompt file. Use with --robot-controller-spawn")
 	rootCmd.Flags().BoolVar(&robotControllerNoPrompt, "controller-no-prompt", false, "Skip initial prompt. Use with --robot-controller-spawn")
 
@@ -3386,7 +3520,7 @@ func init() {
 	rootCmd.Flags().StringVar(&robotCassContext, "robot-cass-context", "", "Get relevant past context for a task. Example: ntm --robot-cass-context='how to implement auth'")
 
 	// CASS filters - work with --robot-cass-search and --robot-cass-context
-	rootCmd.Flags().StringVar(&cassAgent, "cass-agent", "", "Filter CASS by agent: claude, codex, gemini, cursor, etc. Example: --cass-agent=claude")
+	rootCmd.Flags().StringVar(&cassAgent, "cass-agent", "", "Filter CASS by agent: claude, codex, antigravity, gemini, cursor, etc. Example: --cass-agent=claude")
 	rootCmd.Flags().StringVar(&cassWorkspace, "cass-workspace", "", "Filter CASS by workspace/project path. Example: --cass-workspace=/path/to/project")
 	rootCmd.Flags().StringVar(&cassSince, "cass-since", "", "Filter CASS by recency: 1d, 7d, 30d, etc. Example: --cass-since=7d")
 	rootCmd.Flags().IntVar(&cassLimit, "cass-limit", 10, "Max CASS results to return. Example: --cass-limit=20")
@@ -3445,9 +3579,21 @@ func init() {
 	rootCmd.Flags().StringVar(&robotHistorySince, "history-since", "", "Show entries since time (1h, 30m, 2d, or RFC3339). Optional with --robot-history")
 	rootCmd.Flags().BoolVar(&robotHistoryStats, "history-stats", false, "Show statistics instead of entries. Optional with --robot-history")
 
+	// Robot-causality flags for unified causality timelines across coordination sources
+	rootCmd.Flags().StringVar(&robotCausality, "robot-causality", "", "Get unified causality timeline for a session (JSON). Required: SESSION. Example: ntm --robot-causality=myproject")
+	rootCmd.Flags().StringVar(&robotCausalityProject, "causality-project", "", "Project path override for Agent Mail and pipeline state lookup. Optional with --robot-causality")
+	rootCmd.Flags().StringVar(&robotCausalityAgent, "causality-agent", "", "Agent Mail identity used to fetch inbox messages. Optional with --robot-causality")
+	rootCmd.Flags().StringVar(&robotCausalityBead, "causality-bead", "", "Filter events by bead/thread ID (e.g. bd-2mb03.4). Optional with --robot-causality")
+	rootCmd.Flags().StringVar(&robotCausalityPane, "causality-pane", "", "Filter events by pane index/ID. Optional with --robot-causality")
+	rootCmd.Flags().StringVar(&robotCausalityType, "causality-type", "", "Filter events by normalized type. Optional with --robot-causality")
+	rootCmd.Flags().StringVar(&robotCausalityChain, "causality-chain", "", "Filter events by correlation/chain ID. Optional with --robot-causality")
+	rootCmd.Flags().StringVar(&robotCausalitySince, "causality-since", "", "Lower time bound (duration or RFC3339). Optional with --robot-causality")
+	rootCmd.Flags().StringVar(&robotCausalityUntil, "causality-until", "", "Upper time bound (duration or RFC3339). Optional with --robot-causality")
+	rootCmd.Flags().IntVar(&robotCausalityLimit, "causality-limit", 200, "Max causality events to return (default 200). Optional with --robot-causality")
+
 	// Robot-activity flags for agent activity detection
 	rootCmd.Flags().StringVar(&robotActivity, "robot-activity", "", "Get agent activity state (idle/busy/error). Required: SESSION. Example: ntm --robot-activity=myproject")
-	rootCmd.Flags().StringVar(&robotActivityType, "activity-type", "", "Filter by agent type: claude, codex, gemini. Optional with --robot-activity. Example: --activity-type=claude")
+	rootCmd.Flags().StringVar(&robotActivityType, "activity-type", "", "Filter by agent type: claude, codex, antigravity, gemini. Optional with --robot-activity. Example: --activity-type=claude")
 
 	// Robot-wait flags for waiting on agent states
 	rootCmd.Flags().StringVar(&robotWait, "robot-wait", "", "Wait for agents to reach state. Required: SESSION. Example: ntm --robot-wait=myproject --wait-until=idle")
@@ -3478,6 +3624,8 @@ func init() {
 	rootCmd.Flags().StringVar(&robotPipelineVars, "pipeline-vars", "", "JSON variables for pipeline. Optional with --robot-pipeline-run. Example: --pipeline-vars='{\"env\":\"prod\"}'")
 	rootCmd.Flags().BoolVar(&robotPipelineDryRun, "pipeline-dry-run", false, "Validate workflow without executing. Optional with --robot-pipeline-run")
 	rootCmd.Flags().BoolVar(&robotPipelineBG, "pipeline-background", false, "Run pipeline in background. Optional with --robot-pipeline-run")
+	rootCmd.Flags().StringVar(&robotPipelineStartFrom, "pipeline-start-from", "", "Top-level step ID to start from. Optional with --robot-pipeline-run. Example: --pipeline-start-from=step-3")
+	rootCmd.Flags().StringVar(&robotPipelineFromState, "pipeline-from-state", "", "Prior run ID whose persisted outputs should be reused for steps skipped by --pipeline-start-from. Requires --pipeline-start-from.")
 
 	// TUI Parity robot flags - expose TUI dashboard functionality to AI agents
 	rootCmd.Flags().StringVar(&robotFiles, "robot-files", "", "Get file changes with agent attribution. Optional SESSION filter. Example: ntm --robot-files=myproject --files-window=15m")
@@ -3572,6 +3720,8 @@ func init() {
 	rootCmd.Flags().StringVar(&robotDCGCmd, "cmd", "", "DEPRECATED: use --command")
 	rootCmd.Flags().StringVar(&robotDCGContext, "context", "", "Context/intent for the command (helps DCG make better decisions). Example: --context='Cleaning build artifacts'")
 	rootCmd.Flags().StringVar(&robotDCGCwd, "cwd", "", "Working directory context (defaults to current directory). Example: --cwd=/tmp/scratch")
+	rootCmd.Flags().BoolVar(&robotSafetySimulate, "robot-safety-simulate", false, "Simulate a safety policy command plan without execution. JSON output. Use --command and/or repeated --step.")
+	rootCmd.Flags().StringArrayVar(&robotSafetySteps, "step", nil, "Command step for --robot-safety-simulate; repeat for multi-step plans")
 
 	// Robot-slb flags for SLB approvals
 	rootCmd.Flags().BoolVar(&robotSLBPending, "robot-slb-pending", false, "List pending SLB approval requests. JSON output. Example: ntm --robot-slb-pending")
@@ -3635,7 +3785,7 @@ func init() {
 	rootCmd.Flags().IntVar(&cassLimit, "limit", 10, "Max results to return (default varies by command)")
 	rootCmd.Flags().IntVar(&robotOffset, "offset", 0, "Pagination offset (default 0)")
 	// Note: --since already defined at line 1631 for robotSince (used by --robot-snapshot)
-	rootCmd.Flags().StringVar(&cassAgent, "agent", "", "Filter by agent type: claude, codex, gemini, cursor, etc.")
+	rootCmd.Flags().StringVar(&cassAgent, "agent", "", "Filter by agent type: claude, codex, antigravity, gemini, cursor, etc.")
 	rootCmd.Flags().StringVar(&cassWorkspace, "workspace", "", "Filter by workspace/project path")
 
 	// --category and --tag for JFP
@@ -3684,7 +3834,7 @@ func init() {
 	rootCmd.Flags().StringVar(&robotReplayID, "id", "", "Entry ID for replay")
 
 	// --provider for CAAM/quota
-	rootCmd.Flags().StringVar(&robotAccountStatusProvider, "provider", "", "Filter by provider: claude|anthropic, openai, gemini|google")
+	rootCmd.Flags().StringVar(&robotAccountStatusProvider, "provider", "", "Filter by provider: claude|anthropic, openai, antigravity|agy, gemini|google")
 
 	// --verbose global flag (works with multiple commands)
 	rootCmd.Flags().BoolVar(&robotIsWorkingVerbose, "verbose", false, "Include detailed/verbose output for commands that support it, including --robot-is-working, --robot-agent-health, and --robot-smart-restart")
@@ -3907,6 +4057,7 @@ func init() {
 		newReviewQueueCmd(),
 		newScaleCmd(),
 		newControllerCmd(),
+		newCodexCmd(),
 
 		// Session navigation
 		newAttachCmd(),
@@ -3972,6 +4123,10 @@ func init() {
 		newWorkCmd(),
 		newEnsembleCmd(),
 		newModesCmd(),
+
+		// Agent-name navigation (ntm#139)
+		newSwitchAgentCmd(),
+		newMappingCmd(),
 
 		// Internal commands
 		newMonitorCmd(),
@@ -4491,12 +4646,14 @@ Examples:
 					"theme":         effectiveCfg.Theme,
 					"palette_file":  effectiveCfg.PaletteFile,
 					"agents": map[string]string{
-						"claude":   effectiveCfg.Agents.Claude,
-						"codex":    effectiveCfg.Agents.Codex,
-						"gemini":   effectiveCfg.Agents.Gemini,
-						"cursor":   effectiveCfg.Agents.Cursor,
-						"windsurf": effectiveCfg.Agents.Windsurf,
-						"aider":    effectiveCfg.Agents.Aider,
+						"claude":      effectiveCfg.Agents.Claude,
+						"codex":       effectiveCfg.Agents.Codex,
+						"antigravity": effectiveCfg.Agents.Antigravity,
+						"gemini":      effectiveCfg.Agents.Gemini,
+						"cursor":      effectiveCfg.Agents.Cursor,
+						"windsurf":    effectiveCfg.Agents.Windsurf,
+						"aider":       effectiveCfg.Agents.Aider,
+						"oc":          effectiveCfg.Agents.Opencode,
 					},
 					"tmux": map[string]interface{}{
 						"default_panes":      effectiveCfg.Tmux.DefaultPanes,
@@ -4587,9 +4744,10 @@ Examples:
 						"rotate_threshold":  effectiveCfg.ContextRotation.RotateThreshold,
 					},
 					"agent_mail": map[string]interface{}{
-						"enabled":       effectiveCfg.AgentMail.Enabled,
-						"url":           effectiveCfg.AgentMail.URL,
-						"auto_register": effectiveCfg.AgentMail.AutoRegister,
+						"enabled":            effectiveCfg.AgentMail.Enabled,
+						"url":                effectiveCfg.AgentMail.URL,
+						"auto_register":      effectiveCfg.AgentMail.AutoRegister,
+						"supervisor_enabled": effectiveCfg.AgentMail.SupervisorEnabledOrDefault(),
 					},
 					"ensemble": map[string]interface{}{
 						"default_ensemble": effectiveCfg.Ensemble.DefaultEnsemble,
@@ -4823,6 +4981,7 @@ func printDefaultPrompts() error {
 		CCDefault  string `json:"cc_default"`
 		CodDefault string `json:"cod_default"`
 		GmiDefault string `json:"gmi_default"`
+		AgyDefault string `json:"agy_default"`
 	}
 	r := result{Success: true}
 	if cfg != nil {
@@ -4835,6 +4994,9 @@ func printDefaultPrompts() error {
 		}
 		if v, err := p.ResolveForType("gmi"); err == nil {
 			r.GmiDefault = v
+		}
+		if v, err := p.ResolveForType("agy"); err == nil {
+			r.AgyDefault = v
 		}
 	}
 	data, err := json.MarshalIndent(r, "", "  ")
@@ -4890,6 +5052,27 @@ func robotLinesOrDefault(cmd *cobra.Command, fallback int) int {
 
 func robotIsWorkingLines(cmd *cobra.Command) int {
 	return robotLinesOrDefault(cmd, robot.DefaultIsWorkingOptions().LinesCaptured)
+}
+
+// resolveSemanticWindow resolves the --semantic look-back window (#199).
+// Priority: --semantic-window flag (Go duration) > [robot.semantic].window_minutes
+// config > conservative 30m default. A non-positive resolved window falls back
+// to the default so the reader never receives a zero/negative window.
+func resolveSemanticWindow(flagVal string) (time.Duration, error) {
+	if strings.TrimSpace(flagVal) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(flagVal))
+		if err != nil {
+			return 0, err
+		}
+		if d <= 0 {
+			return 0, fmt.Errorf("must be positive, got %s", flagVal)
+		}
+		return d, nil
+	}
+	if cfg != nil && cfg.Robot.Semantic.WindowMinutes > 0 {
+		return time.Duration(cfg.Robot.Semantic.WindowMinutes) * time.Minute, nil
+	}
+	return 30 * time.Minute, nil
 }
 
 func robotAgentHealthLines(cmd *cobra.Command) int {

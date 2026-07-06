@@ -46,7 +46,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Go** in this project. This is a pure Go project — never introduce non-Go tooling for building or testing.
 
-- **Version:** Go 1.25+ (as specified in `go.mod`)
+- **Version:** Go 1.26.3+ (as specified in `go.mod`)
 - **Lockfiles:** `go.mod` and `go.sum` only
 - **Build:** `go build ./cmd/ntm`
 - **Format:** `gofmt` or `goimports`
@@ -330,7 +330,7 @@ Robot command outputs follow consistent semantics for absent, null, and empty fi
 |------|---------------|---------------|-------------|
 | `--msg` | `--robot-send` | `--robot-ack` | Message content |
 | `--panes` | - | `--robot-tail`, `--robot-send`, `--robot-ack`, `--robot-interrupt` | Filter to pane indices |
-| `--type` | - | `--robot-send`, `--robot-ack`, `--robot-interrupt` | Agent type: claude\|cc, codex\|cod, gemini\|gmi |
+| `--type` | - | `--robot-send`, `--robot-ack`, `--robot-interrupt` | Agent type: claude\|cc, codex\|cod, antigravity\|agy, gemini\|gmi (legacy) |
 | `--all` | - | `--robot-send`, `--robot-interrupt` | Include user pane |
 | `--track` | - | `--robot-send` | Combined send+ack mode |
 | `--lines` | - | `--robot-tail` | Lines per pane (default 20) |
@@ -729,7 +729,7 @@ Returns structured results with file paths, line ranges, and extracted code snip
 
 ## cass — Cross-Agent Search
 
-`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, etc.) so we can reuse solved problems.
+`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Antigravity, Gemini (legacy), ChatGPT, etc.) so we can reuse solved problems.
 
 Rules:
 - Never run bare `cass` (TUI). Always use `--robot` or `--json`.
@@ -756,7 +756,7 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 ## Memory System: cass-memory
 
-The Cass Memory System (cm) is a tool for giving agents an effective memory based on the ability to quickly search across previous coding agent sessions across an array of different coding agent tools (e.g., Claude Code, Codex, Gemini-CLI, Cursor, etc.) and projects (and even across multiple machines, optionally) and then reflect on what they find and learn in new sessions to draw out useful lessons and takeaways; these lessons are then stored and can be queried and retrieved later, much like how human memory works.
+The Cass Memory System (cm) is a tool for giving agents an effective memory based on the ability to quickly search across previous coding agent sessions across an array of different coding agent tools (e.g., Claude Code, Codex, Antigravity, Gemini-CLI (legacy), Cursor, etc.) and projects (and even across multiple machines, optionally) and then reflect on what they find and learn in new sessions to draw out useful lessons and takeaways; these lessons are then stored and can be queried and retrieved later, much like how human memory works.
 
 The `cm onboard` command guides you through analyzing historical sessions and extracting valuable rules.
 

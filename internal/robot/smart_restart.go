@@ -4,12 +4,25 @@ package robot
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+)
+
+const (
+	// shellReturnTimeout bounds the post-exit poll for the shell to return.
+	// Agents like Claude can take several seconds to tear down, so a fixed
+	// short sleep produced false SHELL_NOT_RETURNED failures (#187).
+	shellReturnTimeout = 12 * time.Second
+	// shellReturnPollInterval is the shell-return poll cadence.
+	shellReturnPollInterval = 400 * time.Millisecond
+	// smartRestartMinReadyTimeout is the floor for the post-launch ready-gate.
+	smartRestartMinReadyTimeout = 10 * time.Second
 )
 
 // =============================================================================
@@ -54,7 +67,7 @@ type SmartRestartOptions struct {
 	Prompt        string        // Optional prompt to send after restart
 	LinesCaptured int           // Lines to capture for pre-check (default: 100)
 	Verbose       bool          // Include extra debugging info
-	PostWaitTime  time.Duration // Time to wait after launch before verification (default: 6s)
+	PostWaitTime  time.Duration // Max time to wait for agent readiness after launch (ready-gate polls and exits early; floored at 10s, #187)
 	HardKill      bool          // Use hard kill (kill -9) as fallback if soft exit fails (bd-bh74z)
 	HardKillOnly  bool          // Skip soft exit entirely and use kill -9 immediately
 }
@@ -187,7 +200,12 @@ func GetSmartRestart(opts SmartRestartOptions) (*SmartRestartOutput, error) {
 
 	// Step 2: Process each pane
 	for paneStr, workStatus := range isWorkingResult.Panes {
-		paneNum, _ := strconv.Atoi(paneStr)
+		// The is-working map key is "window.pane" on multi-window sessions and a
+		// bare pane index on single-window sessions (#172). Parse both so the
+		// restart targets the real window instead of defaulting to window 0/1
+		// (the old `strconv.Atoi("1.2")` -> 0 mis-fire that ctrl-c'd a
+		// nonexistent pane while the envelope claimed success).
+		restartWin, paneNum := parseRestartPaneKey(paneStr)
 
 		action := RestartAction{
 			PreCheck: &PreCheckInfo{
@@ -233,7 +251,7 @@ func GetSmartRestart(opts SmartRestartOptions) (*SmartRestartOutput, error) {
 			if warning != "" {
 				action.Warning = warning
 			}
-			restartResult, restartErr := executeRestart(opts.Session, paneNum, workStatus.AgentType, opts)
+			restartResult, restartErr := executeRestart(opts.Session, restartWin, paneNum, workStatus.AgentType, opts)
 			if restartErr != nil {
 				action.Action = ActionFailed
 				action.Reason = reason
@@ -248,7 +266,7 @@ func GetSmartRestart(opts SmartRestartOptions) (*SmartRestartOutput, error) {
 				action.Action = ActionRestarted
 				action.Reason = reason
 				action.RestartSequence = restartResult
-				action.PostState = verifyRestart(opts.Session, paneNum, opts)
+				action.PostState = verifyRestart(opts.Session, restartWin, paneNum, opts)
 				output.Summary.Restarted++
 				appendPaneToAction(output.Summary.PanesByAction, "RESTARTED", paneNum)
 			}
@@ -257,7 +275,68 @@ func GetSmartRestart(opts SmartRestartOptions) (*SmartRestartOutput, error) {
 		output.Actions[paneStr] = action
 	}
 
+	// Fail loud (#172) instead of silently reporting success:true when the
+	// restart accomplished nothing useful. Two dangerous classes are caught:
+	//
+	//   1. No restartable target resolved. On multi-window / window-per-agent
+	//      layouts a window-local `--panes=N` filter can match nothing (or match
+	//      a pane address that does not exist), leaving the action set empty or
+	//      populated only with not-found error panes. Previously the top-level
+	//      response still said success:true.
+	//   2. One or more individual restart actions FAILED (e.g. executeRestart
+	//      could not find the pane, or the agent never relaunched). Previously
+	//      these were recorded under the action but the envelope stayed
+	//      success:true.
+	//
+	// In dry-run mode no restart is attempted, so a non-empty would-restart set
+	// is a successful preview and must keep success:true.
+	if !opts.DryRun {
+		restartableTargets := output.Summary.Restarted + output.Summary.Failed +
+			output.Summary.Skipped + output.Summary.Waiting
+		switch {
+		case output.Summary.Failed > 0:
+			output.Success = false
+			output.ErrorCode = ErrCodeInternalError
+			output.Error = fmt.Sprintf("%d of %d targeted pane(s) failed to restart", output.Summary.Failed, len(output.Actions))
+			output.Hint = smartRestartTargetingHint(opts, output)
+		case restartableTargets == 0:
+			output.Success = false
+			output.ErrorCode = ErrCodePaneNotFound
+			output.Error = "no restartable panes matched the request"
+			output.Hint = smartRestartTargetingHint(opts, output)
+		}
+	}
+
 	return output, nil
+}
+
+// smartRestartTargetingHint builds an actionable remediation hint for the
+// fail-loud paths. On multi-window layouts a bare pane index is window-local and
+// may need a `window.pane` address; we surface the panes that were actually
+// found so the caller can re-target precisely.
+func smartRestartTargetingHint(opts SmartRestartOptions, output *SmartRestartOutput) string {
+	found := make([]string, 0, len(output.Actions))
+	for paneKey := range output.Actions {
+		found = append(found, paneKey)
+	}
+	sort.Strings(found)
+
+	var b strings.Builder
+	if len(opts.Panes) > 0 {
+		b.WriteString("On multi-window / window-per-agent layouts a bare --panes index is window-local; ")
+		b.WriteString("the pane may need a window.pane address. ")
+	}
+	if len(found) > 0 {
+		b.WriteString("Panes evaluated: ")
+		b.WriteString(strings.Join(found, ", "))
+		b.WriteString(". ")
+	} else {
+		b.WriteString("No panes were evaluated for this session. ")
+	}
+	b.WriteString("Run 'ntm --robot-is-working=")
+	b.WriteString(opts.Session)
+	b.WriteString("' to see live pane addresses and states.")
+	return b.String()
 }
 
 // decideRestart determines whether a pane should be restarted based on its state.
@@ -342,6 +421,25 @@ func buildWaitInfo(status *PaneWorkStatus) *WaitInfo {
 	return info
 }
 
+// parseRestartPaneKey decodes the is-working response-map key into a
+// (window, pane) pair. On multi-window sessions the key is "window.pane"
+// (#172); on single-window sessions it is a bare pane index. For the bare-index
+// case the window is reported as -1 ("unknown") so executeRestart/verifyRestart
+// fall back to the session's first window — preserving single-window behavior
+// while fixing the multi-window mis-fire where strconv.Atoi("1.2") yielded 0
+// and ctrl-c'd a nonexistent pane.
+func parseRestartPaneKey(key string) (win, pane int) {
+	if w, p, ok := strings.Cut(key, "."); ok {
+		wi, errW := strconv.Atoi(strings.TrimSpace(w))
+		pi, errP := strconv.Atoi(strings.TrimSpace(p))
+		if errW == nil && errP == nil {
+			return wi, pi
+		}
+	}
+	p, _ := strconv.Atoi(strings.TrimSpace(key))
+	return -1, p
+}
+
 // appendPaneToAction adds a pane number to the action's pane list.
 func appendPaneToAction(panesByAction map[string][]int, action string, pane int) {
 	if panesByAction[action] == nil {
@@ -367,23 +465,30 @@ func newRestartError(code, message, phase string, pane int, agentType string, at
 }
 
 // executeRestart performs the actual restart sequence for a pane.
-func executeRestart(session string, pane int, agentType string, opts SmartRestartOptions) (*RestartSequence, error) {
+func executeRestart(session string, win, pane int, agentType string, opts SmartRestartOptions) (*RestartSequence, error) {
 	seq := &RestartSequence{
 		AgentType: agentType,
 	}
 	var attemptedActions []string
 	var softExitFailed bool
 
-	firstWin, err := tmux.GetFirstWindow(session)
-	if err != nil {
-		firstWin = 1 // fallback
+	// win < 0 means "single-window session, window unknown" — fall back to the
+	// session's first window. On multi-window sessions win is the pane's real
+	// window index (#172), so the target addresses the correct window instead
+	// of always window 1.
+	if win < 0 {
+		fw, err := tmux.GetFirstWindow(session)
+		if err != nil {
+			fw = 1 // fallback
+		}
+		win = fw
 	}
-	target := fmt.Sprintf("%s:%d.%d", session, firstWin, pane)
+	target := fmt.Sprintf("%s:%d.%d", session, win, pane)
 
 	// Step 1: Exit the current agent using agent-specific method (unless HardKillOnly)
 	if !opts.HardKillOnly {
 		attemptedActions = append(attemptedActions, "exit-agent-"+agentType)
-		exitErr := exitAgent(session, pane, agentType, seq)
+		exitErr := exitAgent(session, win, pane, agentType, seq)
 		if exitErr != nil {
 			if opts.HardKill {
 				// Soft exit failed, but we're allowed to try hard kill
@@ -402,53 +507,38 @@ func executeRestart(session string, pane int, agentType string, opts SmartRestar
 			}
 		}
 
-		// Step 2: Wait for shell to return (after soft exit attempt)
-		attemptedActions = append(attemptedActions, "wait-3s")
-		seq.ExitDurationMs = 3000
-		time.Sleep(3 * time.Second)
-
-		// Step 3: Verify shell prompt
-		attemptedActions = append(attemptedActions, "verify-shell-prompt")
-		output, err := tmux.CapturePaneOutput(target, 10)
-		if err != nil {
-			if opts.HardKill {
-				softExitFailed = true
-			} else {
+		// Steps 2+3: Poll for the shell to return after the soft exit.
+		// Confirmation is primarily by PROCESS DEATH (no agent child under
+		// the pane shell): a fixed sleep plus prompt-glyph scraping produced
+		// false SHELL_NOT_RETURNED during multi-second agent teardown and
+		// false RESTARTED when a live agent's own "❯" input line satisfied
+		// the glyph heuristic (#187).
+		attemptedActions = append(attemptedActions, "wait-shell-return")
+		waitStart := time.Now()
+		shellReturned, lastOutput := waitForShellReturn(session, win, pane, shellReturnTimeout)
+		seq.ExitDurationMs = int(time.Since(waitStart).Milliseconds())
+		seq.ShellConfirmed = shellReturned
+		if !shellReturned {
+			if !opts.HardKill {
 				structErr := newRestartError(
 					ErrCodeShellNotReturned,
-					"Failed to capture pane output after exit: "+err.Error(),
+					fmt.Sprintf("Shell did not return within %s after exit - agent may still be running", shellReturnTimeout),
 					"post_exit",
 					pane,
 					agentType,
 					attemptedActions,
-					"",
-				).WithRecoveryHint("Check if the pane still exists with ntm status")
-				return seq, structErr
-			}
-		} else {
-			seq.ShellConfirmed = looksLikeShellPrompt(output)
-			if !seq.ShellConfirmed && !opts.HardKill {
-				structErr := newRestartError(
-					ErrCodeShellNotReturned,
-					"Shell prompt not detected after exit - agent may still be running",
-					"post_exit",
-					pane,
-					agentType,
-					attemptedActions,
-					output,
+					lastOutput,
 				).WithRecoveryHint(fmt.Sprintf("Try ntm --robot-smart-restart=%s --panes=%d --hard-kill, or manually kill the process", session, pane))
 				return seq, structErr
 			}
-			if !seq.ShellConfirmed {
-				softExitFailed = true
-			}
+			softExitFailed = true
 		}
 	}
 
 	// Step 3b: Hard kill fallback if soft exit failed or HardKillOnly (bd-bh74z)
 	if opts.HardKillOnly || (opts.HardKill && softExitFailed) {
 		attemptedActions = append(attemptedActions, "hard-kill")
-		hardKillResult, err := hardKillAgent(session, pane, seq)
+		hardKillResult, err := hardKillAgent(session, win, pane, seq)
 		seq.HardKillUsed = true
 		seq.HardKillResult = hardKillResult
 
@@ -470,35 +560,20 @@ func executeRestart(session string, pane int, agentType string, opts SmartRestar
 			return seq, structErr
 		}
 
-		// Wait for shell to return after hard kill
-		attemptedActions = append(attemptedActions, "wait-1s-after-kill")
-		time.Sleep(1 * time.Second)
-
-		// Verify shell prompt after hard kill
-		output, err := tmux.CapturePaneOutput(target, 10)
-		if err != nil {
+		// Poll for the shell to return after hard kill — same process-death
+		// confirmation as the soft-exit path (#187).
+		attemptedActions = append(attemptedActions, "wait-shell-return-after-kill")
+		shellReturned, lastOutput := waitForShellReturn(session, win, pane, shellReturnTimeout)
+		seq.ShellConfirmed = shellReturned
+		if !shellReturned {
 			structErr := newRestartError(
 				ErrCodeShellNotReturned,
-				"Failed to capture pane output after hard kill: "+err.Error(),
+				fmt.Sprintf("Shell did not return within %s after hard kill", shellReturnTimeout),
 				"post_hard_kill",
 				pane,
 				agentType,
 				attemptedActions,
-				"",
-			).WithRecoveryHint("Check if the pane still exists with ntm status")
-			return seq, structErr
-		}
-
-		seq.ShellConfirmed = looksLikeShellPrompt(output)
-		if !seq.ShellConfirmed {
-			structErr := newRestartError(
-				ErrCodeShellNotReturned,
-				"Shell prompt not detected after hard kill",
-				"post_hard_kill",
-				pane,
-				agentType,
-				attemptedActions,
-				output,
+				lastOutput,
 			).WithRecoveryHint("Shell may be in unexpected state - try manually running 'reset' in the pane")
 			return seq, structErr
 		}
@@ -508,7 +583,7 @@ func executeRestart(session string, pane int, agentType string, opts SmartRestar
 	alias := restartLaunchAlias(agentType)
 
 	attemptedActions = append(attemptedActions, "launch-"+alias)
-	launchErr := sendKeys(session, pane, alias+"\n")
+	launchErr := sendKeys(session, win, pane, alias+"\n")
 	if launchErr != nil {
 		structErr := newRestartError(
 			ErrCodeCCLaunchFailed,
@@ -522,19 +597,38 @@ func executeRestart(session string, pane int, agentType string, opts SmartRestar
 		return seq, structErr
 	}
 
-	// Step 5: Wait for agent initialization
-	waitTime := opts.PostWaitTime
-	if waitTime == 0 {
-		waitTime = 6 * time.Second
+	// Step 5: Ready-gate — poll until the agent TUI is actually up instead of
+	// sleeping a fixed interval, so the prompt is never typed into a bare
+	// shell when the agent boots slowly (#187).
+	readyTimeout := opts.PostWaitTime
+	if readyTimeout < smartRestartMinReadyTimeout {
+		readyTimeout = smartRestartMinReadyTimeout
 	}
-	attemptedActions = append(attemptedActions, fmt.Sprintf("wait-%ds", int(waitTime.Seconds())))
-	time.Sleep(waitTime)
+	attemptedActions = append(attemptedActions, "wait-agent-ready")
+	shellPID, pidErr := getShellPID(session, win, pane)
+	if pidErr != nil {
+		shellPID = 0 // ready-gate falls back to content-only detection
+	}
+	if !waitForPaneAgentReady(target, shellPID, agentType, readyTimeout) {
+		lastOutput, _ := tmux.CapturePaneOutput(target, 10)
+		structErr := newRestartError(
+			ErrCodeCCLaunchFailed,
+			fmt.Sprintf("Agent did not become ready within %s after launch", readyTimeout),
+			"launch",
+			pane,
+			agentType,
+			attemptedActions,
+			lastOutput,
+		).WithRecoveryHint("Verify the agent CLI is installed and in PATH, then check the pane with ntm status")
+		return seq, structErr
+	}
 
-	// Step 6: Send prompt if provided
+	// Step 6: Send prompt if provided — use the double-Enter submission
+	// protocol (same as ntm send / robot-send) so the prompt is reliably
+	// submitted to the agent TUI rather than left typed-but-unsubmitted.
 	if opts.Prompt != "" {
 		attemptedActions = append(attemptedActions, "send-prompt")
-		time.Sleep(500 * time.Millisecond)
-		promptErr := sendKeys(session, pane, opts.Prompt+"\n")
+		promptErr := tmux.SendKeysForAgentDoubleEnter(target, opts.Prompt, tmux.AgentType(agentType))
 		if promptErr != nil {
 			// Non-fatal - agent launched but prompt failed
 			seq.AgentLaunched = true
@@ -549,14 +643,73 @@ func executeRestart(session string, pane int, agentType string, opts SmartRestar
 	return seq, nil
 }
 
+// waitForShellReturn polls a pane until its shell has returned after an agent
+// exit, primarily by PROCESS DEATH: the shell has returned iff the pane shell
+// has no live child process. Pane-content heuristics are only used when the
+// process state is unknowable (#187). Returns confirmation plus the last
+// captured pane content for diagnostics.
+func waitForShellReturn(session string, win, pane int, timeout time.Duration) (bool, string) {
+	target := formatTargetWin(session, win, pane)
+	deadline := time.Now().Add(timeout)
+	lastOutput := ""
+	for {
+		if content, err := tmux.CapturePaneOutput(target, 10); err == nil {
+			lastOutput = content
+		}
+		childAlive := false
+		childKnown := false
+		if shellPID, err := getShellPID(session, win, pane); err == nil && shellPID > 0 {
+			childKnown = true
+			childAlive = process.HasChildAlive(shellPID)
+		}
+		if confirmShellReturned(childAlive, childKnown, lastOutput) {
+			return true, lastOutput
+		}
+		if time.Now().After(deadline) {
+			return false, lastOutput
+		}
+		time.Sleep(shellReturnPollInterval)
+	}
+}
+
+// confirmShellReturned reports whether a single observation confirms the pane
+// shell has returned. The primary signal is process death: when the child
+// state is known, the shell has returned iff no agent child is alive. Only
+// when process state is unknowable does it fall back to the prompt-glyph
+// heuristic — and then rejects frames the agent parser still classifies as a
+// live agent, because a busy Claude pane renders its own "❯" input line which
+// satisfies the glyph heuristic (#187).
+func confirmShellReturned(childAlive, childKnown bool, paneContent string) bool {
+	if childKnown {
+		return !childAlive
+	}
+	if !looksLikeShellPrompt(paneContent) {
+		return false
+	}
+	return !paneShowsLiveAgent(paneContent)
+}
+
+// paneShowsLiveAgent reports whether pane content is classified by the agent
+// parser as a recognizable agent TUI (the approach verifyRestart uses).
+func paneShowsLiveAgent(content string) bool {
+	parser := agent.NewParser()
+	state, err := parser.Parse(content)
+	if err != nil || state == nil {
+		return false
+	}
+	return state.Type != agent.AgentTypeUnknown && state.Type != agent.AgentTypeUser
+}
+
 func restartCanonicalAgentType(agentType string) agent.AgentType {
 	switch canonical := agent.AgentType(agentType).Canonical(); canonical {
 	case agent.AgentTypeClaudeCode,
 		agent.AgentTypeCodex,
 		agent.AgentTypeGemini,
+		agent.AgentTypeAntigravity,
 		agent.AgentTypeCursor,
 		agent.AgentTypeWindsurf,
 		agent.AgentTypeAider,
+		agent.AgentTypeOpencode,
 		agent.AgentTypeOllama,
 		agent.AgentTypeUser,
 		agent.AgentTypeUnknown:
@@ -575,14 +728,19 @@ func restartLaunchAlias(agentType string) string {
 	}
 }
 
-// verifyRestart checks the post-restart state of a pane.
-func verifyRestart(session string, pane int, opts SmartRestartOptions) *PostStateInfo {
-	firstWin, err := tmux.GetFirstWindow(session)
-	if err != nil {
-		firstWin = 1 // fallback
+// verifyRestart checks the post-restart state of a pane. win is the pane's real
+// window index (#172); win < 0 falls back to the session's first window for the
+// single-window case.
+func verifyRestart(session string, win, pane int, opts SmartRestartOptions) *PostStateInfo {
+	if win < 0 {
+		fw, err := tmux.GetFirstWindow(session)
+		if err != nil {
+			fw = 1 // fallback
+		}
+		win = fw
 	}
 	// Capture current state
-	target := fmt.Sprintf("%s:%d.%d", session, firstWin, pane)
+	target := fmt.Sprintf("%s:%d.%d", session, win, pane)
 	content, err := tmux.CapturePaneOutput(target, 50)
 	if err != nil {
 		return &PostStateInfo{

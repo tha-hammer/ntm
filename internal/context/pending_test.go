@@ -1,9 +1,12 @@
 package context
 
 import (
+	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -394,6 +397,72 @@ func TestPendingRotationStore_MalformedLines(t *testing.T) {
 	}
 	if all[0].AgentID != "agent-1" {
 		t.Errorf("AgentID = %q, want agent-1", all[0].AgentID)
+	}
+}
+
+func TestPendingRotationStore_AddFailsClosedOnReadError(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pending.jsonl")
+	store := NewPendingRotationStoreWithPath(path)
+
+	timeout := time.Now().Add(10 * time.Minute)
+	if err := store.Add(makePending("agent-1", "sess-1", "1.1", timeout)); err != nil {
+		t.Fatalf("Add initial entry: %v", err)
+	}
+	initial, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile initial: %v", err)
+	}
+
+	corrupted := append(append([]byte{}, initial...), []byte(strings.Repeat("x", 1024*1024+1))...)
+	if err := os.WriteFile(path, corrupted, 0o600); err != nil {
+		t.Fatalf("WriteFile corrupted: %v", err)
+	}
+
+	err = store.Add(makePending("agent-2", "sess-1", "1.2", timeout))
+	if err == nil {
+		t.Fatal("expected Add to fail on scanner read error")
+	}
+	if !strings.Contains(err.Error(), "reading pending rotations") {
+		t.Fatalf("expected read error context, got %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after failed Add: %v", err)
+	}
+	if !bytes.Equal(after, corrupted) {
+		t.Fatal("Add rewrote pending rotations after a read error")
+	}
+}
+
+func TestPendingRotationStore_AddReturnsMarshalError(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pending.jsonl")
+	store := NewPendingRotationStoreWithPath(path)
+
+	pending := makePending("agent-1", "sess-1", "1.1", time.Now().Add(10*time.Minute))
+	pending.ContextPercent = math.NaN()
+
+	err := store.Add(pending)
+	if err == nil {
+		t.Fatal("expected Add to fail when pending rotation cannot be marshaled")
+	}
+	if !strings.Contains(err.Error(), "marshaling pending rotation") {
+		t.Fatalf("expected marshal error context, got %v", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("expected no committed pending file after marshal error, stat err=%v", statErr)
+	}
+}
+
+func TestPendingRotationStore_AddRejectsNil(t *testing.T) {
+	t.Parallel()
+	store := NewPendingRotationStoreWithPath(filepath.Join(t.TempDir(), "pending.jsonl"))
+	if err := store.Add(nil); err == nil {
+		t.Fatal("expected Add(nil) to return an error")
 	}
 }
 

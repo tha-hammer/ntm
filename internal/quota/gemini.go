@@ -18,7 +18,7 @@ var geminiUsagePatterns = struct {
 }{
 	Usage:   regexp.MustCompile(`(?i)usage[:\s]+(\d+(?:\.\d+)?)\s*%`),
 	Quota:   regexp.MustCompile(`(?i)quota[:\s]+(\d+(?:\.\d+)?)\s*%`),
-	Limited: regexp.MustCompile(`(?i)(?:rate\s*limit|limited|exceeded|quota\s*exceeded)`),
+	Limited: regexp.MustCompile(`(?i)\b(?:rate[\s-]*limit(?:ed)?|limit[\s-]*(?:exceeded|reached)|quota[\s-]*(?:exceeded|exhausted|reached)|exceeded\s+quota)\b`),
 }
 
 var geminiStatusPatterns = struct {

@@ -161,28 +161,30 @@ func TestSpawnAssignAgentTypeAliases(t *testing.T) {
 		ccOnly  bool
 		codOnly bool
 		gmiOnly bool
+		agyOnly bool
 		agent   string
 		want    string
 	}{
-		{false, false, false, "", ""},
-		{true, false, false, "", "claude"},
-		{false, true, false, "", "codex"},
-		{false, false, true, "", "gemini"},
-		{false, false, false, "claude", "claude"},
-		{false, false, false, "CC", "claude"},
-		{false, false, false, "Codex", "codex"},
-		{false, false, false, "codex-cli", "codex"},
-		{false, false, false, "GEMINI", "gemini"},
-		{false, false, false, " google-gemini ", "gemini"},
+		{false, false, false, false, "", ""},
+		{true, false, false, false, "", "claude"},
+		{false, true, false, false, "", "codex"},
+		{false, false, true, false, "", "gemini"},
+		{false, false, false, true, "", "antigravity"},
+		{false, false, false, false, "claude", "claude"},
+		{false, false, false, false, "CC", "claude"},
+		{false, false, false, false, "Codex", "codex"},
+		{false, false, false, false, "codex-cli", "codex"},
+		{false, false, false, false, "GEMINI", "gemini"},
+		{false, false, false, false, " google-gemini ", "gemini"},
 		// --assign-agent should take precedence
-		{true, false, false, "codex", "codex"},
+		{true, false, false, false, "codex", "codex"},
 	}
 
 	for _, tc := range tests {
-		got := resolveSpawnAssignAgentType(tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly)
+		got := resolveSpawnAssignAgentType(tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly, tc.agyOnly)
 		if got != tc.want {
-			t.Errorf("resolveSpawnAssignAgentType(agent=%q, cc=%v, cod=%v, gmi=%v) = %q, want %q",
-				tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly, got, tc.want)
+			t.Errorf("resolveSpawnAssignAgentType(agent=%q, cc=%v, cod=%v, gmi=%v, agy=%v) = %q, want %q",
+				tc.agent, tc.ccOnly, tc.codOnly, tc.gmiOnly, tc.agyOnly, got, tc.want)
 		}
 	}
 }

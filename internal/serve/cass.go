@@ -201,9 +201,14 @@ type CASSStatusResponse struct {
 	ReindexReason string `json:"reindex_reason,omitempty"`
 }
 
-// MemoryContextRequest is the request body for POST /api/v1/memory/context
+// MemoryContextRequest is the request body for POST /api/v1/memory/context.
+//
+// Workspace, when set, becomes the CM workspace scope so same-basename
+// projects do not share memory results (#132). Empty Workspace falls through
+// to the unscoped query for callers that don't track workspace identity.
 type MemoryContextRequest struct {
 	Task        string `json:"task"`
+	Workspace   string `json:"workspace,omitempty"`
 	MaxRules    int    `json:"max_rules,omitempty"`
 	MaxSnippets int    `json:"max_snippets,omitempty"`
 }
@@ -285,8 +290,12 @@ func (s *Server) handleCASSStatus(w http.ResponseWriter, r *http.Request) {
 			status.Version = statusResp.Version
 			status.IndexSize = statusResp.Index.SizeBytes
 			status.DocCount = statusResp.Index.DocCount
-			if !statusResp.Index.LastUpdated.IsZero() {
-				status.LastIndexed = statusResp.Index.LastUpdated.Format(time.RFC3339)
+			if status.DocCount == 0 {
+				status.DocCount = statusResp.Index.Documents
+			}
+			lastIndexedAt := statusResp.Index.EffectiveLastIndexedAt(statusResp.LastIndexedAt)
+			if !lastIndexedAt.IsZero() {
+				status.LastIndexed = lastIndexedAt.Format(time.RFC3339)
 			}
 		}
 
@@ -1045,7 +1054,7 @@ func (s *Server) handleMemoryContext(w http.ResponseWriter, r *http.Request) {
 	if daemonInfo.State == DaemonStateRunning && daemonInfo.SessionID != "" {
 		client, err := cm.NewClient(s.projectDir, daemonInfo.SessionID)
 		if err == nil {
-			result, err := client.GetContext(ctx, req.Task)
+			result, err := client.GetContext(ctx, req.Task, req.Workspace)
 			if err == nil {
 				// Convert to response format
 				rules := make([]map[string]interface{}, 0, len(result.RelevantBullets))
@@ -1104,7 +1113,7 @@ func (s *Server) handleMemoryContext(w http.ResponseWriter, r *http.Request) {
 		maxSnippets = 5
 	}
 
-	result, err := cliClient.GetRecoveryContext(ctx, req.Task, maxRules, maxSnippets)
+	result, err := cliClient.GetRecoveryContext(ctx, req.Task, req.Workspace, maxRules, maxSnippets)
 	if err != nil {
 		slog.Warn("memory context failed", "error", err, "request_id", reqID)
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeContextFailed,
@@ -1343,7 +1352,10 @@ func (s *Server) handleMemoryRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := cliClient.GetContext(ctx, "list all available rules")
+	// "list all available rules" is a global discovery surface, not a
+	// workspace-scoped query — leave workspace empty so CM returns the full
+	// rule catalog (matches prior behavior).
+	result, err := cliClient.GetContext(ctx, "list all available rules", "")
 	if err != nil {
 		slog.Warn("memory rules failed", "error", err, "request_id", reqID)
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeContextFailed,

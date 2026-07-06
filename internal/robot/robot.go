@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/git"
 	"github.com/Dicklesworthstone/ntm/internal/health"
 	"github.com/Dicklesworthstone/ntm/internal/models"
+	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/recipe"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
@@ -51,11 +53,12 @@ type CASSStatusOutput struct {
 
 // CASSIndexStats holds index statistics
 type CASSIndexStats struct {
-	Exists        bool  `json:"exists"`
-	Fresh         bool  `json:"fresh"`
-	LastIndexedAt int64 `json:"last_indexed_at"`
-	Conversations int64 `json:"conversations"`
-	Messages      int64 `json:"messages"`
+	Exists        bool   `json:"exists"`
+	Fresh         bool   `json:"fresh"`
+	LastIndexedAt int64  `json:"last_indexed_at"`
+	Conversations *int64 `json:"conversations,omitempty"`
+	Messages      *int64 `json:"messages,omitempty"`
+	CountsSkipped bool   `json:"counts_skipped,omitempty"`
 }
 
 // GetCASSStatus collects CASS health and stats.
@@ -86,8 +89,11 @@ func GetCASSStatus() (*CASSStatusOutput, error) {
 		output.Index.Exists = true
 		output.Index.Fresh = status.Index.Healthy
 		output.Index.LastIndexedAt = status.LastIndexedAt.UnixMilli()
-		output.Index.Conversations = status.Conversations
-		output.Index.Messages = status.Messages
+		output.Index.CountsSkipped = status.Database.CountsSkipped
+		if !status.Database.CountsSkipped {
+			output.Index.Conversations = &status.Conversations
+			output.Index.Messages = &status.Messages
+		}
 	} else {
 		output.RobotResponse = NewErrorResponse(
 			err,
@@ -1774,25 +1780,27 @@ const (
 
 // StatusSummary provides aggregate stats
 type StatusSummary struct {
-	TotalSessions int            `json:"total_sessions"`
-	TotalAgents   int            `json:"total_agents"`
-	AttachedCount int            `json:"attached_count"`
-	ClaudeCount   int            `json:"claude_count"`
-	CodexCount    int            `json:"codex_count"`
-	GeminiCount   int            `json:"gemini_count"`
-	CursorCount   int            `json:"cursor_count"`
-	WindsurfCount int            `json:"windsurf_count"`
-	AiderCount    int            `json:"aider_count"`
-	OllamaCount   int            `json:"ollama_count"`
-	AgentsByState map[string]int `json:"agents_by_state"`
-	AgentsByType  map[string]int `json:"agents_by_type"`
-	ReadyWork     int            `json:"ready_work"`
-	InProgress    int            `json:"in_progress"`
-	HealthScore   float64        `json:"health_score"`
-	HealthStatus  string         `json:"health_status,omitempty"`
-	AlertsActive  int            `json:"alerts_active"`
-	MailUnread    int            `json:"mail_unread"`
-	MailUrgent    int            `json:"mail_urgent"`
+	TotalSessions    int            `json:"total_sessions"`
+	TotalAgents      int            `json:"total_agents"`
+	AttachedCount    int            `json:"attached_count"`
+	ClaudeCount      int            `json:"claude_count"`
+	CodexCount       int            `json:"codex_count"`
+	GeminiCount      int            `json:"gemini_count"`
+	AntigravityCount int            `json:"antigravity_count"`
+	CursorCount      int            `json:"cursor_count"`
+	WindsurfCount    int            `json:"windsurf_count"`
+	AiderCount       int            `json:"aider_count"`
+	OpencodeCount    int            `json:"opencode_count"`
+	OllamaCount      int            `json:"ollama_count"`
+	AgentsByState    map[string]int `json:"agents_by_state"`
+	AgentsByType     map[string]int `json:"agents_by_type"`
+	ReadyWork        int            `json:"ready_work"`
+	InProgress       int            `json:"in_progress"`
+	HealthScore      float64        `json:"health_score"`
+	HealthStatus     string         `json:"health_status,omitempty"`
+	AlertsActive     int            `json:"alerts_active"`
+	MailUnread       int            `json:"mail_unread"`
+	MailUrgent       int            `json:"mail_urgent"`
 }
 
 // ProgressSummary provides bead completion metrics for status and dashboard (bd-1qct).
@@ -2242,6 +2250,27 @@ func newSnapshotOutput(cfg *config.Config) *SnapshotOutput {
 	}
 }
 
+var collectSnapshotResourcePressure = collectLiveSnapshotResourcePressure
+
+func attachSnapshotResourcePressure(output *SnapshotOutput) {
+	if output == nil {
+		return
+	}
+	output.ResourcePressure = collectSnapshotResourcePressure()
+}
+
+func collectLiveSnapshotResourcePressure() *pressure.RobotPressure {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	g := pressure.New(pressure.Config{
+		Mode:      pressure.ModeObserve,
+		Providers: []pressure.Provider{pressure.NewSystemProvider()},
+	})
+	g.Refresh(ctx)
+	snapshot := g.RobotSnapshot()
+	return &snapshot
+}
+
 func cloneSnapshotOutput(base *SnapshotOutput) *SnapshotOutput {
 	if base == nil {
 		return newSnapshotOutput(config.Default())
@@ -2254,31 +2283,40 @@ func cloneSnapshotOutput(base *SnapshotOutput) *SnapshotOutput {
 	cloned.Alerts = append([]string(nil), base.Alerts...)
 	cloned.AlertsDetailed = append([]AlertInfo(nil), base.AlertsDetailed...)
 	cloned.Summary = StatusSummary{
-		TotalSessions: base.Summary.TotalSessions,
-		TotalAgents:   base.Summary.TotalAgents,
-		AttachedCount: base.Summary.AttachedCount,
-		ClaudeCount:   base.Summary.ClaudeCount,
-		CodexCount:    base.Summary.CodexCount,
-		GeminiCount:   base.Summary.GeminiCount,
-		CursorCount:   base.Summary.CursorCount,
-		WindsurfCount: base.Summary.WindsurfCount,
-		AiderCount:    base.Summary.AiderCount,
-		OllamaCount:   base.Summary.OllamaCount,
-		AgentsByState: make(map[string]int, len(base.Summary.AgentsByState)),
-		AgentsByType:  make(map[string]int, len(base.Summary.AgentsByType)),
-		ReadyWork:     base.Summary.ReadyWork,
-		InProgress:    base.Summary.InProgress,
-		HealthScore:   base.Summary.HealthScore,
-		HealthStatus:  base.Summary.HealthStatus,
-		AlertsActive:  base.Summary.AlertsActive,
-		MailUnread:    base.Summary.MailUnread,
-		MailUrgent:    base.Summary.MailUrgent,
+		TotalSessions:    base.Summary.TotalSessions,
+		TotalAgents:      base.Summary.TotalAgents,
+		AttachedCount:    base.Summary.AttachedCount,
+		ClaudeCount:      base.Summary.ClaudeCount,
+		CodexCount:       base.Summary.CodexCount,
+		GeminiCount:      base.Summary.GeminiCount,
+		AntigravityCount: base.Summary.AntigravityCount,
+		CursorCount:      base.Summary.CursorCount,
+		WindsurfCount:    base.Summary.WindsurfCount,
+		AiderCount:       base.Summary.AiderCount,
+		OpencodeCount:    base.Summary.OpencodeCount,
+		OllamaCount:      base.Summary.OllamaCount,
+		AgentsByState:    make(map[string]int, len(base.Summary.AgentsByState)),
+		AgentsByType:     make(map[string]int, len(base.Summary.AgentsByType)),
+		ReadyWork:        base.Summary.ReadyWork,
+		InProgress:       base.Summary.InProgress,
+		HealthScore:      base.Summary.HealthScore,
+		HealthStatus:     base.Summary.HealthStatus,
+		AlertsActive:     base.Summary.AlertsActive,
+		MailUnread:       base.Summary.MailUnread,
+		MailUrgent:       base.Summary.MailUrgent,
 	}
 	for key, value := range base.Summary.AgentsByState {
 		cloned.Summary.AgentsByState[key] = value
 	}
 	for key, value := range base.Summary.AgentsByType {
 		cloned.Summary.AgentsByType[key] = value
+	}
+
+	if base.ResourcePressure != nil {
+		resourcePressure := *base.ResourcePressure
+		resourcePressure.Limiting = append([]string(nil), base.ResourcePressure.Limiting...)
+		resourcePressure.Sources = append([]pressure.RobotSource(nil), base.ResourcePressure.Sources...)
+		cloned.ResourcePressure = &resourcePressure
 	}
 
 	if base.AgentMail != nil {
@@ -2581,12 +2619,16 @@ func statusAccumulateAgentSummary(summary *StatusSummary, agentType, agentState 
 		summary.CodexCount++
 	case "gemini":
 		summary.GeminiCount++
+	case "antigravity":
+		summary.AntigravityCount++
 	case "cursor":
 		summary.CursorCount++
 	case "windsurf":
 		summary.WindsurfCount++
 	case "aider":
 		summary.AiderCount++
+	case "oc":
+		summary.OpencodeCount++
 	case "ollama":
 		summary.OllamaCount++
 	}
@@ -3059,12 +3101,13 @@ func getInboxTally(ctx context.Context, client *agentmail.Client, projectKey, ag
 }
 
 type ntmPaneInfo struct {
-	Key       string
-	Label     string
-	Type      string
-	Index     int
-	TmuxIndex int
-	Variant   string
+	Key         string
+	Label       string
+	Type        string
+	Index       int
+	TmuxIndex   int
+	WindowIndex int // tmux window index of the pane (for round-trippable W.P addresses, #172)
+	Variant     string
 }
 
 func parseNTMPanes(panes []tmux.Pane) map[string][]ntmPaneInfo {
@@ -3094,12 +3137,13 @@ func parseNTMPanes(panes []tmux.Pane) map[string][]ntmPaneInfo {
 		}
 
 		out[typ] = append(out[typ], ntmPaneInfo{
-			Key:       key,
-			Label:     fmt.Sprintf("%s_%d", typ, idx),
-			Type:      typ,
-			Index:     idx,
-			TmuxIndex: p.Index,
-			Variant:   p.Variant,
+			Key:         key,
+			Label:       fmt.Sprintf("%s_%d", typ, idx),
+			Type:        typ,
+			Index:       idx,
+			TmuxIndex:   p.Index,
+			WindowIndex: p.WindowIndex,
+			Variant:     p.Variant,
 		})
 	}
 
@@ -3675,12 +3719,16 @@ func detectAgentType(title string) string {
 		return "codex"
 	case strings.Contains(titleLower, "gemini"):
 		return "gemini"
+	case strings.Contains(titleLower, "antigravity"):
+		return "antigravity"
 	case strings.Contains(titleLower, "cursor"):
 		return "cursor"
 	case strings.Contains(titleLower, "windsurf"):
 		return "windsurf"
 	case strings.Contains(titleLower, "aider"):
 		return "aider"
+	case strings.Contains(titleLower, "opencode"):
+		return "oc"
 	case strings.Contains(titleLower, "ollama"):
 		return "ollama"
 	}
@@ -3695,15 +3743,20 @@ func detectAgentType(title string) string {
 		return "codex"
 	case containsShortForm(titleLower, "gmi"):
 		return "gemini"
+	case containsShortForm(titleLower, "agy"):
+		return "antigravity"
 	case containsShortForm(titleLower, "ws"):
 		return "windsurf"
+	case containsShortForm(titleLower, "oc"):
+		return "oc"
 	}
 
 	return "unknown"
 }
 
 // DetectAgentType detects the agent type from a pane title.
-// Returns one of: "claude", "codex", "gemini", "cursor", "windsurf", "aider", or "unknown".
+// Returns one of: "claude", "codex", "gemini", "cursor", "windsurf",
+// "aider", "oc" (opencode), "ollama", or "unknown".
 func DetectAgentType(title string) string {
 	return detectAgentType(title)
 }
@@ -3729,12 +3782,16 @@ func ResolveAgentType(t string) string {
 		return "codex"
 	case agent.AgentTypeGemini:
 		return "gemini"
+	case agent.AgentTypeAntigravity:
+		return "antigravity"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
 		return "windsurf"
 	case agent.AgentTypeAider:
 		return "aider"
+	case agent.AgentTypeOpencode:
+		return "oc"
 	case agent.AgentTypeOllama:
 		return "ollama"
 	case agent.AgentTypeUser:
@@ -3778,8 +3835,8 @@ func detectModel(agentType, title string) string {
 		return "sonnet" // Default Claude model
 	case "codex":
 		return "gpt4" // Default Codex model
-	case "gemini":
-		return "gemini" // Default Gemini model
+	case "gemini", "antigravity":
+		return "gemini" // Default Gemini-class model (agy shares Gemini models)
 	default:
 		return "unknown"
 	}
@@ -3799,6 +3856,10 @@ type TailOutput struct {
 	CapturedAt    time.Time             `json:"captured_at"`
 	Panes         map[string]PaneOutput `json:"panes"`
 	AgentHints    *TailAgentHints       `json:"_agent_hints,omitempty"`
+
+	// SourceHealth — same provenance contract as ActivityOutput. See ntm#117
+	// and docs/freshness-degraded-state-contract.md.
+	SourceHealth map[string]SourceHealthEntry `json:"source_health,omitempty"`
 }
 
 // TailAgentHints provides agent guidance specific to tail output
@@ -3814,6 +3875,29 @@ type PaneOutput struct {
 	State     string   `json:"state"` // active, idle, unknown
 	Lines     []string `json:"lines"`
 	Truncated bool     `json:"truncated"`
+
+	// PanePID is the tmux shell PID of this pane (`#{pane_pid}`). Populated
+	// additively so downstream watchdogs can detect respawns by comparing
+	// against the PID they last observed. See ntm#117.
+	PanePID int `json:"pane_pid,omitempty"`
+
+	// Per-pane capture provenance (ntm#117 follow-up). Output-level
+	// `source_health.tmux` answers "is anyone reachable"; these fields
+	// answer "which specific pane went dark". Populated for every pane,
+	// fresh or failed, so a watchdog polling --robot-tail across many
+	// sessions can pinpoint which panes are missing without reverse-
+	// engineering empty-Lines.
+	//
+	//   capture_collected_at  RFC 3339 timestamp the pane capture started.
+	//   capture_provenance    "live" when the capture succeeded;
+	//                         "unavailable" when tmux returned an error
+	//                         for this specific pane.
+	//   capture_error         the underlying tmux error string when
+	//                         capture_provenance == "unavailable". Omitted
+	//                         on the happy path.
+	CaptureCollectedAt string `json:"capture_collected_at,omitempty"`
+	CaptureProvenance  string `json:"capture_provenance,omitempty"`
+	CaptureError       string `json:"capture_error,omitempty"`
 }
 
 // TailOptions configures the GetTail operation.
@@ -3843,6 +3927,8 @@ func GetTail(opts TailOptions) (*TailOutput, error) {
 		}, nil
 	}
 
+	tmuxCollectedAt := time.Now().UTC()
+	tmuxCollectedAtStr := tmuxCollectedAt.Format(time.RFC3339)
 	panes, err := tmux.GetPanes(opts.Session)
 	if err != nil {
 		return &TailOutput{
@@ -3854,6 +3940,19 @@ func GetTail(opts TailOptions) (*TailOutput, error) {
 			Session:    opts.Session,
 			CapturedAt: time.Now().UTC(),
 			Panes:      make(map[string]PaneOutput),
+			SourceHealth: map[string]SourceHealthEntry{
+				"tmux": {
+					Source:           "tmux",
+					Status:           "unavailable",
+					CollectedAt:      tmuxCollectedAtStr,
+					FreshnessSec:     0,
+					StaleAfterSec:    5,
+					Provenance:       "live",
+					DegradedFeatures: []string{"pane_output", "pane_pid"},
+					LastError:        err.Error(),
+					LastErrorAt:      time.Now().UTC().Format(time.RFC3339),
+				},
+			},
 		}, nil
 	}
 
@@ -3862,32 +3961,50 @@ func GetTail(opts TailOptions) (*TailOutput, error) {
 		Session:       opts.Session,
 		CapturedAt:    time.Now().UTC(),
 		Panes:         make(map[string]PaneOutput),
+		SourceHealth: map[string]SourceHealthEntry{
+			"tmux": {
+				Source:        "tmux",
+				Status:        "fresh",
+				CollectedAt:   tmuxCollectedAtStr,
+				FreshnessSec:  int(time.Since(tmuxCollectedAt).Seconds()),
+				StaleAfterSec: 5,
+				Provenance:    "live",
+			},
+		},
 	}
 
-	// Build pane filter map
-	filterMap := make(map[string]bool)
-	for _, p := range opts.PaneFilter {
-		filterMap[p] = true
-	}
-	hasFilter := len(filterMap) > 0
+	// Build pane filter (topology-aware, #172).
+	multiWindow := paneSessionIsMultiWindow(panes)
+	paneFilter := opts.PaneFilter
+	hasFilter := len(paneFilter) > 0
 
 	for _, pane := range panes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		// Use the topology-aware key so window-per-agent layouts don't collapse
+		// every window's pane onto a single output-map entry (#172).
+		paneKey := paneTargetKey(pane, multiWindow)
 
 		// Skip if filter is set and this pane is not in it
-		if hasFilter && !filterMap[paneKey] && !filterMap[pane.ID] {
+		if hasFilter && !paneMatchesAnyToken(pane, paneFilter, multiWindow) {
 			continue
 		}
 
-		// Capture pane output
+		// Capture pane output. Stamp the attempt time *before* the call so
+		// CaptureCollectedAt reflects when we asked tmux, not when it answered.
+		paneCapturedAt := time.Now().UTC().Format(time.RFC3339)
 		captured, err := tmux.CapturePaneOutput(pane.ID, opts.Lines)
 		if err != nil {
-			// Include empty output on error
+			// Include empty output on error, but populate per-pane
+			// provenance so a watchdog can pinpoint the failed pane
+			// instead of inferring "this pane went dark" from len(lines)==0.
 			output.Panes[paneKey] = PaneOutput{
-				Type:      paneAgentType(pane),
-				State:     "unknown",
-				Lines:     []string{},
-				Truncated: false,
+				Type:               paneAgentType(pane),
+				State:              "unknown",
+				Lines:              []string{},
+				Truncated:          false,
+				PanePID:            pane.PID,
+				CaptureCollectedAt: paneCapturedAt,
+				CaptureProvenance:  "unavailable",
+				CaptureError:       err.Error(),
 			}
 			continue
 		}
@@ -3904,10 +4021,13 @@ func GetTail(opts TailOptions) (*TailOutput, error) {
 		truncated := len(outputLines) >= opts.Lines
 
 		output.Panes[paneKey] = PaneOutput{
-			Type:      agentType,
-			State:     state,
-			Lines:     outputLines,
-			Truncated: truncated,
+			Type:               agentType,
+			State:              state,
+			Lines:              outputLines,
+			Truncated:          truncated,
+			PanePID:            pane.PID,
+			CaptureCollectedAt: paneCapturedAt,
+			CaptureProvenance:  "live",
 		}
 	}
 
@@ -4246,10 +4366,11 @@ type SnapshotOutput struct {
 	Quota                    *adapters.QuotaSection        `json:"quota,omitempty"`
 	AgentMail                *SnapshotAgentMail            `json:"agent_mail,omitempty"`
 	MailUnread               int                           `json:"mail_unread,omitempty"`
-	Tools                    []ToolInfoOutput              `json:"tools,omitempty"`           // Flywheel tool inventory and health
-	Swarm                    *SwarmSnapshot                `json:"swarm,omitempty"`           // Active swarm orchestration state (optional)
-	Alerts                   []string                      `json:"alerts"`                    // Legacy: simple string alerts
-	AlertsDetailed           []AlertInfo                   `json:"alerts_detailed,omitempty"` // Rich alert objects
+	Tools                    []ToolInfoOutput              `json:"tools,omitempty"`             // Flywheel tool inventory and health
+	ResourcePressure         *pressure.RobotPressure       `json:"resource_pressure,omitempty"` // Host pressure projection for large-swarm operators
+	Swarm                    *SwarmSnapshot                `json:"swarm,omitempty"`             // Active swarm orchestration state (optional)
+	Alerts                   []string                      `json:"alerts"`                      // Legacy: simple string alerts
+	AlertsDetailed           []AlertInfo                   `json:"alerts_detailed,omitempty"`   // Rich alert objects
 	AlertSummary             *AlertSummaryInfo             `json:"alert_summary,omitempty"`
 	AttentionSummary         *SnapshotAttentionSummary     `json:"attention_summary,omitempty"` // Compact feed summary for bootstrap orientation
 }
@@ -4396,6 +4517,7 @@ type SwarmPlanAllocation struct {
 	CCAgents  int    `json:"cc_agents"`
 	CodAgents int    `json:"cod_agents"`
 	GmiAgents int    `json:"gmi_agents"`
+	AgyAgents int    `json:"agy_agents"`
 }
 
 type SwarmSessionInfo struct {
@@ -4434,6 +4556,7 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 		cfg = config.Default()
 	}
 	output := newSnapshotOutput(cfg)
+	attachSnapshotResourcePressure(output)
 
 	feed := GetAttentionFeed()
 	populateSnapshotFeedMetadata(output, feed)
@@ -4511,7 +4634,10 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 			detection := DetectAgentTypeEnhanced(pane, captured)
 
 			agent := SnapshotAgent{
-				Pane:             fmt.Sprintf("%d.%d", 0, pane.Index),
+				// Emit the pane's real window index (#172) so the W.P address
+				// round-trips on multi-window / window-per-agent layouts;
+				// hardcoding window 0 misaddressed every pane outside window 0.
+				Pane:             fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
 				Type:             detection.Type,
 				Variant:          pane.Variant,
 				TypeConfidence:   detection.Confidence,
@@ -5570,6 +5696,7 @@ func buildSwarmSnapshotPlan(cfg *config.Config, fallbackTotalAgents int) SwarmSn
 			CCAgents:  alloc.CCAgents,
 			CodAgents: alloc.CodAgents,
 			GmiAgents: alloc.GmiAgents,
+			AgyAgents: alloc.AgyAgents,
 		})
 	}
 
@@ -5616,12 +5743,16 @@ func agentTypeString(t tmux.AgentType) string {
 		return "codex"
 	case tmux.AgentGemini:
 		return "gemini"
+	case tmux.AgentAntigravity:
+		return "antigravity"
 	case tmux.AgentCursor:
 		return "cursor"
 	case tmux.AgentWindsurf:
 		return "windsurf"
 	case tmux.AgentAider:
 		return "aider"
+	case tmux.AgentOpencode:
+		return "oc"
 	case tmux.AgentOllama:
 		return "ollama"
 	case tmux.AgentUser:
@@ -5663,7 +5794,8 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 			if cfg.Models.DefaultCodex != "" {
 				return cfg.Models.DefaultCodex
 			}
-		case tmux.AgentGemini:
+		case tmux.AgentGemini, tmux.AgentAntigravity:
+			// agy (Antigravity) shares Gemini-class models.
 			if cfg.Models.DefaultGemini != "" {
 				return cfg.Models.DefaultGemini
 			}
@@ -5681,7 +5813,7 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 		return defaults.DefaultClaude
 	case tmux.AgentCodex:
 		return defaults.DefaultCodex
-	case tmux.AgentGemini:
+	case tmux.AgentGemini, tmux.AgentAntigravity:
 		return defaults.DefaultGemini
 	case tmux.AgentCursor:
 		return "cursor"
@@ -5689,6 +5821,8 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 		return "windsurf"
 	case tmux.AgentAider:
 		return "aider"
+	case tmux.AgentOpencode:
+		return "opencode"
 	case tmux.AgentOllama:
 		return defaults.DefaultOllama
 	default:
@@ -6536,25 +6670,39 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 
 	// Send to all targets
 	for i, pane := range targetPanes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		// targetKeys is index-aligned with targetPanes and already encodes the
+		// topology-aware key (window.pane on multi-window sessions, #172).
+		paneKey := targetKeys[i]
 
 		// Apply delay between sends (except for first)
 		if i > 0 && opts.DelayMs > 0 {
 			time.Sleep(time.Duration(opts.DelayMs) * time.Millisecond)
 		}
 
-		// Determine appropriate Enter delay based on pane type.
-		// User/shell panes need a longer delay than AI agent TUIs because
-		// shells (bash, zsh) have different input buffering behavior.
-		enterDelay := tmux.DefaultEnterDelay
 		agentType := paneAgentType(pane)
-		if pane.Type == tmux.AgentUser || agentType == "user" || agentType == "unknown" {
-			enterDelay = tmux.ShellEnterDelay
-		}
 
-		// Use agent-aware send method which handles Gemini's multi-line quirks
-		// by using buffer-based paste instead of send-keys when content has newlines
-		err := tmux.SendKeysForAgentWithDelay(pane.ID, messageToSend, sendEnter, enterDelay, pane.Type)
+		var err error
+		if robotSendUsesDoubleEnter(pane.Type, agentType, sendEnter) {
+			// Agent panes get the double-Enter submission protocol (same as
+			// ntm send and the palette, #94/#187): a single delayed Enter
+			// races a busy agent TUI's busy->idle re-render and can leave
+			// the message typed-but-unsubmitted. SendKeysForAgentDoubleEnter
+			// routes through SendKeysForAgent, preserving buffer-based paste
+			// for multi-line content (Gemini/Codex/Claude quirks).
+			err = tmux.SendKeysForAgentDoubleEnter(pane.ID, messageToSend, pane.Type)
+		} else {
+			// Determine appropriate Enter delay based on pane type.
+			// User/shell panes need a longer delay than AI agent TUIs because
+			// shells (bash, zsh) have different input buffering behavior.
+			enterDelay := tmux.DefaultEnterDelay
+			if pane.Type == tmux.AgentUser || agentType == "user" || agentType == "unknown" {
+				enterDelay = tmux.ShellEnterDelay
+			}
+
+			// Use agent-aware send method which handles Gemini's multi-line quirks
+			// by using buffer-based paste instead of send-keys when content has newlines
+			err = tmux.SendKeysForAgentWithDelay(pane.ID, messageToSend, sendEnter, enterDelay, pane.Type)
+		}
 		if err != nil {
 			output.Failed = append(output.Failed, SendError{
 				Pane:  paneKey,
@@ -6579,12 +6727,118 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 	return &output, nil
 }
 
-func selectSendTargets(panes []tmux.Pane, opts SendOptions, excludeMap map[string]bool) ([]tmux.Pane, []string) {
-	paneFilterMap := make(map[string]bool)
-	for _, p := range opts.Panes {
-		paneFilterMap[p] = true
+// robotSendUsesDoubleEnter reports whether --robot-send should deliver via the
+// double-Enter submission protocol (#187): agent panes with Enter requested.
+// User/unknown panes keep the single delayed-Enter path (shells need no
+// double-Enter and would execute a spurious empty command), as does
+// --enter=false (text staged without submission).
+func robotSendUsesDoubleEnter(paneType tmux.AgentType, resolvedType string, sendEnter bool) bool {
+	if !sendEnter {
+		return false
 	}
-	hasPaneFilter := len(paneFilterMap) > 0
+	if paneType == tmux.AgentUser || resolvedType == "user" || resolvedType == "unknown" {
+		return false
+	}
+	return true
+}
+
+// paneSessionIsMultiWindow reports whether the session's panes span more than
+// one tmux window. On a multi-window session a bare window-local pane index is
+// no longer a unique address, so targeting and the response-map key switch to
+// the canonical "window.pane" form (#172).
+func paneSessionIsMultiWindow(panes []tmux.Pane) bool {
+	if len(panes) == 0 {
+		return false
+	}
+	first := panes[0].WindowIndex
+	for _, p := range panes[1:] {
+		if p.WindowIndex != first {
+			return true
+		}
+	}
+	return false
+}
+
+// paneTargetKey returns the canonical response-map / target key for a pane.
+// Single-window sessions use the bare window-local index (byte-identical to the
+// historical behavior every robot consumer expects). Multi-window sessions use
+// the "window.pane" address so a window-per-agent layout (N windows × 1 pane,
+// every pane sharing window-local index, e.g. 1) does not collapse onto one
+// key (#172).
+func paneTargetKey(pane tmux.Pane, multiWindow bool) string {
+	if multiWindow {
+		return fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index)
+	}
+	return fmt.Sprintf("%d", pane.Index)
+}
+
+// paneMatchesToken reports whether a --panes token addresses the given pane.
+// The grammar (first non-empty match wins) is topology-aware (#172):
+//
+//   - "%N"  -> tmux pane ID (pane.ID); base-index-independent, always unambiguous.
+//   - "W.P" -> WindowIndex.Index; explicit window.pane address.
+//   - bare integer N:
+//   - on a multi-window session, N selects a whole WINDOW (WindowIndex==N),
+//     so --panes=1 hits exactly the panes in window 1 instead of broadcasting
+//     to every window's index-1 pane.
+//   - on a single-window session, N is the window-local pane index
+//     (Index==N) — byte-identical to the historical behavior.
+//
+// Returning here is purely a membership test; callers build the response keys
+// via paneTargetKey so single-window output stays unchanged.
+func paneMatchesToken(pane tmux.Pane, token string, multiWindow bool) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+	// %N tmux pane ID.
+	if strings.HasPrefix(token, "%") {
+		return token == pane.ID
+	}
+	// W.P explicit window.pane address.
+	if win, p, ok := strings.Cut(token, "."); ok {
+		wi, errW := strconv.Atoi(strings.TrimSpace(win))
+		pi, errP := strconv.Atoi(strings.TrimSpace(p))
+		if errW != nil || errP != nil {
+			return false
+		}
+		return pane.WindowIndex == wi && pane.Index == pi
+	}
+	// Bare integer.
+	n, err := strconv.Atoi(token)
+	if err != nil {
+		return false
+	}
+	if multiWindow {
+		return pane.WindowIndex == n
+	}
+	return pane.Index == n
+}
+
+// paneMatchesAnyToken reports whether any token in the filter set addresses the
+// pane (topology-aware, #172).
+func paneMatchesAnyToken(pane tmux.Pane, tokens []string, multiWindow bool) bool {
+	for _, t := range tokens {
+		if paneMatchesToken(pane, t, multiWindow) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectSendTargets(panes []tmux.Pane, opts SendOptions, excludeMap map[string]bool) ([]tmux.Pane, []string) {
+	multiWindow := paneSessionIsMultiWindow(panes)
+
+	paneFilter := make([]string, 0, len(opts.Panes))
+	for _, p := range opts.Panes {
+		paneFilter = append(paneFilter, p)
+	}
+	hasPaneFilter := len(paneFilter) > 0
+
+	excludeTokens := make([]string, 0, len(excludeMap))
+	for k := range excludeMap {
+		excludeTokens = append(excludeTokens, k)
+	}
 
 	typeFilterMap := make(map[string]bool)
 	for _, t := range opts.AgentTypes {
@@ -6595,12 +6849,12 @@ func selectSendTargets(panes []tmux.Pane, opts SendOptions, excludeMap map[strin
 	var targetPanes []tmux.Pane
 	var targetKeys []string
 	for _, pane := range panes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		paneKey := paneTargetKey(pane, multiWindow)
 
-		if excludeMap[paneKey] || excludeMap[pane.ID] {
+		if paneMatchesAnyToken(pane, excludeTokens, multiWindow) {
 			continue
 		}
-		if hasPaneFilter && !paneFilterMap[paneKey] && !paneFilterMap[pane.ID] {
+		if hasPaneFilter && !paneMatchesAnyToken(pane, paneFilter, multiWindow) {
 			continue
 		}
 
@@ -8549,7 +8803,10 @@ func buildCorrelationGraph() *GraphCorrelation {
 							assignmentByAgent[agentName] = a
 						}
 						a.Session = sess.Name
-						a.Pane = fmt.Sprintf("%d.%d", 0, pane.TmuxIndex)
+						// Emit the pane's real window index (#172) so the W.P
+						// address round-trips on multi-window layouts; the prior
+						// hardcoded 0 misaddressed panes outside window 0.
+						a.Pane = fmt.Sprintf("%d.%d", pane.WindowIndex, pane.TmuxIndex)
 						a.Agent = fmt.Sprintf("%s:%s", sess.Name, a.Pane)
 						a.Detected = paneType
 						a.DetectedFrom = "ntm_pane_title"
@@ -9505,6 +9762,10 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 	var lowUsage, highUsage []string
 	var totalUsage float64
 
+	// Topology-aware key (#172): emit a round-trippable "window.pane" address on
+	// multi-window sessions instead of a window-blind bare index.
+	multiWindow := paneSessionIsMultiWindow(panes)
+
 	for _, pane := range panes {
 		agentType := paneAgentType(pane)
 		if agentType == "unknown" || agentType == "user" {
@@ -9525,7 +9786,7 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 		contextLimit := getContextLimit(model)
 		usagePct := float64(withOverhead) / float64(contextLimit) * 100
 
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		paneKey := paneTargetKey(pane, multiWindow)
 		usageLevel := getUsageLevel(usagePct)
 
 		// Align thresholds with getUsageLevel: <40% is Low, >=70% is High/Critical
@@ -9606,6 +9867,14 @@ type ActivityOutput struct {
 	Agents     []AgentActivityInfo `json:"agents"`
 	Summary    ActivitySummary     `json:"summary"`
 	AgentHints *ActivityAgentHints `json:"_agent_hints,omitempty"`
+
+	// SourceHealth reports per-source freshness/provenance metadata for the
+	// data feeding this output. Populated for the `tmux` source today; the
+	// `degraded_features` slice names which output fields fall back to a
+	// stale or unavailable value when a source is unhealthy. See ntm#117 —
+	// downstream watchdogs must distinguish "live tmux observation" from
+	// "stale snapshot" before making restart/capacity decisions.
+	SourceHealth map[string]SourceHealthEntry `json:"source_health,omitempty"`
 }
 
 // AgentActivityInfo contains activity state for a single agent pane.
@@ -9619,6 +9888,67 @@ type AgentActivityInfo struct {
 	StateSince       string   `json:"state_since,omitempty"`       // RFC3339 timestamp
 	DetectedPatterns []string `json:"detected_patterns,omitempty"` // pattern names that matched
 	LastOutput       string   `json:"last_output,omitempty"`       // RFC3339 timestamp of last output
+
+	// PanePID is the tmux shell PID (`#{pane_pid}`) of the pane this
+	// observation came from. Populated additively so callers can detect a
+	// pane respawn — the pane index stays the same after restart, but
+	// PanePID changes. Without this, downstream watchdogs treat post-respawn
+	// observations as a silent continuation of the old observation stream
+	// and make wrong recovery decisions. See ntm#117.
+	PanePID int `json:"pane_pid,omitempty"`
+
+	// Per-pane capture provenance (ntm#117 deferred item #1). Output-level
+	// `source_health.tmux` answers "is anyone reachable"; these fields
+	// answer "which specific pane went dark" when a fleet watchdog polls
+	// --robot-activity across many sessions and one pane's classification
+	// silently fails (today the pane appears with State=UNKNOWN and a
+	// classification error is dropped on the floor).
+	//
+	//   capture_collected_at  RFC 3339 timestamp the per-pane classification
+	//                         attempt started.
+	//   capture_provenance    "live" when the classifier ran cleanly;
+	//                         "unavailable" when classification returned an
+	//                         error (and we synthesized State=UNKNOWN).
+	//   capture_error         the underlying classifier error string when
+	//                         capture_provenance == "unavailable". Omitted
+	//                         on the happy path.
+	CaptureCollectedAt string `json:"capture_collected_at,omitempty"`
+	CaptureProvenance  string `json:"capture_provenance,omitempty"`
+	CaptureError       string `json:"capture_error,omitempty"`
+}
+
+// SourceHealthEntry describes the freshness of a source feeding a robot
+// output. Field names, types, and JSON keys exactly match the documented
+// contract in docs/freshness-degraded-state-contract.md §2.2, and the
+// timestamp fields use the same `string` (RFC 3339) shape as the existing
+// adapters.SourceInfo timestamps (UpdatedAt / DegradedSince / RetryingAt)
+// so this surface can be consumed interchangeably with the existing
+// adapters.SourceHealthSection used by --robot-status. See ntm#117.
+type SourceHealthEntry struct {
+	// Identity
+	Source string `json:"source"` // e.g. "tmux"
+	// Status enum: "fresh" | "stale" | "unavailable" | "unknown".
+	Status string `json:"status"`
+	// Timing — RFC 3339 timestamp + integer seconds. CollectedAt is a
+	// string (not time.Time) because the contract spec types it as a
+	// string and the matching adapters.SourceInfo timestamps are also
+	// strings; storing a Go time.Time here would marshal to RFC 3339Nano
+	// (sub-second precision) and silently surprise downstream consumers
+	// that expect the doc's stripped-to-seconds RFC 3339 shape. Integer
+	// FreshnessSec / StaleAfterSec match the contract for the same reason
+	// — float values would emit `0.000123` and break strict consumers.
+	CollectedAt   string `json:"collected_at"`
+	FreshnessSec  int    `json:"freshness_sec"`
+	StaleAfterSec int    `json:"stale_after_sec"`
+	// Degradation — degraded_features names which output fields are
+	// stale or missing because of this source. last_error / last_error_at
+	// are populated when status != "fresh"; they're optional in the
+	// healthy case so a fresh entry stays compact.
+	DegradedFeatures []string `json:"degraded_features,omitempty"`
+	LastError        string   `json:"last_error,omitempty"`
+	LastErrorAt      string   `json:"last_error_at,omitempty"`
+	// Provenance enum: "live" | "cached" | "derived".
+	Provenance string `json:"provenance"`
 }
 
 // ActivitySummary provides aggregate state counts.
@@ -9662,8 +9992,29 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 		return output, nil
 	}
 
+	// Track tmux source health (ntm#117). Populated as a single observation
+	// — every agent in this output came from this tmux capture, so the
+	// freshness/provenance applies uniformly. On capture failure the entry
+	// flips to status=unavailable with degraded_features identifying the
+	// fields that are now stale or missing, rather than silently emitting
+	// an empty agent list.
+	tmuxCollectedAt := time.Now().UTC()
+	tmuxCollectedAtStr := tmuxCollectedAt.Format(time.RFC3339)
 	panes, err := tmux.GetPanes(opts.Session)
 	if err != nil {
+		output.SourceHealth = map[string]SourceHealthEntry{
+			"tmux": {
+				Source:           "tmux",
+				Status:           "unavailable",
+				CollectedAt:      tmuxCollectedAtStr,
+				FreshnessSec:     0,
+				StaleAfterSec:    5,
+				Provenance:       "live",
+				DegradedFeatures: []string{"agent_states", "pane_pid", "agent_list"},
+				LastError:        err.Error(),
+				LastErrorAt:      time.Now().UTC().Format(time.RFC3339),
+			},
+		}
 		output.RobotResponse = NewErrorResponse(
 			fmt.Errorf("failed to get panes: %w", err),
 			ErrCodeInternalError,
@@ -9672,14 +10023,27 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 		return output, nil
 	}
 
+	// Mark tmux source as fresh — pane data was collected live from tmux
+	// just now. `stale_after_sec` is a hint that downstream watchdogs
+	// should re-poll if they see a freshness exceeding it; we conservatively
+	// suggest 5s for live observation.
+	output.SourceHealth = map[string]SourceHealthEntry{
+		"tmux": {
+			Source:        "tmux",
+			Status:        "fresh",
+			CollectedAt:   tmuxCollectedAtStr,
+			FreshnessSec:  int(time.Since(tmuxCollectedAt).Seconds()),
+			StaleAfterSec: 5,
+			Provenance:    "live",
+		},
+	}
+
 	output.Agents = make([]AgentActivityInfo, 0, len(panes))
 
-	// Build filter maps
-	paneFilterMap := make(map[string]bool)
-	for _, p := range opts.Panes {
-		paneFilterMap[p] = true
-	}
-	hasPaneFilter := len(paneFilterMap) > 0
+	// Build filter maps (topology-aware, #172).
+	multiWindow := paneSessionIsMultiWindow(panes)
+	paneFilter := opts.Panes
+	hasPaneFilter := len(paneFilter) > 0
 
 	typeFilterMap := make(map[string]bool)
 	for _, t := range opts.AgentTypes {
@@ -9691,10 +10055,10 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 	var availableAgents, busyAgents, problemAgents []string
 
 	for _, pane := range panes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		paneKey := paneTargetKey(pane, multiWindow)
 
 		// Apply pane filter
-		if hasPaneFilter && !paneFilterMap[paneKey] && !paneFilterMap[pane.ID] {
+		if hasPaneFilter && !paneMatchesAnyToken(pane, paneFilter, multiWindow) {
 			continue
 		}
 
@@ -9715,16 +10079,25 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 			AgentType: agentType,
 		})
 
-		// Classify current state
+		// Classify current state. Stamp before the call so
+		// CaptureCollectedAt reflects when we asked, not when we got an answer.
+		paneCapturedAt := time.Now().UTC().Format(time.RFC3339)
 		activity, err := classifier.Classify()
 		if err != nil {
-			// Include with unknown state on error
+			// Include with unknown state on error, plus per-pane
+			// capture provenance so a watchdog can distinguish
+			// "this pane was classified UNKNOWN" from "this pane's
+			// classifier silently errored". See ntm#117 deferred item #1.
 			output.Agents = append(output.Agents, AgentActivityInfo{
-				Pane:       paneKey,
-				PaneIdx:    pane.Index,
-				AgentType:  agentType,
-				State:      string(StateUnknown),
-				Confidence: 0.0,
+				Pane:               paneKey,
+				PaneIdx:            pane.Index,
+				AgentType:          agentType,
+				State:              string(StateUnknown),
+				Confidence:         0.0,
+				PanePID:            pane.PID,
+				CaptureCollectedAt: paneCapturedAt,
+				CaptureProvenance:  "unavailable",
+				CaptureError:       err.Error(),
 			})
 			output.Summary.ByState[string(StateUnknown)]++
 			continue
@@ -9732,13 +10105,16 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 
 		// Build agent info
 		info := AgentActivityInfo{
-			Pane:             paneKey,
-			PaneIdx:          pane.Index,
-			AgentType:        activity.AgentType,
-			State:            string(activity.State),
-			Confidence:       activity.Confidence,
-			Velocity:         activity.Velocity,
-			DetectedPatterns: activity.DetectedPatterns,
+			Pane:               paneKey,
+			PaneIdx:            pane.Index,
+			AgentType:          activity.AgentType,
+			State:              string(activity.State),
+			Confidence:         activity.Confidence,
+			Velocity:           activity.Velocity,
+			DetectedPatterns:   activity.DetectedPatterns,
+			PanePID:            pane.PID,
+			CaptureCollectedAt: paneCapturedAt,
+			CaptureProvenance:  "live",
 		}
 
 		if !activity.StateSince.IsZero() {

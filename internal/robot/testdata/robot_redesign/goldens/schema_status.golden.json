@@ -942,6 +942,10 @@
             "description": "Alerts active",
             "type": "integer"
           },
+          "antigravity_count": {
+            "description": "Antigravity count",
+            "type": "integer"
+          },
           "attached_count": {
             "description": "Attached count",
             "type": "integer"
@@ -986,6 +990,10 @@
             "description": "Ollama count",
             "type": "integer"
           },
+          "opencode_count": {
+            "description": "Opencode count",
+            "type": "integer"
+          },
           "ready_work": {
             "description": "Ready work",
             "type": "integer"
@@ -1010,9 +1018,11 @@
           "claude_count",
           "codex_count",
           "gemini_count",
+          "antigravity_count",
           "cursor_count",
           "windsurf_count",
           "aider_count",
+          "opencode_count",
           "ollama_count",
           "agents_by_state",
           "agents_by_type",

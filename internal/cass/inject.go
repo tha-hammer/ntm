@@ -133,9 +133,14 @@ func QueryCASS(prompt string, config CASSConfig) CASSQueryResult {
 	result.QueryTime = time.Since(start)
 
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			result.Success = true
-			return result
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 1 || exitErr.ExitCode() == 3 {
+				// Exit 1: No results found
+				// Exit 3: CASS database uninitialized
+				// Both are graceful empty-result states for context injection
+				result.Success = true
+				return result
+			}
 		}
 		result.Error = err.Error()
 		return result
@@ -754,7 +759,7 @@ func FormatForAgent(agentType string) InjectionFormat {
 	switch agentCanonicalLongName(agentType) {
 	case "codex":
 		return FormatMinimal
-	case "gemini":
+	case "gemini", "antigravity":
 		return FormatStructured
 	default:
 		return FormatMarkdown
@@ -769,12 +774,16 @@ func agentCanonicalLongName(agentType string) string {
 		return "codex"
 	case agentpkg.AgentTypeGemini:
 		return "gemini"
+	case agentpkg.AgentTypeAntigravity:
+		return "antigravity"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:
 		return "windsurf"
 	case agentpkg.AgentTypeAider:
 		return "aider"
+	case agentpkg.AgentTypeOpencode:
+		return "oc"
 	case agentpkg.AgentTypeOllama:
 		return "ollama"
 	case agentpkg.AgentTypeUser:

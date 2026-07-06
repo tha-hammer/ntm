@@ -28,12 +28,12 @@ func resolveReplaySession(entrySession, sessionOverride string) (string, error) 
 
 func newReplayCmd() *cobra.Command {
 	var (
-		targetCC, targetCod, targetGmi, targetAll bool
-		sessionOverride                           string
-		edit                                      bool
-		dryRun                                    bool
-		noHistory                                 bool
-		last                                      bool
+		targetCC, targetCod, targetGmi, targetAgy, targetAll bool
+		sessionOverride                                      string
+		edit                                                 bool
+		dryRun                                               bool
+		noHistory                                            bool
+		last                                                 bool
 	)
 
 	cmd := &cobra.Command{
@@ -140,7 +140,7 @@ Examples:
 
 			// Filter panes based on flags
 			var targets []tmux.Pane
-			noFilter := !targetCC && !targetCod && !targetGmi && !targetAll
+			noFilter := !targetCC && !targetCod && !targetGmi && !targetAgy && !targetAll
 
 			for _, p := range panes {
 				if targetAll {
@@ -157,7 +157,8 @@ Examples:
 				}
 
 				// Apply specific filters
-				if matchesLegacySendTypeFilter(p, targetCC, targetCod, targetGmi) {
+				if matchesLegacySendTypeFilter(p, targetCC, targetCod, targetGmi) ||
+					(targetAgy && tmux.AgentType(p.Type).Canonical() == tmux.AgentAntigravity) {
 					targets = append(targets, p)
 				}
 			}
@@ -196,6 +197,7 @@ Examples:
 	cmd.Flags().BoolVar(&targetCC, "cc", false, "send to Claude agents only")
 	cmd.Flags().BoolVar(&targetCod, "cod", false, "send to Codex agents only")
 	cmd.Flags().BoolVar(&targetGmi, "gmi", false, "send to Gemini agents only")
+	cmd.Flags().BoolVar(&targetAgy, "agy", false, "send to Antigravity agents only")
 	cmd.Flags().BoolVar(&targetAll, "all", false, "send to all panes")
 	cmd.Flags().StringVar(&sessionOverride, "session", "", "override target session")
 	cmd.Flags().BoolVar(&edit, "edit", false, "edit prompt before sending")

@@ -26,8 +26,16 @@ type SessionState struct {
 	// Pane Details (for exact recreation)
 	Panes []PaneState `json:"panes"`
 
-	// Layout
-	Layout string `json:"layout"` // "tiled", "even-horizontal", etc.
+	// Layout is the whole-session fallback layout (the active window's
+	// #{window_layout} at save time). Per-window exact geometry lives in
+	// Windows; Layout is retained as a fallback for windows without captured
+	// per-window geometry and for display (ntm sessions show).
+	Layout string `json:"layout"` // "tiled", "even-horizontal", or a serialized geometry string
+
+	// Windows captures per-window metadata for faithful restore: exact
+	// geometry, window names, active-window flag, and zoom state. Empty for
+	// states saved before this field existed (restore falls back to Layout).
+	Windows []WindowState `json:"windows,omitempty"`
 
 	// Metadata
 	CreatedAt time.Time `json:"created_at,omitempty"` // Original session creation
@@ -39,19 +47,21 @@ type SessionState struct {
 
 // AgentConfig represents agent counts by type.
 type AgentConfig struct {
-	Claude   int `json:"cc"`
-	Codex    int `json:"cod"`
-	Gemini   int `json:"gmi"`
-	Cursor   int `json:"cursor"`
-	Windsurf int `json:"windsurf"`
-	Aider    int `json:"aider"`
-	Ollama   int `json:"ollama"`
-	User     int `json:"user"`
+	Claude      int `json:"cc"`
+	Codex       int `json:"cod"`
+	Gemini      int `json:"gmi"`
+	Antigravity int `json:"agy,omitempty"`
+	Cursor      int `json:"cursor"`
+	Windsurf    int `json:"windsurf"`
+	Aider       int `json:"aider"`
+	Opencode    int `json:"oc"`
+	Ollama      int `json:"ollama"`
+	User        int `json:"user"`
 }
 
 // Total returns the total number of agents.
 func (a AgentConfig) Total() int {
-	return a.Claude + a.Codex + a.Gemini + a.Cursor + a.Windsurf + a.Aider + a.Ollama + a.User
+	return a.Claude + a.Codex + a.Gemini + a.Antigravity + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Ollama + a.User
 }
 
 // PaneState represents the state of a single pane.
@@ -66,28 +76,54 @@ type PaneState struct {
 	Width       int    `json:"width,omitempty"`   // Pane width
 	Height      int    `json:"height,omitempty"`  // Pane height
 	PaneID      string `json:"pane_id,omitempty"` // Original pane ID
+
+	// Agent CLI session linkage (for resume). Captured best-effort by
+	// discovering the most-recent provider session for the pane's cwd+agent.
+	// Resume is delegated to casr / native `--resume <id>` (see internal/agentsession),
+	// not reimplemented here.
+	SessionID       string `json:"session_id,omitempty"`       // Provider session id (e.g. Claude UUID)
+	SessionProvider string `json:"session_provider,omitempty"` // casr provider name ("claude", "codex", "gemini")
+	SessionFile     string `json:"session_file,omitempty"`     // On-disk session file id was discovered from
+}
+
+// WindowState captures per-window metadata so a restored session reproduces
+// not just pane counts but exact split geometry (ntm-r3k0) plus window names,
+// the active window, and zoom state (ntm-fphu).
+type WindowState struct {
+	Index int    `json:"index"`          // tmux window index at save time
+	Name  string `json:"name,omitempty"` // window name (rename-window on restore)
+	// Layout is the tmux #{window_layout} string for this window. It encodes the
+	// exact nested split geometry and per-pane sizes; applying it via
+	// select-layout reproduces the geometry precisely when the pane count matches.
+	Layout string `json:"layout,omitempty"`
+	Active bool   `json:"active,omitempty"` // was this the active window
+	Zoomed bool   `json:"zoomed,omitempty"` // was this window zoomed (resize-pane -Z)
 }
 
 // ConfigSnapshot captures relevant config at save time.
 type ConfigSnapshot struct {
-	ClaudeCmd   string `json:"claude_cmd,omitempty"`
-	CodexCmd    string `json:"codex_cmd,omitempty"`
-	GeminiCmd   string `json:"gemini_cmd,omitempty"`
-	CursorCmd   string `json:"cursor_cmd,omitempty"`
-	WindsurfCmd string `json:"windsurf_cmd,omitempty"`
-	AiderCmd    string `json:"aider_cmd,omitempty"`
-	OllamaCmd   string `json:"ollama_cmd,omitempty"`
+	ClaudeCmd      string `json:"claude_cmd,omitempty"`
+	CodexCmd       string `json:"codex_cmd,omitempty"`
+	GeminiCmd      string `json:"gemini_cmd,omitempty"`
+	AntigravityCmd string `json:"antigravity_cmd,omitempty"`
+	CursorCmd      string `json:"cursor_cmd,omitempty"`
+	WindsurfCmd    string `json:"windsurf_cmd,omitempty"`
+	AiderCmd       string `json:"aider_cmd,omitempty"`
+	OpencodeCmd    string `json:"opencode_cmd,omitempty"`
+	OllamaCmd      string `json:"ollama_cmd,omitempty"`
 }
 
 // AgentCommands defines the launch commands for agents.
 type AgentCommands struct {
-	Claude   string
-	Codex    string
-	Gemini   string
-	Cursor   string
-	Windsurf string
-	Aider    string
-	Ollama   string
+	Claude      string
+	Codex       string
+	Gemini      string
+	Antigravity string
+	Cursor      string
+	Windsurf    string
+	Aider       string
+	Opencode    string
+	Ollama      string
 }
 
 // SaveOptions configures how a session is saved.

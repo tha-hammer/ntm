@@ -82,6 +82,12 @@ func (p *parserImpl) DetectAgentType(output string) AgentType {
 		return AgentTypeCodex
 	}
 
+	// Antigravity patterns (checked before Gemini so an agy pane is not
+	// misclassified as the legacy Gemini CLI; the two share other signatures).
+	if agyHeaderPattern.MatchString(output) {
+		return AgentTypeAntigravity
+	}
+
 	// Gemini patterns
 	if gmiHeaderPattern.MatchString(output) {
 		return AgentTypeGemini
@@ -182,8 +188,8 @@ func (p *parserImpl) extractMetrics(output string, state *AgentState) {
 			state.TokensUsed = tokens
 		}
 
-	case AgentTypeGemini:
-		// Gemini shows memory usage
+	case AgentTypeGemini, AgentTypeAntigravity:
+		// Gemini (and its successor Antigravity) show memory usage
 		// Example: "gemini-3-pro-preview /model | 396.8 MB"
 		if mb := extractFloat(gmiMemoryPattern, output); mb != nil {
 			state.MemoryMB = mb
@@ -196,7 +202,7 @@ func (p *parserImpl) extractMetrics(output string, state *AgentState) {
 			state.IsContextLow = true
 		}
 
-	case AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOllama:
+	case AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeOllama:
 		// No specific metrics yet for these agents
 	}
 }
@@ -227,6 +233,38 @@ func (p *parserImpl) detectStateFlags(output string, state *AgentState) {
 		state.WorkIndicators = p.collectWorkIndicators(output, state.Type)
 	}
 
+	// For Claude Code the live-tail spinner is the AUTHORITATIVE working signal
+	// and must win over everything else. Claude pins its "❯ " input box to the
+	// bottom of the screen even while busy, so the live spinner (just above the
+	// box) is the only reliable in-flight marker. ClaudeActivelyWorking inspects
+	// the spinner-vs-turn-ended ordering in the live tail and is biased to
+	// false-WORKING, so trusting it can never mislabel a busy agent as idle.
+	if state.Type == AgentTypeClaudeCode {
+		if ClaudeActivelyWorking(output) {
+			// Definitively working: a live spinner is the most-recent dynamic
+			// marker. Idle is impossible here regardless of the box being drawn.
+			state.IsWorking = true
+			state.IsIdle = false
+			if len(state.WorkIndicators) == 0 {
+				state.WorkIndicators = []string{"claude_live_spinner"}
+			}
+			state.IsInError = p.detectError(output, state.Type)
+			return
+		}
+		// No live spinner. A finished-turn idle prompt (detectIdle, already
+		// gated on !ClaudeActivelyWorking) wins over loose scrollback keyword
+		// matches that linger after a turn ends. Otherwise fall back to the
+		// substring working heuristics so mid-stream content (code blocks, file
+		// operations) with no spinner frame in the capture still reads as work.
+		if state.IsIdle {
+			state.IsWorking = false
+		} else {
+			state.IsWorking = rawIsWorking
+		}
+		state.IsInError = p.detectError(output, state.Type)
+		return
+	}
+
 	// Conflict resolution: Prompt beats substring heuristics
 	// If we see a definitive prompt at the end (IsIdle), we are not working,
 	// regardless of what keywords appear in the scrollback.
@@ -250,7 +288,7 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, ccRateLimitPatterns)
 	case AgentTypeCodex:
 		return matchAny(recentOutput, codRateLimitPatterns)
-	case AgentTypeGemini:
+	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiRateLimitPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorRateLimitPatterns)
@@ -283,7 +321,7 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, ccWorkingPatterns)
 	case AgentTypeCodex:
 		return matchAny(recentOutput, codWorkingPatterns)
-	case AgentTypeGemini:
+	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiWorkingPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorWorkingPatterns)
@@ -322,25 +360,34 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		if strings.TrimSpace(lastLines) == "" {
 			return true
 		}
-		idleMatch := matchAnyRegex(lastLines, ccIdlePatterns)
-		// Active spinner overrides idle ONLY when the spinner appears AFTER
-		// the most recent prompt marker. A stale spinner above a fresh ❯
-		// prompt (e.g. agent just finished a 17-minute "thinking" run, then
-		// printed its idle prompt) must NOT block the idle verdict, otherwise
-		// operators polling for dispatchable panes never see them as idle.
-		if idleMatch {
-			lastIdle := lastLineIdxMatching(lastLines, ccIdlePatterns)
-			lastSpin := lastLineIdxMatching(lastLines, ccSpinnerActivePatterns)
-			if lastSpin > lastIdle {
-				return false
-			}
+		// A genuinely WORKING pane is NEVER idle. Claude pins its "❯ " input
+		// box to the bottom of the screen even while busy, so an empty-chevron
+		// match alone is not sufficient evidence of idleness — the live spinner
+		// renders just above the box. ClaudeActivelyWorking inspects the
+		// relative order of the spinner vs. turn-ended markers in the live tail
+		// (see patterns.go) and is biased to false-WORKING when ambiguous, so
+		// gating on it here can never produce a false-idle for a busy agent.
+		if ClaudeActivelyWorking(output) {
+			return false
+		}
+		// Idle when a finished-turn prompt is showing. This covers both the
+		// empty chevron and the broader finished-turn footer: an input box that
+		// holds queued text or an "…" ellipsis, plus the post-turn
+		// "new task? /clear to save … tokens" hint. We pass the full `output`
+		// (not just `lastLines`) to the footer recognizer because the box and
+		// its decorative rules can exceed the bounded idle-line window.
+		if matchAnyRegex(lastLines, ccIdlePatterns) {
+			return true
+		}
+		if claudeFinishedTurnIdle(output) {
 			return true
 		}
 		return false
 	case AgentTypeCodex:
 		return matchAnyRegex(lastLines, codIdlePatterns)
-	case AgentTypeGemini:
-		// Gemini is trickier - check for prompt or lack of working indicators
+	case AgentTypeGemini, AgentTypeAntigravity:
+		// Gemini (and its successor Antigravity) are trickier - check for prompt
+		// or lack of working indicators
 		return matchAnyRegex(lastLines, gmiIdlePatterns)
 	case AgentTypeCursor:
 		return matchAnyRegex(lastLines, cursorIdlePatterns)
@@ -372,7 +419,7 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, ccErrorPatterns)
 	case AgentTypeCodex:
 		return matchAny(recentOutput, codErrorPatterns)
-	case AgentTypeGemini:
+	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiErrorPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorErrorPatterns)
@@ -404,7 +451,7 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		return collectMatches(recentOutput, ccRateLimitPatterns)
 	case AgentTypeCodex:
 		return collectMatches(recentOutput, codRateLimitPatterns)
-	case AgentTypeGemini:
+	case AgentTypeGemini, AgentTypeAntigravity:
 		return collectMatches(recentOutput, gmiRateLimitPatterns)
 	case AgentTypeCursor:
 		return collectMatches(recentOutput, cursorRateLimitPatterns)
@@ -437,7 +484,7 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 		return collectMatches(recentOutput, ccWorkingPatterns)
 	case AgentTypeCodex:
 		return collectMatches(recentOutput, codWorkingPatterns)
-	case AgentTypeGemini:
+	case AgentTypeGemini, AgentTypeAntigravity:
 		return collectMatches(recentOutput, gmiWorkingPatterns)
 	case AgentTypeCursor:
 		return collectMatches(recentOutput, cursorWorkingPatterns)

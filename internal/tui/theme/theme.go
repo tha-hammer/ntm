@@ -56,6 +56,7 @@ type Theme struct {
 	Cursor   lipgloss.Color
 	Windsurf lipgloss.Color
 	Aider    lipgloss.Color
+	Opencode lipgloss.Color
 	Ollama   lipgloss.Color
 	User     lipgloss.Color
 }
@@ -106,6 +107,7 @@ var CatppuccinMocha = Theme{
 	Cursor:   lipgloss.Color("#94e2d5"), // Teal
 	Windsurf: lipgloss.Color("#f2cdcd"), // Flamingo
 	Aider:    lipgloss.Color("#fab387"), // Peach
+	Opencode: lipgloss.Color("#b4befe"), // Lavender
 	Ollama:   lipgloss.Color("#a6e3a1"), // Green
 	User:     lipgloss.Color("#a6e3a1"), // Green
 }
@@ -151,6 +153,7 @@ var CatppuccinMacchiato = Theme{
 	Cursor:   lipgloss.Color("#8bd5ca"),
 	Windsurf: lipgloss.Color("#f0c6c6"),
 	Aider:    lipgloss.Color("#f5a97f"),
+	Opencode: lipgloss.Color("#b7bdf8"),
 	Ollama:   lipgloss.Color("#a6da95"),
 	User:     lipgloss.Color("#a6da95"),
 }
@@ -196,6 +199,7 @@ var CatppuccinLatte = Theme{
 	Cursor:   lipgloss.Color("#8bd5ca"),
 	Windsurf: lipgloss.Color("#f0c6c6"),
 	Aider:    lipgloss.Color("#f5a97f"),
+	Opencode: lipgloss.Color("#7287fd"),
 	Ollama:   lipgloss.Color("#a6da95"),
 	User:     lipgloss.Color("#40a02b"),
 }
@@ -247,6 +251,7 @@ var Plain = Theme{
 	Cursor:   lipgloss.Color(""),
 	Windsurf: lipgloss.Color(""),
 	Aider:    lipgloss.Color(""),
+	Opencode: lipgloss.Color(""),
 	Ollama:   lipgloss.Color(""),
 	User:     lipgloss.Color(""),
 }
@@ -292,6 +297,7 @@ var Nord = Theme{
 	Cursor:   lipgloss.Color("#8fbcbb"),
 	Windsurf: lipgloss.Color("#d8dee9"),
 	Aider:    lipgloss.Color("#d08770"),
+	Opencode: lipgloss.Color("#b48ead"),
 	Ollama:   lipgloss.Color("#a3be8c"),
 	User:     lipgloss.Color("#5e81ac"),
 }

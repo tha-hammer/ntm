@@ -29,7 +29,15 @@ type BulkAssignOptions struct {
 	Stagger            time.Duration
 	SkipPanes          []int
 	PromptTemplatePath string
-	Deps               *BulkAssignDependencies
+	// DefaultTemplatePath is a project/user-level configured template file
+	// (cfg.Assign.PromptTemplateFile). It is used when PromptTemplatePath is
+	// empty, and overrides DefaultTemplate and the built-in const.
+	DefaultTemplatePath string
+	// DefaultTemplate is an inline project/user-level configured template
+	// (cfg.Assign.PromptTemplate). It is used when neither PromptTemplatePath
+	// nor DefaultTemplatePath resolves to content, and overrides the built-in const.
+	DefaultTemplate string
+	Deps            *BulkAssignDependencies
 }
 
 // BulkAssignDependencies allows tests to stub external interactions.
@@ -711,12 +719,16 @@ func bulkAssignTMUXAgentType(agentType string) tmux.AgentType {
 		return tmux.AgentCodex
 	case "gemini":
 		return tmux.AgentGemini
+	case "antigravity":
+		return tmux.AgentAntigravity
 	case "cursor":
 		return tmux.AgentCursor
 	case "windsurf":
 		return tmux.AgentWindsurf
 	case "aider":
 		return tmux.AgentAider
+	case "oc":
+		return tmux.AgentOpencode
 	case "ollama":
 		return tmux.AgentOllama
 	case "user":
@@ -765,15 +777,44 @@ func buildBulkAssignPrompt(template string, deps BulkAssignDependencies, assignm
 	), nil
 }
 
+// loadBulkAssignTemplate resolves the dispatch prompt template using the
+// following precedence (first match wins):
+//  1. Per-invocation --bulk-assign-template file (opts.PromptTemplatePath).
+//  2. Project/user-level configured template file (opts.DefaultTemplatePath).
+//  3. Project/user-level configured inline template (opts.DefaultTemplate).
+//  4. The built-in defaultBulkAssignTemplate const.
+//
+// This lets a project pin its dispatch contract (e.g. "Read SKILL.md" or
+// "Set gc.outcome when done") via .ntm/config.toml without wrapping every
+// `ntm --robot-bulk-assign` call in --bulk-assign-template (#153).
 func loadBulkAssignTemplate(opts BulkAssignOptions, deps BulkAssignDependencies) (string, error) {
-	if opts.PromptTemplatePath == "" {
-		return defaultBulkAssignTemplate, nil
+	// 1. Explicit per-invocation override.
+	if opts.PromptTemplatePath != "" {
+		data, err := deps.ReadFile(opts.PromptTemplatePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read prompt template: %w", err)
+		}
+		return string(data), nil
 	}
-	data, err := deps.ReadFile(opts.PromptTemplatePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read prompt template: %w", err)
+
+	// 2. Configured default template file.
+	if opts.DefaultTemplatePath != "" {
+		data, err := deps.ReadFile(opts.DefaultTemplatePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read configured prompt template %q: %w", opts.DefaultTemplatePath, err)
+		}
+		if strings.TrimSpace(string(data)) != "" {
+			return string(data), nil
+		}
 	}
-	return string(data), nil
+
+	// 3. Configured inline default template.
+	if strings.TrimSpace(opts.DefaultTemplate) != "" {
+		return opts.DefaultTemplate, nil
+	}
+
+	// 4. Built-in fallback.
+	return defaultBulkAssignTemplate, nil
 }
 
 func expandBulkAssignTemplate(template, beadID, beadTitle, beadType string, beadDeps []string, session string, pane int) string {

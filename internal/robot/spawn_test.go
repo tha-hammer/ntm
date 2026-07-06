@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -287,6 +288,73 @@ func TestSpawnOptions_DryRunMode(t *testing.T) {
 		resp.Session, len(resp.WouldCreate), typeCounts)
 }
 
+func TestSpawnOptions_DryRunIncludesAdmission(t *testing.T) {
+	opts := SpawnOptions{
+		Session:    "test_dryrun_admission",
+		CCCount:    1,
+		CodCount:   1,
+		NoUserPane: false,
+		DryRun:     true,
+	}
+
+	// Hoist the agent cap above any plausible runner state so this
+	// test is environment-independent. With bd-1oenb's fix the
+	// admission cap counts running + requested vs MaxAgents; the
+	// real-tmux RunningAgents on a CI/agent-swarm host would
+	// otherwise trip the default cap before the request is even
+	// considered.
+	cfg := config.Default()
+	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
+
+	resp, err := GetSpawn(opts, cfg)
+	if err != nil {
+		t.Fatalf("GetSpawn returned error: %v", err)
+	}
+	if resp.Admission == nil {
+		t.Fatal("Admission is nil")
+	}
+	if resp.Admission.RequestedAgents != 2 {
+		t.Errorf("Admission.RequestedAgents = %d, want 2", resp.Admission.RequestedAgents)
+	}
+	if resp.Admission.RequestedPanes != 3 {
+		t.Errorf("Admission.RequestedPanes = %d, want 3", resp.Admission.RequestedPanes)
+	}
+	if resp.Admission.Decision != pressure.SpawnAdmissionAdmit {
+		t.Errorf("Admission.Decision = %s, want admit", resp.Admission.Decision)
+	}
+}
+
+func TestSpawnOptions_DryRunAdmissionRefusesAgentCap(t *testing.T) {
+	cfg := config.Default()
+	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1
+	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 0
+	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 0
+
+	resp, err := GetSpawn(SpawnOptions{
+		Session:    "test_dryrun_admission_refuse",
+		CCCount:    2,
+		NoUserPane: true,
+		DryRun:     true,
+	}, cfg)
+	if err != nil {
+		t.Fatalf("GetSpawn returned error: %v", err)
+	}
+	if resp.Admission == nil {
+		t.Fatal("Admission is nil")
+	}
+	if resp.Admission.Decision != pressure.SpawnAdmissionRefuse {
+		t.Fatalf("Admission.Decision = %s, want refuse", resp.Admission.Decision)
+	}
+	if resp.Admission.Reason != "agent_limit_exceeded" {
+		t.Errorf("Admission.Reason = %q, want agent_limit_exceeded", resp.Admission.Reason)
+	}
+	if !resp.Success {
+		t.Error("dry-run should stay successful even when admission would refuse a real spawn")
+	}
+}
+
 // TestSpawnOptions_NoAgentsSpecified validates error when no agents specified
 func TestSpawnOptions_NoAgentsSpecified(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
@@ -312,7 +380,7 @@ func TestSpawnOptions_NoAgentsSpecified(t *testing.T) {
 	if resp.Error == "" {
 		t.Error("[E2E-SPAWN] Expected error for no agents specified")
 	}
-	if resp.Error != "no agents specified (use cc, cod, or gmi counts)" {
+	if resp.Error != "no agents specified (use cc, cod, gmi, or agy counts)" {
 		t.Errorf("[E2E-SPAWN] Unexpected error message: %s", resp.Error)
 	}
 
@@ -376,6 +444,11 @@ func TestSpawnOptions_MultipleAgentTypes(t *testing.T) {
 	}
 
 	cfg := config.Default()
+	// Hoist agent caps so bd-1oenb's running+requested cap check
+	// doesn't refuse the spawn on a busy runner (default caps are 7).
+	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
 	// Use fast echo commands
 	cfg.Agents.Claude = "echo claude_test"
 	cfg.Agents.Codex = "echo codex_test"

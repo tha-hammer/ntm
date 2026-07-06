@@ -4,6 +4,7 @@ package health
 import (
 	"context"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -106,6 +107,16 @@ type HealthSummary struct {
 	Unknown int `json:"unknown"` // Agents with unknown status
 }
 
+const (
+	// Keep detection windows small so stale historical messages don't dominate
+	// health classification once an agent has recovered and is back at prompt.
+	rateLimitLookbackLines     = 20
+	rateLimitContextLines      = 50
+	errorLookbackLines         = 20
+	criticalErrorLookbackLines = 50
+	processExitLookbackLines   = 12
+)
+
 // CheckSession performs health checks on all agents in a session
 func CheckSession(ctx context.Context, session string) (*SessionHealth, error) {
 	panesWithActivity, err := tmux.GetPanesWithActivityContext(ctx, session)
@@ -174,6 +185,17 @@ func CheckSession(ctx context.Context, session string) (*SessionHealth, error) {
 		return nil, ctx.Err()
 	}
 
+	// bd-brr6h: parallel checkAgent goroutines append to health.Agents
+	// in completion order, not source order. Sort by (Pane, PaneID) so
+	// two CheckSession calls against the same pane set produce byte-
+	// stable JSON output downstream — sibling of bd-c9wr1.
+	sort.SliceStable(health.Agents, func(i, j int) bool {
+		if health.Agents[i].Pane != health.Agents[j].Pane {
+			return health.Agents[i].Pane < health.Agents[j].Pane
+		}
+		return health.Agents[i].PaneID < health.Agents[j].PaneID
+	})
+
 	return health, nil
 }
 
@@ -198,6 +220,7 @@ func checkAgent(ctx context.Context, pa tmux.PaneActivity) AgentHealth {
 		ProcessStatus: ProcessUnknown,
 		Activity:      ActivityUnknown,
 		Issues:        []Issue{},
+		ShellPID:      pa.Pane.PID,
 	}
 
 	// Set last activity
@@ -223,7 +246,7 @@ func checkAgent(ctx context.Context, pa tmux.PaneActivity) AgentHealth {
 	}
 
 	// Check for other error patterns (skipping rate limit since we already checked)
-	otherIssues := detectErrors(output)
+	otherIssues := detectErrorsForAgent(output, string(pa.Pane.Type))
 	for _, issue := range otherIssues {
 		if issue.Type != "rate_limit" {
 			agent.Issues = append(agent.Issues, issue)
@@ -234,7 +257,7 @@ func checkAgent(ctx context.Context, pa tmux.PaneActivity) AgentHealth {
 	agent.Activity = detectActivity(output, pa.LastActivity, string(pa.Pane.Type))
 
 	// Determine process status using PID-based check (preferred) with text fallback
-	agent.ProcessStatus = detectProcessStatus(output, pa.Pane.Command, pa.Pane.PID)
+	agent.ProcessStatus = detectProcessStatusForAgent(output, pa.Pane.Command, pa.Pane.PID, string(pa.Pane.Type))
 
 	// Detect work progress
 	agent.Progress = detectProgress(output, agent.Activity, agent.Issues)
@@ -246,45 +269,155 @@ func checkAgent(ctx context.Context, pa tmux.PaneActivity) AgentHealth {
 }
 
 func detectRateLimit(output string, agentType string) ratelimit.RateLimitDetection {
-	return ratelimit.DetectRateLimitForAgent(output, agentType)
+	recentOutput := util.GetLastNLines(output, rateLimitLookbackLines)
+	detection := ratelimit.DetectRateLimitForAgent(recentOutput, agentType)
+	if detection.RateLimited || !hasRateLimitChatter(recentOutput) {
+		return detection
+	}
+
+	contextOutput := util.GetLastNLines(output, rateLimitContextLines)
+	contextDetection := ratelimit.DetectRateLimitForAgent(contextOutput, agentType)
+	if contextDetection.RateLimited {
+		return contextDetection
+	}
+	return detection
 }
 
 // detectErrors scans output for error patterns
 func detectErrors(output string) []Issue {
 	var issues []Issue
+	output = util.GetLastNLines(output, errorLookbackLines)
 	errorTypes := status.DetectAllErrorsInOutput(output)
 
 	for _, et := range errorTypes {
-		var typeStr string
-		var message string
-
-		switch et {
-		case status.ErrorRateLimit:
-			typeStr = "rate_limit"
-			message = "Rate limit detected"
-		case status.ErrorCrash:
-			typeStr = "crash"
-			message = "Agent crashed"
-		case status.ErrorAuth:
-			typeStr = "auth_error"
-			message = "Authentication error"
-		case status.ErrorConnection:
-			typeStr = "network_error"
-			message = "Network error"
-		case status.ErrorGeneric:
-			typeStr = "error"
-			message = "Error detected"
-		default:
+		issue, ok := issueForErrorType(et)
+		if !ok {
 			continue
 		}
-
-		issues = append(issues, Issue{
-			Type:    typeStr,
-			Message: message,
-		})
+		issues = append(issues, issue)
 	}
 
 	return issues
+}
+
+func detectErrorsForAgent(output string, agentType string) []Issue {
+	postPrompt, hasPrompt := outputAfterMostRecentPrompt(output, agentType)
+	scanOutput := output
+	if hasPrompt {
+		// Any prompt anywhere in the buffer marks recovery — only scan
+		// what came AFTER it. Crashes prior to that prompt have been
+		// recovered, even if the agent has since produced new output
+		// that pushes the prompt out of the trailing-3-line window.
+		scanOutput = postPrompt
+	}
+
+	issues := detectErrors(scanOutput)
+	if agentType == "" || hasPrompt {
+		return issues
+	}
+
+	// No prompt seen anywhere in the buffer → the agent never recovered.
+	// Escalate the crash window so a panic that scrolled past the normal
+	// 20-line lookback (e.g. compilation noise) is still reported.
+	criticalOutput := util.GetLastNLines(output, criticalErrorLookbackLines)
+	for _, et := range status.DetectAllErrorsInOutput(criticalOutput) {
+		if et != status.ErrorCrash || hasIssueType(issues, "crash") {
+			continue
+		}
+		issue, ok := issueForErrorType(et)
+		if ok {
+			issues = append(issues, issue)
+		}
+	}
+
+	return issues
+}
+
+// promptScanLineBudget caps how many tail lines outputAfterMostRecentPrompt
+// will scan when looking for a recovery prompt. A typical tmux capture is a
+// few hundred lines; 1024 covers realistic scrollback without making
+// per-pane health checks expensive on giant buffers.
+const promptScanLineBudget = 1024
+
+// outputAfterMostRecentPrompt returns the slice of output that follows the
+// last prompt line in the buffer, plus a flag indicating whether such a
+// prompt was found. The scan is bounded to the last promptScanLineBudget
+// non-empty lines so a panic-and-recover-and-resume buffer of any practical
+// size still detects the recovery marker. Returns (output, false) when
+// agentType is empty or no prompt is found.
+func outputAfterMostRecentPrompt(output string, agentType string) (string, bool) {
+	if agentType == "" {
+		return output, false
+	}
+	lines := strings.Split(status.StripANSI(output), "\n")
+	linesChecked := 0
+	for i := len(lines) - 1; i >= 0 && linesChecked < promptScanLineBudget; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		linesChecked++
+		if status.IsPromptLine(line, agentType) {
+			return strings.Join(lines[i+1:], "\n"), true
+		}
+	}
+	return output, false
+}
+
+func issueForErrorType(et status.ErrorType) (Issue, bool) {
+	switch et {
+	case status.ErrorRateLimit:
+		return Issue{Type: "rate_limit", Message: "Rate limit detected"}, true
+	case status.ErrorCrash:
+		return Issue{Type: "crash", Message: "Agent crashed"}, true
+	case status.ErrorAuth:
+		return Issue{Type: "auth_error", Message: "Authentication error"}, true
+	case status.ErrorConnection:
+		return Issue{Type: "network_error", Message: "Network error"}, true
+	case status.ErrorGeneric:
+		return Issue{Type: "error", Message: "Error detected"}, true
+	default:
+		return Issue{}, false
+	}
+}
+
+func hasIssueType(issues []Issue, issueType string) bool {
+	for _, issue := range issues {
+		if issue.Type == issueType {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRateLimitChatter is the cheap pre-filter that gates the
+// detectRateLimit second-chance scan over the larger 50-line context
+// window. The keyword list intentionally covers (a) generic
+// throttling phrases and (b) the explicit phrasings used by the major
+// agent CLIs (claude/cc, codex/cod, gemini/gmi) so we don't miss a
+// rate-limit signal that scrolled out of the trailing 20 lines.
+//
+// New markers should follow the existing form (lowercased, substring
+// safe, agent-CLI agnostic). Avoid adding terms so generic they
+// match arbitrary chatter (e.g. "wait" alone).
+func hasRateLimitChatter(output string) bool {
+	cleaned := strings.ToLower(status.StripANSI(output))
+	for _, marker := range []string{
+		"retry",
+		"try again",
+		"cooldown",
+		"throttl",
+		"rate limit",
+		"rate exceeded",
+		"quota",
+		"too many requests",
+		"resource exhausted",
+	} {
+		if strings.Contains(cleaned, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseWaitTime extracts the suggested wait time in seconds from rate limit messages
@@ -483,6 +616,10 @@ func detectActivity(output string, lastActivity time.Time, agentType string) Act
 // Text-pattern matching is only used as a fallback when no PID is available
 // (e.g. in tests or when tmux doesn't report a PID).
 func detectProcessStatus(output string, command string, shellPID int) ProcessStatus {
+	return detectProcessStatusForAgent(output, command, shellPID, "")
+}
+
+func detectProcessStatusForAgent(output string, command string, shellPID int, agentType string) ProcessStatus {
 	// Primary: PID-based liveness check (reliable, no false positives).
 	if shellPID > 0 {
 		if process.HasChildAlive(shellPID) {
@@ -492,13 +629,19 @@ func detectProcessStatus(output string, command string, shellPID int) ProcessSta
 		return ProcessExited
 	}
 
+	// If the pane is clearly at prompt for this agent type, treat as running.
+	// This prevents stale text like "connection closed" from forcing exited.
+	if status.DetectIdleFromOutput(output, agentType) {
+		return ProcessRunning
+	}
+
 	// Fallback: text-based detection when PID is unavailable.
 	exitPatterns := []string{
 		"exit status", "exited with", "process exited",
 		"connection closed", "session ended",
 	}
 
-	outputLower := strings.ToLower(output)
+	outputLower := strings.ToLower(util.GetLastNLines(output, processExitLookbackLines))
 	for _, pattern := range exitPatterns {
 		if strings.Contains(outputLower, pattern) {
 			return ProcessExited

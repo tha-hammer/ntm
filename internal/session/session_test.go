@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -611,6 +612,7 @@ func TestGetAgentCommand(t *testing.T) {
 		Cursor:   "cursor agent",
 		Windsurf: "windsurf start",
 		Aider:    "aider --watch",
+		Opencode: "opencode run",
 		Ollama:   "ollama serve",
 	}
 
@@ -631,6 +633,8 @@ func TestGetAgentCommand(t *testing.T) {
 		{"windsurf", "windsurf start"},
 		{"ws", "windsurf start"},
 		{"aider", "aider --watch"},
+		{"oc", "opencode run"},
+		{"opencode", "opencode run"},
 		{"ollama", "ollama serve"},
 		{"unknown", ""},
 		{"", ""},
@@ -842,7 +846,7 @@ func TestMapPaneStates(t *testing.T) {
 
 	t.Run("empty panes", func(t *testing.T) {
 		t.Parallel()
-		states := mapPaneStates(nil)
+		states := mapPaneStates(nil, "")
 		if len(states) != 0 {
 			t.Errorf("expected empty for nil input, got len=%d", len(states))
 		}
@@ -862,7 +866,7 @@ func TestMapPaneStates(t *testing.T) {
 				Height:  40,
 			},
 		}
-		states := mapPaneStates(panes)
+		states := mapPaneStates(panes, "")
 		if len(states) != 1 {
 			t.Fatalf("len = %d, want 1", len(states))
 		}
@@ -900,7 +904,7 @@ func TestMapPaneStates(t *testing.T) {
 			{Index: 1, Type: tmux.AgentClaude, Title: "proj__cc_1"},
 			{Index: 2, Type: tmux.AgentCodex, Title: "proj__cod_1"},
 		}
-		states := mapPaneStates(panes)
+		states := mapPaneStates(panes, "")
 		if len(states) != 3 {
 			t.Fatalf("len = %d, want 3", len(states))
 		}
@@ -919,4 +923,116 @@ func TestMapPaneStates(t *testing.T) {
 			t.Errorf("states[2].AgentType = %q, want cod", states[2].AgentType)
 		}
 	})
+}
+
+// TestWindowCreationOrder verifies the distinct window indices are returned in
+// first-appearance order (the order Restore creates windows), which is how
+// restoreWindowFidelity maps saved windows to freshly-created tmux windows.
+func TestWindowCreationOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("distinct in first-appearance order", func(t *testing.T) {
+		t.Parallel()
+		// Already sorted by (WindowIndex, Index) as Restore sorts before calling.
+		panes := []PaneState{
+			{WindowIndex: 0, Index: 0},
+			{WindowIndex: 0, Index: 1},
+			{WindowIndex: 2, Index: 0},
+			{WindowIndex: 2, Index: 1},
+			{WindowIndex: 5, Index: 0},
+		}
+		got := windowCreationOrder(panes)
+		want := []int{0, 2, 5}
+		if len(got) != len(want) {
+			t.Fatalf("len = %d (%v), want %d (%v)", len(got), got, len(want), want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("order[%d] = %d, want %d", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		t.Parallel()
+		if got := windowCreationOrder(nil); len(got) != 0 {
+			t.Errorf("nil panes -> %v, want empty", got)
+		}
+	})
+}
+
+// TestParseWindowList verifies the `list-windows` output parser used by capture
+// (ntm-r3k0/ntm-fphu). It must extract index/name/active/zoom/layout per line
+// and skip blank, under-delimited, or non-numeric-index lines. The separator is
+// a printable token (tmux escapes control bytes in format output).
+func TestParseWindowList(t *testing.T) {
+	t.Parallel()
+
+	const sep = "_NTM_SEP_"
+	out := "1" + sep + "editor" + sep + "1" + sep + "0" + sep + "d4cd,200x50,0,0{100x50,0,0,1,99x50,101,0,2}\n" +
+		"2" + sep + "logs" + sep + "0" + sep + "1" + sep + "b4ca,200x50,0,0[200x25,0,0,3,200x24,0,26,4]\n" +
+		"\n" + // blank line -> skipped
+		"x" + sep + "bad" + sep + "0" + sep + "0" + sep + "layout" + "\n" + // non-numeric index -> skipped
+		"3" + sep + "tooFew" // under-delimited -> skipped
+
+	got := parseWindowList(out, sep)
+	if len(got) != 2 {
+		t.Fatalf("parsed %d windows, want 2: %+v", len(got), got)
+	}
+
+	w0 := got[0]
+	if w0.Index != 1 || w0.Name != "editor" || !w0.Active || w0.Zoomed ||
+		w0.Layout != "d4cd,200x50,0,0{100x50,0,0,1,99x50,101,0,2}" {
+		t.Errorf("window[0] = %+v", w0)
+	}
+
+	w1 := got[1]
+	if w1.Index != 2 || w1.Name != "logs" || w1.Active || !w1.Zoomed ||
+		w1.Layout != "b4ca,200x50,0,0[200x25,0,0,3,200x24,0,26,4]" {
+		t.Errorf("window[1] = %+v", w1)
+	}
+
+	if got := parseWindowList("", sep); len(got) != 0 {
+		t.Errorf("empty output -> %v, want no windows", got)
+	}
+}
+
+// TestSessionState_WindowsRoundTrip verifies the per-window fidelity metadata
+// (ntm-r3k0/ntm-fphu) and the per-pane rendered Command (ntm-boi0) survive the
+// JSON serialization that backs saved-session files.
+func TestSessionState_WindowsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	orig := &SessionState{
+		Name: "demo",
+		Panes: []PaneState{
+			{Index: 0, WindowIndex: 0, AgentType: "cc", Model: "opus", Command: "claude --model opus", Active: true},
+		},
+		Layout: "tiled",
+		Windows: []WindowState{
+			{Index: 0, Name: "main", Layout: "abcd,80x24,0,0,1", Active: true, Zoomed: true},
+		},
+		Version: StateVersion,
+	}
+
+	data, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got SessionState
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(got.Windows) != 1 {
+		t.Fatalf("windows lost in round-trip: %+v", got.Windows)
+	}
+	w := got.Windows[0]
+	if w.Name != "main" || w.Layout != "abcd,80x24,0,0,1" || !w.Active || !w.Zoomed {
+		t.Errorf("window round-trip mismatch: %+v", w)
+	}
+	if got.Panes[0].Command != "claude --model opus" {
+		t.Errorf("pane Command lost in round-trip: %q", got.Panes[0].Command)
+	}
 }

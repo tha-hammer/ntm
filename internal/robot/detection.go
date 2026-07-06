@@ -45,7 +45,16 @@ var processPatterns = map[string]string{
 	"windsurf":     "windsurf",
 	"aider":        "aider",
 	"aider-chat":   "aider",
-	"ollama":       "ollama",
+	// `opencode` (https://opencode.ai) — note we deliberately do NOT add a
+	// bare `oc` pattern here because `processPatterns` uses substring match
+	// (`strings.Contains`), and `oc` collides with both the OpenShift CLI
+	// (a real binary named `oc`) and with any command containing the
+	// substring "oc" — e.g. `docker`, `localhost`, `procmon`. Detection
+	// must key on the unambiguous binary name `opencode`. Pane titles still
+	// use the short `oc` suffix because they are NTM-formatted (`__oc_N`)
+	// and parsed by the title regex, not by substring match.
+	"opencode": "oc",
+	"ollama":   "ollama",
 }
 
 // contentPatterns provides regex patterns for detecting agents from output
@@ -93,6 +102,18 @@ var contentPatterns = []struct {
 		patterns: []*regexp.Regexp{
 			regexp.MustCompile(`(?i)aider\s*(>|$)`),
 			regexp.MustCompile(`(?i)aider/`),
+		},
+	},
+	{
+		// `opencode` (https://opencode.ai). Matches the binary name as a
+		// whole word followed by `>` (prompt indicator) or end-of-line, or
+		// `opencode/` as a path-style fragment in tracebacks. Word-boundary
+		// `\b` avoids false-matching session names like `openconductor` or
+		// project names containing `opencode` as a substring.
+		agentType: "oc",
+		patterns: []*regexp.Regexp{
+			regexp.MustCompile(`(?i)\bopencode\s*(>|$)`),
+			regexp.MustCompile(`(?i)\bopencode/`),
 		},
 	},
 	{

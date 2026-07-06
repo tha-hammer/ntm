@@ -112,14 +112,22 @@ func TestIsOverlayKeyBound(t *testing.T) {
 		wantBound bool
 	}{
 		{
-			name: "F12 bound with ntm",
+			name: "F12 bound with current (--inferred) ntm overlay",
 			confLines: []string{
 				"set -g status on",
-				`bind-key -n F12 display-popup -E "NTM_POPUP=1 ntm dashboard --popup #{session_name}"`,
+				`bind-key -n F12 display-popup -E "NTM_POPUP=1 ntm dashboard --popup --inferred #{session_name}"`,
 				"set -g mouse on",
 			},
 			key:       "F12",
 			wantBound: true,
+		},
+		{
+			name: "F12 bound with stale pre-#201 overlay (no --inferred) → not current, needs migration",
+			confLines: []string{
+				`bind-key -n F12 display-popup -E "NTM_POPUP=1 ntm dashboard --popup #{session_name}"`,
+			},
+			key:       "F12",
+			wantBound: false,
 		},
 		{
 			name: "F12 bound but not ntm",
@@ -195,10 +203,16 @@ func TestIsOverlayBindingLine(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "overlay binding",
-			line: `bind-key -n F12 display-popup -E -w 95% -h 95% "NTM_POPUP=1 ntm dashboard --popup #{session_name}"`,
+			name: "current overlay binding (with --inferred)",
+			line: `bind-key -n F12 display-popup -E -w 95% -h 95% "NTM_POPUP=1 ntm dashboard --popup --inferred #{session_name}"`,
 			key:  "F12",
 			want: true,
+		},
+		{
+			name: "stale overlay binding without --inferred is not current",
+			line: `bind-key -n F12 display-popup -E -w 95% -h 95% "NTM_POPUP=1 ntm dashboard --popup #{session_name}"`,
+			key:  "F12",
+			want: false,
 		},
 		{
 			name: "palette binding is not overlay",
@@ -235,6 +249,49 @@ func TestIsOverlayKeyBound_NoConfFile(t *testing.T) {
 	result := isOverlayKeyBound("F12")
 	if result != false {
 		t.Errorf("isOverlayKeyBound with no conf file = %v, want false", result)
+	}
+}
+
+func TestSplitOverlayStderr(t *testing.T) {
+	tests := []struct {
+		name         string
+		captured     string
+		wantWarnings string
+		wantCause    string
+	}{
+		{
+			name:      "bare error line",
+			captured:  "Error: getting project root failed",
+			wantCause: "getting project root failed",
+		},
+		{
+			name:         "warnings before error",
+			captured:     "Warning: project directory does not exist\nfalling back to cwd\nError: getting project root failed",
+			wantWarnings: "Warning: project directory does not exist\nfalling back to cwd",
+			wantCause:    "getting project root failed",
+		},
+		{
+			name:      "no error prefix is treated as the whole cause",
+			captured:  "some unexpected output",
+			wantCause: "some unexpected output",
+		},
+		{
+			name:         "last error line wins",
+			captured:     "Error: first\nError: second",
+			wantWarnings: "Error: first",
+			wantCause:    "second",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotW, gotC := splitOverlayStderr(tt.captured)
+			if gotW != tt.wantWarnings {
+				t.Errorf("warnings = %q, want %q", gotW, tt.wantWarnings)
+			}
+			if gotC != tt.wantCause {
+				t.Errorf("cause = %q, want %q", gotC, tt.wantCause)
+			}
+		})
 	}
 }
 
@@ -345,10 +402,51 @@ func TestOverlayTmuxArgs(t *testing.T) {
 }
 
 func TestOverlayPopupInnerCommandIncludesAttentionCursor(t *testing.T) {
-	got := overlayPopupInnerCommand("/usr/local/bin/ntm", "myproject", 42135)
+	got := overlayPopupInnerCommand("/usr/local/bin/ntm", "myproject", 42135, false)
 	want := "NTM_POPUP=1 '/usr/local/bin/ntm' dashboard --popup --attention-cursor 42135 'myproject'"
 	if got != want {
 		t.Fatalf("overlayPopupInnerCommand() = %q, want %q", got, want)
+	}
+}
+
+func TestOverlayPopupInnerCommandInferredMarker(t *testing.T) {
+	// When the relaunch is inferred (plain `ntm dash` for the current session),
+	// the inner command must carry --inferred so the popup keeps lenient,
+	// current-session project-dir resolution instead of failing closed.
+	gotInferred := overlayPopupInnerCommand("/usr/local/bin/ntm", "myproject", 0, true)
+	wantInferred := "NTM_POPUP=1 '/usr/local/bin/ntm' dashboard --popup --inferred 'myproject'"
+	if gotInferred != wantInferred {
+		t.Fatalf("overlayPopupInnerCommand(inferred=true) = %q, want %q", gotInferred, wantInferred)
+	}
+
+	// Genuinely-explicit invocations (inferred=false) must NOT get --inferred,
+	// preserving strict resolution for `ntm overlay <session>` / `ntm dash <session>`.
+	gotExplicit := overlayPopupInnerCommand("/usr/local/bin/ntm", "myproject", 0, false)
+	if strings.Contains(gotExplicit, "--inferred") {
+		t.Fatalf("overlayPopupInnerCommand(inferred=false) leaked --inferred: %q", gotExplicit)
+	}
+	wantExplicit := "NTM_POPUP=1 '/usr/local/bin/ntm' dashboard --popup 'myproject'"
+	if gotExplicit != wantExplicit {
+		t.Fatalf("overlayPopupInnerCommand(inferred=false) = %q, want %q", gotExplicit, wantExplicit)
+	}
+
+	// The inferred marker must appear before the positional session arg so cobra
+	// parses it as a flag, not a second positional.
+	if idxFlag, idxSession := strings.Index(gotInferred, "--inferred"), strings.Index(gotInferred, "'myproject'"); idxFlag < 0 || idxFlag > idxSession {
+		t.Fatalf("--inferred must precede the session arg: %q", gotInferred)
+	}
+}
+
+func TestShellSingleQuote(t *testing.T) {
+	cases := map[string]string{
+		"/tmp/foo.log":            "'/tmp/foo.log'",
+		"/tmp/has space/foo.log":  "'/tmp/has space/foo.log'",
+		"/tmp/it's/weird/foo.log": `'/tmp/it'\''s/weird/foo.log'`,
+	}
+	for in, want := range cases {
+		if got := shellSingleQuote(in); got != want {
+			t.Errorf("shellSingleQuote(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -675,19 +773,27 @@ func TestOverlayBindingLineVariations(t *testing.T) {
 	}{
 		{
 			name:      "full_overlay_binding",
-			line:      `bind-key -n F12 display-popup -E -w 95% -h 95% "NTM_POPUP=1 ntm dashboard --popup #{session_name}"`,
+			line:      `bind-key -n F12 display-popup -E -w 95% -h 95% "NTM_POPUP=1 ntm dashboard --popup --inferred #{session_name}"`,
 			key:       "F12",
 			wantMatch: true,
 			matchType: "overlay",
-			desc:      "Complete overlay binding with all flags",
+			desc:      "Complete current overlay binding with all flags",
+		},
+		{
+			name:      "stale_overlay_no_inferred",
+			line:      `bind-key -n F12 display-popup -E -w 95% -h 95% "NTM_POPUP=1 ntm dashboard --popup #{session_name}"`,
+			key:       "F12",
+			wantMatch: false,
+			matchType: "binding",
+			desc:      "Pre-#201 overlay binding without --inferred: still a binding, no longer 'current overlay' so it gets migrated",
 		},
 		{
 			name:      "minimal_overlay_binding",
-			line:      `bind -n F12 display-popup "ntm dashboard --popup foo"`,
+			line:      `bind -n F12 display-popup "ntm dashboard --popup --inferred foo"`,
 			key:       "F12",
 			wantMatch: true,
 			matchType: "overlay",
-			desc:      "Minimal overlay binding without size flags",
+			desc:      "Minimal current overlay binding without size flags",
 		},
 		{
 			name:      "palette_binding",
@@ -715,11 +821,11 @@ func TestOverlayBindingLineVariations(t *testing.T) {
 		},
 		{
 			name:      "trailing_whitespace",
-			line:      `bind-key -n F12 display-popup -E "ntm dashboard --popup foo"   `,
+			line:      `bind-key -n F12 display-popup -E "ntm dashboard --popup --inferred foo"   `,
 			key:       "F12",
 			wantMatch: true,
 			matchType: "overlay",
-			desc:      "Binding with trailing whitespace",
+			desc:      "Current binding with trailing whitespace",
 		},
 	}
 

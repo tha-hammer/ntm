@@ -305,6 +305,66 @@ func TestExportSVG_TimeRange(t *testing.T) {
 	}
 }
 
+func TestPrepareData_TimeRangeFiltersAndSeedsPriorState(t *testing.T) {
+	base := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	events := []state.AgentEvent{
+		{
+			AgentID:   "cc_1",
+			AgentType: state.AgentTypeClaude,
+			State:     state.TimelineIdle,
+			Timestamp: base,
+		},
+		{
+			AgentID:   "cc_1",
+			AgentType: state.AgentTypeClaude,
+			State:     state.TimelineWorking,
+			Timestamp: base.Add(5 * time.Minute),
+		},
+		{
+			AgentID:   "cc_1",
+			AgentType: state.AgentTypeClaude,
+			State:     state.TimelineWaiting,
+			Timestamp: base.Add(20 * time.Minute),
+		},
+		{
+			AgentID:   "cod_1",
+			AgentType: state.AgentTypeCodex,
+			State:     state.TimelineWorking,
+			Timestamp: base.Add(25 * time.Minute),
+		},
+	}
+
+	opts := DefaultExportOptions()
+	opts.Since = base.Add(10 * time.Minute)
+	opts.Until = base.Add(18 * time.Minute)
+	exporter := NewTimelineExporter(opts)
+
+	data := exporter.prepareData(events)
+	if data.TotalEvents != 0 {
+		t.Fatalf("TotalEvents = %d, want 0 in-range source events", data.TotalEvents)
+	}
+	if len(data.Agents) != 1 {
+		t.Fatalf("expected only the seeded cc_1 track, got %d tracks", len(data.Agents))
+	}
+	track := data.Agents[0]
+	if track.AgentID != "cc_1" {
+		t.Fatalf("AgentID = %q, want cc_1", track.AgentID)
+	}
+	if len(track.Segments) != 1 {
+		t.Fatalf("expected one seeded segment, got %d", len(track.Segments))
+	}
+	segment := track.Segments[0]
+	if segment.State != state.TimelineWorking {
+		t.Fatalf("seeded segment state = %s, want %s", segment.State, state.TimelineWorking)
+	}
+	if !segment.StartTime.Equal(opts.Since) || !segment.EndTime.Equal(opts.Until) {
+		t.Fatalf("seeded segment range = %s..%s, want %s..%s", segment.StartTime, segment.EndTime, opts.Since, opts.Until)
+	}
+	if segment.XStart < float64(data.LeftMargin) || segment.XEnd > float64(data.LeftMargin+data.BarWidth) {
+		t.Fatalf("segment coordinates outside bar: start %.1f end %.1f", segment.XStart, segment.XEnd)
+	}
+}
+
 // TestExportPNG_Basic verifies basic PNG export
 func TestExportPNG_Basic(t *testing.T) {
 	events := createTestEvents()

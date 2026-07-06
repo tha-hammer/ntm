@@ -85,7 +85,10 @@ func runLock(session string, patterns []string, reason, ttlStr string, shared bo
 			result := LockResult{Success: false, Session: session, Error: "Session has no Agent Mail identity"}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(result)
+			if encErr := enc.Encode(result); encErr != nil {
+				return encErr
+			}
+			return jsonFailureExit()
 		}
 		return fmt.Errorf("session '%s' has no Agent Mail identity", session)
 	}
@@ -96,7 +99,10 @@ func runLock(session string, patterns []string, reason, ttlStr string, shared bo
 			result := LockResult{Success: false, Session: session, Agent: sessionAgent.AgentName, Error: "Agent Mail server unavailable"}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(result)
+			if encErr := enc.Encode(result); encErr != nil {
+				return encErr
+			}
+			return jsonFailureExit()
 		}
 		return fmt.Errorf("agent mail server unavailable")
 	}
@@ -138,7 +144,13 @@ func runLock(session string, patterns []string, reason, ttlStr string, shared bo
 	if IsJSONOutput() {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(result)
+		if encErr := enc.Encode(result); encErr != nil {
+			return encErr
+		}
+		if !result.Success {
+			return jsonFailureExit()
+		}
+		return nil
 	}
 
 	return printLockResult(result, shared)

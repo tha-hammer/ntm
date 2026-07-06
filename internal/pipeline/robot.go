@@ -80,48 +80,56 @@ type PipelineExecution struct {
 
 // PipelineProgress tracks overall progress
 type PipelineProgress struct {
-	Completed int     `json:"completed"`
-	Running   int     `json:"running"`
-	Pending   int     `json:"pending"`
-	Failed    int     `json:"failed"`
-	Skipped   int     `json:"skipped"`
-	Total     int     `json:"total"`
-	Percent   float64 `json:"percent"`
+	Completed      int              `json:"completed"`
+	Running        int              `json:"running"`
+	Pending        int              `json:"pending"`
+	Failed         int              `json:"failed"`
+	Skipped        int              `json:"skipped"`
+	Total          int              `json:"total"`
+	Percent        float64          `json:"percent"`
+	SkipKindCounts map[SkipKind]int `json:"skip_kind_counts,omitempty"`
 }
 
 // PipelineStep represents step status in pipeline output
 type PipelineStep struct {
-	ID          string `json:"id"`
-	Status      string `json:"status"`
-	Agent       string `json:"agent,omitempty"`
-	PaneUsed    string `json:"pane_used,omitempty"`
-	StartedAt   string `json:"started_at,omitempty"`
-	FinishedAt  string `json:"finished_at,omitempty"`
-	DurationMs  int64  `json:"duration_ms,omitempty"`
-	OutputLines int    `json:"output_lines,omitempty"`
-	Error       string `json:"error,omitempty"`
+	ID          string   `json:"id"`
+	Status      string   `json:"status"`
+	Agent       string   `json:"agent,omitempty"`
+	PaneUsed    string   `json:"pane_used,omitempty"`
+	StartedAt   string   `json:"started_at,omitempty"`
+	FinishedAt  string   `json:"finished_at,omitempty"`
+	DurationMs  int64    `json:"duration_ms,omitempty"`
+	OutputLines int      `json:"output_lines,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	SkipKind    SkipKind `json:"skip_kind,omitempty"`
+	SkipReason  string   `json:"skip_reason,omitempty"`
 }
 
 // PipelineRunOptions configures a pipeline run
 type PipelineRunOptions struct {
-	WorkflowFile string                 // Path to workflow YAML/TOML file
-	Session      string                 // Tmux session name
-	ProjectDir   string                 // Optional: project root for .ntm pipeline state
-	Variables    map[string]interface{} // Runtime variables
-	DryRun       bool                   // Validate without executing
-	Background   bool                   // Run in background
+	WorkflowFile   string                 // Path to workflow YAML/TOML file
+	Session        string                 // Tmux session name
+	ProjectDir     string                 // Optional: project root for .ntm pipeline state
+	Variables      map[string]interface{} // Runtime variables
+	DryRun         bool                   // Validate without executing
+	Background     bool                   // Run in background
+	StartFromStep  string                 // Optional top-level step ID to start from
+	FromState      string                 // Optional prior run ID to copy skipped outputs from
+	StartFromState *ExecutionState        // Optional preloaded prior state
 }
 
 // PipelineRunOutput is the response for --robot-pipeline-run
 type PipelineRunOutput struct {
 	RobotResponse
-	RunID      string           `json:"run_id"`
-	WorkflowID string           `json:"workflow_id"`
-	Session    string           `json:"session"`
-	Status     string           `json:"status"`
-	DryRun     bool             `json:"dry_run,omitempty"`
-	Progress   PipelineProgress `json:"progress,omitempty"`
-	AgentHints *PipelineHints   `json:"_agent_hints,omitempty"`
+	RunID       string              `json:"run_id"`
+	WorkflowID  string              `json:"workflow_id"`
+	Session     string              `json:"session"`
+	Status      string              `json:"status"`
+	DryRun      bool                `json:"dry_run,omitempty"`
+	Warnings    []ParseError        `json:"warnings,omitempty"`
+	Progress    PipelineProgress    `json:"progress,omitempty"`
+	SideEffects *SideEffectManifest `json:"side_effect_manifest,omitempty"`
+	AgentHints  *PipelineHints      `json:"_agent_hints,omitempty"`
 }
 
 // PipelineStatusOutput is the response for --robot-pipeline=run-id
@@ -273,6 +281,35 @@ func PrintPipelineRun(opts PipelineRunOptions) int {
 		return 1
 	}
 
+	if opts.StartFromStep == "" && (opts.FromState != "" || opts.StartFromState != nil) {
+		output.RobotResponse = NewErrorResponse(
+			errors.New("--from-state requires --start-from"),
+			ErrCodeInvalidFlag,
+			"Provide a top-level step with --start-from when reusing prior state.",
+		)
+		outputJSON(output)
+		return 1
+	}
+
+	varValidation, varErr := ValidateWorkflowVariables(workflow, opts.Variables)
+	if varErr != nil {
+		output.RobotResponse = NewErrorResponse(
+			errors.New(varErr.Message),
+			ErrCodeInvalidFlag,
+			varErr.Hint,
+		)
+		outputJSON(output)
+		return 1
+	}
+	if varValidation != nil {
+		opts.Variables = varValidation.Variables
+		output.Warnings = varValidation.Warnings
+	}
+	if opts.DryRun {
+		manifest := BuildSideEffectManifest(workflow)
+		output.SideEffects = &manifest
+	}
+
 	// Create executor
 	execCfg := DefaultExecutorConfig(opts.Session)
 	execCfg.DryRun = opts.DryRun
@@ -282,6 +319,21 @@ func PrintPipelineRun(opts PipelineRunOptions) int {
 		execCfg.ProjectDir = projectDir
 	}
 	execCfg.WorkflowFile = workflowPath
+	execCfg.StartFromStep = opts.StartFromStep
+	execCfg.StartFromState = opts.StartFromState
+	if opts.FromState != "" {
+		prior, err := LoadState(execCfg.ProjectDir, opts.FromState)
+		if err != nil {
+			output.RobotResponse = NewErrorResponse(
+				fmt.Errorf("--from-state: load run %q: %w", opts.FromState, err),
+				ErrCodeInvalidFlag,
+				"Check that the prior run ID exists under the pipeline state directory.",
+			)
+			outputJSON(output)
+			return 1
+		}
+		execCfg.StartFromState = prior
+	}
 	executor := NewExecutor(execCfg)
 
 	// Create context
@@ -551,6 +603,12 @@ func calculateProgress(state *ExecutionState) PipelineProgress {
 			progress.Failed++
 		case StatusSkipped:
 			progress.Skipped++
+			if result.SkipKind != SkipKindNone {
+				if progress.SkipKindCounts == nil {
+					progress.SkipKindCounts = make(map[SkipKind]int)
+				}
+				progress.SkipKindCounts[result.SkipKind]++
+			}
 		case StatusPending:
 			progress.Pending++
 		}
@@ -571,10 +629,12 @@ func convertSteps(state *ExecutionState) map[string]PipelineStep {
 
 	for id, result := range state.Steps {
 		step := PipelineStep{
-			ID:       id,
-			Status:   string(result.Status),
-			Agent:    result.AgentType,
-			PaneUsed: result.PaneUsed,
+			ID:         id,
+			Status:     string(result.Status),
+			Agent:      result.AgentType,
+			PaneUsed:   result.PaneUsed,
+			SkipKind:   result.SkipKind,
+			SkipReason: result.SkipReason,
 		}
 
 		if !result.StartedAt.IsZero() {

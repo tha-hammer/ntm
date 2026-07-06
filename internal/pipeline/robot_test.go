@@ -335,6 +335,96 @@ func TestConvertSteps(t *testing.T) {
 	}
 }
 
+func TestRobotProgressSkipKindCounts(t *testing.T) {
+	state := &ExecutionState{
+		Steps: map[string]StepResult{
+			"a": {Status: StatusSkipped, SkipKind: SkipKindWhenCondition},
+			"b": {Status: StatusSkipped, SkipKind: SkipKindFailedDependency},
+			"c": {Status: StatusSkipped, SkipKind: SkipKindFailedDependency},
+			"d": {Status: StatusSkipped, SkipKind: SkipKindNone},
+			"e": {Status: StatusCompleted},
+		},
+	}
+
+	got := calculateProgress(state)
+
+	if got.Skipped != 4 {
+		t.Fatalf("Skipped = %d, want 4", got.Skipped)
+	}
+	if got.SkipKindCounts == nil {
+		t.Fatal("SkipKindCounts is nil")
+	}
+	if got.SkipKindCounts[SkipKindWhenCondition] != 1 {
+		t.Errorf("when_false count = %d, want 1", got.SkipKindCounts[SkipKindWhenCondition])
+	}
+	if got.SkipKindCounts[SkipKindFailedDependency] != 2 {
+		t.Errorf("failed_dependency count = %d, want 2", got.SkipKindCounts[SkipKindFailedDependency])
+	}
+	if _, ok := got.SkipKindCounts[SkipKindNone]; ok {
+		t.Errorf("SkipKindNone should not appear in distribution")
+	}
+}
+
+func TestRobotConvertStepsCarriesSkipKind(t *testing.T) {
+	state := &ExecutionState{
+		Steps: map[string]StepResult{
+			"step1": {
+				StepID:     "step1",
+				Status:     StatusSkipped,
+				SkipKind:   SkipKindForeachFilter,
+				SkipReason: "filter excluded role==reviewer",
+			},
+		},
+	}
+
+	steps := convertSteps(state)
+	step, ok := steps["step1"]
+	if !ok {
+		t.Fatal("step1 missing")
+	}
+	if step.SkipKind != SkipKindForeachFilter {
+		t.Errorf("SkipKind = %q, want %q", step.SkipKind, SkipKindForeachFilter)
+	}
+	if step.SkipReason != "filter excluded role==reviewer" {
+		t.Errorf("SkipReason = %q, want %q", step.SkipReason, "filter excluded role==reviewer")
+	}
+
+	payload, err := json.Marshal(step)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	body := string(payload)
+	if !strings.Contains(body, `"skip_kind":"foreach_filter_excluded"`) {
+		t.Errorf("json missing skip_kind field: %s", body)
+	}
+	if !strings.Contains(body, `"skip_reason":"filter excluded role==reviewer"`) {
+		t.Errorf("json missing skip_reason field: %s", body)
+	}
+}
+
+func TestRobotProgressSkipKindCountsJSON(t *testing.T) {
+	progress := PipelineProgress{
+		Skipped: 2,
+		Total:   2,
+		SkipKindCounts: map[SkipKind]int{
+			SkipKindStartFrom: 2,
+		},
+	}
+	payload, err := json.Marshal(progress)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	body := string(payload)
+	if !strings.Contains(body, `"skip_kind_counts":{"start_from_excluded":2}`) {
+		t.Errorf("json missing skip_kind_counts: %s", body)
+	}
+
+	emptyPayload, _ := json.Marshal(PipelineProgress{})
+	if strings.Contains(string(emptyPayload), "skip_kind_counts") {
+		t.Errorf("empty progress should omit skip_kind_counts: %s", emptyPayload)
+	}
+}
+
 func TestCountLines(t *testing.T) {
 
 	tests := []struct {
@@ -1510,14 +1600,42 @@ func TestPrintPipelineRun_DryRun(t *testing.T) {
 
 	workflowContent := `schema_version: "1.0"
 name: dry-run-test
+outputs:
+  - name: report
+    path: artifacts/report.md
+settings:
+  on_cancel:
+    - id: cleanup
+      command: "echo cleanup"
 steps:
   - id: step1
     prompt: "Hello world"
     agent: claude
   - id: step2
-    prompt: "Second step"
-    agent: codex
+    command: "go test ./internal/pipeline"
     depends_on: [step1]
+  - id: notify
+    mail_send:
+      project_key: /data/projects/ntm
+      agent_name: YellowBluff
+      to: TealCrane
+      subject: "[bd-fxj4f.6] preview"
+      body: "dry-run"
+      thread_id: bd-fxj4f.6
+    depends_on: [step2]
+  - id: reserve
+    file_reservation_paths:
+      project_key: /data/projects/ntm
+      agent_name: YellowBluff
+      paths: ["internal/pipeline/*.go"]
+      exclusive: true
+    depends_on: [notify]
+post_pipeline_steps:
+  - id: release
+    file_reservation_release:
+      project_key: /data/projects/ntm
+      agent_name: YellowBluff
+      paths: ["internal/pipeline/*.go"]
 `
 	workflowPath := tmpDir + "/test.yaml"
 	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
@@ -1555,6 +1673,80 @@ steps:
 	}
 	if result.Status != "completed" {
 		t.Errorf("Status = %q, want %q", result.Status, "completed")
+	}
+	if result.SideEffects == nil {
+		t.Fatal("SideEffects should be present in dry-run response")
+	}
+	if got := result.SideEffects.Summary.ByKind[sideEffectKindTmuxSend]; got != 1 {
+		t.Errorf("tmux side-effect count = %d, want 1", got)
+	}
+	if got := result.SideEffects.Summary.ByKind[sideEffectKindShellCommand]; got != 2 {
+		t.Errorf("shell side-effect count = %d, want 2", got)
+	}
+	if got := result.SideEffects.Summary.ByKind[sideEffectKindAgentMailSend]; got != 1 {
+		t.Errorf("mail_send side-effect count = %d, want 1", got)
+	}
+	if got := result.SideEffects.Summary.ByKind[sideEffectKindAgentMailReservation]; got != 1 {
+		t.Errorf("reservation side-effect count = %d, want 1", got)
+	}
+	if got := result.SideEffects.Summary.ByKind[sideEffectKindFilesystemWrite]; got != 1 {
+		t.Errorf("filesystem side-effect count = %d, want 1", got)
+	}
+	if len(result.SideEffects.RollbackPreview) != 2 {
+		t.Fatalf("RollbackPreview length = %d, want 2; preview=%#v", len(result.SideEffects.RollbackPreview), result.SideEffects.RollbackPreview)
+	}
+}
+
+func TestPrintPipelineRun_DryRunHonorsStartFrom(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	workflowContent := `schema_version: "2.0"
+name: start-from-json-test
+steps:
+  - id: step1
+    prompt: "first"
+  - id: step2
+    prompt: "second"
+    depends_on: [step1]
+  - id: step3
+    prompt: "third"
+    depends_on: [step2]
+`
+	workflowPath := tmpDir + "/start-from.yaml"
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	opts := PipelineRunOptions{
+		WorkflowFile:  workflowPath,
+		Session:       "test-session",
+		ProjectDir:    tmpDir,
+		DryRun:        true,
+		StartFromStep: "step2",
+	}
+
+	var exitCode int
+	output := captureStdout(t, func() {
+		exitCode = PrintPipelineRun(opts)
+	})
+	if exitCode != 0 {
+		t.Fatalf("PrintPipelineRun() exit code = %d, want 0\nOutput: %s", exitCode, output)
+	}
+
+	var result PipelineRunOutput
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, output)
+	}
+
+	state, err := LoadState(tmpDir, result.RunID)
+	if err != nil {
+		t.Fatalf("LoadState(%q) failed: %v", result.RunID, err)
+	}
+	if got := state.Steps["step1"]; got.Status != StatusSkipped || got.SkipReason != StartFromSkipReason {
+		t.Fatalf("step1 result = %#v, want start-from skipped", got)
+	}
+	if got := state.Steps["step2"]; got.Status != StatusCompleted {
+		t.Fatalf("step2 status = %v, want completed", got.Status)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -114,6 +115,15 @@ func NewContextPackCacheWithDir(dir string, cfg CacheConfig, logger *slog.Logger
 }
 
 func defaultContextCacheDir() (string, error) {
+	// Honor XDG_CACHE_HOME on every platform. os.UserCacheDir uses
+	// $HOME/Library/Caches on macOS and ignores XDG_CACHE_HOME entirely,
+	// which makes test isolation impossible without explicitly setting
+	// HOME. Treating an explicit XDG_CACHE_HOME as authoritative keeps
+	// the macOS-default behavior intact (XDG_CACHE_HOME is unset there
+	// by default) while letting tests sandbox the path portably.
+	if xdg := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); xdg != "" {
+		return filepath.Join(xdg, "ntm", "context-packs"), nil
+	}
 	base, err := os.UserCacheDir()
 	if err != nil {
 		home, homeErr := os.UserHomeDir()

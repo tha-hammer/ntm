@@ -65,34 +65,47 @@ type SessionResponse struct {
 
 // PaneResponse is the standard format for pane-related output
 type PaneResponse struct {
-	Index          int     `json:"index"`
-	Title          string  `json:"title"`
-	Type           string  `json:"type"`              // claude, codex, gemini, user
-	Variant        string  `json:"variant,omitempty"` // model alias or persona name
-	Active         bool    `json:"active,omitempty"`
-	Width          int     `json:"width,omitempty"`
-	Height         int     `json:"height,omitempty"`
-	Command        string  `json:"command,omitempty"`
-	Status         string  `json:"status,omitempty"`          // idle, working, error
-	PromptDelayMs  int64   `json:"prompt_delay_ms,omitempty"` // Stagger delay in milliseconds
-	ContextTokens  int     `json:"context_tokens,omitempty"`
-	ContextLimit   int     `json:"context_limit,omitempty"`
-	ContextPercent float64 `json:"context_percent,omitempty"`
-	ContextModel   string  `json:"context_model,omitempty"`
+	Index   int    `json:"index"`
+	Title   string `json:"title"`
+	Type    string `json:"type"`              // claude, codex, gemini, user
+	Variant string `json:"variant,omitempty"` // model alias or persona name
+	Persona string `json:"persona,omitempty"` // persona name when spawned via --profile-set/--profiles (ntm#149)
+	// PersonaPromptSource is the prepared system-prompt file path used to seed the
+	// persona's role prompt. Lets orchestrators verify *which* prompt source landed
+	// on each pane after a --profile-set launch, not just the persona's display
+	// name. Empty when no persona is attached. (ntm#159)
+	PersonaPromptSource string  `json:"persona_prompt_source,omitempty"`
+	Active              bool    `json:"active,omitempty"`
+	Width               int     `json:"width,omitempty"`
+	Height              int     `json:"height,omitempty"`
+	Command             string  `json:"command,omitempty"`
+	Status              string  `json:"status,omitempty"`          // idle, working, error
+	PromptDelayMs       int64   `json:"prompt_delay_ms,omitempty"` // Stagger delay in milliseconds
+	ContextTokens       int     `json:"context_tokens,omitempty"`
+	ContextLimit        int     `json:"context_limit,omitempty"`
+	ContextPercent      float64 `json:"context_percent,omitempty"`
+	ContextModel        string  `json:"context_model,omitempty"`
 }
 
-// AgentCountsResponse is the standard format for agent counts
+// AgentCountsResponse is the standard format for agent counts.
+//
+// Real agent types (claude/codex/gemini/cursor/windsurf/aider/opencode/
+// ollama) always emit even at 0 so consumers see a stable schema across
+// sessions. Only the metadata categories (user, other) use `omitempty` —
+// they're not agents per se, just fallback buckets.
 type AgentCountsResponse struct {
-	Claude   int `json:"claude"`
-	Codex    int `json:"codex"`
-	Gemini   int `json:"gemini"`
-	Ollama   int `json:"ollama"`
-	Cursor   int `json:"cursor"`
-	Windsurf int `json:"windsurf"`
-	Aider    int `json:"aider"`
-	User     int `json:"user,omitempty"`
-	Other    int `json:"other,omitempty"`
-	Total    int `json:"total"`
+	Claude      int `json:"claude"`
+	Codex       int `json:"codex"`
+	Gemini      int `json:"gemini"`
+	Antigravity int `json:"antigravity"`
+	Ollama      int `json:"ollama"`
+	Cursor      int `json:"cursor"`
+	Windsurf    int `json:"windsurf"`
+	Aider       int `json:"aider"`
+	Opencode    int `json:"opencode"`
+	User        int `json:"user,omitempty"`
+	Other       int `json:"other,omitempty"`
+	Total       int `json:"total"`
 }
 
 // StaggerConfig represents stagger settings in spawn response
@@ -120,6 +133,10 @@ type SpawnResponse struct {
 	AgentCounts      AgentCountsResponse   `json:"agent_counts"`
 	Stagger          *StaggerConfig        `json:"stagger,omitempty"`
 	AgentMail        *AgentMailSpawnStatus `json:"agent_mail,omitempty"`
+	// ProfileSet is the --profile-set name when the session was spawned from a
+	// persona set. Combined with each pane's `persona` field this gives an
+	// orchestrator a deterministic persona→pane mapping (ntm#149).
+	ProfileSet string `json:"profile_set,omitempty"`
 }
 
 // CreateResponse is the output format for create command (basic session)
@@ -136,16 +153,18 @@ type CreateResponse struct {
 // AddResponse is the output format for add command (adding agents to session)
 type AddResponse struct {
 	TimestampedResponse
-	Session       string         `json:"session"`
-	AddedClaude   int            `json:"added_claude"`
-	AddedCodex    int            `json:"added_codex"`
-	AddedGemini   int            `json:"added_gemini"`
-	AddedOllama   int            `json:"added_ollama"`
-	AddedCursor   int            `json:"added_cursor"`
-	AddedWindsurf int            `json:"added_windsurf"`
-	AddedAider    int            `json:"added_aider"`
-	TotalAdded    int            `json:"total_added"`
-	NewPanes      []PaneResponse `json:"new_panes,omitempty"`
+	Session          string         `json:"session"`
+	AddedClaude      int            `json:"added_claude"`
+	AddedCodex       int            `json:"added_codex"`
+	AddedGemini      int            `json:"added_gemini"`
+	AddedAntigravity int            `json:"added_antigravity"`
+	AddedOllama      int            `json:"added_ollama"`
+	AddedCursor      int            `json:"added_cursor"`
+	AddedWindsurf    int            `json:"added_windsurf"`
+	AddedAider       int            `json:"added_aider"`
+	AddedOpencode    int            `json:"added_opencode"`
+	TotalAdded       int            `json:"total_added"`
+	NewPanes         []PaneResponse `json:"new_panes,omitempty"`
 }
 
 // SendResponse is the output format for send command

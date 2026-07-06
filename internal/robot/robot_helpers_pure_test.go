@@ -1347,8 +1347,8 @@ func TestPrintDashboardMarkdown_RendersModernAgentCounts(t *testing.T) {
 		"| Aider | 1 |",
 		"| Ollama | 1 |",
 		"| Other Agents | 1 |",
-		"| Session | Attached | Panes | User | Claude | Codex | Gemini | Cursor | Windsurf | Aider | Ollama | Other |",
-		"| proj-modern | no | 6 | 1 | 0 | 0 | 0 | 1 | 1 | 1 | 1 | 1 |",
+		"| Session | Attached | Panes | User | Claude | Codex | Gemini | Antigravity | Cursor | Windsurf | Aider | Ollama | Other |",
+		"| proj-modern | no | 6 | 1 | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 1 | 1 |",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("dashboard markdown missing %q:\n%s", want, rendered)

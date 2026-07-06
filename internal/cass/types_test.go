@@ -141,6 +141,38 @@ func TestStatusResponseIsHealthy(t *testing.T) {
 	if unhealthy.IsHealthy() {
 		t.Error("IsHealthy() should return false when index unhealthy")
 	}
+
+	pathOnlyDB := StatusResponse{
+		Healthy:  true,
+		Index:    IndexInfo{Healthy: true},
+		Database: DBInfo{Path: "/tmp/cass.db"},
+	}
+	if pathOnlyDB.IsHealthy() {
+		t.Error("IsHealthy() should return false when database is path-only but not opened/healthy")
+	}
+}
+
+func TestDBInfoIsUsable(t *testing.T) {
+	tests := []struct {
+		name string
+		db   DBInfo
+		want bool
+	}{
+		{name: "legacy healthy", db: DBInfo{Healthy: true}, want: true},
+		{name: "opened database", db: DBInfo{Opened: true, Path: "/tmp/cass.db"}, want: true},
+		{name: "existing database path", db: DBInfo{Exists: true, Path: "/tmp/cass.db"}, want: true},
+		{name: "path only is not usable", db: DBInfo{Path: "/tmp/cass.db"}, want: false},
+		{name: "empty database info", db: DBInfo{}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.db.IsUsable()
+			if got != tt.want {
+				t.Errorf("IsUsable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestCapabilitiesHasFeature(t *testing.T) {
@@ -277,6 +309,79 @@ func TestStatusResponseUnmarshal(t *testing.T) {
 	}
 	if !resp.Pending.HasPending() {
 		t.Error("Pending.HasPending() should return true")
+	}
+}
+
+func TestStatusResponseUnmarshalCurrentStatusSchema(t *testing.T) {
+	jsonData := `{
+		"status": "healthy",
+		"healthy": true,
+		"recommended_action": "Lexical search is ready",
+		"index": {
+			"exists": true,
+			"status": "ready",
+			"fresh": true,
+			"last_indexed_at": "2026-05-09T00:02:48.355+00:00",
+			"rebuilding": false
+		},
+		"database": {
+			"exists": true,
+			"opened": true,
+			"path": "/home/user/.local/share/coding-agent-search/agent_search.db",
+			"counts_skipped": true,
+			"open_skipped": true
+		},
+		"pending": {
+			"sessions": 0
+		}
+	}`
+
+	var resp StatusResponse
+	if err := json.Unmarshal([]byte(jsonData), &resp); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+
+	if !resp.IsHealthy() {
+		t.Error("IsHealthy() should accept current cass status schema")
+	}
+	if !resp.Index.IsReady() {
+		t.Error("Index.IsReady() should use fresh ready current status fields")
+	}
+	if resp.Index.EffectiveLastIndexedAt(resp.LastIndexedAt).IsZero() {
+		t.Error("EffectiveLastIndexedAt() should use index.last_indexed_at")
+	}
+	if !resp.Database.CountsSkipped {
+		t.Error("Database.CountsSkipped should parse current cass status counts_skipped field")
+	}
+}
+
+func TestStatusResponseUnmarshalCurrentStatusSchema_OpenSkippedImpliesCountsSkipped(t *testing.T) {
+	jsonData := `{
+		"status": "healthy",
+		"healthy": true,
+		"index": {
+			"exists": true,
+			"status": "ready",
+			"fresh": true
+		},
+		"database": {
+			"exists": true,
+			"opened": false,
+			"open_skipped": true,
+			"path": "/home/user/.local/share/coding-agent-search/agent_search.db"
+		}
+	}`
+
+	var resp StatusResponse
+	if err := json.Unmarshal([]byte(jsonData), &resp); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+
+	if !resp.Database.OpenSkipped {
+		t.Fatal("Database.OpenSkipped should parse from current cass status schema")
+	}
+	if !resp.Database.CountsSkipped {
+		t.Error("Database.CountsSkipped should be true when open_skipped=true and counts_skipped is absent")
 	}
 }
 

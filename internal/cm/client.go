@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -71,8 +72,15 @@ type Snippet struct {
 }
 
 // GetContext queries CM for task-relevant rules via HTTP.
-func (c *Client) GetContext(ctx context.Context, task string) (*ContextResult, error) {
+//
+// `workspace`, when non-empty, is sent as a `workspace` field on the request
+// body so the daemon can scope its retrieval to that workspace and avoid
+// same-basename cross-project context bleed (#132).
+func (c *Client) GetContext(ctx context.Context, task string, workspace string) (*ContextResult, error) {
 	reqBody := map[string]string{"task": task}
+	if strings.TrimSpace(workspace) != "" {
+		reqBody["workspace"] = workspace
+	}
 	data, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling request: %w", err)
@@ -251,9 +259,14 @@ func (c *CLIClient) IsInstalled() bool {
 }
 
 // GetContext queries CM for task-relevant rules and history via CLI.
-// It executes: cm context '<task>' --json
+// It executes: cm context '<task>' --json [--workspace <path>]
 // Returns nil with no error if CM is not installed (graceful degradation).
-func (c *CLIClient) GetContext(ctx context.Context, task string) (*CLIContextResponse, error) {
+//
+// `workspace` should be the absolute path of the workspace that owns this
+// query. When non-empty it is passed as `--workspace <path>` so same-basename
+// workspaces (e.g. /clientA/app and /clientB/app) do not share recovery
+// context (#132). Empty workspace falls through to the unscoped CM query.
+func (c *CLIClient) GetContext(ctx context.Context, task string, workspace string) (*CLIContextResponse, error) {
 	if !c.IsInstalled() {
 		return nil, nil // Graceful degradation: CM not available
 	}
@@ -261,7 +274,11 @@ func (c *CLIClient) GetContext(ctx context.Context, task string) (*CLIContextRes
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, c.binaryPath, "context", task, "--json")
+	args := []string{"context", task, "--json"}
+	if strings.TrimSpace(workspace) != "" {
+		args = append(args, "--workspace", workspace)
+	}
+	cmd := exec.CommandContext(ctx, c.binaryPath, args...)
 	cmd.WaitDelay = 2 * time.Second
 	// Run from a stable directory. Some environments (and some tests) temporarily
 	// chdir into directories that may later be removed; if that happens, `cm`
@@ -293,9 +310,15 @@ func (c *CLIClient) GetContext(ctx context.Context, task string) (*CLIContextRes
 
 // GetRecoveryContext is a convenience method that formats the task for recovery use.
 // It queries CM with a recovery-focused task description and limits results.
-func (c *CLIClient) GetRecoveryContext(ctx context.Context, projectName string, maxRules, maxSnippets int) (*CLIContextResponse, error) {
+//
+// `projectName` becomes part of the task string (CM uses task text for
+// retrieval), and `workspace` is the absolute path passed through to CM as
+// `--workspace`. The two are independent: same-basename workspaces produce
+// the same projectName but different `--workspace`, so CM's own scoping
+// keeps their recovery memories distinct (#132).
+func (c *CLIClient) GetRecoveryContext(ctx context.Context, projectName string, workspace string, maxRules, maxSnippets int) (*CLIContextResponse, error) {
 	task := fmt.Sprintf("%s: starting new coding session", projectName)
-	result, err := c.GetContext(ctx, task)
+	result, err := c.GetContext(ctx, task, workspace)
 	if err != nil || result == nil {
 		return result, err
 	}

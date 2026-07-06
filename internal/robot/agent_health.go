@@ -164,14 +164,32 @@ type AgentHealthOutput struct {
 	FleetHealth     FleetHealthSummary          `json:"fleet_health"`
 }
 
-// PrintAgentHealth outputs the health state for specified panes in a session.
-// This is a thin wrapper around GetAgentHealth() for CLI output.
-func PrintAgentHealth(opts AgentHealthOptions) error {
+// PrintAgentHealth outputs the health state for specified panes in a session
+// and returns the process exit code (0 on success, nonzero when the result
+// reports success:false — see ExitCodeForResponse and ntm#207). The failure
+// envelope is always emitted as JSON so callers still receive the payload.
+func PrintAgentHealth(opts AgentHealthOptions) int {
 	output, err := GetAgentHealth(opts)
 	if err != nil {
-		return err
+		// GetAgentHealth returns a partially-populated output alongside an
+		// unexpected internal error; force the failure envelope so the emitted
+		// JSON and the exit code agree.
+		if output == nil {
+			outputJSON(NewErrorResponse(err, ErrCodeInternalError, ""))
+			return 1
+		}
+		output.Success = false
+		if output.Error == "" {
+			output.Error = err.Error()
+		}
+		if output.ErrorCode == "" {
+			output.ErrorCode = ErrCodeInternalError
+		}
+		_ = encodeJSON(output)
+		return 1
 	}
-	return encodeJSON(output)
+	_ = encodeJSON(output)
+	return ExitCodeForResponse(output.RobotResponse)
 }
 
 // GetAgentHealth returns the health state for specified panes in a session.
@@ -436,6 +454,8 @@ func findPTState(ptStates map[string]*pt.AgentState, session, paneStr, agentType
 		agentPrefix = "cod"
 	case agent.AgentTypeGemini:
 		agentPrefix = "gmi"
+	case agent.AgentTypeAntigravity:
+		agentPrefix = "agy"
 	case agent.AgentTypeCursor:
 		agentPrefix = "cursor"
 	case agent.AgentTypeWindsurf:

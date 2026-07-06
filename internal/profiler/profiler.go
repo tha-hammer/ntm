@@ -165,7 +165,9 @@ func GetSpans() []*Span {
 	defer global.mu.RUnlock()
 
 	result := make([]*Span, len(global.spans))
-	copy(result, global.spans)
+	for i, span := range global.spans {
+		result[i] = cloneSpanSnapshot(span)
+	}
 	return result
 }
 
@@ -177,10 +179,38 @@ func GetSpansByPhase(phase string) []*Span {
 	var result []*Span
 	for _, s := range global.spans {
 		if s.Phase == phase {
-			result = append(result, s)
+			result = append(result, cloneSpanSnapshot(s))
 		}
 	}
 	return result
+}
+
+func cloneSpanSnapshot(s *Span) *Span {
+	if s == nil {
+		return nil
+	}
+
+	snapshot := *s
+	snapshot.Tags = cloneTags(s.Tags)
+	snapshot.tracked = false
+	if len(s.children) > 0 {
+		snapshot.children = make([]*Span, len(s.children))
+		for i, child := range s.children {
+			snapshot.children[i] = cloneSpanSnapshot(child)
+		}
+	}
+	return &snapshot
+}
+
+func cloneTags(tags Tags) Tags {
+	if tags == nil {
+		return nil
+	}
+	out := make(Tags, len(tags))
+	for k, v := range tags {
+		out[k] = v
+	}
+	return out
 }
 
 // TotalDuration returns the total profiling duration
@@ -244,7 +274,7 @@ func GetProfile() Profile {
 			Parent:     s.Parent,
 		}
 		if len(s.Tags) > 0 {
-			report.Tags = s.Tags
+			report.Tags = cloneTags(s.Tags)
 		}
 		profile.Spans = append(profile.Spans, report)
 

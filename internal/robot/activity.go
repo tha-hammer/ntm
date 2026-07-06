@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -755,9 +756,17 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	// so matching them anywhere in the capture would falsely keep a
 	// long-idle pane in THINKING state. Dropping stale thinking matches
 	// lets classifyState fall through to the correct idle/unknown path.
+	//
+	// CategoryError matches are filtered with the same live-window logic
+	// when an idle prompt is present in the live tail: stale "failed" or
+	// "api error" text high in scrollback above a current chevron prompt
+	// would otherwise pin the pane to ERROR forever, even though the agent
+	// is sitting at a healthy prompt waiting for input. Fresh errors that
+	// land inside the live tail still classify as ERROR.
 	liveContent := lastNLines(content, liveThinkingWindowLines)
 	liveMatches := sc.patternLibrary.Match(liveContent, sc.agentType)
 	effectiveMatches := filterThinkingToLive(matches, liveMatches)
+	effectiveMatches = filterErrorToLiveWhenIdle(effectiveMatches, liveMatches)
 
 	// Calculate proposed state and confidence
 	proposedState, confidence, trigger := sc.classifyState(velocity, effectiveMatches)
@@ -767,7 +776,15 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 
 	// Check whether any matched pattern is a rate-limit indicator so the
 	// RateLimited flag on AgentActivity is set from real pattern evidence.
-	rateLimited := isRateLimitPatternMatch(matches)
+	// We scan `effectiveMatches` rather than `matches` so the flag stays
+	// consistent with the state classification: when filterErrorToLiveWhenIdle
+	// drops a stale rate-limit pattern that scrolled above a current idle
+	// prompt, the pane is no longer rate-limited and downstream consumers
+	// (`internal/health/health.go`, `internal/resilience/monitor.go`) must
+	// not continue to gate on a recovered pane as if it were still throttled.
+	// `DetectedPatterns` deliberately keeps the unfiltered view because it
+	// is an observability surface, not a state predicate.
+	rateLimited := isRateLimitPatternMatch(effectiveMatches)
 
 	// Build result
 	activity := &AgentActivity{
@@ -807,6 +824,49 @@ func isRateLimitPatternMatch(matches []PatternMatch) bool {
 		}
 	}
 	return false
+}
+
+// IsLiveBusy returns true when the trailing live-window of `scrollback`
+// contains any thinking-category pattern for `agentType`. This is a single-
+// snapshot heuristic — it cannot detect velocity-based GENERATING states
+// (those need two timestamped samples) — but it is the canonical way to ask
+// "would `--robot-activity` classify this pane as THINKING right now?"
+// using only the data that is cheap to capture from a tmux pane.
+//
+// Callers in the assign/dispatch path use this to honor live pane state
+// when deciding whether a pane is safe to dispatch to: legacy idle/working
+// scrollback parsers can miss in-flight work that came from another driver
+// (`ntm send`, an external orchestrator, manual operator) because the
+// internal assignment ledger has no record of it. The live-window check
+// closes that gap by reading the same surface that `--robot-activity` uses.
+func IsLiveBusy(scrollback string, agentType string) bool {
+	if scrollback == "" {
+		return false
+	}
+
+	// Claude panes: defer to the ordering-aware classifier instead of a
+	// position-blind CategoryThinking match. Claude pins its input box to the
+	// bottom and renders the live spinner just above it; when a turn ends it
+	// REPLACES the spinner with a completion line ("✻ Churned for 6s") but a
+	// STALE spinner ("· Thundering… (4s)") can still sit ABOVE that completion
+	// line within the live window. A bare CategoryThinking match would see the
+	// stale spinner and report busy — overriding the correct idle verdict — so
+	// the dispatcher sees 0 idle agents after every burst and the swarm stalls
+	// with ready work waiting. agent.ClaudeActivelyWorking checks the relative
+	// ORDER of the most-recent spinner vs. the most-recent turn-ended marker and
+	// is the single source of truth for Claude liveness; routing Claude through
+	// it keeps IsLiveBusy in agreement with the rest of the Claude detection
+	// layer (parser, status, ClaudeIdlePromptShowing).
+	if normalizeAgentType(agentType) == "claude" {
+		return agent.ClaudeActivelyWorking(scrollback)
+	}
+
+	live := lastNLines(scrollback, liveThinkingWindowLines)
+	if live == "" {
+		return false
+	}
+	matches := DefaultLibrary.MatchByCategory(live, agentType, CategoryThinking)
+	return len(matches) > 0
 }
 
 // lastNLines returns the last n non-empty-slice lines of s, preserving
@@ -870,6 +930,83 @@ func filterThinkingToLive(full, live []PatternMatch) []PatternMatch {
 	for _, m := range full {
 		if m.Category == CategoryThinking {
 			if _, ok := liveThinking[m.Pattern]; !ok {
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// filterErrorToLiveWhenIdle drops CategoryError matches from `full` whose
+// pattern name is not also present in `live`, but only when `live` contains a
+// CategoryIdle prompt match. The combination of "no live error + a live idle
+// prompt" is the signature of historical error text scrolled high in the
+// buffer above a current healthy chevron/prompt: the agent has finished the
+// failure path, recovered, and is now waiting for the next input. Fresh
+// errors (rate limits, auth failures, crashes that just happened) still
+// match in `live` and survive the filter as ERROR. When no idle prompt is in
+// the live tail the pane is not currently waiting and `full` is returned
+// unchanged so error priority is preserved.
+//
+// Plain-text error patterns (failed_text, api_error, exception, …) are the
+// load-bearing instances of this false positive because their regexes match
+// raw substrings ("failed", "error:", "exception:") that linger in
+// scrollback long after the offending operation completed. The filter is
+// pattern-agnostic though — it applies to every CategoryError match that
+// exists in `full` but not in `live` once a fresh idle prompt is observed,
+// including rate-limit, auth, network, and crash patterns.
+func filterErrorToLiveWhenIdle(full, live []PatternMatch) []PatternMatch {
+	// Fast path: no error matches at all → nothing to filter.
+	hasError := false
+	for _, m := range full {
+		if m.Category == CategoryError {
+			hasError = true
+			break
+		}
+	}
+	if !hasError {
+		return full
+	}
+	// Only debounce when the live tail shows the pane is actively waiting
+	// at an idle prompt. Without this guard a pane that just rolled an
+	// error past the live window with no follow-up prompt would silently
+	// drop the error and misclassify as the next-best non-error state.
+	hasLiveIdle := false
+	for _, m := range live {
+		if m.Category == CategoryIdle {
+			hasLiveIdle = true
+			break
+		}
+	}
+	if !hasLiveIdle {
+		return full
+	}
+	// Build the set of error-pattern names that are still in the live tail.
+	// Any CategoryError match in `full` whose name is in this set is fresh
+	// and must keep ERROR priority; the rest are stale scrollback artifacts.
+	liveError := make(map[string]struct{}, len(live))
+	for _, m := range live {
+		if m.Category == CategoryError {
+			liveError[m.Pattern] = struct{}{}
+		}
+	}
+	allLive := true
+	for _, m := range full {
+		if m.Category == CategoryError {
+			if _, ok := liveError[m.Pattern]; !ok {
+				allLive = false
+				break
+			}
+		}
+	}
+	if allLive {
+		return full
+	}
+	out := make([]PatternMatch, 0, len(full))
+	for _, m := range full {
+		if m.Category == CategoryError {
+			if _, ok := liveError[m.Pattern]; !ok {
 				continue
 			}
 		}

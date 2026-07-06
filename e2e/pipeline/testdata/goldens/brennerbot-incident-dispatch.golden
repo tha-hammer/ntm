@@ -1,0 +1,39 @@
+--- dispatch 1 ---
+=== Dispatch ===
+MO: templates/MO-04a-investigate.md
+Target pane: pane-1
+Target session: incident-session
+Params:
+  H_ID=H-001
+  INCIDENT_ID=INC-2026-05-07
+=== Rendered ===
+# MO-04a Investigate
+
+**Parameters:** H-001, INC-2026-05-07, <WORKSPACE>, incident-session
+
+Investigate hypothesis H-001 for incident INC-2026-05-07.
+
+Workspace: <WORKSPACE>
+Session: incident-session
+
+Return one line beginning with `MO-04a result:` and include the hypothesis id.
+
+--- dispatch 2 ---
+=== Dispatch ===
+MO: templates/MO-04a-investigate.md
+Target pane: pane-2
+Target session: incident-session
+Params:
+  H_ID=H-002
+  INCIDENT_ID=INC-2026-05-07
+=== Rendered ===
+# MO-04a Investigate
+
+**Parameters:** H-002, INC-2026-05-07, <WORKSPACE>, incident-session
+
+Investigate hypothesis H-002 for incident INC-2026-05-07.
+
+Workspace: <WORKSPACE>
+Session: incident-session
+
+Return one line beginning with `MO-04a result:` and include the hypothesis id.

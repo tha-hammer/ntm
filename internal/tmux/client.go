@@ -18,6 +18,32 @@ import (
 // has failed too many times consecutively and we are in backoff).
 var ErrCircuitOpen = errors.New("tmux circuit breaker open: too many consecutive failures, backing off")
 
+// CommandErrorKind is the stable category for a tmux command failure.
+type CommandErrorKind string
+
+const (
+	CommandErrorNone              CommandErrorKind = ""
+	CommandErrorTimeout           CommandErrorKind = "timeout"
+	CommandErrorCanceled          CommandErrorKind = "canceled"
+	CommandErrorCircuitOpen       CommandErrorKind = "circuit_open"
+	CommandErrorBinaryUnavailable CommandErrorKind = "binary_unavailable"
+	CommandErrorPermissionDenied  CommandErrorKind = "permission_denied"
+	CommandErrorRemoteUnavailable CommandErrorKind = "remote_unavailable"
+	CommandErrorSessionNotFound   CommandErrorKind = "session_not_found"
+	CommandErrorPaneNotFound      CommandErrorKind = "pane_not_found"
+	CommandErrorNoServer          CommandErrorKind = "no_server"
+	CommandErrorMalformedOutput   CommandErrorKind = "malformed_output"
+	CommandErrorCommandFailed     CommandErrorKind = "command_failed"
+	CommandErrorUnknown           CommandErrorKind = "unknown"
+)
+
+// CommandErrorClass describes how callers should treat a tmux command error.
+type CommandErrorClass struct {
+	Kind           CommandErrorKind
+	Infrastructure bool
+	Retryable      bool
+}
+
 // Circuit breaker configuration.
 const (
 	// cbMaxFailures is the number of consecutive failures before the circuit
@@ -177,7 +203,7 @@ func (c *Client) RunContext(ctx context.Context, args ...string) (string, error)
 		out, err = runSSHContext(ctx, "--", c.Remote, remoteCmd)
 	}
 
-	if err != nil && isInfrastructureError(err) {
+	if err != nil && ClassifyCommandError(err).Infrastructure {
 		c.cbRecordFailure()
 	} else {
 		// Both success (err==nil) and application-level errors (tmux ran
@@ -188,36 +214,66 @@ func (c *Client) RunContext(ctx context.Context, args ...string) (string, error)
 	return out, err
 }
 
-// isInfrastructureError returns true for errors indicating the tmux
-// process itself is unavailable (timeouts, exec failures, connection
-// errors) as opposed to tmux responding normally with an error status.
-func isInfrastructureError(err error) bool {
+// ClassifyCommandError returns the stable class for a tmux command failure.
+// It keeps caller decisions about retry and circuit-breaker accounting aligned.
+func ClassifyCommandError(err error) CommandErrorClass {
 	if err == nil {
-		return false
+		return CommandErrorClass{Kind: CommandErrorNone}
 	}
-	// Context timeout or cancellation → tmux is hung or too slow.
+	msg := strings.ToLower(err.Error())
+
+	if errors.Is(err, ErrCircuitOpen) {
+		return CommandErrorClass{Kind: CommandErrorCircuitOpen, Infrastructure: true, Retryable: true}
+	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
+		if errors.Is(err, context.Canceled) {
+			return CommandErrorClass{Kind: CommandErrorCanceled, Infrastructure: true}
+		}
+		return CommandErrorClass{Kind: CommandErrorTimeout, Infrastructure: true, Retryable: true}
 	}
-	// exec.Error means the binary couldn't be started at all (not found,
-	// permission denied).
+	if strings.Contains(msg, "can't find pane") || strings.Contains(msg, "can't find window") {
+		return CommandErrorClass{Kind: CommandErrorPaneNotFound}
+	}
+	if strings.Contains(msg, "can't find session") ||
+		strings.Contains(msg, "no such session") ||
+		strings.Contains(msg, "session not found") {
+		return CommandErrorClass{Kind: CommandErrorSessionNotFound}
+	}
+	if strings.Contains(msg, "no server running") ||
+		strings.Contains(msg, "error connecting to") ||
+		strings.Contains(msg, "no sessions") {
+		return CommandErrorClass{Kind: CommandErrorNoServer, Infrastructure: true, Retryable: true}
+	}
+	if strings.Contains(msg, "unexpected session format") ||
+		strings.Contains(msg, "malformed tmux output") ||
+		strings.Contains(msg, "malformed output") {
+		return CommandErrorClass{Kind: CommandErrorMalformedOutput, Infrastructure: true, Retryable: true}
+	}
+	if strings.Contains(msg, "permission denied") {
+		return CommandErrorClass{Kind: CommandErrorPermissionDenied, Infrastructure: true}
+	}
+
 	var execErr *exec.Error
 	if errors.As(err, &execErr) {
-		return true
+		switch {
+		case errors.Is(execErr.Err, exec.ErrNotFound):
+			return CommandErrorClass{Kind: CommandErrorBinaryUnavailable, Infrastructure: true}
+		case errors.Is(execErr.Err, os.ErrPermission):
+			return CommandErrorClass{Kind: CommandErrorPermissionDenied, Infrastructure: true}
+		default:
+			return CommandErrorClass{Kind: CommandErrorBinaryUnavailable, Infrastructure: true}
+		}
 	}
-	// exec.ExitError means the process ran and exited non-zero.  For local
-	// tmux this is an application-level error ("session not found" etc.).
-	// For SSH, exit code 255 specifically indicates a connection/protocol
-	// failure — that IS an infrastructure error.
+
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		if exitErr.ExitCode() == 255 {
-			return true // SSH connection failure
+			return CommandErrorClass{Kind: CommandErrorRemoteUnavailable, Infrastructure: true, Retryable: true}
 		}
-		return false // normal non-zero exit from tmux
+		return CommandErrorClass{Kind: CommandErrorCommandFailed}
 	}
-	// Unknown error type — conservatively treat as infrastructure failure.
-	return true
+
+	return CommandErrorClass{Kind: CommandErrorUnknown, Infrastructure: true, Retryable: true}
 }
 
 // ShellQuote returns a POSIX-shell-safe single-quoted string.

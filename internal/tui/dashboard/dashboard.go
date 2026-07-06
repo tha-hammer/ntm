@@ -25,6 +25,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
 	"github.com/Dicklesworthstone/ntm/internal/clipboard"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	ctxmon "github.com/Dicklesworthstone/ntm/internal/context"
 	"github.com/Dicklesworthstone/ntm/internal/cost"
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
@@ -49,6 +50,32 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/util"
 	"github.com/Dicklesworthstone/ntm/internal/watcher"
 )
+
+// compactionRecoveryConfigToRuntime converts the `[context_rotation.recovery]`
+// TOML surface into the runtime `status.RecoveryConfig` that the recovery
+// engine consumes. Zero / empty fields fall through to the engine's hardcoded
+// defaults, so a partial TOML override behaves the same as a full default
+// config except for the fields the user actually set. The `Enabled` flag is
+// honoured by skipping recovery entirely when false; that semantic lives in
+// the dashboard call site rather than the engine because the engine has no
+// notion of "configured but disabled".
+func compactionRecoveryConfigToRuntime(cfg *config.CompactionRecoveryConfig) status.RecoveryConfig {
+	rc := status.DefaultRecoveryConfig()
+	if cfg == nil {
+		return rc
+	}
+	if cfg.CooldownSeconds > 0 {
+		rc.Cooldown = time.Duration(cfg.CooldownSeconds) * time.Second
+	}
+	if cfg.MaxRecoveriesPerPane > 0 {
+		rc.MaxRecoveries = cfg.MaxRecoveriesPerPane
+	}
+	if cfg.Prompt != "" {
+		rc.Prompt = cfg.Prompt
+	}
+	rc.IncludeBeadContext = cfg.IncludeBeadContext
+	return rc
+}
 
 func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	prevWidth := m.width
@@ -127,7 +154,15 @@ func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 			tierLabel(prevTier), tierLabel(m.tier), m.width, m.height)
 	}
 
-	return *m, nil
+	// Force a full clear + repaint on every resize (#186). In alt-screen mode
+	// the renderer's resize repaint only re-emits the new frame's lines; it
+	// erases each line to the right and the area below only when the new frame
+	// has *fewer* lines. Cells painted by the previous (differently sized) frame
+	// that fall outside the new frame's footprint - common when growing the
+	// window, or shrinking then growing - are not guaranteed to be erased,
+	// leaving stale glyphs ("scrambled" UI). tea.ClearScreen issues a hard
+	// EraseEntireScreen before the next render, guaranteeing a clean repaint.
+	return *m, tea.ClearScreen
 }
 
 func (m Model) subscribeToConfig() tea.Cmd {
@@ -218,6 +253,38 @@ func (m *Model) recordVelocitySnapshot() {
 			m.velocityByType[key] = appendVelocitySample(m.velocityByType[key], 0, velocityHistoryLimit)
 		}
 	}
+}
+
+// paneTokenVelocity returns the genuine fresh-token rate (tokens/minute) for a
+// pane, derived from the change in its token count since the previous sample.
+//
+// It stashes the latest (count, timestamp) per pane in m.velocityByPaneID and
+// compares against the prior sample via tokenVelocityRate. The first observation
+// of a pane (or any window where the count did not grow) yields 0, so an idle
+// swarm produces a flat ~0 reading and a flat sparkline; the value only climbs
+// when fresh tokens actually appear. This replaces the old
+// snapshot-size/repaint-age formula that spiked on every redraw at rest.
+func (m *Model) paneTokenVelocity(st status.AgentStatus) float64 {
+	if m == nil {
+		return 0
+	}
+	if m.velocityByPaneID == nil {
+		m.velocityByPaneID = make(map[string]velocitySample)
+	}
+
+	now := time.Now()
+	tokensNow := statusTokenCount(st)
+
+	// Panes are keyed by ID; without one we cannot persist a prior sample, so we
+	// have no window to rate against and must report 0 (never a snapshot spike).
+	if st.PaneID == "" {
+		return 0
+	}
+
+	prev, hasPrev := m.velocityByPaneID[st.PaneID]
+	rate := tokenVelocityRate(prev, hasPrev, tokensNow, now)
+	m.velocityByPaneID[st.PaneID] = velocitySample{tokens: tokensNow, sampledAt: now}
+	return rate
 }
 
 func appendVelocitySample(history []float64, sample float64, limit int) []float64 {
@@ -1906,7 +1973,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.healthMessage = "Spawn cancelled"
 			return m, nil
 		}
-		total := msg.Result.CCCount + msg.Result.CodCount + msg.Result.GmiCount
+		total := msg.Result.CCCount + msg.Result.CodCount + msg.Result.GmiCount + msg.Result.AgyCount
 		m.healthMessage = fmt.Sprintf("Adding %d agent(s)...", total)
 		if m.toasts != nil {
 			m.toasts.PushPersistent(spawnWizardProgressToastID, m.healthMessage, components.ToastInfo)
@@ -2454,7 +2521,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					state = "compacted"
 				}
 				ps.State = state
-				ps.TokenVelocity = tokenVelocityFromStatus(st)
+				ps.TokenVelocity = m.paneTokenVelocity(st)
 				m.agentStatuses[st.PaneID] = st
 				if m.recordTimelineStatus(currentPane, st) {
 					timelineUpdated = true
@@ -2476,8 +2543,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				// Compaction check
-				event, recoverySent, _ := m.compaction.CheckAndRecover(data.Output, statusAgentType, m.session, data.PaneIndex)
+				// Compaction check — gated by [context_rotation.recovery] enabled
+				// per issue #113. Pre-config-load (m.cfg == nil) we run with
+				// defaults (recovery enabled). Once the first ConfigReloadMsg
+				// lands, m.cfg.ContextRotation.Recovery.Enabled is the source
+				// of truth; users who set it to false get neither compaction
+				// detection nor recovery prompts on this pane.
+				var event *status.CompactionEvent
+				var recoverySent bool
+				if m.cfg == nil || m.cfg.ContextRotation.Recovery.Enabled {
+					event, recoverySent, _ = m.compaction.CheckAndRecover(data.Output, statusAgentType, m.session, data.PaneIndex)
+				}
 
 				if event != nil {
 					now := time.Now()
@@ -2627,7 +2703,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ps.State = state
 
 			// Pre-calculate token velocity
-			ps.TokenVelocity = tokenVelocityFromStatus(st)
+			ps.TokenVelocity = m.paneTokenVelocity(st)
 
 			// Local perf snapshot + memory enrichment (Ollama panes only).
 			if pane, ok := paneByID[st.PaneID]; ok && string(pane.Type) == "ollama" {
@@ -2716,6 +2792,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Config.Integrations.Rano.PollIntervalMs > 0 {
 				m.ranoNetworkRefreshInterval = time.Duration(msg.Config.Integrations.Rano.PollIntervalMs) * time.Millisecond
 			}
+
+			// Issue #113: rebuild the compaction-recovery integration from
+			// `[context_rotation.recovery]` so user TOML actually reaches
+			// the runtime. Until this wired up, the dashboard would silently
+			// use NewCompactionRecoveryIntegrationDefault() regardless of
+			// what the config file said. Defaults still kick in when fields
+			// are zero — see compactionRecoveryConfigToRuntime — so this is
+			// a pure additive bridge.
+			m.compaction = status.NewCompactionRecoveryIntegration(
+				compactionRecoveryConfigToRuntime(&msg.Config.ContextRotation.Recovery),
+			)
 
 			// Re-initialize renderer with new theme colors
 			_, detailWidth := layout.SplitProportions(m.width)
@@ -3540,6 +3627,7 @@ func (m *Model) updateStats() {
 	m.claudeCount = 0
 	m.codexCount = 0
 	m.geminiCount = 0
+	m.antigravityCount = 0
 	m.cursorCount = 0
 	m.windsurfCount = 0
 	m.aiderCount = 0
@@ -3554,6 +3642,8 @@ func (m *Model) updateStats() {
 			m.codexCount++
 		case tmux.AgentGemini:
 			m.geminiCount++
+		case tmux.AgentAntigravity:
+			m.antigravityCount++
 		case tmux.AgentCursor:
 			m.cursorCount++
 		case tmux.AgentWindsurf:
@@ -3611,7 +3701,7 @@ func (m *Model) updateTickerData() {
 	if activeAgents == 0 && len(m.panes) > 0 {
 		// Status detection hasn't populated yet; show total agents as placeholder
 		// This prevents showing "0/17" when we simply haven't fetched status yet
-		activeAgents = m.claudeCount + m.codexCount + m.geminiCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount
+		activeAgents = m.claudeCount + m.codexCount + m.geminiCount + m.antigravityCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount
 	}
 
 	// Count alerts by severity
@@ -3634,6 +3724,7 @@ func (m *Model) updateTickerData() {
 		ClaudeCount:      m.claudeCount,
 		CodexCount:       m.codexCount,
 		GeminiCount:      m.geminiCount,
+		AntigravityCount: m.antigravityCount,
 		CursorCount:      m.cursorCount,
 		WindsurfCount:    m.windsurfCount,
 		AiderCount:       m.aiderCount,
@@ -3849,6 +3940,10 @@ func (m Model) renderPaneGrid() string {
 		case tmux.AgentGemini:
 			borderColor = t.Gemini
 			iconColor = t.Gemini
+			agentIcon = ic.Gemini
+		case tmux.AgentAntigravity:
+			borderColor = t.Lavender
+			iconColor = t.Lavender
 			agentIcon = ic.Gemini
 		default:
 			borderColor = t.Green
@@ -4532,7 +4627,7 @@ func (m *Model) resolveCostModelForPane(pane tmux.Pane) string {
 			return m.cfg.Models.DefaultCodex
 		}
 		return "gpt-4"
-	case tmux.AgentGemini:
+	case tmux.AgentGemini, tmux.AgentAntigravity:
 		if m.cfg != nil && m.cfg.Models.DefaultGemini != "" {
 			return m.cfg.Models.DefaultGemini
 		}
@@ -5560,6 +5655,9 @@ func (m Model) renderPaneDetail(width int) string {
 		typeIcon = ic.Codex
 	case tmux.AgentGemini:
 		typeColor = t.Gemini
+		typeIcon = ic.Gemini
+	case tmux.AgentAntigravity:
+		typeColor = t.Lavender
 		typeIcon = ic.Gemini
 	default:
 		typeColor = t.Green

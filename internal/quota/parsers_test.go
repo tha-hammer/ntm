@@ -32,6 +32,12 @@ func TestParseCodexUsage(t *testing.T) {
 			wantLimited: true,
 		},
 		{
+			name:        "hyphenated rate-limited",
+			output:      "Account is rate-limited. Please wait.",
+			wantFound:   true,
+			wantLimited: true,
+		},
+		{
 			name:      "no matching patterns",
 			output:    "some random output",
 			wantFound: false,
@@ -103,6 +109,12 @@ func TestParseGeminiUsage(t *testing.T) {
 		{
 			name:        "limited keyword",
 			output:      "quota exceeded",
+			wantFound:   true,
+			wantLimited: true,
+		},
+		{
+			name:        "hyphenated rate-limited",
+			output:      "Account is rate-limited. Please wait.",
 			wantFound:   true,
 			wantLimited: true,
 		},

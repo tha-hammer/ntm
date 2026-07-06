@@ -321,12 +321,16 @@ func shortAgentTypeLocal(agentType string) string {
 		return "cod"
 	case agent.AgentTypeGemini:
 		return "gmi"
+	case agent.AgentTypeAntigravity:
+		return "agy"
 	case agent.AgentTypeCursor:
 		return "cur"
 	case agent.AgentTypeWindsurf:
 		return "ws"
 	case agent.AgentTypeAider:
 		return "aid"
+	case agent.AgentTypeOpencode:
+		return "oc"
 	case agent.AgentTypeOllama:
 		return "oll"
 	case agent.AgentTypeUser:
@@ -353,12 +357,16 @@ func logsAgentTypeColor(agentType string, th theme.Theme) lipgloss.Color {
 		return th.Codex
 	case agent.AgentTypeGemini:
 		return th.Gemini
+	case agent.AgentTypeAntigravity:
+		return th.Lavender
 	case agent.AgentTypeCursor:
 		return th.Cursor
 	case agent.AgentTypeWindsurf:
 		return th.Windsurf
 	case agent.AgentTypeAider:
 		return th.Aider
+	case agent.AgentTypeOpencode:
+		return th.Opencode
 	case agent.AgentTypeOllama:
 		return th.Ollama
 	case agent.AgentTypeUser:

@@ -209,7 +209,7 @@ steps:
 
   # Final review
   - id: final_review
-    agent: gemini
+    agent: antigravity
     depends_on: [revise]
     when: ${steps.revise.status} == "completed"
     prompt: |
@@ -342,7 +342,7 @@ steps:
         output_var: schema_result
 
       - id: business_rules_check
-        agent: gemini
+        agent: antigravity
         prompt: |
           Check business rules against:
           ${vars.processed_data}

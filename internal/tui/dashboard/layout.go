@@ -442,21 +442,62 @@ func currentBeadForPane(pane tmux.Pane, beads *bv.BeadsSummary) string {
 	return ""
 }
 
-func tokenVelocityFromStatus(st status.AgentStatus) float64 {
+// velocitySample stores the previous token count for a pane and the wall-clock
+// time it was observed, so the next sample can derive a genuine fresh-token rate
+// from the delta. It lives in the persistent dashboard Model (keyed by pane ID),
+// NOT recomputed per render.
+type velocitySample struct {
+	tokens    int64
+	sampledAt time.Time
+}
+
+// statusTokenCount returns the best available current cumulative token count for
+// a status. It PREFERS the parsed agent metric (TokensUsed, a monotonic counter
+// scraped from the agent's own TUI) over a screen-estimate, because TokensUsed
+// reflects real consumption rather than the size of the last captured snapshot.
+// When TokensUsed is unavailable (0 — not parsed for this agent/output), it
+// falls back to estimating tokens from the last captured output. Either way the
+// caller treats this as a count and rates are computed as a DELTA over a window,
+// never as count/age.
+func statusTokenCount(st status.AgentStatus) int64 {
+	if st.TokensUsed > 0 {
+		return st.TokensUsed
+	}
 	if st.LastOutput == "" {
 		return 0
 	}
-	// Avoid zero/negative durations; fall back to a 60s window.
-	minutes := time.Since(st.LastActive).Minutes()
-	if minutes <= 0 {
-		minutes = 1.0
-	}
+	return int64(tokens.EstimateTokens(st.LastOutput))
+}
 
-	tokensOut := tokens.EstimateTokens(st.LastOutput)
-	if tokensOut == 0 {
+// tokenVelocityRate computes a fresh-token rate (tokens/minute) from the delta
+// between a previously sampled token count and the current one over the elapsed
+// wall-clock window. It is the pure, testable core of the velocity calculation.
+//
+// Guards (all return 0 rather than a spurious spike):
+//   - hasPrev == false: no prior sample yet (first observation of this pane).
+//   - elapsed window <= 0: zero/negative duration (clock skew, duplicate sample).
+//   - tokensNow < prevTokens: the count shrank (scroll-off, snapshot truncation,
+//     or a fresh/compacted session) — never report a negative or fabricated rate.
+//
+// The result is the genuine growth (tokensNow - prevTokens) divided by the
+// minutes between samples, so an idle pane (count unchanged) reads exactly 0 and
+// only real new tokens move the needle.
+func tokenVelocityRate(prev velocitySample, hasPrev bool, tokensNow int64, now time.Time) float64 {
+	if !hasPrev {
 		return 0
 	}
-	return float64(tokensOut) / minutes
+	if tokensNow < prev.tokens {
+		return 0
+	}
+	minutes := now.Sub(prev.sampledAt).Minutes()
+	if minutes <= 0 {
+		return 0
+	}
+	delta := tokensNow - prev.tokens
+	if delta <= 0 {
+		return 0
+	}
+	return float64(delta) / minutes
 }
 
 func activityLabelAndColor(state string, t theme.Theme) (string, lipgloss.Color) {
@@ -770,6 +811,8 @@ func agentRowTypePresentation(agentType string, t theme.Theme) (lipgloss.Color, 
 		return t.Codex, "󰘦"
 	case tmux.AgentGemini:
 		return t.Gemini, "󰇮"
+	case tmux.AgentAntigravity:
+		return t.Lavender, "󰇮"
 	default:
 		return t.Green, "󰄛"
 	}
@@ -809,6 +852,8 @@ func RenderPaneDetail(pane tmux.Pane, ps PaneStatus, dims LayoutDimensions, t th
 		typeColor = t.Codex
 	case tmux.AgentGemini:
 		typeColor = t.Gemini
+	case tmux.AgentAntigravity:
+		typeColor = t.Lavender
 	default:
 		typeColor = t.Green
 	}
@@ -1175,6 +1220,8 @@ func AgentBorderColor(agentType string, t theme.Theme) lipgloss.Color {
 		return t.Codex
 	case tmux.AgentGemini:
 		return t.Gemini
+	case tmux.AgentAntigravity:
+		return t.Lavender
 	case tmux.AgentCursor:
 		return t.Claude
 	case tmux.AgentWindsurf:

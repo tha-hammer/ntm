@@ -320,9 +320,18 @@ func TestLoadAllCommandHooks_InvalidMainConfigPropagatesError(t *testing.T) {
 
 // --- HookManager tests using temp git repos ---
 
+// initTempGitRepo creates a temp git repo and returns the canonical
+// (symlink-resolved) path. On macOS, t.TempDir returns /var/folders/...
+// but git rev-parse --show-toplevel returns the /private/var/folders/...
+// canonical form, which breaks string equality with the tempdir we
+// originally returned. Resolving symlinks once up-front keeps the
+// expected/actual paths aligned on every platform.
 func initTempGitRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	cmd := exec.Command("git", "init", dir)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -330,6 +339,26 @@ func initTempGitRepo(t *testing.T) string {
 		t.Fatalf("git init: %v", err)
 	}
 	return dir
+}
+
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmdArgs := append([]string{"-C", dir}, args...)
+	cmd := exec.Command("git", cmdArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, string(output))
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func initTempGitRepoWithCommit(t *testing.T) string {
+	t.Helper()
+	repo := initTempGitRepo(t)
+	runGit(t, repo, "config", "user.email", "ntm-test@example.com")
+	runGit(t, repo, "config", "user.name", "NTM Test")
+	runGit(t, repo, "commit", "--allow-empty", "-m", "initial")
+	return repo
 }
 
 func TestNewManager(t *testing.T) {
@@ -345,6 +374,29 @@ func TestNewManager(t *testing.T) {
 	}
 	if m.HooksDir() != filepath.Join(repo, ".git", "hooks") {
 		t.Errorf("HooksDir = %q, want %q", m.HooksDir(), filepath.Join(repo, ".git", "hooks"))
+	}
+}
+
+func TestNewManager_LinkedWorktreeUsesGitHooksDir(t *testing.T) {
+	t.Parallel()
+	repo := initTempGitRepoWithCommit(t)
+	parent := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+		parent = resolved
+	}
+	linked := filepath.Join(parent, "linked")
+	runGit(t, repo, "worktree", "add", linked)
+
+	m, err := NewManager(linked)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if m.RepoRoot() != linked {
+		t.Errorf("RepoRoot = %q, want %q", m.RepoRoot(), linked)
+	}
+	wantHooksDir := filepath.Join(repo, ".git", "hooks")
+	if m.HooksDir() != wantHooksDir {
+		t.Errorf("HooksDir = %q, want %q", m.HooksDir(), wantHooksDir)
 	}
 }
 
@@ -615,6 +667,55 @@ func TestManagerInstall_OverwriteExistingNTMHook(t *testing.T) {
 	err = m.Install(HookPostCheckout, false)
 	if err != nil {
 		t.Fatalf("Install over existing NTM hook: %v", err)
+	}
+}
+
+func TestManagerInstall_ExistingNTMSymlinkDoesNotOverwriteTarget(t *testing.T) {
+	t.Parallel()
+	repo := initTempGitRepo(t)
+	m, err := NewManager(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hookPath := filepath.Join(m.HooksDir(), string(HookPostCheckout))
+	if err := os.MkdirAll(filepath.Dir(hookPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	outsidePath := filepath.Join(t.TempDir(), "outside-hook")
+	outsideContent := "#!/bin/sh\n# NTM_MANAGED_HOOK\necho outside\n"
+	if err := os.WriteFile(outsidePath, []byte(outsideContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsidePath, hookPath); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+
+	err = m.Install(HookPostCheckout, false)
+	if err != nil {
+		t.Fatalf("Install over existing NTM symlink: %v", err)
+	}
+
+	outside, err := os.ReadFile(outsidePath)
+	if err != nil {
+		t.Fatalf("reading outside hook target: %v", err)
+	}
+	if string(outside) != outsideContent {
+		t.Fatalf("outside hook target was overwritten: got %q, want %q", string(outside), outsideContent)
+	}
+	info, err := os.Lstat(hookPath)
+	if err != nil {
+		t.Fatalf("lstat installed hook: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("installed hook is still a symlink")
+	}
+	content, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("reading installed hook: %v", err)
+	}
+	if !isNTMHook(string(content)) {
+		t.Fatal("installed hook should contain NTM_MANAGED_HOOK marker")
 	}
 }
 

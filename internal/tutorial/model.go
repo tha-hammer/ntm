@@ -173,7 +173,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.tier = layout.TierForWidth(msg.Width)
-		return m, nil
+		// Force a full clear + repaint on resize (#186). In alt-screen mode the
+		// renderer only repaints the new frame's lines and does not reliably
+		// erase cells left by a previous, differently sized frame, which can
+		// leave stale glyphs ("scrambled" UI) - especially when growing the
+		// window. tea.ClearScreen guarantees a clean repaint.
+		return m, tea.ClearScreen
 
 	case TickMsg:
 		if m.skipAnimations {

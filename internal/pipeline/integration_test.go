@@ -121,8 +121,8 @@ steps:
 	}
 
 	parallelStep := workflow.Steps[0]
-	if len(parallelStep.Parallel) != 3 {
-		t.Errorf("len(parallelStep.Parallel) = %d, want 3", len(parallelStep.Parallel))
+	if len(parallelStep.Parallel.Steps) != 3 {
+		t.Errorf("len(parallelStep.Parallel.Steps) = %d, want 3", len(parallelStep.Parallel.Steps))
 	}
 }
 
@@ -447,7 +447,7 @@ steps:
 	}
 
 	// Verify all parallel steps completed
-	parallelSteps := []string{"worker_a", "worker_b", "worker_c"}
+	parallelSteps := []string{"parallel_work_worker_a", "parallel_work_worker_b", "parallel_work_worker_c"}
 	for _, stepID := range parallelSteps {
 		result, ok := state.Steps[stepID]
 		if !ok {
@@ -777,7 +777,7 @@ steps:
 
   - id: aggregator
     agent: claude
-    prompt: Aggregate from ${steps.parallel_producers}
+    prompt: Aggregate from ${steps.parallel_producers.output}
     depends_on:
       - parallel_producers
 `
@@ -810,7 +810,7 @@ steps:
 	}
 
 	// Verify all producers have results
-	producers := []string{"producer_a", "producer_b"}
+	producers := []string{"parallel_producers_producer_a", "parallel_producers_producer_b"}
 	for _, id := range producers {
 		result, ok := state.Steps[id]
 		if !ok {

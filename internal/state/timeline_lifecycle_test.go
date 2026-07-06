@@ -359,7 +359,15 @@ func TestTimelineLifecycle_StartSessionDoesNotRacePastStop(t *testing.T) {
 
 func TestStartSessionTimeline(t *testing.T) {
 	// This tests the convenience function
-	// Note: This uses the global lifecycle, so we need to be careful about state
+	// Note: This uses the global lifecycle, so we need to be careful about state.
+	// bd-ev740: scope HOME to a temp dir and clear ambient
+	// XDG_CONFIG_HOME / NTM_CONFIG so the global lifecycle's lazy
+	// initialization cannot route through an outer-shell-injected
+	// invalid config path (e.g. /nonexistent/config.toml).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("NTM_CONFIG", "")
+	resetGlobalTimelineLifecycleForTest()
 
 	sessionID := "convenience-test-" + time.Now().Format("20060102150405")
 
@@ -393,6 +401,13 @@ func TestStartSessionTimeline_RejectsInvalidSessionID(t *testing.T) {
 }
 
 func TestEndSessionTimeline(t *testing.T) {
+	// bd-ev740: hermetic HOME/XDG/NTM_CONFIG isolation (see
+	// TestStartSessionTimeline comment).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("NTM_CONFIG", "")
+	resetGlobalTimelineLifecycleForTest()
+
 	sessionID := "end-convenience-test-" + time.Now().Format("20060102150405")
 
 	// Start first

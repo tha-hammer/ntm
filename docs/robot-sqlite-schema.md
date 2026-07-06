@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS robot_agents (
     session_id          TEXT NOT NULL REFERENCES robot_sessions(id) ON DELETE CASCADE,
     pane_index          INTEGER NOT NULL,
     pane_id             TEXT NOT NULL,     -- "0.2"
-    agent_type          TEXT NOT NULL,     -- "claude", "codex", "gemini"
+    agent_type          TEXT NOT NULL,     -- "claude", "codex", "antigravity", "gemini" (legacy)
     model               TEXT,
     state               TEXT NOT NULL,     -- "idle", "busy", "error", "compacting"
     state_changed_at    TEXT NOT NULL,     -- RFC3339

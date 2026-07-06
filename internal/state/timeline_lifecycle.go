@@ -166,6 +166,17 @@ func GetGlobalTimelineLifecycle() (*TimelineLifecycle, error) {
 	return globalTimelineLifecycle, globalTimelineLifecycleErr
 }
 
+// resetGlobalTimelineLifecycleForTest tears down the singleton state so a test
+// can re-initialize it under a hermetic HOME/XDG_CONFIG_HOME/NTM_CONFIG
+// environment. Tests should call this AFTER setting their env overrides via
+// t.Setenv. Not safe for production — only intended for the bd-ev740
+// regression isolation pattern.
+func resetGlobalTimelineLifecycleForTest() {
+	globalTimelineLifecycle = nil
+	globalTimelineLifecycleErr = nil
+	globalTimelineLifecycleOnce = sync.Once{}
+}
+
 // StartSessionTimeline is a convenience function to start timeline tracking for a session.
 // It uses the global lifecycle manager.
 func StartSessionTimeline(sessionID string) error {

@@ -13,17 +13,18 @@ import (
 
 // StatusBarOptions configures status bar rendering.
 type StatusBarOptions struct {
-	Width           int
-	Session         string
-	ClaudeCount     int
-	CodexCount      int
-	GeminiCount     int
-	UserCount       int
-	FocusedPanel    string
-	LayoutTier      string // "Narrow", "Split", "Wide", "Ultra", "Mega"
-	Paused          bool
-	CurrentVelocity float64
-	VelocityHistory []float64
+	Width            int
+	Session          string
+	ClaudeCount      int
+	CodexCount       int
+	GeminiCount      int
+	AntigravityCount int
+	UserCount        int
+	FocusedPanel     string
+	LayoutTier       string // "Narrow", "Split", "Wide", "Ultra", "Mega"
+	Paused           bool
+	CurrentVelocity  float64
+	VelocityHistory  []float64
 }
 
 // RenderStatusBar renders a three-section status bar: left | center | right.
@@ -100,6 +101,7 @@ func renderStatusLeft(t theme.Theme, base lipgloss.Style, opts StatusBarOptions)
 		{"CC", t.Claude, opts.ClaudeCount},
 		{"COD", t.Codex, opts.CodexCount},
 		{"GMI", t.Gemini, opts.GeminiCount},
+		{"AGY", t.Lavender, opts.AntigravityCount},
 	}
 
 	for _, ab := range badges {

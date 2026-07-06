@@ -7,7 +7,7 @@
 <div align="center">
 
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg)
-![Go Version](https://img.shields.io/badge/go-1.25+-00ADD8.svg)
+![Go Version](https://img.shields.io/badge/go-1.26.3+-00ADD8.svg)
 ![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)
 ![Release](https://img.shields.io/github/v/release/Dicklesworthstone/ntm?include_prereleases)
 
@@ -65,7 +65,7 @@ NTM gives you a single local system for:
 NTM is a pure Go project, but the runtime experience is intentionally integration-heavy.
 
 - Required: `tmux`
-- Required for agent spawning: whichever CLIs you want to run, typically Claude Code, Codex, and Gemini CLI
+- Required for agent spawning: whichever CLIs you want to run, typically Claude Code, Codex, and Antigravity CLI (Gemini CLI is supported as legacy)
 - Optional but powerful: `br`, `bv`, Agent Mail, `cass`, `dcg`, `pt`
 - Sanity check everything with `ntm deps -v`
 
@@ -85,7 +85,7 @@ ntm deps -v
 ntm quick api --template=go
 
 # Launch a mixed swarm
-ntm spawn api --cc=2 --cod=1 --gmi=1
+ntm spawn api --cc=2 --cod=1 --agy=1
 
 # Open the live operator surfaces
 ntm dashboard api
@@ -115,7 +115,7 @@ can treat a swarm like a manageable unit instead of a pile of terminals.
 
 ```bash
 ntm quick payments --template=go
-ntm spawn payments --cc=3 --cod=2 --gmi=1
+ntm spawn payments --cc=3 --cod=2 --agy=1
 ntm add payments --cc=1
 ntm list
 ntm status payments
@@ -169,6 +169,60 @@ ntm work graph
 ntm assign payments --auto --strategy=dependency
 ntm assign payments --beads=br-123,br-124 --agent=codex
 ```
+
+When `br` and `bv` report that no ready work exists, use the queue-dry flow to
+distinguish a genuinely empty queue from stale coordination state:
+
+```bash
+# Confirm the work queue first. Do not run bare bv; use robot output.
+br ready --json
+bv --robot-triage | jq '.triage.quick_ref'
+
+# Diagnose why the queue appears dry.
+ntm work queue-dry --format=json | jq '{queue_dry, evidence, recommendations}'
+
+# Render an advisory roadmap only after the dry queue is confirmed.
+ntm work queue-dry --ideate --format=json | jq '{
+  queue_dry,
+  ideation: {
+    status: .ideation.status,
+    guard: .ideation.guard.recommendation,
+    rendered: .ideation.roadmap.rendered_count,
+    preview: .ideation.creation.remaining_commands
+  },
+  warnings
+}'
+
+# The same plan is available as markdown for human review.
+ntm work queue-dry --ideate --format=markdown
+```
+
+Review the duplicate and novelty evidence before creating anything. If `br ready`
+has work, or `bv --robot-triage` shows actionable recommendations, claim that work
+instead of ideating. `--force` is only for an explicit preview when an operator wants
+to inspect the plan despite ready work or degraded tracker state.
+
+Gated creation is opt-in and still uses Beads as the source of truth:
+
+```bash
+# Re-check the preview and guard before mutating Beads.
+ntm work queue-dry --ideate --format=json | jq '.ideation.creation.remaining_commands'
+
+# Create proposed beads only after review. The plan version is an audit token.
+ntm work queue-dry --ideate --create-beads --yes --plan-version="$(git rev-parse --short HEAD)"
+
+# Validate the graph and export Beads state after any mutation.
+br dep cycles --json
+bv --robot-triage | jq '.triage.quick_ref'
+br sync --flush-only
+git add .beads/issues.jsonl
+```
+
+If Agent Mail, CASS, or CM are unavailable, `queue-dry --ideate` keeps running and
+marks those sources as degraded in `warnings`. Treat degraded Agent Mail reservation
+visibility as a coordination stop sign for mutating creation; fix coordination or use
+the non-mutating preview. Never edit `.beads/*.jsonl` directly, and use
+`ntm work queue-dry --help` for the current flag surface.
 
 ### 4. Coordination, Reservations, and Human Oversight
 
@@ -231,9 +285,14 @@ ntm template show fix-bug
 ntm pipeline run .ntm/pipelines/review.yaml --session payments
 ntm pipeline status run-20241230-123456-abcd
 ntm pipeline list
-ntm pipeline resume run-20241230-123456-abcd
+ntm pipeline resume run-20241230-123456-abcd --mode=continue
 ntm pipeline cleanup --older=7d
 ```
+
+Pipeline resume preserves completed step outputs by default and re-runs the first incomplete
+step or loop iteration. Commands, templates, and foreach/loop iteration bodies should be
+idempotent when resumed, or operators should resume with `--keep-state=false` or
+`--mode=force-iter --step-id=<id> --iteration=<n>` to deliberately re-run work.
 
 ### 7. Durable State, Audit, and Recovery
 
@@ -417,11 +476,11 @@ not bolt-on scripts.
               +-------------+-------------+      +---------------------------+
                             |
                             v
-              +---------------------------+
-              | tmux sessions and panes   |
-              | Claude / Codex / Gemini   |
-              | labeled multi-agent work  |
-              +---------------------------+
+              +------------------------------+
+              | tmux sessions and panes      |
+              | Claude / Codex / Antigravity |
+              | labeled multi-agent work     |
+              +------------------------------+
 ```
 
 ## Installation
@@ -438,12 +497,6 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install
 brew install dicklesworthstone/tap/ntm
 ```
 
-### Go Install
-
-```bash
-go install github.com/Dicklesworthstone/ntm/cmd/ntm@latest
-```
-
 ### Docker
 
 ```bash
@@ -456,7 +509,7 @@ docker run --rm -it ntm
 ```bash
 git clone https://github.com/Dicklesworthstone/ntm.git
 cd ntm
-go build ./cmd/ntm
+go install ./cmd/ntm
 ```
 
 ## Troubleshooting
@@ -473,6 +526,40 @@ ntm deps -v
 
 NTM can only launch tools that are installed and discoverable in `PATH`.
 Use `ntm deps -v` to check what it sees.
+
+### `claude`, `codex`, `agy`, or `gemini` not detected over SSH / tmux / non-login shells
+
+NTM discovers agent CLIs via the `PATH` of the **runtime environment it is launched in** —
+not the `PATH` of your interactive login shell. Tools installed under npm-global or
+`~/.local/bin` are often added to `PATH` by your `~/.bashrc` / `~/.zshrc` / `~/.profile`,
+which a non-interactive or non-login shell (a bare SSH command, a detached tmux server, a
+systemd unit, a CI runner) does not source. In that case `ntm deps -v` reports the agents as
+missing even though they work fine in your normal terminal.
+
+First, confirm what *NTM's* environment actually resolves, under the same shell/SSH/tmux
+context where you run NTM:
+
+```bash
+command -v claude
+command -v codex
+command -v agy
+command -v gemini
+ntm deps -v
+```
+
+If those `command -v` checks come up empty here but succeed in your interactive shell, the
+fix is to put the missing directories on `PATH` before launching NTM. The most robust option
+is a small wrapper that exports the right `PATH` and then `exec`s NTM (paths vary by host):
+
+```bash
+#!/usr/bin/env bash
+# ~/bin/ntm-wrapper — ensure agent CLIs are on PATH, then hand off to ntm.
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+exec ntm "$@"
+```
+
+Make it executable (`chmod +x ~/bin/ntm-wrapper`) and invoke that instead of `ntm`. Re-run
+`ntm deps -v` through the wrapper to confirm all three CLIs are now detected.
 
 ### A work command has nothing useful to say
 

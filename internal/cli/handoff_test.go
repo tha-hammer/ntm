@@ -1131,6 +1131,8 @@ func TestResolveHandoffProjectDirRejectsWorkspaceFallbackForExplicitSession(t *t
 }
 
 func TestResolveHandoffProjectDirUsesSavedSessionAgentProjectKey(t *testing.T) {
+	isolateSessionAgentStorage(t)
+
 	origCfg := cfg
 	origDir, _ := os.Getwd()
 	t.Cleanup(func() {
@@ -1140,16 +1142,16 @@ func TestResolveHandoffProjectDirUsesSavedSessionAgentProjectKey(t *testing.T) {
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
-	cwdDir := t.TempDir()
+	cwdDir := canonicalTempDir(t)
 	if err := os.Chdir(cwdDir); err != nil {
 		t.Fatalf("chdir cwd: %v", err)
 	}
 
 	session := "testsession"
-	actualProject := filepath.Join(t.TempDir(), "actual-project")
+	actualProject := filepath.Join(canonicalTempDir(t), "actual-project")
 	if err := os.MkdirAll(filepath.Join(actualProject, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir actual project git dir: %v", err)
 	}

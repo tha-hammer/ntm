@@ -24,6 +24,9 @@ func TestStatusUpdateSetsPaneStateAndTimestamp(t *testing.T) {
 	m.paneStatus[0] = PaneStatus{}
 
 	now := time.Now()
+	// First update establishes the velocity baseline. With no prior sample, the
+	// fresh-token rate is genuinely 0 (it is a delta over a window, not a
+	// snapshot/age), so velocity history is recorded as 0 here.
 	msg := StatusUpdateMsg{
 		Statuses: []status.AgentStatus{
 			{
@@ -31,6 +34,7 @@ func TestStatusUpdateSetsPaneStateAndTimestamp(t *testing.T) {
 				State:      status.StateIdle,
 				LastActive: now.Add(-1 * time.Minute),
 				LastOutput: strings.Repeat("token ", 24),
+				TokensUsed: 10_000,
 				UpdatedAt:  now,
 			},
 		},
@@ -49,10 +53,38 @@ func TestStatusUpdateSetsPaneStateAndTimestamp(t *testing.T) {
 	if len(m2.aggregateVelocityHistory) == 0 {
 		t.Fatalf("expected aggregate velocity history to be recorded")
 	}
-	if got := m2.aggregateVelocityHistory[len(m2.aggregateVelocityHistory)-1]; got <= 0 {
-		t.Fatalf("expected aggregate velocity sample > 0, got %v", got)
+	if got := m2.aggregateVelocityHistory[len(m2.aggregateVelocityHistory)-1]; got != 0 {
+		t.Fatalf("expected first-sample aggregate velocity to be 0 (no prior window), got %v", got)
 	}
-	if got := len(m2.velocityByType[string(tmux.AgentCodex)]); got == 0 {
+
+	// Backfill the prior sample to a known earlier time so the next update has a
+	// real wall-clock window to rate against, then feed genuine token growth
+	// (+4000 tokens over ~2 minutes ≈ 2000 tok/min).
+	m2.velocityByPaneID["%1"] = velocitySample{
+		tokens:    10_000,
+		sampledAt: now.Add(-2 * time.Minute),
+	}
+	now2 := time.Now()
+	msg2 := StatusUpdateMsg{
+		Statuses: []status.AgentStatus{
+			{
+				PaneID:     "%1",
+				State:      status.StateWorking,
+				LastActive: now2,
+				LastOutput: strings.Repeat("token ", 24),
+				TokensUsed: 14_000,
+				UpdatedAt:  now2,
+			},
+		},
+		Time: now2,
+	}
+	updated2, _ := m2.Update(msg2)
+	m3 := updated2.(Model)
+
+	if got := m3.aggregateVelocityHistory[len(m3.aggregateVelocityHistory)-1]; got <= 0 {
+		t.Fatalf("expected aggregate velocity sample > 0 after genuine growth, got %v", got)
+	}
+	if got := len(m3.velocityByType[string(tmux.AgentCodex)]); got == 0 {
 		t.Fatalf("expected per-type velocity history to be recorded")
 	}
 }

@@ -46,11 +46,13 @@ func newScaleCmd() *cobra.Command {
 		targetCC  int
 		targetCod int
 		targetGmi int
+		targetAgy int
 		dryRun    bool
 		force     bool
 		setCc     bool
 		setCod    bool
 		setGmi    bool
+		setAgy    bool
 	)
 
 	cmd := &cobra.Command{
@@ -73,6 +75,7 @@ Examples:
 			setCc = cmd.Flags().Changed("cc")
 			setCod = cmd.Flags().Changed("cod")
 			setGmi = cmd.Flags().Changed("gmi")
+			setAgy = cmd.Flags().Changed("agy")
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			session := args[0]
@@ -81,6 +84,7 @@ Examples:
 				{agentType: AgentTypeClaude, count: targetCC, set: setCc},
 				{agentType: AgentTypeCodex, count: targetCod, set: setCod},
 				{agentType: AgentTypeGemini, count: targetGmi, set: setGmi},
+				{agentType: AgentTypeAntigravity, count: targetAgy, set: setAgy},
 			}
 
 			return runScale(session, targets, dryRun, force)
@@ -90,6 +94,7 @@ Examples:
 	cmd.Flags().IntVar(&targetCC, "cc", 0, "Target Claude agent count")
 	cmd.Flags().IntVar(&targetCod, "cod", 0, "Target Codex agent count")
 	cmd.Flags().IntVar(&targetGmi, "gmi", 0, "Target Gemini agent count")
+	cmd.Flags().IntVar(&targetAgy, "agy", 0, "Target Antigravity agent count")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview changes without executing")
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "Skip confirmation on scale-down")
 
@@ -128,7 +133,7 @@ func runScale(session string, targets []scaleTarget, dryRun, force bool) error {
 		}
 	}
 	if !anySet {
-		return outputError(fmt.Errorf("no target counts specified (use --cc, --cod, or --gmi)"))
+		return outputError(fmt.Errorf("no target counts specified (use --cc, --cod, --gmi, or --agy)"))
 	}
 
 	// Validate target counts
@@ -161,6 +166,7 @@ func runScale(session string, targets []scaleTarget, dryRun, force bool) error {
 		"cc":  currentCounts["cc"],
 		"cod": currentCounts["cod"],
 		"gmi": currentCounts["gmi"],
+		"agy": currentCounts["agy"],
 	}
 
 	// Calculate deltas and build actions
@@ -369,7 +375,7 @@ func runScale(session string, targets []scaleTarget, dryRun, force bool) error {
 	if fetchErr != nil {
 		slog.Warn("scale: could not verify final pane state", "session", session, "error", fetchErr)
 	}
-	finalCounts := map[string]int{"cc": 0, "cod": 0, "gmi": 0}
+	finalCounts := map[string]int{"cc": 0, "cod": 0, "gmi": 0, "agy": 0}
 	for _, p := range finalPanes {
 		typeStr := scaleAgentTypeLabel(p.Type)
 		if _, ok := finalCounts[typeStr]; ok {
@@ -400,8 +406,8 @@ func runScale(session string, targets []scaleTarget, dryRun, force bool) error {
 		return output.PrintJSON(resp)
 	}
 
-	fmt.Printf("\nScaling complete. Current state: cc=%d, cod=%d, gmi=%d\n",
-		finalCounts["cc"], finalCounts["cod"], finalCounts["gmi"])
+	fmt.Printf("\nScaling complete. Current state: cc=%d, cod=%d, gmi=%d, agy=%d\n",
+		finalCounts["cc"], finalCounts["cod"], finalCounts["gmi"], finalCounts["agy"])
 
 	if len(errors) > 0 {
 		fmt.Println("\nErrors encountered:")
@@ -440,6 +446,8 @@ func scaleAgentTypeLabel(t tmux.AgentType) string {
 		return "cod"
 	case tmux.AgentGemini:
 		return "gmi"
+	case tmux.AgentAntigravity:
+		return "agy"
 	case tmux.AgentUser:
 		return "user"
 	default:
@@ -451,8 +459,8 @@ func scaleAgentTypeLabel(t tmux.AgentType) string {
 func printScalePlan(session string, before, after map[string]int, actions []ScaleAction) {
 	fmt.Printf("Scale plan for session '%s':\n\n", session)
 
-	types := []string{"cc", "cod", "gmi"}
-	labels := map[string]string{"cc": "Claude", "cod": "Codex", "gmi": "Gemini"}
+	types := []string{"cc", "cod", "gmi", "agy"}
+	labels := map[string]string{"cc": "Claude", "cod": "Codex", "gmi": "Gemini", "agy": "Antigravity"}
 
 	for _, t := range types {
 		b := before[t]

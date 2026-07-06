@@ -183,6 +183,7 @@ func newErrorsCmd() *cobra.Command {
 		ccFlag       bool
 		codFlag      bool
 		gmiFlag      bool
+		agyFlag      bool
 	)
 
 	cmd := &cobra.Command{
@@ -238,9 +239,10 @@ Examples:
 			}
 
 			filter := AgentFilter{
-				Claude: ccFlag,
-				Codex:  codFlag,
-				Gemini: gmiFlag,
+				Claude:      ccFlag,
+				Codex:       codFlag,
+				Gemini:      gmiFlag,
+				Antigravity: agyFlag,
 			}
 
 			opts := ErrorsOptions{
@@ -264,6 +266,7 @@ Examples:
 	cmd.Flags().BoolVar(&ccFlag, "cc", false, "Show Claude pane errors only")
 	cmd.Flags().BoolVar(&codFlag, "cod", false, "Show Codex pane errors only")
 	cmd.Flags().BoolVar(&gmiFlag, "gmi", false, "Show Gemini pane errors only")
+	cmd.Flags().BoolVar(&agyFlag, "agy", false, "Show Antigravity pane errors only")
 
 	return cmd
 }

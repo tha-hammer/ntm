@@ -160,62 +160,127 @@ func TestRenderContextMiniBar_EdgeCases(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// tokenVelocityFromStatus
+// statusTokenCount — count extraction (prefers parsed TokensUsed)
 // ---------------------------------------------------------------------------
 
-func TestTokenVelocityFromStatus(t *testing.T) {
+func TestStatusTokenCount(t *testing.T) {
+	t.Run("prefers_parsed_tokens_used", func(t *testing.T) {
+		st := status.AgentStatus{
+			TokensUsed: 12345,
+			LastOutput: strings.Repeat("noise ", 100),
+		}
+		if got := statusTokenCount(st); got != 12345 {
+			t.Errorf("statusTokenCount() = %d, want 12345 (TokensUsed)", got)
+		}
+	})
 
-	tests := []struct {
-		name   string
-		st     status.AgentStatus
-		wantGt float64 // result must be > this
-		wantEq float64 // result must == this (use -1 to skip)
-	}{
-		{
-			name:   "empty_output_returns_zero",
-			st:     status.AgentStatus{LastOutput: ""},
-			wantEq: 0,
-		},
-		{
-			name: "with_output_and_recent_activity",
-			st: status.AgentStatus{
-				LastOutput: strings.Repeat("hello world ", 100),
-				LastActive: time.Now(),
-			},
-			wantGt: 0,
-			wantEq: -1,
-		},
-		{
-			name: "with_output_and_stale_activity",
-			st: status.AgentStatus{
-				LastOutput: "some text here",
-				LastActive: time.Now().Add(-10 * time.Minute),
-			},
-			wantGt: 0,
-			wantEq: -1,
-		},
-		{
-			name: "future_activity_clamps_minutes",
-			st: status.AgentStatus{
-				LastOutput: "some text",
-				LastActive: time.Now().Add(5 * time.Minute),
-			},
-			// When minutes <= 0, clamped to 1.0
-			wantGt: 0,
-			wantEq: -1,
-		},
+	t.Run("falls_back_to_estimate_when_no_tokens_used", func(t *testing.T) {
+		st := status.AgentStatus{LastOutput: strings.Repeat("hello world ", 100)}
+		if got := statusTokenCount(st); got <= 0 {
+			t.Errorf("statusTokenCount() = %d, want > 0 (estimate fallback)", got)
+		}
+	})
+
+	t.Run("empty_output_and_no_tokens_returns_zero", func(t *testing.T) {
+		if got := statusTokenCount(status.AgentStatus{}); got != 0 {
+			t.Errorf("statusTokenCount() = %d, want 0", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// tokenVelocityRate — genuine delta-over-window rate (pure core)
+// ---------------------------------------------------------------------------
+
+func TestTokenVelocityRate(t *testing.T) {
+	base := time.Now()
+
+	t.Run("no_prior_sample_returns_zero", func(t *testing.T) {
+		// (a) First sample / no prior → 0, never a snapshot spike.
+		if got := tokenVelocityRate(velocitySample{}, false, 100_000, base); got != 0 {
+			t.Errorf("tokenVelocityRate(no prior) = %v, want 0", got)
+		}
+	})
+
+	t.Run("idle_same_count_returns_zero", func(t *testing.T) {
+		// (b) Idle: identical count across two samples → 0, NOT a huge value.
+		prev := velocitySample{tokens: 50_000, sampledAt: base}
+		got := tokenVelocityRate(prev, true, 50_000, base.Add(1*time.Minute))
+		if got != 0 {
+			t.Errorf("tokenVelocityRate(idle) = %v, want 0", got)
+		}
+	})
+
+	t.Run("genuine_growth_returns_rate", func(t *testing.T) {
+		// (c) Growth: +2000 tokens over 2 minutes → ~1000 tok/min.
+		prev := velocitySample{tokens: 10_000, sampledAt: base}
+		got := tokenVelocityRate(prev, true, 12_000, base.Add(2*time.Minute))
+		if got < 999.9 || got > 1000.1 {
+			t.Errorf("tokenVelocityRate(growth) = %v, want ~1000", got)
+		}
+	})
+
+	t.Run("shrinking_count_returns_zero", func(t *testing.T) {
+		// (d) Shrinking snapshot (tokensNow < prevTokens) → 0, not negative/spike.
+		prev := velocitySample{tokens: 80_000, sampledAt: base}
+		got := tokenVelocityRate(prev, true, 30_000, base.Add(1*time.Minute))
+		if got != 0 {
+			t.Errorf("tokenVelocityRate(shrink) = %v, want 0", got)
+		}
+	})
+
+	t.Run("zero_or_negative_window_returns_zero", func(t *testing.T) {
+		prev := velocitySample{tokens: 10_000, sampledAt: base}
+		// Same instant (zero window).
+		if got := tokenVelocityRate(prev, true, 12_000, base); got != 0 {
+			t.Errorf("tokenVelocityRate(zero window) = %v, want 0", got)
+		}
+		// Negative window (clock skew).
+		if got := tokenVelocityRate(prev, true, 12_000, base.Add(-1*time.Minute)); got != 0 {
+			t.Errorf("tokenVelocityRate(negative window) = %v, want 0", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// paneTokenVelocity — stateful per-pane sampling against the persistent Model
+// ---------------------------------------------------------------------------
+
+func TestPaneTokenVelocity(t *testing.T) {
+	m := &Model{velocityByPaneID: make(map[string]velocitySample)}
+
+	// First observation establishes a baseline; no prior window → 0 (no spike),
+	// even though the snapshot is large and "recently active".
+	first := status.AgentStatus{
+		PaneID:     "%0",
+		TokensUsed: 100_000,
+		LastActive: time.Now(),
+	}
+	if got := m.paneTokenVelocity(first); got != 0 {
+		t.Fatalf("paneTokenVelocity(first sample) = %v, want 0", got)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := tokenVelocityFromStatus(tc.st)
-			if tc.wantEq >= 0 && got != tc.wantEq {
-				t.Errorf("tokenVelocityFromStatus() = %v, want %v", got, tc.wantEq)
-			}
-			if tc.wantEq < 0 && got <= tc.wantGt {
-				t.Errorf("tokenVelocityFromStatus() = %v, want > %v", got, tc.wantGt)
-			}
-		})
+	// Idle: same cumulative count on the next tick → 0, not the old ~296k spike.
+	idle := first
+	if got := m.paneTokenVelocity(idle); got != 0 {
+		t.Errorf("paneTokenVelocity(idle, unchanged count) = %v, want 0", got)
+	}
+
+	// Backfill the prior sample to a known time so the next call has a real
+	// window to rate against, then observe genuine growth.
+	m.velocityByPaneID["%0"] = velocitySample{
+		tokens:    100_000,
+		sampledAt: time.Now().Add(-2 * time.Minute),
+	}
+	grown := status.AgentStatus{PaneID: "%0", TokensUsed: 104_000}
+	got := m.paneTokenVelocity(grown)
+	if got < 1500 || got > 2500 {
+		t.Errorf("paneTokenVelocity(growth +4000/~2min) = %v, want ~2000", got)
+	}
+
+	// A pane with no ID cannot persist a window → 0.
+	if got := m.paneTokenVelocity(status.AgentStatus{TokensUsed: 1_000_000}); got != 0 {
+		t.Errorf("paneTokenVelocity(no pane id) = %v, want 0", got)
 	}
 }
 

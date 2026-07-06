@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func captureStdout(t *testing.T, fn func()) string {
@@ -812,4 +814,200 @@ func TestMatchFailurePatternsConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// installFakeBr writes a fake `br` executable into a fresh dir, prepends that
+// dir to PATH for the test, and returns the dir. The fake `br` emits a JSON
+// array whose single object carries the given status, so checkBeadClosed sees
+// the bead as that status. Skips the test if the dir cannot be prepared.
+func installFakeBr(t *testing.T, status string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"# Fake br for tests: always reports a bead with a fixed status.\n" +
+		"printf '%s' '[{\"id\":\"bd-x\",\"status\":\"" + status + "\"}]'\n"
+	path := dir + "/br"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake br: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestDetectorReloadsStoreObservesPostStartupDispatch is the Fix-1 guard. The
+// completion detector is handed the watch loop's store instance at
+// construction, but post-startup dispatches are recorded by a SEPARATE store
+// instance (executeAssignmentsEnhanced does its own LoadStore + Assign + Save).
+// Before the fix the detector's view was frozen at startup and it never saw
+// anything dispatched later. checkAll now reloads the store from disk at the
+// top of each tick; this test writes a NEW assignment through a second store
+// instance and asserts the detector's store observes it after checkAll runs.
+func TestDetectorReloadsStoreObservesPostStartupDispatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	session := "reload-test-session"
+
+	// The detector holds store A (as the watch loop would).
+	storeA, err := assignment.LoadStore(session)
+	if err != nil {
+		t.Fatalf("LoadStore A: %v", err)
+	}
+	d := New(session, storeA)
+
+	// At startup the detector sees no assignments.
+	if got := len(storeA.ListActive()); got != 0 {
+		t.Fatalf("expected 0 active assignments at startup, got %d", got)
+	}
+
+	// A SEPARATE store instance (store B) records a post-startup dispatch and
+	// persists it to disk — exactly what executeAssignmentsEnhanced does.
+	storeB, err := assignment.LoadStore(session)
+	if err != nil {
+		t.Fatalf("LoadStore B: %v", err)
+	}
+	if _, err := storeB.Assign("bd-after-startup", "late bead", 1, "claude", "claude_1", "do work"); err != nil {
+		t.Fatalf("storeB.Assign: %v", err)
+	}
+
+	// Before reload, store A still does not see it (frozen view).
+	if got := len(storeA.ListActive()); got != 0 {
+		t.Fatalf("store A should not see the dispatch before reload, got %d", got)
+	}
+
+	// Run a tick. tmux is unavailable / the pane does not exist, so no events
+	// fire, but checkAll's reload must pull in the on-disk assignment.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events := make(chan CompletionEvent, 4)
+	d.checkAll(ctx, events)
+
+	active := storeA.ListActive()
+	if len(active) != 1 {
+		t.Fatalf("after checkAll reload, store A should observe 1 active assignment, got %d", len(active))
+	}
+	if active[0].BeadID != "bd-after-startup" {
+		t.Errorf("observed bead = %q, want %q", active[0].BeadID, "bd-after-startup")
+	}
+}
+
+// TestCompletionPatternRequiresBeadClosedConfirmation is the Fix-2 prompt-echo
+// guard. The completion patterns (e.g. `br\s+close`) also match the dispatch
+// prompt's OWN ECHO ("run `br close <id>`"). A crashed/slow agent whose pane
+// still shows that prompt must NOT be declared complete unless br confirms the
+// bead is actually closed. This drives checkAssignment against a real ephemeral
+// tmux pane whose content is only the prompt echo.
+func TestCompletionPatternRequiresBeadClosedConfirmation(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	session := "promptecho-session"
+	_ = tmux.KillSession(session)
+	if err := tmux.CreateSession(session, t.TempDir()); err != nil {
+		t.Skipf("CreateSession failed (host-sensitive): %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+
+	panes, err := tmux.GetPanes(session)
+	if err != nil || len(panes) == 0 {
+		t.Skipf("GetPanes failed: %v", err)
+	}
+	pane := panes[0]
+
+	// Put the dispatch prompt ECHO (and nothing else) in the pane: the prompt
+	// instructs the agent to run `br close`, which the completion pattern
+	// `br\s+(close|...)` matches even though the agent has done no work.
+	promptEcho := "Work on bead bd-echo: fix the thing. When done, run br close bd-echo."
+	if err := tmux.SendKeys(pane.ID, promptEcho, false); err != nil {
+		t.Skipf("SendKeys failed: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Sanity: the prompt echo really does trip the completion pattern — this is
+	// the trap the fix defends against.
+	out, _ := tmux.CapturePaneOutput(pane.ID, 50)
+	d := New(session, assignment.NewStore(session))
+	if !d.matchCompletionPatterns(out) {
+		t.Skip("prompt echo did not render the completion phrase in this environment")
+	}
+
+	// Fake br reports the bead as OPEN — so the pattern match must NOT be
+	// trusted as a success.
+	installFakeBr(t, "open")
+	brAvail := true
+	d.brAvailable = &brAvail
+
+	a := &assignment.Assignment{
+		BeadID:     "bd-echo",
+		Pane:       pane.Index,
+		AgentType:  "claude",
+		AssignedAt: time.Now(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	event := d.checkAssignment(ctx, a)
+	if event != nil && !event.IsFailed && event.Method == MethodPatternMatch {
+		t.Fatalf("prompt echo wrongly marked complete: %+v", event)
+	}
+}
+
+// TestIdleTimeoutWithOpenBeadReportsFailed is the second half of Fix-2: an
+// idle/stalled agent whose bead is NOT closed must be reported FAILED (so the
+// pane is released and the bead reassigned), not a silent success.
+func TestIdleTimeoutWithOpenBeadReportsFailed(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	session := "idlefail-session"
+	_ = tmux.KillSession(session)
+	if err := tmux.CreateSession(session, t.TempDir()); err != nil {
+		t.Skipf("CreateSession failed (host-sensitive): %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+
+	panes, err := tmux.GetPanes(session)
+	if err != nil || len(panes) == 0 {
+		t.Skipf("GetPanes failed: %v", err)
+	}
+	pane := panes[0]
+
+	// Fake br: bead is OPEN (not closed) — an idle timeout here is a stall.
+	installFakeBr(t, "open")
+
+	cfg := DefaultConfig()
+	cfg.IdleThreshold = 10 * time.Millisecond
+	cfg.CaptureLines = 50
+	d := NewWithConfig(session, assignment.NewStore(session), cfg)
+	brAvail := true
+	d.brAvailable = &brAvail
+
+	a := &assignment.Assignment{
+		BeadID:     "bd-stalled",
+		Pane:       pane.Index,
+		AgentType:  "claude",
+		AssignedAt: time.Now(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Prime the idle tracker, then let the pane go quiet past the threshold.
+	_ = d.checkAssignment(ctx, a)
+	time.Sleep(20 * time.Millisecond)
+
+	event := d.checkAssignment(ctx, a)
+	if event == nil {
+		t.Skip("no idle event produced in this environment (pane churn)")
+	}
+	if event.Method == MethodBeadClosed {
+		t.Fatalf("bead was reported closed but fake br says open: %+v", event)
+	}
+	if event.Method == MethodIdle && !event.IsFailed {
+		t.Fatalf("idle timeout with an OPEN bead must be reported FAILED, got success: %+v", event)
+	}
+	if event.Method == MethodIdle && event.IsFailed && event.FailReason == "" {
+		t.Errorf("failed idle event should carry a fail reason")
+	}
 }

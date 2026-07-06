@@ -181,6 +181,9 @@ func FormatBytes(b int64) string {
 // SafeSlice truncates a string to maxLen bytes, ensuring the cut is at a rune boundary.
 // Unlike Truncate, it does not add an ellipsis.
 func SafeSlice(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
 	if len(s) <= maxLen {
 		return s
 	}
@@ -198,6 +201,9 @@ func SafeSlice(s string, maxLen int) string {
 // SafeSliceFromEnd truncates a string to at most maxLen bytes from the end,
 // ensuring the cut is at a rune boundary.
 func SafeSliceFromEnd(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
 	if len(s) <= maxLen {
 		return s
 	}
@@ -211,14 +217,29 @@ func SafeSliceFromEnd(s string, maxLen int) string {
 
 // GetLastNLines returns the last n lines of text efficiently.
 // If the text has fewer than n lines, returns the entire text.
+//
+// Matches GNU `tail -n` semantics: a single trailing newline is treated
+// as the end-of-line of the last line, not as the start of an empty
+// (N+1)-th line. Without this normalization, the reverse scan would
+// count the trailing newline as the first match and the function would
+// return only N-1 actual lines (bd-itfik).
 func GetLastNLines(text string, n int) string {
 	if n <= 0 {
 		return ""
 	}
 
+	// Skip exactly one trailing '\n' so it does not count as a
+	// separator beginning an empty trailing line. Trailing '\n\n'
+	// keeps one of them, which correctly represents an empty final
+	// line.
+	end := len(text)
+	if end > 0 && text[end-1] == '\n' {
+		end--
+	}
+
 	// Search from the end for the n-th newline
 	count := 0
-	for i := len(text) - 1; i >= 0; i-- {
+	for i := end - 1; i >= 0; i-- {
 		if text[i] == '\n' {
 			count++
 			if count == n {

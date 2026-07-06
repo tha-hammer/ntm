@@ -160,7 +160,9 @@ func AgentTypeToProvider(agentType string) string {
 		return "claude"
 	case agent.AgentTypeCodex:
 		return "codex"
-	case agent.AgentTypeGemini:
+	case agent.AgentTypeGemini, agent.AgentTypeAntigravity:
+		// agy (Antigravity) shares Google's auth/quota with Gemini, so for
+		// provider/auth identity it reuses the gemini bucket.
 		return "gemini"
 	case agent.AgentTypeCursor:
 		return "cursor"
@@ -182,6 +184,8 @@ func ProviderToAgentType(provider string) string {
 		return "cod"
 	case agent.AgentTypeGemini:
 		return "gmi"
+	case agent.AgentTypeAntigravity:
+		return "agy"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
@@ -197,6 +201,8 @@ func ProviderToAgentType(provider string) string {
 		return "cod"
 	case "google", "gemini":
 		return "gmi"
+	case "antigravity", "agy":
+		return "agy"
 	case "cursor":
 		return "cursor"
 	case "windsurf":

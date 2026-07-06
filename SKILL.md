@@ -35,7 +35,7 @@ ntm deps -v
 ntm quick myproject --template=go
 
 # Launch a mixed swarm
-ntm spawn myproject --cc=2 --cod=1 --gmi=1
+ntm spawn myproject --cc=2 --cod=1 --agy=1
 
 # Dispatch work
 ntm send myproject --cc "Map the auth layer and propose a refactor plan."
@@ -50,7 +50,7 @@ ntm --robot-snapshot
 Use these for day-to-day session lifecycle management:
 
 ```bash
-ntm spawn myproject --cc=3 --cod=2 --gmi=1
+ntm spawn myproject --cc=3 --cod=2 --agy=1
 ntm spawn myproject --label frontend --cc=2
 ntm spawn myproject --label backend --cc=2 --worktrees
 ntm add myproject --cc=1
@@ -145,6 +145,10 @@ ntm audit show myproject
 ntm changes conflicts myproject
 ntm resume myproject
 ```
+
+Treat `ntm checkpoint save` as a routine cadence, not just a pre-disaster snapshot. Good points to checkpoint: once prompts are confirmed received after a spawn or restore, after an investigation isolates a root cause, before risky edits, after significant uncommitted work but before verification, after a green verification, and before a merge/cleanup/handoff. Cheap checkpoints make any later `ntm checkpoint restore` land on a known-good state.
+
+Note that Agent Mail may run as an external MCP or service-manager process **outside** the tmux session. If Agent Mail and tmux appear to fail together, don't assume tmux took Agent Mail down — check the service manager, process/cgroup ancestry, and OOM/memory signals at the service boundary before relaunching workers.
 
 Isolation options:
 

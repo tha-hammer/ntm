@@ -314,6 +314,8 @@ func normalizeRecipeAgentType(raw string) (string, error) {
 		return string(agentpkg.AgentTypeCodex), nil
 	case agentpkg.AgentTypeGemini:
 		return string(agentpkg.AgentTypeGemini), nil
+	case agentpkg.AgentTypeAntigravity:
+		return string(agentpkg.AgentTypeAntigravity), nil
 	case agentpkg.AgentTypeCursor:
 		return string(agentpkg.AgentTypeCursor), nil
 	case agentpkg.AgentTypeWindsurf:

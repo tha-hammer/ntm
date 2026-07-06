@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "description": "Pane-health classifier calibration corpus (bd-3v1gs.2). Each entry pins a labeled scrollback fixture against the expected detector verdict so future tuning surfaces regressions as failed classifications. Seed corpus targets the bd-a2fwr / bd-9b0et / bd-2mb03.6.6 / bd-v9sbz cases; new fixtures append here.",
+  "fixtures": [
+    {
+      "id": "idle-cc-prompt-only",
+      "category": "idle_prompts",
+      "agent_type": "cc",
+      "file": "idle/cc-prompt-only.txt",
+      "expect": {
+        "at_prompt": true,
+        "rate_limited": false,
+        "crashed": false
+      },
+      "notes": "Trivial baseline: bare Claude prompt."
+    },
+    {
+      "id": "crash-unrecovered-go-panic",
+      "category": "unrecovered_crashes",
+      "agent_type": "cc",
+      "file": "crashes/unrecovered-go-panic.txt",
+      "expect": {
+        "at_prompt": false,
+        "rate_limited": false,
+        "crashed": true
+      },
+      "notes": "Go panic with no trailing prompt. Must trip the 50-line crash escalation."
+    },
+    {
+      "id": "recovered-prompt-after-panic",
+      "category": "recovered_prompts",
+      "agent_type": "cc",
+      "file": "recovered/prompt-after-panic.txt",
+      "expect": {
+        "at_prompt": true,
+        "rate_limited": false,
+        "crashed": false
+      },
+      "notes": "bd-a2fwr/bd-9b0et: panic in scrollback, prompt below it. Crash issue must NOT fire."
+    },
+    {
+      "id": "ratelimit-cc-explicit",
+      "category": "rate_limits",
+      "agent_type": "cc",
+      "file": "ratelimit/cc-explicit.txt",
+      "expect": {
+        "at_prompt": false,
+        "rate_limited": true,
+        "crashed": false
+      }
+    },
+    {
+      "id": "stale-panic-recovered-then-busy",
+      "category": "stale_historical_errors",
+      "agent_type": "cc",
+      "file": "stale/panic-recovered-then-busy.txt",
+      "expect": {
+        "at_prompt": true,
+        "rate_limited": false,
+        "crashed": false
+      },
+      "notes": "bd-2mb03.6.6 / bd-9b0et: stale panic far above, prompt visible, agent producing new output past the trailing window. Full-buffer prompt scan must still suppress crash."
+    }
+  ]
+}

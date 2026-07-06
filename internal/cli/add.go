@@ -39,6 +39,18 @@ type AddOptions struct {
 	Prompt           string
 }
 
+// opencodeCommandOrDefault returns the configured [agents] oc launch command,
+// falling back to config.DefaultOpencodeCommand (a model-aware template)
+// when it is unset. Centralizing this keeps the spawn, add, restart, and
+// session-resume dispatch paths in lockstep so a model override is honored and
+// Agent Mail registration receives a non-empty model everywhere. See ntm#193.
+func opencodeCommandOrDefault(configured string) string {
+	if configured == "" {
+		return config.DefaultOpencodeCommand
+	}
+	return configured
+}
+
 func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]plugins.AgentPlugin, ollamaHost string) (string, map[string]string, error) {
 	switch agentType {
 	case AgentTypeClaude:
@@ -47,6 +59,8 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 		return cfg.Agents.Codex, nil, nil
 	case AgentTypeGemini:
 		return cfg.Agents.Gemini, nil, nil
+	case AgentTypeAntigravity:
+		return cfg.Agents.Antigravity, nil, nil
 	case AgentTypeOllama:
 		if ollamaHost == "" {
 			return cfg.Agents.Ollama, nil, nil
@@ -58,6 +72,11 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 		return cfg.Agents.Windsurf, nil, nil
 	case AgentTypeAider:
 		return cfg.Agents.Aider, nil, nil
+	case AgentTypeOpencode:
+		// Falls back to the model-aware default when [agents] oc is unset, so
+		// `ntm spawn --oc=N` and `ntm add --oc=N` behave identically and a
+		// model override is honored. See ntm#193.
+		return opencodeCommandOrDefault(cfg.Agents.Opencode), nil, nil
 	default:
 		if p, ok := pluginMap[string(agentType)]; ok {
 			return p.Command, p.Env, nil
@@ -185,10 +204,12 @@ func newAddCmd() *cobra.Command {
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model pinned to Gemini 3.1 Pro (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOllama, &agentSpecs), "ollama", "Ollama agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "cursor", "Cursor agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeWindsurf, &agentSpecs), "windsurf", "Windsurf agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAider, &agentSpecs), "aider", "Aider agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOpencode, &agentSpecs), "oc", "Opencode agents (N or N:model)")
 	cmd.Flags().Var(&personaSpecs, "persona", "Persona-defined agents (name or name:count)")
 
 	// Goal label for multi-session support (bd-1933u)
@@ -205,11 +226,7 @@ func newAddCmd() *cobra.Command {
 	pluginsDir := pluginAgentsDirForArgs(os.Args[1:])
 	loadedPlugins, _ := plugins.LoadAgentPlugins(pluginsDir)
 	for _, p := range loadedPlugins {
-		agentType := AgentType(p.Name)
-		cmd.Flags().Var(NewAgentSpecsValue(agentType, &agentSpecs), p.Name, p.Description)
-		if p.Alias != "" {
-			cmd.Flags().Var(NewAgentSpecsValue(agentType, &agentSpecs), p.Alias, p.Description+" (alias)")
-		}
+		registerPluginAgentFlags(cmd, p, &agentSpecs)
 	}
 
 	return cmd
@@ -391,7 +408,7 @@ func runAdd(opts AddOptions) error {
 
 	// Add agents
 	flatAgents := opts.Agents.Flatten()
-	ccCount, codCount, gmiCount, ollamaCount, cursorCount, windsurfCount, aiderCount := 0, 0, 0, 0, 0, 0, 0
+	ccCount, codCount, gmiCount, agyCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0
 	var rateLimitTracker *ratelimit.RateLimitTracker
 	openAICooldownWaited := false
 	ollamaHost := ""
@@ -463,6 +480,8 @@ func runAdd(opts AddOptions) error {
 			codCount++
 		case AgentTypeGemini:
 			gmiCount++
+		case AgentTypeAntigravity:
+			agyCount++
 		case AgentTypeOllama:
 			ollamaCount++
 		case AgentTypeCursor:
@@ -471,6 +490,8 @@ func runAdd(opts AddOptions) error {
 			windsurfCount++
 		case AgentTypeAider:
 			aiderCount++
+		case AgentTypeOpencode:
+			opencodeCount++
 		}
 
 		// Configure Claude hooks for DCG and RCH integrations
@@ -479,16 +500,12 @@ func runAdd(opts AddOptions) error {
 			var hookSources []string
 
 			if cfg.Integrations.DCG.Enabled && dcg.ShouldConfigureHooks(cfg.Integrations.DCG.Enabled, cfg.Integrations.DCG.BinaryPath) {
-				customWhitelist := cfg.Integrations.DCG.CustomWhitelist
-				if cfg.Integrations.RCH.Enabled && cfg.Integrations.RCH.DCGWhitelist {
-					customWhitelist = dcg.AppendRCHWhitelist(customWhitelist)
-				}
 				dcgOpts := dcg.DCGHookOptions{
 					BinaryPath:      cfg.Integrations.DCG.BinaryPath,
 					AuditLog:        cfg.Integrations.DCG.AuditLog,
-					Timeout:         5000, // 5 second timeout for hook
+					Timeout:         5,
 					CustomBlocklist: cfg.Integrations.DCG.CustomBlocklist,
-					CustomWhitelist: customWhitelist,
+					CustomWhitelist: cfg.Integrations.DCG.CustomWhitelist,
 				}
 				dcgConfig, err := dcg.GenerateHookConfig(dcgOpts)
 				if err == nil {
@@ -503,7 +520,7 @@ func runAdd(opts AddOptions) error {
 				rchHook, err := dcg.GenerateRCHHookEntry(dcg.RCHHookOptions{
 					BinaryPath: cfg.Integrations.RCH.BinaryPath,
 					Patterns:   cfg.Integrations.RCH.InterceptPatterns,
-					Timeout:    5000,
+					Timeout:    5,
 				})
 				if err == nil {
 					preToolHooks = append(preToolHooks, rchHook)
@@ -534,9 +551,17 @@ func runAdd(opts AddOptions) error {
 			}
 		}
 
-		// Resolve model alias to full model name
-		resolvedModel := ResolveModel(agent.Type, agent.Model)
+		// Resolve model alias to full model name (falling back to the plugin's
+		// declared default for bare plugin specs — see resolveAgentModel).
+		resolvedModel := resolveAgentModel(agent.Type, agent.Model, opts.PluginMap)
 		modelRequested := strings.TrimSpace(agent.Model) != ""
+		// Reasoning effort comes from the direct spec (`--cc=N:model:effort`)
+		// parsed onto the FlatAgent, and is overridden by the persona below when
+		// one is attached — mirroring spawn.go's threading. Without this the
+		// Claude template's `{{if .ReasoningEffort}} --effort ...{{end}}` clause
+		// rendered nothing and an added pane silently launched at the CLI
+		// default (ntm#195; same class as the spawn fix from ntm#188).
+		resolvedReasoningEffort := agent.ReasoningEffort
 
 		// Check if this is a persona agent and prepare system prompt
 		var systemPromptFile string
@@ -545,6 +570,9 @@ func runAdd(opts AddOptions) error {
 			if p, ok := opts.PersonaMap[agent.Model]; ok {
 				personaName = p.Name
 				modelRequested = strings.TrimSpace(p.Model) != ""
+				if strings.TrimSpace(p.ReasoningEffort) != "" {
+					resolvedReasoningEffort = p.ReasoningEffort
+				}
 				// Prepare system prompt file
 				promptFile, err := persona.PrepareSystemPrompt(p, dir)
 				if err != nil {
@@ -555,7 +583,7 @@ func runAdd(opts AddOptions) error {
 					systemPromptFile = promptFile
 				}
 				// For persona agents, resolve the model from the persona config
-				resolvedModel = ResolveModel(agent.Type, p.Model)
+				resolvedModel = resolveAgentModel(agent.Type, p.Model, opts.PluginMap)
 			}
 		}
 
@@ -569,6 +597,7 @@ func runAdd(opts AddOptions) error {
 			ProjectDir:       dir,
 			SystemPromptFile: systemPromptFile,
 			PersonaName:      personaName,
+			ReasoningEffort:  resolvedReasoningEffort,
 		})
 		if err != nil {
 			return outputError(fmt.Errorf("generating command for %s agent: %w", agent.Type, err))
@@ -712,10 +741,12 @@ func runAdd(opts AddOptions) error {
 			AddedClaude:         ccCount,
 			AddedCodex:          codCount,
 			AddedGemini:         gmiCount,
+			AddedAntigravity:    agyCount,
 			AddedOllama:         ollamaCount,
 			AddedCursor:         cursorCount,
 			AddedWindsurf:       windsurfCount,
 			AddedAider:          aiderCount,
+			AddedOpencode:       opencodeCount,
 			TotalAdded:          totalAgents,
 			NewPanes:            newPanes,
 		})

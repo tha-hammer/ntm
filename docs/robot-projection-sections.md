@@ -125,7 +125,7 @@ type SessionInfo struct {
 
 type AgentInfo struct {
     Pane           string   `json:"pane"`           // "window.pane" format
-    Type           string   `json:"type"`           // claude, codex, gemini
+    Type           string   `json:"type"`           // claude, codex, antigravity, gemini (legacy)
     Variant        string   `json:"variant,omitempty"` // Model variant
     State          string   `json:"state"`          // idle, busy, error, compacting
     StateTimestamp string   `json:"state_timestamp"` // When state last changed

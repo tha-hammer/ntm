@@ -9,8 +9,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+)
+
+const (
+	// restartPaneSettleDelay is how long to wait after respawn-pane -k before
+	// typing into the fresh shell (the shell needs a moment to initialize).
+	restartPaneSettleDelay = 750 * time.Millisecond
+	// restartPaneReadyTimeout bounds the post-relaunch ready-gate: we poll for
+	// the agent TUI instead of sleeping a fixed interval (#187).
+	restartPaneReadyTimeout = 15 * time.Second
+	// restartPaneReadyPollInterval is the ready-gate poll cadence.
+	restartPaneReadyPollInterval = 400 * time.Millisecond
 )
 
 // RestartPaneOutput is the structured output for --robot-restart-pane
@@ -23,9 +35,15 @@ type RestartPaneOutput struct {
 	DryRun       bool            `json:"dry_run,omitempty"`
 	WouldAffect  []string        `json:"would_affect,omitempty"`
 	BeadAssigned string          `json:"bead_assigned,omitempty"` // Bead ID if --bead was used
-	PromptSent   bool            `json:"prompt_sent,omitempty"`   // True if prompt was sent to pane(s)
+	PromptSent   bool            `json:"prompt_sent,omitempty"`   // True if prompt was delivered after the agent ready-gate passed
 	PromptError  string          `json:"prompt_error,omitempty"`  // Non-fatal prompt send error
-	ProcessAlive map[string]bool `json:"process_alive,omitempty"` // Post-restart liveness per pane
+	ProcessAlive map[string]bool `json:"process_alive,omitempty"` // Post-restart liveness per pane (agent panes require a live agent child, not just the shell)
+	// AgentRelaunched reports, per agent pane, whether the agent CLI was
+	// relaunched after respawn and became ready. respawn-pane -k only restores
+	// the pane's default command (the login shell); in ntm sessions the agent
+	// CLI is started by keystroke after spawn, so it must be relaunched
+	// explicitly (#187). User/unknown panes are not included.
+	AgentRelaunched map[string]bool `json:"agent_relaunched,omitempty"`
 }
 
 // RestartError represents a failed restart attempt
@@ -46,9 +64,10 @@ type RestartPaneOptions struct {
 }
 
 type restartPromptTarget struct {
-	Pane      string
-	Target    string
-	AgentType tmux.AgentType
+	Pane         string
+	Target       string
+	AgentType    tmux.AgentType
+	ResolvedType string // restartPaneAgentType result: "claude", "codex", ..., "user", "unknown"
 }
 
 // GetRestartPane restarts panes (respawn-pane -k) and returns the result.
@@ -115,6 +134,8 @@ func GetRestartPane(opts RestartPaneOptions) (*RestartPaneOutput, error) {
 	for _, p := range opts.Panes {
 		paneFilterMap[p] = true
 	}
+	// Topology-aware keys (#172): canonical "window.pane" on multi-window sessions.
+	multiWindow := paneSessionIsMultiWindow(panes)
 	targetPanes := selectRestartPaneTargets(panes, paneFilterMap, opts.Type, opts.All)
 
 	if len(targetPanes) == 0 {
@@ -125,7 +146,7 @@ func GetRestartPane(opts RestartPaneOptions) (*RestartPaneOutput, error) {
 	if opts.DryRun {
 		output.DryRun = true
 		for _, pane := range targetPanes {
-			paneKey := fmt.Sprintf("%d", pane.Index)
+			paneKey := paneTargetKey(pane, multiWindow)
 			output.WouldAffect = append(output.WouldAffect, paneKey)
 		}
 		if opts.Bead != "" {
@@ -134,10 +155,10 @@ func GetRestartPane(opts RestartPaneOptions) (*RestartPaneOutput, error) {
 		return output, nil
 	}
 
-	// Restart targets — track pane IDs for post-restart liveness check
+	// Restart targets — track pane IDs for post-restart relaunch/liveness steps
 	restartedPaneInfo := make(map[string]restartPromptTarget) // paneKey -> prompt target info
 	for _, pane := range targetPanes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		paneKey := paneTargetKey(pane, multiWindow)
 
 		// Always use kill=true for restart to ensure process is cycled
 		err := tmux.RespawnPane(pane.ID, true)
@@ -149,71 +170,234 @@ func GetRestartPane(opts RestartPaneOptions) (*RestartPaneOutput, error) {
 		} else {
 			output.Restarted = append(output.Restarted, paneKey)
 			restartedPaneInfo[paneKey] = restartPromptTarget{
-				Pane:      paneKey,
-				Target:    pane.ID,
-				AgentType: pane.Type,
+				Pane:         paneKey,
+				Target:       pane.ID,
+				AgentType:    pane.Type,
+				ResolvedType: restartPaneAgentType(pane),
 			}
 		}
 	}
 
-	// Post-restart liveness check: verify each restarted pane has a running child process
+	// Relaunch agent CLIs in respawned agent panes (#187). respawn-pane -k
+	// only restores the pane's default command — the login shell. In ntm
+	// sessions the agent CLI is launched by keystroke after spawn, so without
+	// an explicit relaunch the pane is left at a bare shell and any restart
+	// prompt would be typed into zsh instead of an agent.
+	agentPaneReady := make(map[string]bool, len(output.Restarted))
 	if len(output.Restarted) > 0 {
-		time.Sleep(750 * time.Millisecond)
+		cfg, cfgErr := config.LoadMerged(mustGetwd(), config.DefaultPath())
+		if cfgErr != nil {
+			cfg = config.Default()
+		}
+
+		// Let fresh shells initialize before typing into them.
+		time.Sleep(restartPaneSettleDelay)
+
+		output.AgentRelaunched = make(map[string]bool)
 		output.ProcessAlive = make(map[string]bool, len(output.Restarted))
 		for _, paneKey := range output.Restarted {
-			paneID := restartedPaneInfo[paneKey].Target
-			alive := false
-			// Query the fresh pane_pid from tmux (respawn assigns a new shell PID)
-			pidStr, err := tmux.DefaultClient.Run("display-message", "-t", paneID, "-p", "#{pane_pid}")
-			if err == nil {
-				pidStr = strings.TrimSpace(pidStr)
-				if newPID, convErr := strconv.Atoi(pidStr); convErr == nil && newPID > 0 {
-					alive = process.HasChildAlive(newPID)
-					if !alive {
-						// The shell itself may be the process (no child yet); check shell liveness
-						alive = process.IsAlive(newPID)
-					}
-				}
+			info := restartedPaneInfo[paneKey]
+
+			if !restartTargetIsAgent(info.ResolvedType) {
+				// User/unknown panes have no agent CLI to relaunch; the fresh
+				// shell is the fully restored state.
+				pid := paneShellPID(info.Target)
+				output.ProcessAlive[paneKey] = pid > 0 && process.IsAlive(pid)
+				continue
 			}
-			output.ProcessAlive[paneKey] = alive
+
+			launchCmd := restartAgentLaunchCommand(cfg, info.ResolvedType)
+			if err := tmux.SendKeysForAgent(info.Target, launchCmd, true, info.AgentType); err != nil {
+				output.AgentRelaunched[paneKey] = false
+				output.ProcessAlive[paneKey] = false
+				output.Failed = append(output.Failed, RestartError{
+					Pane:   paneKey,
+					Reason: fmt.Sprintf("failed to relaunch agent: %v", err),
+				})
+				continue
+			}
+
+			// Ready-gate: poll until the agent TUI is up instead of sleeping
+			// a fixed interval, so prompts are never typed into a bare shell.
+			// Query the fresh pane_pid from tmux (respawn assigns a new shell
+			// PID) so the process check sees the post-respawn shell.
+			shellPID := paneShellPID(info.Target)
+			ready := waitForPaneAgentReady(info.Target, shellPID, info.ResolvedType, restartPaneReadyTimeout)
+			agentPaneReady[paneKey] = ready
+			output.AgentRelaunched[paneKey] = ready
+			// Agent panes are only "alive" with a live agent child under the
+			// shell — mere shell liveness is exactly the false success this
+			// command used to report (#187).
+			output.ProcessAlive[paneKey] = shellPID > 0 && process.HasChildAlive(shellPID)
+			if !ready {
+				output.Failed = append(output.Failed, RestartError{
+					Pane:   paneKey,
+					Reason: fmt.Sprintf("agent not ready within %s after relaunch", restartPaneReadyTimeout),
+				})
+			}
 		}
 	}
 
-	// Send prompt to successfully restarted panes
+	// Send prompt to successfully restarted panes. Agent panes only receive
+	// the prompt once the ready-gate has passed; prompt_sent stays false when
+	// any eligible delivery was skipped or failed (#187).
 	if promptToSend != "" && len(output.Restarted) > 0 {
 		if opts.Bead != "" {
 			output.BeadAssigned = opts.Bead
 		}
 
-		// Wait for panes to initialize after respawn
-		time.Sleep(500 * time.Millisecond)
-
 		promptTargets := make([]restartPromptTarget, 0, len(output.Restarted))
+		var promptErrors []string
 		for _, paneKey := range output.Restarted {
-			promptTargets = append(promptTargets, restartedPaneInfo[paneKey])
+			info := restartedPaneInfo[paneKey]
+			if restartTargetIsAgent(info.ResolvedType) && !agentPaneReady[paneKey] {
+				promptErrors = append(promptErrors, fmt.Sprintf("pane %s: agent not ready, prompt not sent", paneKey))
+				continue
+			}
+			promptTargets = append(promptTargets, info)
 		}
-		promptErrors := sendRestartPrompts(promptTargets, promptToSend, tmux.SendKeysForAgentDoubleEnter)
+		promptErrors = append(promptErrors, sendRestartPrompts(promptTargets, promptToSend, tmux.SendKeysForAgentDoubleEnter)...)
 
 		if len(promptErrors) > 0 {
 			output.PromptSent = false
 			output.PromptError = strings.Join(promptErrors, "; ")
 		} else {
-			output.PromptSent = true
+			output.PromptSent = len(promptTargets) > 0
+		}
+	}
+
+	// Honest overall status (#187): any per-pane failure (respawn, relaunch,
+	// or readiness) degrades overall success instead of reporting success:true.
+	if len(output.Failed) > 0 {
+		output.Success = false
+		if output.Error == "" {
+			output.Error = fmt.Sprintf("%d pane(s) failed to restart cleanly", len(output.Failed))
+			output.ErrorCode = ErrCodeInternalError
 		}
 	}
 
 	return output, nil
 }
 
+// restartTargetIsAgent reports whether a resolved pane type identifies an
+// agent CLI pane (as opposed to a user shell or an unidentifiable pane).
+func restartTargetIsAgent(resolvedType string) bool {
+	switch resolvedType {
+	case "", "user", "unknown":
+		return false
+	default:
+		return true
+	}
+}
+
+// restartAgentLaunchCommand resolves the command used to relaunch an agent CLI
+// in a respawned pane. It prefers the configured (template-rendered) agent
+// command — the same command robot-spawn delivers by keystroke — and falls
+// back to the canonical launch alias (cc/cod/gmi/...) when no usable command
+// is configured (#187).
+func restartAgentLaunchCommand(cfg *config.Config, agentType string) string {
+	alias := restartLaunchAlias(agentType)
+
+	var tmpl string
+	if cfg != nil {
+		switch ResolveAgentType(agentType) {
+		case "claude":
+			tmpl = cfg.Agents.Claude
+		case "codex":
+			tmpl = cfg.Agents.Codex
+		case "gemini":
+			tmpl = cfg.Agents.Gemini
+		case "antigravity":
+			tmpl = cfg.Agents.Antigravity
+		case "cursor":
+			tmpl = cfg.Agents.Cursor
+		case "windsurf":
+			tmpl = cfg.Agents.Windsurf
+		case "aider":
+			tmpl = cfg.Agents.Aider
+		case "oc":
+			// Fall back to the model-aware default when [agents] oc is unset
+			// so a respawn launches the real `opencode` binary rather than the
+			// bare `oc` alias. See ntm#193.
+			tmpl = cfg.Agents.Opencode
+			if strings.TrimSpace(tmpl) == "" {
+				tmpl = config.DefaultOpencodeCommand
+			}
+		case "ollama":
+			tmpl = cfg.Agents.Ollama
+		}
+	}
+	if strings.TrimSpace(tmpl) == "" {
+		return alias
+	}
+
+	rendered, err := config.GenerateAgentCommand(tmpl, config.AgentTemplateVars{})
+	if err != nil || strings.TrimSpace(rendered) == "" {
+		return alias
+	}
+	if _, err := tmux.SanitizePaneCommand(rendered); err != nil {
+		return alias
+	}
+	return rendered
+}
+
+// paneShellPID queries the pane's current shell PID from tmux. Returns 0 when
+// unavailable. After respawn-pane the shell PID changes, so this must be
+// queried fresh rather than taken from the pre-restart pane snapshot.
+func paneShellPID(target string) int {
+	pidStr, err := tmux.DefaultClient.Run("display-message", "-t", target, "-p", "#{pane_pid}")
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(pidStr))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
+// waitForPaneAgentReady polls a pane until isAgentReady reports the agent TUI
+// is up AND the pane shell has a live child process (the agent CLI). The
+// process check guards against isAgentReady matching a bare shell prompt
+// glyph (#187). A shellPID <= 0 skips the process check. Returns false when
+// the timeout elapses first.
+func waitForPaneAgentReady(target string, shellPID int, agentType string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		ready := false
+		if captured, err := tmux.CapturePaneOutput(target, 50); err == nil && isAgentReady(captured, agentType) {
+			ready = true
+		}
+		if ready && shellPID > 0 && !process.HasChildAlive(shellPID) {
+			// Content looks ready but nothing is running under the shell —
+			// a bare-prompt false positive. Keep polling.
+			ready = false
+		}
+		if ready {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(restartPaneReadyPollInterval)
+	}
+}
+
 func selectRestartPaneTargets(panes []tmux.Pane, paneFilterMap map[string]bool, filterType string, all bool) []tmux.Pane {
 	hasPaneFilter := len(paneFilterMap) > 0
 	targetType := translateAgentTypeForStatus(filterType)
 
+	// Topology-aware --panes matching (#172): a bare index selects a whole window
+	// on multi-window layouts instead of broadcasting or no-op'ing.
+	multiWindow := paneSessionIsMultiWindow(panes)
+	filterTokens := make([]string, 0, len(paneFilterMap))
+	for k := range paneFilterMap {
+		filterTokens = append(filterTokens, k)
+	}
+
 	var targetPanes []tmux.Pane
 	for _, pane := range panes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
-
-		if hasPaneFilter && !paneFilterMap[paneKey] && !paneFilterMap[pane.ID] {
+		if hasPaneFilter && !paneMatchesAnyToken(pane, filterTokens, multiWindow) {
 			continue
 		}
 

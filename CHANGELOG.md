@@ -11,6 +11,175 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ---
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **`ntm codex preflight` no longer captures deep scrollback (#173).** Preflight inlined its own `capture-pane -S -<lines>` (default `LinesFullContext`=500), so a stale `esc to interrupt` footer buried in scrollback on an otherwise-idle pane could resurrect a false-positive `goal-in-progress` verdict. Preflight now routes through the shared `resolveCodexPane` helper, which captures the **visible screen only** (`capture-pane -S 0`) — matching the goal-action codex subcommands and reflecting the pane's real on-screen state. This changes `provenance_hash`/`captured_lines` in the JSON output (intended).
+- **Robot interrupt / smart-restart now fail loud instead of reporting silent success (#172, safe subset).** On multi-window / window-per-agent layouts, a `--panes` filter could resolve to an empty target set yet the top-level robot response still reported `success: true` (interrupting/restarting nothing). Both `--robot-interrupt` and smart-restart now set `success: false` with a remediation hint (and the panes actually found) when the resolved target set is empty or when one or more individual restart/interrupt actions fail. Emitted pane addresses (`robot.go` send-target / smart-restart action) now carry the pane's real window index instead of a hardcoded `0`, so the `W.P` address round-trips. (The full topology-aware pane-matcher/parser refactor remains as follow-up.)
+
+---
+
+## [v1.18.1] -- 2026-05-20 [GitHub Release]
+
+**2 commits since v1.18.0** — Codex preflight no longer over-rejects ChatGPT/OAuth users.
+
+### Bug Fixes
+
+- **Stop hard-rejecting `gpt-*-codex` on ChatGPT/OAuth logins.** The preflight assumed every `gpt-*-codex` id fails with HTTP 400 on ChatGPT-billed accounts, but that is not universal — recent Codex CLI + ChatGPT plans run `gpt-5.3-codex` and answer prompts fine. The local Codex CLI is now the source of truth: an explicit `gpt-*-codex` model on a ChatGPT login emits a non-blocking advisory and proceeds (capability preserved), with `NTM_CODEX_PREFLIGHT_STRICT=1` to opt back into a hard block (#155) ([0fe72100](https://github.com/Dicklesworthstone/ntm/commit/0fe72100))
+- Reattach an orphaned `waitForAgentsReady` doc comment ([76306f90](https://github.com/Dicklesworthstone/ntm/commit/76306f90))
+
+---
+
+## [v1.18.0] -- 2026-05-20 [GitHub Release]
+
+**10 commits since v1.17.0** — `--profile-set` becomes a first-class persona spawn contract, plus cross-surface fixes.
+
+### Features
+
+- **`--profile-set` / `--profiles` now drive the spawn.** A persona set expands into concrete, ordered agents *before* pane creation — each agent takes its persona's own `agent_type`, model, and prompt, so a persona can never silently run the wrong agent CLI. Adds fail-closed validation on count/type conflicts, deterministic pane assignment, persona-named pane titles, and a machine-readable persona→pane mapping in the spawn JSON (#149) ([779c3a47](https://github.com/Dicklesworthstone/ntm/commit/779c3a47), [dcddd71b](https://github.com/Dicklesworthstone/ntm/commit/dcddd71b), [990e08e4](https://github.com/Dicklesworthstone/ntm/commit/990e08e4))
+- **Alias-aware pane filtering** for robot history ([978f614a](https://github.com/Dicklesworthstone/ntm/commit/978f614a))
+
+### Bug Fixes
+
+- Surface `assign.prompt_template` / `prompt_template_file` in `config diff` for parity with `config show`/`get` (#153) ([358ceb5d](https://github.com/Dicklesworthstone/ntm/commit/358ceb5d))
+- Clamp exported timeline events to the requested time range with carry-in state ([82d270b6](https://github.com/Dicklesworthstone/ntm/commit/82d270b6))
+- Propagate IO errors and fix a temp-file leak in the context-pending rotation store ([f50e8145](https://github.com/Dicklesworthstone/ntm/commit/f50e8145))
+- Tighten the Codex/Gemini "limited" quota regex against neutral quota prose ([17eb10a2](https://github.com/Dicklesworthstone/ntm/commit/17eb10a2))
+- Regression test locking in that expanded personas survive `normalizeSpawnOptions` ([fb02449d](https://github.com/Dicklesworthstone/ntm/commit/fb02449d))
+
+---
+
+## [v1.17.0] -- 2026-05-20 [GitHub Release]
+
+**1 commit since v1.16.3** — project-level default for the assign dispatch template.
+
+### Features
+
+- **Config-driven default bulk-assign dispatch template.** New `[assign] prompt_template` / `prompt_template_file` keys let a project pin its dispatch contract (e.g. "Read SKILL.md", "Set gc.outcome when done") instead of wrapping every `--robot-bulk-assign` call. Resolution precedence: per-invocation `--bulk-assign-template` > configured file > configured inline > built-in const (#153) ([1db27e35](https://github.com/Dicklesworthstone/ntm/commit/1db27e35))
+
+---
+
+## [v1.16.3] -- 2026-05-20 [GitHub Release]
+
+**1 commit since v1.16.2** — worktree CLI correctness.
+
+### Bug Fixes
+
+- **Worktree fixes:** manually-provisioned worktrees are now cleanable by `clean-session` (consistent branch naming), `clean-session` reports the actual count removed instead of false success, and `worktree list --json` emits JSON (#150, #151, #152) ([87a948b7](https://github.com/Dicklesworthstone/ntm/commit/87a948b7))
+
+---
+
+## [v1.16.2] -- 2026-05-20 [GitHub Release]
+
+**1 commit since v1.16.1** — Codex model default.
+
+### Bug Fixes
+
+- Default Codex agents to `gpt-5.5` instead of the obsolete `gpt-5.3-codex` (#148) ([00e789ea](https://github.com/Dicklesworthstone/ntm/commit/00e789ea))
+
+---
+
+## [v1.16.1] -- 2026-05-20 [GitHub Release]
+
+**4 commits since v1.16.0** — Agent Mail and Codex spawn fixes.
+
+### Bug Fixes
+
+- Agent Mail `registration_token` plumbing + overseer via `send_message` (#146) ([7779cbb3](https://github.com/Dicklesworthstone/ntm/commit/7779cbb3))
+- Respect the resolved Codex model in the ChatGPT-account preflight (#147) ([b61f6584](https://github.com/Dicklesworthstone/ntm/commit/b61f6584))
+- Tighten worktree-root + pane-lookup resolution, parse the rch daemon status envelope, allow "." in the lock-path matcher ([d71736b7](https://github.com/Dicklesworthstone/ntm/commit/d71736b7))
+- Fresh-eyes release follow-ups ([308b895a](https://github.com/Dicklesworthstone/ntm/commit/308b895a))
+
+---
+
+## [v1.16.0] -- 2026-05-16 [GitHub Release]
+
+**11 commits since v1.15.1** — wrapper-parity fixes and context-cancellation hardening.
+
+### Features
+
+- **Wrapper-parity bundles:** assign/unlock/redact/state fixes ([9a46a801](https://github.com/Dicklesworthstone/ntm/commit/9a46a801)) and spawn/worktrees/switch fixes ([00e5e1a8](https://github.com/Dicklesworthstone/ntm/commit/00e5e1a8))
+- Modernize the Claude Code hooks integration and tighten handoff validation ([06090fd0](https://github.com/Dicklesworthstone/ntm/commit/06090fd0))
+
+### Bug Fixes
+
+- Make `cmd.Context()` actually cancellable and plumb `context.Context` through the diagnose/fix paths ([880d5799](https://github.com/Dicklesworthstone/ntm/commit/880d5799), [c9aa587c](https://github.com/Dicklesworthstone/ntm/commit/c9aa587c), [a3f79894](https://github.com/Dicklesworthstone/ntm/commit/a3f79894))
+- Resolve tmux panes by ID rather than `session:idx` so pane targeting is `pane-base-index` safe ([b540a212](https://github.com/Dicklesworthstone/ntm/commit/b540a212))
+- DCG integration: always advertise robot mode, use dcg's actual subcommand names ([44cae8f7](https://github.com/Dicklesworthstone/ntm/commit/44cae8f7), [489d235b](https://github.com/Dicklesworthstone/ntm/commit/489d235b))
+
+---
+
+## [v1.15.1] -- 2026-05-14 [GitHub Release]
+
+**1 commit since v1.15.0** — docs.
+
+- Correct source-install guidance in the release docs ([401df929](https://github.com/Dicklesworthstone/ntm/commit/401df929))
+
+---
+
+## [v1.15.0] -- 2026-05-14 [GitHub Release]
+
+**38 commits since v1.14.0** — Go 1.26 toolchain, cross-surface state/audit/tool contracts, and symlink-safety hardening.
+
+### Toolchain & Dependencies
+
+- Bump the Go toolchain to 1.26 and refresh the charmbracelet/chromedp vendored stack ([5b4e99f3](https://github.com/Dicklesworthstone/ntm/commit/5b4e99f3), [f635b12a](https://github.com/Dicklesworthstone/ntm/commit/f635b12a), [7d21473a](https://github.com/Dicklesworthstone/ntm/commit/7d21473a))
+
+### Concurrency & Reliability
+
+- Cross-surface cleanups landing the new state/audit/tool contracts across cli/robot/tui/swarm/ollama/bv/cass/archive/util/webhook/serve ([00457000](https://github.com/Dicklesworthstone/ntm/commit/00457000))
+- Avoid deadlocks under load and surface rate-limit "cleared" transitions across resilience/status/summary/metrics/events ([36213942](https://github.com/Dicklesworthstone/ntm/commit/36213942))
+- Tighten migration TX rollback, expand SQLite pragmas, and stabilise timeline persistence ([8f6693f4](https://github.com/Dicklesworthstone/ntm/commit/8f6693f4))
+- Retry SQLite-locked errors per call and double-check writers under contention ([281bbab0](https://github.com/Dicklesworthstone/ntm/commit/281bbab0))
+- Harden resilience PID/stream cancellation; respect scheduler `GlobalMax` in waiter wake-ups ([1565c8f7](https://github.com/Dicklesworthstone/ntm/commit/1565c8f7), [0aa56e4e](https://github.com/Dicklesworthstone/ntm/commit/0aa56e4e))
+- Recursively register newly-created watcher subdirectories and drop descendant entries on removal/rename ([bfa272c1](https://github.com/Dicklesworthstone/ntm/commit/bfa272c1))
+
+### Security Hardening
+
+- Reject symlinked saved profiles, persona prompt files outside the project, and incremental-diff symlink writes ([9364afc1](https://github.com/Dicklesworthstone/ntm/commit/9364afc1), [bdb0966f](https://github.com/Dicklesworthstone/ntm/commit/bdb0966f), [46be3f95](https://github.com/Dicklesworthstone/ntm/commit/46be3f95))
+- Skip symlink files in directory bundles; resolve git hook paths safely ([b424537d](https://github.com/Dicklesworthstone/ntm/commit/b424537d), [346204e8](https://github.com/Dicklesworthstone/ntm/commit/346204e8))
+
+### Locks & Coordination
+
+- Add the `ntm locks check` API for wrapper-contract callers; own-holder priority + empty-pattern guard ([98dff276](https://github.com/Dicklesworthstone/ntm/commit/98dff276), [f21b54e0](https://github.com/Dicklesworthstone/ntm/commit/f21b54e0))
+- Ignore malformed reservation expiries and shared reservations in `check` ([0da61910](https://github.com/Dicklesworthstone/ntm/commit/0da61910), [475ed187](https://github.com/Dicklesworthstone/ntm/commit/475ed187))
+- Harden Agent Mail pane-identity files ([d031eb0e](https://github.com/Dicklesworthstone/ntm/commit/d031eb0e))
+
+### Pipeline & Assignment
+
+- Split pipeline substitution into seal-retaining vs seal-restoring variants so foreach materialisation never double-substitutes; preserve persisted StepResults for resume-suppressed iterations ([804268f3](https://github.com/Dicklesworthstone/ntm/commit/804268f3), [6a607dfe](https://github.com/Dicklesworthstone/ntm/commit/6a607dfe))
+- Compare agent types canonically so allowed-type checks survive provider aliases; deterministic agent-to-bead selection across strategies ([66ab6887](https://github.com/Dicklesworthstone/ntm/commit/66ab6887), [c9aaba3e](https://github.com/Dicklesworthstone/ntm/commit/c9aaba3e))
+
+---
+
+## [v1.14.0] -- 2026-04-24 [GitHub Release]
+
+**26 commits since v1.13.1** — Claude Code model snapshot/restore and operator-prompt fixes.
+
+### Features
+
+- **Snapshot/restore the Claude Code model setting** across the swarm lifecycle, so per-swarm model overrides don't leak into the user's global Claude Code config (#110) ([29f6efbe](https://github.com/Dicklesworthstone/ntm/commit/29f6efbe), [d27cf24f](https://github.com/Dicklesworthstone/ntm/commit/d27cf24f))
+
+### Bug Fixes
+
+- Teach the controller prompt to use `--robot-*` state commands and `ntm mail inbox SESSION` instead of the broken `ntm view` / `--mail-project=SESSION` forms (#109) ([c6e15d97](https://github.com/Dicklesworthstone/ntm/commit/c6e15d97), [bc734496](https://github.com/Dicklesworthstone/ntm/commit/bc734496))
+- Suppress the fresh-project recovery-inbox warning and tighten the agent-not-found heuristic to avoid APIError false-positives (#108) ([278aa1a1](https://github.com/Dicklesworthstone/ntm/commit/278aa1a1), [ab36867d](https://github.com/Dicklesworthstone/ntm/commit/ab36867d), [04062366](https://github.com/Dicklesworthstone/ntm/commit/04062366))
+- Don't mis-delete a `settings.json` containing JSON null; prevent a `WriteModel` panic on null settings ([7ba6c11a](https://github.com/Dicklesworthstone/ntm/commit/7ba6c11a), [6256bfcb](https://github.com/Dicklesworthstone/ntm/commit/6256bfcb))
+- Only honor the active-spinner override when the spinner appears after the most recent idle prompt ([0a916561](https://github.com/Dicklesworthstone/ntm/commit/0a916561))
+- Register `newTimelineCmd()` so `ntm timeline` is available ([a8649f87](https://github.com/Dicklesworthstone/ntm/commit/a8649f87))
+- Repair CI failures across config merge, alerts, pane-identity, bead handlers, and the perf bench ([eb99f75f](https://github.com/Dicklesworthstone/ntm/commit/eb99f75f))
+
+---
+
+## [v1.13.1] -- 2026-04-16 [GitHub Release]
+
+**1 commit since v1.13.0** — Agent Mail pane-identity contract.
+
+- Converge on the canonical Agent Mail pane-identity contract, fixing drift (#107) ([5ca8a452](https://github.com/Dicklesworthstone/ntm/commit/5ca8a452))
+
+---
+
 ## [v1.13.0] -- 2026-04-12 [GitHub Release]
 
 **56 commits since v1.12.1** — Lifecycle hardening, concurrency safety, and security improvements.

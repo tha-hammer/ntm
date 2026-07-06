@@ -223,7 +223,7 @@ func TestAlertConfigForProject_ResolvesCurrentProjectDirWhenUnset(t *testing.T) 
 		}
 	})
 
-	projectDir := t.TempDir()
+	projectDir := tempDirCanonical(t)
 	nestedDir := filepath.Join(projectDir, "internal", "robot")
 	if err := os.MkdirAll(filepath.Join(projectDir, ".ntm"), 0o755); err != nil {
 		t.Fatal(err)

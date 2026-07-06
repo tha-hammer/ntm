@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
+	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/recovery"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -33,6 +35,7 @@ type SpawnOptions struct {
 	CCCount        int      // Claude agents
 	CodCount       int      // Codex agents
 	GmiCount       int      // Gemini agents
+	AgyCount       int      // Antigravity agents
 	Preset         string   // Recipe/preset name
 	NoUserPane     bool     // Don't create user pane
 	WorkingDir     string   // Override working directory
@@ -48,20 +51,21 @@ type SpawnOptions struct {
 // SpawnOutput is the structured output for --robot-spawn.
 type SpawnOutput struct {
 	RobotResponse
-	Session        string            `json:"session"`
-	CreatedAt      string            `json:"created_at"`
-	PresetUsed     string            `json:"preset_used,omitempty"`
-	WorkingDir     string            `json:"working_dir"`
-	Agents         []SpawnedAgent    `json:"agents"`
-	Layout         string            `json:"layout"`
-	TotalStartupMs int64             `json:"total_startup_ms"`
-	Error          string            `json:"error,omitempty"`
-	DryRun         bool              `json:"dry_run,omitempty"`
-	WouldCreate    []SpawnedAgent    `json:"would_create,omitempty"`
-	Mode           string            `json:"mode,omitempty"`            // "orchestrator" when AssignWork is enabled
-	Assignments    []SpawnAssignment `json:"assignments,omitempty"`     // Work assignments when AssignWork is enabled
-	AssignStrategy string            `json:"assign_strategy,omitempty"` // Strategy used for assignments
-	Recovery       *SpawnRecovery    `json:"recovery,omitempty"`        // Session recovery context from handoff
+	Session        string                   `json:"session"`
+	CreatedAt      string                   `json:"created_at"`
+	PresetUsed     string                   `json:"preset_used,omitempty"`
+	WorkingDir     string                   `json:"working_dir"`
+	Agents         []SpawnedAgent           `json:"agents"`
+	Layout         string                   `json:"layout"`
+	TotalStartupMs int64                    `json:"total_startup_ms"`
+	Error          string                   `json:"error,omitempty"`
+	DryRun         bool                     `json:"dry_run,omitempty"`
+	WouldCreate    []SpawnedAgent           `json:"would_create,omitempty"`
+	Mode           string                   `json:"mode,omitempty"`            // "orchestrator" when AssignWork is enabled
+	Assignments    []SpawnAssignment        `json:"assignments,omitempty"`     // Work assignments when AssignWork is enabled
+	AssignStrategy string                   `json:"assign_strategy,omitempty"` // Strategy used for assignments
+	Recovery       *SpawnRecovery           `json:"recovery,omitempty"`        // Session recovery context from handoff
+	Admission      *pressure.SpawnAdmission `json:"admission,omitempty"`       // Pre-spawn resource-pressure admission result
 }
 
 // SpawnRecovery contains session recovery context loaded from handoff.
@@ -98,6 +102,72 @@ type SpawnedAgent struct {
 	Ready     bool   `json:"ready"`
 	StartupMs int64  `json:"startup_ms"`
 	Error     string `json:"error,omitempty"`
+}
+
+func collectSpawnAdmissionInput(opts SpawnOptions, cfg *config.Config, totalAgents, totalPanes int) pressure.SpawnAdmissionInput {
+	input := pressure.SpawnAdmissionInput{
+		Session:         opts.Session,
+		RequestedAgents: totalAgents,
+		RequestedPanes:  totalPanes,
+	}
+
+	if cfg == nil || cfg.SpawnPacing.Enabled {
+		input.LargeSpawnThreshold = pressure.DefaultBudget().MaxPipelineFanout
+		if cfg != nil {
+			if cfg.SpawnPacing.MaxConcurrentSpawns > 0 {
+				input.LargeSpawnThreshold = cfg.SpawnPacing.MaxConcurrentSpawns
+			}
+			input.MaxAgents = spawnAdmissionAgentLimit(cfg)
+		}
+		input.Pressure = collectSystemPressureSnapshot()
+	}
+
+	panesBySession, err := tmux.GetAllPanes()
+	if err != nil {
+		return input
+	}
+	input.RunningSessions = len(panesBySession)
+	for session, panes := range panesBySession {
+		if session == opts.Session {
+			input.SessionPanes = len(panes)
+		}
+		input.CurrentPanes += len(panes)
+		for _, pane := range panes {
+			if isSpawnAdmissionAgentPane(pane) {
+				input.RunningAgents++
+			}
+		}
+	}
+	return input
+}
+
+func spawnAdmissionAgentLimit(cfg *config.Config) int {
+	if cfg == nil {
+		return 0
+	}
+	caps := cfg.SpawnPacing.AgentCaps
+	total := 0
+	for _, cap := range []int{caps.ClaudeMaxConcurrent, caps.CodexMaxConcurrent, caps.GeminiMaxConcurrent} {
+		if cap > 0 {
+			total += cap
+		}
+	}
+	return total
+}
+
+func collectSystemPressureSnapshot() pressure.Snapshot {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	g := pressure.New(pressure.Config{
+		Mode:      pressure.ModeEnforce,
+		Providers: []pressure.Provider{pressure.NewSystemProvider()},
+	})
+	return g.Refresh(ctx)
+}
+
+func isSpawnAdmissionAgentPane(pane tmux.Pane) bool {
+	agentType := pane.Type.Canonical()
+	return agentType != "" && agentType != tmux.AgentUser
 }
 
 // GetSpawn creates a session with agents and returns structured output.
@@ -144,7 +214,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	_ = audit.LogEvent(opts.Session, audit.EventTypeSpawn, audit.ActorSystem, "robot.spawn", map[string]interface{}{
 		"phase":           "start",
 		"session":         opts.Session,
-		"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount,
+		"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount,
 		"preset":          opts.Preset,
 		"no_user_pane":    opts.NoUserPane,
 		"dry_run":         opts.DryRun,
@@ -162,7 +232,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 		payload := map[string]interface{}{
 			"phase":           "finish",
 			"session":         opts.Session,
-			"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount,
+			"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount,
 			"preset":          opts.Preset,
 			"no_user_pane":    opts.NoUserPane,
 			"dry_run":         opts.DryRun,
@@ -229,9 +299,9 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	// handoffCtx is available for use in work prompts below
 	_ = handoffCtx // silence unused warning when not in orchestrator mode
 
-	totalAgents := opts.CCCount + opts.CodCount + opts.GmiCount
+	totalAgents := opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount
 	if totalAgents == 0 {
-		output.Error = "no agents specified (use cc, cod, or gmi counts)"
+		output.Error = "no agents specified (use cc, cod, gmi, or agy counts)"
 		output.RobotResponse = NewErrorResponse(fmt.Errorf("%s", output.Error), ErrCodeInvalidFlag, "Specify at least one agent count")
 		return output, nil
 	}
@@ -240,6 +310,18 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	totalPanes := totalAgents
 	if !opts.NoUserPane {
 		totalPanes++
+	}
+
+	admission := pressure.EvaluateSpawnAdmission(collectSpawnAdmissionInput(opts, cfg, totalAgents, totalPanes))
+	output.Admission = &admission
+	if !opts.DryRun && admission.Decision != pressure.SpawnAdmissionAdmit {
+		output.Error = fmt.Sprintf("spawn admission %s: %s", admission.Decision, admission.Reason)
+		hint := admission.Hint
+		if hint == "" {
+			hint = "Reduce requested agents or wait for resource headroom"
+		}
+		output.RobotResponse = NewErrorResponse(fmt.Errorf("%s", output.Error), ErrCodeResourceBusy, hint)
+		return output, nil
 	}
 
 	// Dry-run mode: show what would happen without executing
@@ -298,6 +380,17 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 				Name:  dryRunNameMap.AssignNew("gemini", gmiPane),
 				Type:  "gemini",
 				Title: fmt.Sprintf("%s__gmi_%d", opts.Session, i+1),
+			})
+			paneIdx++
+		}
+
+		for i := 0; i < opts.AgyCount; i++ {
+			agyPane := fmt.Sprintf("0.%d", paneIdx)
+			output.WouldCreate = append(output.WouldCreate, SpawnedAgent{
+				Pane:  agyPane,
+				Name:  dryRunNameMap.AssignNew("antigravity", agyPane),
+				Type:  "antigravity",
+				Title: fmt.Sprintf("%s__agy_%d", opts.Session, i+1),
 			})
 			paneIdx++
 		}
@@ -412,6 +505,14 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	for i := 0; i < opts.GmiCount && agentNum < len(panes); i++ {
 		agent := launchAgent(panes[agentNum], opts.Session, "gemini", i+1, dir, agentCommands["gemini"])
 		agent.Name = nameMap.AssignNew("gemini", agent.Pane)
+		output.Agents = append(output.Agents, agent)
+		agentNum++
+	}
+
+	// Launch Antigravity agents
+	for i := 0; i < opts.AgyCount && agentNum < len(panes); i++ {
+		agent := launchAgent(panes[agentNum], opts.Session, "antigravity", i+1, dir, agentCommands["antigravity"])
+		agent.Name = nameMap.AssignNew("antigravity", agent.Pane)
 		output.Agents = append(output.Agents, agent)
 		agentNum++
 	}
@@ -593,6 +694,8 @@ func agentTypeShort(agentType string) string {
 		return "cod"
 	case tmux.AgentGemini:
 		return "gmi"
+	case tmux.AgentAntigravity:
+		return "agy"
 	case tmux.AgentCursor:
 		return "cursor"
 	case tmux.AgentWindsurf:
@@ -612,9 +715,10 @@ func agentTypeShort(agentType string) string {
 // Templates are rendered with empty vars (optional fields only).
 func getAgentCommands(cfg *config.Config) map[string]string {
 	defaults := map[string]string{
-		"claude": "claude",
-		"codex":  "codex",
-		"gemini": "gemini",
+		"claude":      "claude",
+		"codex":       "codex",
+		"gemini":      "gemini",
+		"antigravity": "agy",
 	}
 
 	if cfg != nil && cfg.Agents.Claude != "" {
@@ -625,6 +729,9 @@ func getAgentCommands(cfg *config.Config) map[string]string {
 	}
 	if cfg != nil && cfg.Agents.Gemini != "" {
 		defaults["gemini"] = cfg.Agents.Gemini
+	}
+	if cfg != nil && cfg.Agents.Antigravity != "" {
+		defaults["antigravity"] = cfg.Agents.Antigravity
 	}
 
 	// Render templates with empty vars (all template fields are optional)

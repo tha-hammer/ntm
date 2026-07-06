@@ -4,10 +4,20 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
 // LoadMerged loads the global config and merges any project-specific config found starting from cwd.
+//
+// If the project overlay (.ntm/config.toml) fails to parse/validate, the global
+// config that loaded successfully is preserved and the bad overlay is skipped
+// after printing a clear stderr warning that names the offending file and the
+// parse error. This avoids silently reverting every global setting to built-in
+// defaults just because a project overlay has a typo or stale schema (issue #162).
+//
+// A genuinely broken global config still returns an error so the caller can
+// surface the real cause.
 func LoadMerged(cwd, globalPath string) (*Config, error) {
 	// Load global
 	cfg, err := loadWithCWD(globalPath, cwd)
@@ -22,8 +32,18 @@ func LoadMerged(cwd, globalPath string) (*Config, error) {
 
 	projectDir, projectCfg, err := FindProjectConfig(cwd)
 	if err != nil {
-		// Return error if project config is invalid, so user knows
-		return cfg, fmt.Errorf("loading project config: %w", err)
+		// The project overlay is invalid. Keep the global config that loaded
+		// fine and skip only the bad overlay, warning loudly on stderr so the
+		// user sees the real cause (offending file + parse error) instead of
+		// silently reverting to built-in defaults.
+		projectConfigPath := "project .ntm/config.toml"
+		if projectDir != "" {
+			projectConfigPath = filepath.Join(projectDir, ".ntm", "config.toml")
+		}
+		fmt.Fprintf(os.Stderr,
+			"ntm: warning: ignoring invalid project config %s: %v (continuing with global config)\n",
+			projectConfigPath, err)
+		return cfg, nil
 	}
 
 	if projectCfg != nil {

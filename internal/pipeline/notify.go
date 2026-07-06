@@ -167,13 +167,23 @@ func (n *Notifier) notifyDesktop(payload NotificationPayload) error {
 }
 
 func notifyMacOS(title, body string) error {
+	// bd-coq43: bound osascript with the same 2 s ceiling notifyLinux uses
+	// (bd-7ramj.1) so a modal Apple permission dialog, wedged
+	// NotificationCenter, or TCC authorization stall can't freeze the
+	// pipeline thread.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
 	script := fmt.Sprintf(`display notification %q with title %q`, body, title)
-	cmd := exec.Command("osascript", "-e", script)
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
 	return cmd.Run()
 }
 
 func notifyLinux(title, body string) error {
-	cmd := exec.Command("notify-send", title, body)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "notify-send", title, body)
 	return cmd.Run()
 }
 

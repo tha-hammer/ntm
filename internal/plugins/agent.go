@@ -21,7 +21,12 @@ type AgentPlugin struct {
 	Description string            `toml:"description"`
 	Env         map[string]string `toml:"env"`
 	Defaults    struct {
-		Tags []string `toml:"tags"`
+		// Model is the default model an agent of this plugin type spawns with
+		// when the invocation omits an explicit model (e.g. bare `--hermes=1`).
+		// Consumed by the CLI's model resolution as the lowest-precedence
+		// fallback, below explicit specs and global config defaults.
+		Model string   `toml:"model"`
+		Tags  []string `toml:"tags"`
 	} `toml:"defaults"`
 }
 

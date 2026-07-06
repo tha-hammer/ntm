@@ -87,7 +87,7 @@ func GetDashboard() (*DashboardOutput, error) {
 							continue
 						}
 						snapSession.Agents = append(snapSession.Agents, SnapshotAgent{
-							Pane:           fmt.Sprintf("%d.%d", 0, pane.Index),
+							Pane:           fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
 							Type:           agentType,
 							Variant:        pane.Variant,
 							TypeConfidence: 0.5,
@@ -102,12 +102,16 @@ func GetDashboard() (*DashboardOutput, error) {
 							output.Summary.CodexCount++
 						case "gemini":
 							output.Summary.GeminiCount++
+						case "antigravity":
+							output.Summary.AntigravityCount++
 						case "cursor":
 							output.Summary.CursorCount++
 						case "windsurf":
 							output.Summary.WindsurfCount++
 						case "aider":
 							output.Summary.AiderCount++
+						case "oc":
+							output.Summary.OpencodeCount++
 						case "ollama":
 							output.Summary.OllamaCount++
 						}
@@ -245,9 +249,11 @@ func printDashboardMarkdown(output DashboardOutput) error {
 	fmt.Fprintf(&sb, "| Claude | %d |\n", typeCounts["claude"])
 	fmt.Fprintf(&sb, "| Codex | %d |\n", typeCounts["codex"])
 	fmt.Fprintf(&sb, "| Gemini | %d |\n", typeCounts["gemini"])
+	fmt.Fprintf(&sb, "| Antigravity | %d |\n", typeCounts["antigravity"])
 	fmt.Fprintf(&sb, "| Cursor | %d |\n", typeCounts["cursor"])
 	fmt.Fprintf(&sb, "| Windsurf | %d |\n", typeCounts["windsurf"])
 	fmt.Fprintf(&sb, "| Aider | %d |\n", typeCounts["aider"])
+	fmt.Fprintf(&sb, "| Opencode | %d |\n", typeCounts["oc"])
 	fmt.Fprintf(&sb, "| Ollama | %d |\n", typeCounts["ollama"])
 	if otherPanes > 0 {
 		fmt.Fprintf(&sb, "| Other Agents | %d |\n", otherPanes)
@@ -278,12 +284,12 @@ func printDashboardMarkdown(output DashboardOutput) error {
 	if len(output.Agents) == 0 {
 		sb.WriteString("_No tmux sessions detected._\n\n")
 	} else {
-		sb.WriteString("| Session | Attached | Panes | User | Claude | Codex | Gemini | Cursor | Windsurf | Aider | Ollama | Other |\n")
-		sb.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+		sb.WriteString("| Session | Attached | Panes | User | Claude | Codex | Gemini | Antigravity | Cursor | Windsurf | Aider | Ollama | Other |\n")
+		sb.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 		for _, sess := range output.Agents {
 			sessTotal, sessUsers, sessCounts := dashboardCounts([]SnapshotSession{sess})
 			sessOther := dashboardOtherAgentCount(sessTotal, sessUsers, sessCounts)
-			fmt.Fprintf(&sb, "| %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |\n",
+			fmt.Fprintf(&sb, "| %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |\n",
 				escapeMarkdownCell(sess.Name, 80),
 				yesNo(sess.Attached),
 				sessTotal,
@@ -291,6 +297,7 @@ func printDashboardMarkdown(output DashboardOutput) error {
 				sessCounts["claude"],
 				sessCounts["codex"],
 				sessCounts["gemini"],
+				sessCounts["antigravity"],
 				sessCounts["cursor"],
 				sessCounts["windsurf"],
 				sessCounts["aider"],
@@ -417,17 +424,22 @@ func writeAttentionSection(sb *strings.Builder, attention *SnapshotAttentionSumm
 	}
 }
 
-func dashboardCounts(sessions []SnapshotSession) (totalPanes, userPanes int, typeCounts map[string]int) {
-	typeCounts = map[string]int{
-		"claude":   0,
-		"codex":    0,
-		"gemini":   0,
-		"cursor":   0,
-		"windsurf": 0,
-		"aider":    0,
-		"ollama":   0,
-		"user":     0,
+func dashboardCounts(sessions []SnapshotSession) (int, int, map[string]int) {
+	totalPanes := 0
+	userPanes := 0
+	typeCounts := map[string]int{
+		"claude":      0,
+		"codex":       0,
+		"gemini":      0,
+		"antigravity": 0,
+		"cursor":      0,
+		"windsurf":    0,
+		"aider":       0,
+		"oc":          0,
+		"ollama":      0,
+		"user":        0,
 	}
+
 	for _, sess := range sessions {
 		for _, agent := range sess.Agents {
 			totalPanes++
@@ -448,7 +460,7 @@ func dashboardCounts(sessions []SnapshotSession) (totalPanes, userPanes int, typ
 
 func dashboardOtherAgentCount(totalPanes, userPanes int, typeCounts map[string]int) int {
 	otherPanes := totalPanes - userPanes
-	for _, agentType := range []string{"claude", "codex", "gemini", "cursor", "windsurf", "aider", "ollama"} {
+	for _, agentType := range []string{"claude", "codex", "gemini", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama"} {
 		otherPanes -= typeCounts[agentType]
 	}
 	if otherPanes < 0 {

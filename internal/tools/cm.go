@@ -182,10 +182,14 @@ func (a *CMAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 
 // CM-specific methods
 
-// GetContext retrieves contextual information for a task
+// GetContext retrieves contextual information for a task. The CMAdapter
+// itself doesn't carry workspace identity (it's called from generic tool
+// adapters with no workingDir context), so it forwards an empty workspace
+// to CM's unscoped query. Callers that need workspace-scoped retrieval
+// should use the workspace-aware paths in `internal/cm/client.go` directly.
 func (a *CMAdapter) GetContext(ctx context.Context, taskDescription string) (json.RawMessage, error) {
 	if a.client != nil {
-		res, err := a.client.GetContext(ctx, taskDescription)
+		res, err := a.client.GetContext(ctx, taskDescription, "")
 		if err == nil {
 			return json.Marshal(res)
 		}

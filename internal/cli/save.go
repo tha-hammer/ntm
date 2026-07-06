@@ -22,6 +22,7 @@ func newSaveCmd() *cobra.Command {
 		ccFlag    bool
 		codFlag   bool
 		gmiFlag   bool
+		agyFlag   bool
 	)
 
 	cmd := &cobra.Command{
@@ -46,10 +47,11 @@ Examples:
 			}
 
 			filter := AgentFilter{
-				All:    allFlag,
-				Claude: ccFlag,
-				Codex:  codFlag,
-				Gemini: gmiFlag,
+				All:         allFlag,
+				Claude:      ccFlag,
+				Codex:       codFlag,
+				Gemini:      gmiFlag,
+				Antigravity: agyFlag,
 			}
 
 			// Default to all if no filter specified
@@ -67,6 +69,7 @@ Examples:
 	cmd.Flags().BoolVar(&ccFlag, "cc", false, "Save from Claude panes")
 	cmd.Flags().BoolVar(&codFlag, "cod", false, "Save from Codex panes")
 	cmd.Flags().BoolVar(&gmiFlag, "gmi", false, "Save from Gemini panes")
+	cmd.Flags().BoolVar(&agyFlag, "agy", false, "Save from Antigravity panes")
 	cmd.ValidArgsFunction = completeSessionArgs
 
 	return cmd

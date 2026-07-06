@@ -556,6 +556,32 @@ claude = "claude --project test"
 	})
 }
 
+// captureStderr runs fn with os.Stderr redirected to a pipe and returns
+// everything written to stderr during the call.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	fn()
+
+	os.Stderr = orig
+	_ = w.Close()
+	out := <-done
+	_ = r.Close()
+	return out
+}
+
 func TestLoadMerged(t *testing.T) {
 	// Create temp dirs for global and project configs
 	globalDir := t.TempDir()
@@ -638,18 +664,61 @@ claude = "claude --project-override"
 		}
 	})
 
-	t.Run("returns error for invalid project config", func(t *testing.T) {
+	t.Run("invalid project overlay is skipped and global config preserved", func(t *testing.T) {
+		// Issue #162: a project .ntm/config.toml that fails to parse/validate
+		// must NOT silently discard the (valid) global config. The bad overlay
+		// is skipped, the global config survives, a warning is printed to
+		// stderr, and LoadMerged returns no error.
 		badProjectDir := t.TempDir()
 		badNtmDir := filepath.Join(badProjectDir, ".ntm")
 		os.MkdirAll(badNtmDir, 0755)
 		os.WriteFile(filepath.Join(badNtmDir, "config.toml"), []byte("invalid { toml"), 0644)
 
-		_, err := LoadMerged(badProjectDir, globalConfigPath)
-		if err == nil {
-			t.Fatal("expected error for invalid project config")
+		stderr := captureStderr(t, func() {
+			cfg, err := LoadMerged(badProjectDir, globalConfigPath)
+			if err != nil {
+				t.Fatalf("LoadMerged should not error on invalid project overlay, got=%v", err)
+			}
+			// The valid global config must be preserved (theme=nord here),
+			// not reverted to built-in defaults.
+			if cfg.Theme != "nord" {
+				t.Errorf("expected global theme nord to survive bad overlay, got=%s", cfg.Theme)
+			}
+		})
+
+		// A clear stderr warning naming the offending file + parse error.
+		if !strings.Contains(stderr, "config.toml") {
+			t.Errorf("expected warning to name the offending project config file, got=%q", stderr)
 		}
-		if !strings.Contains(err.Error(), "project config") {
-			t.Errorf("expected error to mention project config, got=%v", err)
+		if !strings.Contains(stderr, "warning") {
+			t.Errorf("expected a warning to be printed to stderr, got=%q", stderr)
+		}
+	})
+
+	t.Run("unknown-field project overlay is skipped and global config preserved", func(t *testing.T) {
+		// Mirrors the exact reproduction in issue #162: an unknown top-level
+		// section in the project overlay must not nuke the global config.
+		badProjectDir := t.TempDir()
+		badNtmDir := filepath.Join(badProjectDir, ".ntm")
+		os.MkdirAll(badNtmDir, 0755)
+		os.WriteFile(filepath.Join(badNtmDir, "config.toml"),
+			[]byte("[unknown_section]\nsome_field = 1\n"), 0644)
+
+		stderr := captureStderr(t, func() {
+			cfg, err := LoadMerged(badProjectDir, globalConfigPath)
+			if err != nil {
+				t.Fatalf("LoadMerged should not error on unknown-field overlay, got=%v", err)
+			}
+			if cfg.Theme != "nord" {
+				t.Errorf("expected global theme nord to survive bad overlay, got=%s", cfg.Theme)
+			}
+		})
+
+		if !strings.Contains(stderr, "unknown_section") {
+			t.Errorf("expected warning to surface the real parse error, got=%q", stderr)
+		}
+		if !strings.Contains(stderr, filepath.Join(badNtmDir, "config.toml")) {
+			t.Errorf("expected warning to name the offending file path, got=%q", stderr)
 		}
 	})
 

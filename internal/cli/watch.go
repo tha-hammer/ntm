@@ -24,18 +24,19 @@ import (
 
 func newWatchCmd() *cobra.Command {
 	var (
-		filterClaude bool
-		filterCodex  bool
-		filterGemini bool
-		filterPane   string
-		activityOnly bool
-		tailLines    int
-		noColor      bool
-		noTimestamps bool
-		pollInterval string
-		watchBead    string
-		watchPattern string
-		watchCommand string
+		filterClaude      bool
+		filterCodex       bool
+		filterGemini      bool
+		filterAntigravity bool
+		filterPane        string
+		activityOnly      bool
+		tailLines         int
+		noColor           bool
+		noTimestamps      bool
+		pollInterval      string
+		watchBead         string
+		watchPattern      string
+		watchCommand      string
 	)
 
 	cmd := &cobra.Command{
@@ -68,19 +69,20 @@ Examples:
 			}
 
 			opts := watchOptions{
-				filterClaude: filterClaude,
-				filterCodex:  filterCodex,
-				filterGemini: filterGemini,
-				filterPane:   filterPane,
-				activityOnly: activityOnly,
-				tailLines:    tailLines,
-				noColor:      noColor,
-				noTimestamps: noTimestamps,
-				pollInterval: interval,
-				watchBead:    watchBead,
-				intervalSet:  cmd.Flags().Changed("interval"),
-				watchPattern: watchPattern,
-				watchCommand: watchCommand,
+				filterClaude:      filterClaude,
+				filterCodex:       filterCodex,
+				filterGemini:      filterGemini,
+				filterAntigravity: filterAntigravity,
+				filterPane:        filterPane,
+				activityOnly:      activityOnly,
+				tailLines:         tailLines,
+				noColor:           noColor,
+				noTimestamps:      noTimestamps,
+				pollInterval:      interval,
+				watchBead:         watchBead,
+				intervalSet:       cmd.Flags().Changed("interval"),
+				watchPattern:      watchPattern,
+				watchCommand:      watchCommand,
 			}
 
 			return runWatch(session, opts)
@@ -90,6 +92,7 @@ Examples:
 	cmd.Flags().BoolVar(&filterClaude, "cc", false, "Only watch Claude agents")
 	cmd.Flags().BoolVar(&filterCodex, "cod", false, "Only watch Codex agents")
 	cmd.Flags().BoolVar(&filterGemini, "gmi", false, "Only watch Gemini agents")
+	cmd.Flags().BoolVar(&filterAntigravity, "agy", false, "Only watch Antigravity agents")
 	cmd.Flags().StringVar(&filterPane, "pane", "", "Watch specific pane (by name or index)")
 	cmd.Flags().BoolVar(&activityOnly, "activity", false, "Only print when new output appears")
 	cmd.Flags().IntVar(&tailLines, "tail", 20, "Start with last N lines of output")
@@ -106,19 +109,20 @@ Examples:
 }
 
 type watchOptions struct {
-	filterClaude bool
-	filterCodex  bool
-	filterGemini bool
-	filterPane   string
-	activityOnly bool
-	tailLines    int
-	noColor      bool
-	noTimestamps bool
-	pollInterval time.Duration
-	watchBead    string
-	intervalSet  bool
-	watchPattern string
-	watchCommand string
+	filterClaude      bool
+	filterCodex       bool
+	filterGemini      bool
+	filterAntigravity bool
+	filterPane        string
+	activityOnly      bool
+	tailLines         int
+	noColor           bool
+	noTimestamps      bool
+	pollInterval      time.Duration
+	watchBead         string
+	intervalSet       bool
+	watchPattern      string
+	watchCommand      string
 }
 
 func runWatch(session string, opts watchOptions) error {
@@ -424,7 +428,7 @@ func runBeadWatch(ctx context.Context, session, projectDir string, opts watchOpt
 
 func filterPanes(panes []tmux.Pane, opts watchOptions) []tmux.Pane {
 	// If no filters, return all panes
-	if !opts.filterClaude && !opts.filterCodex && !opts.filterGemini && opts.filterPane == "" {
+	if !opts.filterClaude && !opts.filterCodex && !opts.filterGemini && !opts.filterAntigravity && opts.filterPane == "" {
 		return panes
 	}
 
@@ -439,7 +443,8 @@ func filterPanes(panes []tmux.Pane, opts watchOptions) []tmux.Pane {
 		}
 
 		// Filter by agent type
-		if matchesLegacySendTypeFilter(p, opts.filterClaude, opts.filterCodex, opts.filterGemini) {
+		if matchesLegacySendTypeFilter(p, opts.filterClaude, opts.filterCodex, opts.filterGemini) ||
+			(opts.filterAntigravity && tmux.AgentType(p.Type).Canonical() == tmux.AgentAntigravity) {
 			filtered = append(filtered, p)
 		}
 	}
@@ -551,12 +556,16 @@ func paneOutputPrefixColor(agentType tmux.AgentType, t theme.Theme) lipgloss.Col
 		return t.Codex
 	case agent.AgentTypeGemini:
 		return t.Gemini
+	case agent.AgentTypeAntigravity:
+		return t.Lavender
 	case agent.AgentTypeCursor:
 		return t.Cursor
 	case agent.AgentTypeWindsurf:
 		return t.Windsurf
 	case agent.AgentTypeAider:
 		return t.Aider
+	case agent.AgentTypeOpencode:
+		return t.Opencode
 	case agent.AgentTypeOllama:
 		return t.Ollama
 	case agent.AgentTypeUser:

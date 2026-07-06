@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/history"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func TestGetHistoryPagination(t *testing.T) {
@@ -170,6 +171,39 @@ func TestGetHistoryStatsHonorsFilters(t *testing.T) {
 	}
 	if output.Filtered != 1 {
 		t.Fatalf("expected filtered count 1, got %d", output.Filtered)
+	}
+}
+
+func TestHistoryPaneFilterAliasesMatchStoredPaneIndex(t *testing.T) {
+	pane := tmux.Pane{
+		ID:          "%42",
+		Index:       2,
+		WindowIndex: 0,
+		NTMIndex:    1,
+		Title:       "proj__cc_1",
+	}
+
+	if !historyPaneMatchesFilter(pane, "%42") {
+		t.Fatal("expected tmux pane ID filter to match live pane")
+	}
+	if !historyPaneMatchesFilter(pane, "0.2") {
+		t.Fatal("expected window.pane filter to match live pane")
+	}
+	if !historyPaneMatchesFilter(pane, "proj__cc_1") {
+		t.Fatal("expected pane title filter to match live pane")
+	}
+
+	aliases := historyPaneAliases(pane)
+	entry := history.NewEntry("proj", []string{"2"}, "prompt", history.SourceCLI)
+	if !historyEntryMatchesPaneFilter(*entry, aliases) {
+		t.Fatal("pane aliases must match history entries stored by pane index")
+	}
+
+	targetAliases := map[string]struct{}{}
+	addHistoryPaneTargetAliases(targetAliases, pane)
+	wrongEntry := history.NewEntry("proj", []string{"1"}, "wrong prompt", history.SourceCLI)
+	if historyEntryMatchesPaneFilter(*wrongEntry, targetAliases) {
+		t.Fatal("target aliases must not over-match entries stored under a different pane index")
 	}
 }
 

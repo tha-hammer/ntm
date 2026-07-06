@@ -96,7 +96,7 @@ CREATE TABLE runtime_agents (
     session_id    TEXT NOT NULL REFERENCES runtime_sessions(session_id) ON DELETE CASCADE,
     pane_id       TEXT NOT NULL,     -- window.pane format
     pane_index    INTEGER NOT NULL,
-    agent_type    TEXT NOT NULL,     -- claude, codex, gemini, user
+    agent_type    TEXT NOT NULL,     -- claude, codex, antigravity, gemini (legacy), user
 
     -- State
     state         TEXT NOT NULL DEFAULT 'unknown',  -- idle, busy, error, compacting, unknown

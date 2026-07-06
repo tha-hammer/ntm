@@ -336,17 +336,19 @@ func Emit(eventType EventType, session string, data interface{}) {
 }
 
 // EmitSessionCreate logs a session creation event.
-func EmitSessionCreate(session string, claudeCount, codexCount, geminiCount, cursorCount, windsurfCount, aiderCount, ollamaCount int, workDir, recipe string) {
+func EmitSessionCreate(session string, claudeCount, codexCount, geminiCount, antigravityCount, cursorCount, windsurfCount, aiderCount, opencodeCount, ollamaCount int, workDir, recipe string) {
 	Emit(EventSessionCreate, session, SessionCreateData{
-		ClaudeCount:   claudeCount,
-		CodexCount:    codexCount,
-		GeminiCount:   geminiCount,
-		CursorCount:   cursorCount,
-		WindsurfCount: windsurfCount,
-		AiderCount:    aiderCount,
-		OllamaCount:   ollamaCount,
-		WorkDir:       workDir,
-		Recipe:        recipe,
+		ClaudeCount:      claudeCount,
+		CodexCount:       codexCount,
+		GeminiCount:      geminiCount,
+		AntigravityCount: antigravityCount,
+		CursorCount:      cursorCount,
+		WindsurfCount:    windsurfCount,
+		AiderCount:       aiderCount,
+		OpencodeCount:    opencodeCount,
+		OllamaCount:      ollamaCount,
+		WorkDir:          workDir,
+		Recipe:           recipe,
 	})
 }
 
@@ -530,6 +532,7 @@ func (l *Logger) LastEvent() (*Event, error) {
 	const bufferSize = 4096
 	buf := make([]byte, bufferSize)
 	offset := fileSize
+	lineEnd := fileSize
 
 	for offset > 0 {
 		readSize := int64(bufferSize)
@@ -548,24 +551,28 @@ func (l *Logger) LastEvent() (*Event, error) {
 				// Potential end of a line.
 				// If this is the very last byte of file, it's just the terminator of the last line.
 				if offset+int64(i) == fileSize-1 {
+					lineEnd = offset + int64(i)
 					continue
 				}
 
 				// Found start of the last line
 				lineStart := offset + int64(i) + 1
-				lineLen := fileSize - lineStart
-				if lineLen > 10*1024*1024 {
+				lineLen := lineEnd - lineStart
+				if lineLen > 10*1024*1024 || lineLen <= 0 {
+					lineEnd = offset + int64(i)
 					continue // Sanity check
 				}
 
 				lineBuf := make([]byte, lineLen)
 				if _, err := f.ReadAt(lineBuf, lineStart); err != nil && err != io.EOF {
+					lineEnd = offset + int64(i)
 					continue
 				}
 
 				// Decrypt if encrypted
 				plain, err := decryptJSONLine(lineBuf)
 				if err != nil {
+					lineEnd = offset + int64(i)
 					continue
 				}
 
@@ -573,16 +580,18 @@ func (l *Logger) LastEvent() (*Event, error) {
 				if err := json.Unmarshal(plain, &event); err == nil {
 					return &event, nil
 				}
+
+				// Update lineEnd for the next line we might test
+				lineEnd = offset + int64(i)
 			}
 		}
 	}
 
 	// If we got here, maybe only one line and no trailing newline
-	if _, err := f.Seek(0, io.SeekStart); err == nil {
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-		if scanner.Scan() {
-			plain, err := decryptJSONLine(scanner.Bytes())
+	if lineEnd > 0 {
+		lineBuf := make([]byte, lineEnd)
+		if _, err := f.ReadAt(lineBuf, 0); err == nil {
+			plain, err := decryptJSONLine(lineBuf)
 			if err == nil {
 				var event Event
 				if err := json.Unmarshal(plain, &event); err == nil {

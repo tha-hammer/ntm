@@ -262,6 +262,14 @@ func runSessionTemplatesShow(name string) error {
 		fmt.Printf("    %sGemini%s (gmi) x %d [model: %s]\n",
 			colorize(t.Primary), "\033[0m", tmpl.Spec.Agents.Gemini.Count, model)
 	}
+	if tmpl.Spec.Agents.Antigravity != nil {
+		model := tmpl.Spec.Agents.Antigravity.Model
+		if model == "" {
+			model = "default"
+		}
+		fmt.Printf("    %sAntigravity%s (agy) x %d [model: %s]\n",
+			colorize(t.Primary), "\033[0m", tmpl.Spec.Agents.Antigravity.Count, model)
+	}
 	if tmpl.Spec.Agents.Cursor != nil {
 		model := tmpl.Spec.Agents.Cursor.Model
 		if model == "" {

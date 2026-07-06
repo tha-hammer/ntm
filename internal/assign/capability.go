@@ -64,6 +64,19 @@ var DefaultCapabilities = map[tmux.AgentType]map[TaskType]float64{
 		TaskChore:         0.75,
 		TaskEpic:          0.75,
 	},
+	// Antigravity (agy) is Gemini CLI's successor; mirror Gemini's scores.
+	tmux.AgentAntigravity: {
+		TaskRefactor:      0.75,
+		TaskAnalysis:      0.85, // Strong analysis
+		TaskDocs:          0.90, // Excellent documentation
+		TaskDocumentation: 0.90,
+		TaskBug:           0.75,
+		TaskFeature:       0.80,
+		TaskTesting:       0.80,
+		TaskTask:          0.75,
+		TaskChore:         0.75,
+		TaskEpic:          0.75,
+	},
 	tmux.AgentCursor: {
 		TaskRefactor:      0.85,
 		TaskAnalysis:      0.85,
@@ -245,6 +258,8 @@ func ParseAgentType(s string) tmux.AgentType {
 		return tmux.AgentCodex
 	case agent.AgentTypeGemini:
 		return tmux.AgentGemini
+	case agent.AgentTypeAntigravity:
+		return tmux.AgentAntigravity
 	case agent.AgentTypeCursor:
 		return tmux.AgentCursor
 	case agent.AgentTypeWindsurf:

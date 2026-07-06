@@ -163,6 +163,69 @@ func TestGetProfile(t *testing.T) {
 	}
 }
 
+func TestGetSpansReturnsSnapshots(t *testing.T) {
+	Reset()
+	Enable()
+	defer Disable()
+
+	span := StartWithPhase("snapshot-op", "startup")
+	span.Tag("session", "live")
+	span.End()
+
+	spans := GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	spans[0].Name = "mutated"
+	spans[0].Duration = 0
+	spans[0].Tags["session"] = "mutated"
+	spans[0].Tag("extra", "ignored")
+
+	again := GetSpans()
+	if again[0].Name != "snapshot-op" {
+		t.Errorf("GetSpans returned live span pointer; name changed to %q", again[0].Name)
+	}
+	if again[0].Duration == 0 {
+		t.Error("GetSpans returned live span pointer; duration was mutated")
+	}
+	if again[0].Tags["session"] != "live" {
+		t.Errorf("GetSpans returned live tag map; session changed to %v", again[0].Tags["session"])
+	}
+	if _, ok := again[0].Tags["extra"]; ok {
+		t.Error("snapshot Tag call should not mutate tracked profiler span")
+	}
+
+	phaseSpans := GetSpansByPhase("startup")
+	if len(phaseSpans) != 1 {
+		t.Fatalf("expected 1 startup span, got %d", len(phaseSpans))
+	}
+	phaseSpans[0].Tags["session"] = "phase-mutated"
+	if GetSpans()[0].Tags["session"] != "live" {
+		t.Error("GetSpansByPhase returned live tag map")
+	}
+}
+
+func TestGetProfileReturnsSnapshotTags(t *testing.T) {
+	Reset()
+	Enable()
+	defer Disable()
+
+	span := Start("profile-snapshot")
+	span.Tag("session", "live")
+	span.End()
+
+	profile := GetProfile()
+	if len(profile.Spans) != 1 {
+		t.Fatalf("expected 1 profile span, got %d", len(profile.Spans))
+	}
+	profile.Spans[0].Tags["session"] = "mutated"
+
+	again := GetProfile()
+	if again.Spans[0].Tags["session"] != "live" {
+		t.Errorf("GetProfile returned live tag map; session changed to %v", again.Spans[0].Tags["session"])
+	}
+}
+
 func TestWriteJSON(t *testing.T) {
 	Reset()
 	Enable()

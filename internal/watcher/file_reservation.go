@@ -334,6 +334,8 @@ func mapAgentTypeToPatternAgent(agentType tmux.AgentType) string {
 		return "codex"
 	case tmux.AgentGemini:
 		return "gemini"
+	case tmux.AgentAntigravity:
+		return "antigravity"
 	default:
 		return "*"
 	}

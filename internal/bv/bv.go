@@ -67,8 +67,15 @@ func IsInstalled() bool {
 // run executes bv with given args and returns stdout.
 // It includes retry logic for transient database locks.
 func run(dir string, args ...string) (string, error) {
+	return runWithTimeout(dir, DefaultTimeout, args...)
+}
+
+func runWithTimeout(dir string, timeout time.Duration, args ...string) (string, error) {
 	if !IsInstalled() {
 		return "", ErrNotInstalled
+	}
+	if timeout <= 0 {
+		timeout = DefaultTimeout
 	}
 
 	normalizedDir, err := normalizeTriageDir(dir)
@@ -77,8 +84,14 @@ func run(dir string, args ...string) (string, error) {
 	}
 
 	const maxAttempts = 3
+	deadline := time.Now().Add(timeout)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return "", fmt.Errorf("bv timed out after %v: %w", timeout, ErrTimeout)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
 
 		cmd := exec.CommandContext(ctx, "bv", args...)
 		cmd.Dir = normalizedDir
@@ -99,7 +112,7 @@ func run(dir string, args ...string) (string, error) {
 		stdoutStr := stdout.String()
 
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("bv timed out after %v", DefaultTimeout)
+			return "", fmt.Errorf("bv timed out after %v: %w", timeout, ErrTimeout)
 		}
 
 		if strings.Contains(stderrStr, "No baseline found") {
@@ -110,7 +123,11 @@ func run(dir string, args ...string) (string, error) {
 		if attempt < maxAttempts && (strings.Contains(stderrStr, "database is locked") ||
 			strings.Contains(stdoutStr, "database is locked") ||
 			strings.Contains(stderrStr, "database is busy")) {
-			time.Sleep(transientBeadsDBBackoff(attempt))
+			backoff := transientBeadsDBBackoff(attempt)
+			if time.Until(deadline) <= backoff {
+				return "", fmt.Errorf("bv timed out after %v: %w", timeout, ErrTimeout)
+			}
+			time.Sleep(backoff)
 			continue
 		}
 
@@ -656,6 +673,44 @@ func GetDependencyContext(dir string, n int) (*DependencyContext, error) {
 	return ctx, nil
 }
 
+// HasLocalBeadsDB returns true when `dir` itself contains a .beads directory.
+// Recovery callers use this to refuse to walk up into a parent repo's
+// work-item database when the child has none of its own (#130). Generic
+// list helpers (`GetInProgressList`, `GetRecentlyCompletedList`,
+// `GetBlockedList`) deliberately do not gate on this — they preserve br's
+// walk-up behavior so callers that *want* parent rows (alerts, status,
+// triage) keep working from a child directory. Recovery and other
+// trust-sensitive callers must pre-check.
+//
+// This deliberately does NOT use normalizeTriageDir / ResolveProjectDir,
+// because those helpers walk UP the filesystem to find a beads/git root —
+// which is exactly the behavior the recovery contract needs to defeat. We
+// must consult the literal `dir` (after Abs+Clean only) to know whether the
+// caller's working directory is its own beads workspace.
+//
+// An empty `dir` falls back to cwd. Any stat error is treated as "no local
+// db" so we err on the side of an empty recovery list rather than surfacing
+// parent rows.
+func HasLocalBeadsDB(dir string) bool {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return false
+		}
+		dir = cwd
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(filepath.Clean(abs), ".beads"))
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
 // RunBd executes br (beads_rust) with given args and returns stdout.
 // If br reports a missing database and suggests `--no-db`, it retries once with `--no-db`
 // and caches that preference for the remainder of the process.
@@ -991,7 +1046,14 @@ func GetReadyPreview(dir string, limit int) []BeadPreview {
 	return previews
 }
 
-// GetInProgressList returns in-progress beads with assignees
+// GetInProgressList returns in-progress beads with assignees.
+//
+// br walks the filesystem upward to find a workspace root, so this can
+// return rows from a parent repo when the caller's directory has no local
+// .beads/. Callers that need a strict "this directory only" contract
+// (recovery context, anywhere parent-row bleed would be incorrect) should
+// gate via [`HasLocalBeadsDB`] before calling this and refuse to surface
+// the result if it returns false. See #130.
 func GetInProgressList(dir string, limit int) []BeadInProgress {
 	var items []BeadInProgress
 
@@ -1033,6 +1095,10 @@ func GetInProgressList(dir string, limit int) []BeadInProgress {
 
 // GetRecentlyCompletedList returns recently completed beads.
 // These are beads with status=done, ordered by completion time descending.
+//
+// Like [`GetInProgressList`] this will walk up to a parent .beads/ when the
+// directory has none of its own; callers that need a strict per-directory
+// view should pre-check [`HasLocalBeadsDB`] (#130).
 func GetRecentlyCompletedList(dir string, limit int) []BeadPreview {
 	var items []BeadPreview
 
@@ -1067,6 +1133,10 @@ func GetRecentlyCompletedList(dir string, limit int) []BeadPreview {
 }
 
 // GetBlockedList returns blocked beads (beads that are blocked by dependencies).
+//
+// Like [`GetInProgressList`] this will walk up to a parent .beads/ when the
+// directory has none of its own; callers that need a strict per-directory
+// view should pre-check [`HasLocalBeadsDB`] (#130).
 func GetBlockedList(dir string, limit int) []BeadPreview {
 	var items []BeadPreview
 

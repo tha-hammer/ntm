@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,13 +27,16 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/cass"
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
+	"github.com/Dicklesworthstone/ntm/internal/codex"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/coordinator"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/history"
 	"github.com/Dicklesworthstone/ntm/internal/hooks"
 	"github.com/Dicklesworthstone/ntm/internal/integrations/dcg"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/prompt"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
@@ -47,20 +52,22 @@ import (
 
 // SendResult is the JSON output for the send command.
 type SendResult struct {
-	Success       bool               `json:"success"`
-	Session       string             `json:"session"`
-	PromptPreview string             `json:"prompt_preview,omitempty"`
-	Redaction     *RedactionSummary  `json:"redaction,omitempty"`
-	Warnings      []string           `json:"warnings,omitempty"`
-	Blocked       bool               `json:"blocked,omitempty"`
-	ErrorCode     string             `json:"error_code,omitempty"`
-	Randomized    bool               `json:"randomized,omitempty"`
-	SeedUsed      int64              `json:"seed_used,omitempty"`
-	Targets       []int              `json:"targets"`
-	Delivered     int                `json:"delivered"`
-	Failed        int                `json:"failed"`
-	RoutedTo      *SendRoutingResult `json:"routed_to,omitempty"`
-	Error         string             `json:"error,omitempty"`
+	Success              bool                                `json:"success"`
+	Session              string                              `json:"session"`
+	PromptPreview        string                              `json:"prompt_preview,omitempty"`
+	NonInteractiveForced bool                                `json:"non_interactive_forced,omitempty"`
+	Redaction            *RedactionSummary                   `json:"redaction,omitempty"`
+	Warnings             []string                            `json:"warnings,omitempty"`
+	Blocked              bool                                `json:"blocked,omitempty"`
+	ErrorCode            string                              `json:"error_code,omitempty"`
+	Randomized           bool                                `json:"randomized,omitempty"`
+	SeedUsed             int64                               `json:"seed_used,omitempty"`
+	Targets              []int                               `json:"targets"`
+	Delivered            int                                 `json:"delivered"`
+	Failed               int                                 `json:"failed"`
+	RoutedTo             *SendRoutingResult                  `json:"routed_to,omitempty"`
+	DispatchPacing       *coordinator.DispatchPacingDecision `json:"dispatch_pacing,omitempty"`
+	Error                string                              `json:"error,omitempty"`
 }
 
 type SendDryRunEntry struct {
@@ -73,18 +80,20 @@ type SendDryRunEntry struct {
 }
 
 type SendDryRunResult struct {
-	Success   bool               `json:"success"`
-	DryRun    bool               `json:"dry_run"`
-	Session   string             `json:"session"`
-	Redaction *RedactionSummary  `json:"redaction,omitempty"`
-	Warnings  []string           `json:"warnings,omitempty"`
-	Blocked   bool               `json:"blocked,omitempty"`
-	ErrorCode string             `json:"error_code,omitempty"`
-	Total     int                `json:"total"`
-	WouldSend []SendDryRunEntry  `json:"would_send"`
-	RoutedTo  *SendRoutingResult `json:"routed_to,omitempty"`
-	Message   string             `json:"message,omitempty"`
-	Error     string             `json:"error,omitempty"`
+	Success              bool                                `json:"success"`
+	DryRun               bool                                `json:"dry_run"`
+	Session              string                              `json:"session"`
+	NonInteractiveForced bool                                `json:"non_interactive_forced,omitempty"`
+	Redaction            *RedactionSummary                   `json:"redaction,omitempty"`
+	Warnings             []string                            `json:"warnings,omitempty"`
+	Blocked              bool                                `json:"blocked,omitempty"`
+	ErrorCode            string                              `json:"error_code,omitempty"`
+	Total                int                                 `json:"total"`
+	WouldSend            []SendDryRunEntry                   `json:"would_send"`
+	RoutedTo             *SendRoutingResult                  `json:"routed_to,omitempty"`
+	DispatchPacing       *coordinator.DispatchPacingDecision `json:"dispatch_pacing,omitempty"`
+	Message              string                              `json:"message,omitempty"`
+	Error                string                              `json:"error,omitempty"`
 }
 
 // SendRoutingResult contains routing decision info for smart routing.
@@ -227,6 +236,10 @@ type SendOptions struct {
 	Randomize      bool  // Randomize send order for individualized prompts
 	Seed           int64 // Deterministic seed (only used when Randomize=true)
 	PriorityOrder  bool  // Sort batch prompts by priority (P0 first)
+	PaceDispatch   bool  // Include advisory dispatch pacing in JSON/dry-run output
+
+	// Runtime/test injection for advisory dispatch pacing.
+	DispatchPacingInput *coordinator.DispatchPacingInput
 
 	// Smart routing options
 	SmartRoute    bool   // Use smart routing to select best agent
@@ -236,6 +249,12 @@ type SendOptions struct {
 	CassCheck      bool
 	CassSimilarity float64
 	CassCheckDays  int
+
+	// ForceNonInteractive bypasses safe confirmation gates (currently the CASS
+	// duplicate-work prompt) so a recovery/status wrapper can drive `ntm send`
+	// without piping `y` through stdin. Destructive or ambiguous confirmation
+	// classes are NOT bypassed by this flag — they fail closed.
+	ForceNonInteractive bool
 
 	// Hooks
 	NoHooks bool
@@ -362,13 +381,25 @@ func (s SendTargets) MatchesPane(pane tmux.Pane) bool {
 
 // matchesSendTarget checks if a pane matches a send target.
 func matchesSendTarget(pane tmux.Pane, target SendTarget) bool {
-	if normalizeAgentType(string(pane.Type)) != normalizeAgentType(string(target.Type)) {
+	if sendValueNotEqual(normalizeAgentType(string(pane.Type)), normalizeAgentType(string(target.Type))) {
 		return false
 	}
-	if target.Variant != "" && pane.Variant != target.Variant {
+	if sendValueNotEqual(target.Variant, "") && sendValueNotEqual(pane.Variant, target.Variant) {
 		return false
 	}
 	return true
+}
+
+func sendValueEqual[T comparable](left, right T) bool {
+	return left == right
+}
+
+func sendValueNotEqual[T comparable](left, right T) bool {
+	return !sendValueEqual(left, right)
+}
+
+func sendErrorIsNil(err error) bool {
+	return err == nil
 }
 
 func matchesLegacySendTypeFilter(pane tmux.Pane, targetCC, targetCod, targetGmi bool) bool {
@@ -386,7 +417,7 @@ func matchesLegacySendTypeFilter(pane tmux.Pane, targetCC, targetCod, targetGmi 
 
 func isInterruptibleAgentPane(pane tmux.Pane) bool {
 	switch tmux.AgentType(pane.Type).Canonical() {
-	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOllama:
+	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
 		return true
 	default:
 		return false
@@ -488,6 +519,7 @@ func newSendCmd() *cobra.Command {
 	var dryRun bool
 	var cassCheck bool
 	var noCassCheck bool
+	var forceNonInteractive bool
 	var cassSimilarity float64
 	var cassCheckDays int
 	var noHooks bool
@@ -500,6 +532,7 @@ func newSendCmd() *cobra.Command {
 	var randomize bool
 	var seed int64
 	var priorityOrder bool
+	var paceDispatch bool
 	var basePrompt string
 	var basePromptFile string
 
@@ -513,6 +546,9 @@ func newSendCmd() *cobra.Command {
 
 	// Project filter (bd-3cu02.14)
 	var projectFilter string
+
+	// Codex goal-send mode (#165)
+	var codexGoal bool
 
 	cmd := &cobra.Command{
 		Use:   "send <session> [prompt]",
@@ -543,6 +579,13 @@ func newSendCmd() *cobra.Command {
 		Duplicate Detection:
 		By default, checks CASS for similar past sessions to avoid duplicate work.
 		Use --no-cass-check to skip.
+
+		Non-interactive automation:
+		Use --force-non-interactive to bypass safe confirmation gates (currently
+		the CASS duplicate prompt) so recovery/status wrappers can drive 'ntm
+		send' without piping 'y' through stdin. Destructive or ambiguous
+		confirmation classes are NOT bypassed by this flag — they fail closed.
+		When set, JSON output includes "non_interactive_forced": true.
 
 		Smart Routing:
 		Use --smart to automatically select the best agent based on routing strategies.
@@ -580,13 +623,23 @@ func newSendCmd() *cobra.Command {
 						return fmt.Errorf("cannot use --project with a specific session name; use just --project or just a session name")
 					}
 				}
-				return runSendProject(cmd, projectFilter, args, targets, targetAll, skipFirst, paneIndex, tags, noHooks, dryRun)
+				return runSendProject(cmd, projectFilter, args, targets, targetAll, skipFirst, paneIndex, tags, noHooks, dryRun, forceNonInteractive)
 			}
 
 			if len(args) == 0 {
 				return fmt.Errorf("session name required (or use --project)")
 			}
 			session := args[0]
+
+			// Codex goal-send mode (#165): drive the Codex /goal slash command
+			// flow instead of the generic prompt-paste path.
+			if codexGoal {
+				body, _, err := getPromptContent(args[1:], promptFile, prefix, suffix)
+				if err != nil {
+					return err
+				}
+				return runCodexGoalSend(session, paneIndex, body)
+			}
 
 			// Resolve base prompt: flag > file > config (bd-3ejl)
 			var cfgBasePrompt, cfgBasePromptFile string
@@ -618,29 +671,31 @@ func newSendCmd() *cobra.Command {
 					}
 				}
 				batchOpts := SendOptions{
-					Session:         session,
-					BasePrompt:      resolvedBasePrompt,
-					Targets:         targets,
-					TargetAll:       targetAll,
-					SkipFirst:       skipFirst,
-					PaneIndex:       paneIndex,
-					Tags:            tags,
-					SmartRoute:      smartRoute,
-					RouteStrategy:   routeStrategy,
-					CassCheck:       cassCheck && !noCassCheck,
-					CassSimilarity:  cassSimilarity,
-					CassCheckDays:   cassCheckDays,
-					NoHooks:         noHooks,
-					DryRun:          dryRun,
-					BatchFile:       batchFile,
-					BatchDelay:      delay,
-					BatchConfirm:    batchConfirm,
-					BatchStopOnErr:  batchStopOnErr,
-					BatchBroadcast:  batchBroadcast,
-					BatchAgentIndex: batchAgentIndex,
-					Randomize:       randomize,
-					Seed:            seed,
-					PriorityOrder:   priorityOrder,
+					Session:             session,
+					BasePrompt:          resolvedBasePrompt,
+					Targets:             targets,
+					TargetAll:           targetAll,
+					SkipFirst:           skipFirst,
+					PaneIndex:           paneIndex,
+					Tags:                tags,
+					SmartRoute:          smartRoute,
+					RouteStrategy:       routeStrategy,
+					CassCheck:           cassCheck && !noCassCheck,
+					CassSimilarity:      cassSimilarity,
+					CassCheckDays:       cassCheckDays,
+					ForceNonInteractive: forceNonInteractive,
+					NoHooks:             noHooks,
+					DryRun:              dryRun,
+					BatchFile:           batchFile,
+					BatchDelay:          delay,
+					BatchConfirm:        batchConfirm,
+					BatchStopOnErr:      batchStopOnErr,
+					BatchBroadcast:      batchBroadcast,
+					BatchAgentIndex:     batchAgentIndex,
+					Randomize:           randomize,
+					Seed:                seed,
+					PriorityOrder:       priorityOrder,
+					PaceDispatch:        paceDispatch,
 				}
 				return runSendBatch(batchOpts)
 			}
@@ -659,24 +714,26 @@ func newSendCmd() *cobra.Command {
 			}
 
 			opts := SendOptions{
-				Session:        session,
-				BasePrompt:     resolvedBasePrompt,
-				Targets:        targets,
-				TargetAll:      targetAll,
-				SkipFirst:      skipFirst,
-				PaneIndex:      paneIndex,
-				Panes:          panes,
-				PanesSpecified: panesSpecified,
-				Tags:           tags,
-				SmartRoute:     smartRoute,
-				RouteStrategy:  routeStrategy,
-				CassCheck:      cassCheck && !noCassCheck,
-				CassSimilarity: cassSimilarity,
-				CassCheckDays:  cassCheckDays,
-				NoHooks:        noHooks,
-				DryRun:         dryRun,
-				Randomize:      randomize,
-				Seed:           seed,
+				Session:             session,
+				BasePrompt:          resolvedBasePrompt,
+				Targets:             targets,
+				TargetAll:           targetAll,
+				SkipFirst:           skipFirst,
+				PaneIndex:           paneIndex,
+				Panes:               panes,
+				PanesSpecified:      panesSpecified,
+				Tags:                tags,
+				SmartRoute:          smartRoute,
+				RouteStrategy:       routeStrategy,
+				CassCheck:           cassCheck && !noCassCheck,
+				CassSimilarity:      cassSimilarity,
+				CassCheckDays:       cassCheckDays,
+				ForceNonInteractive: forceNonInteractive,
+				NoHooks:             noHooks,
+				DryRun:              dryRun,
+				Randomize:           randomize,
+				Seed:                seed,
+				PaceDispatch:        paceDispatch,
 			}
 
 			// Handle template-based prompts
@@ -722,6 +779,8 @@ func newSendCmd() *cobra.Command {
 	cmd.Flags().Lookup("cod").NoOptDefVal = "true"
 	cmd.Flags().Var(newSendTargetValue(AgentTypeGemini, &targets), "gmi", "send to Gemini agents (optional :variant filter)")
 	cmd.Flags().Lookup("gmi").NoOptDefVal = "true"
+	cmd.Flags().Var(newSendTargetValue(AgentTypeAntigravity, &targets), "agy", "send to Antigravity (agy) agents (optional :variant filter)")
+	cmd.Flags().Lookup("agy").NoOptDefVal = "true"
 	cmd.Flags().BoolVar(&targetAll, "all", false, "send to all panes (including user pane)")
 	cmd.Flags().BoolVarP(&skipFirst, "skip-first", "s", false, "skip the first (user) pane")
 	cmd.Flags().IntVarP(&paneIndex, "pane", "p", -1, "send to specific pane index")
@@ -747,6 +806,10 @@ func newSendCmd() *cobra.Command {
 	// CASS check flags
 	cmd.Flags().BoolVar(&cassCheck, "cass-check", true, "Check for duplicate work in CASS")
 	cmd.Flags().BoolVar(&noCassCheck, "no-cass-check", false, "Skip CASS duplicate check")
+	cmd.Flags().BoolVar(&forceNonInteractive, "force-non-interactive", false,
+		"Bypass safe confirmation gates (currently the CASS duplicate prompt) for "+
+			"recovery/status automation. Destructive or ambiguous classes are NOT "+
+			"bypassed — they fail closed. Sets non_interactive_forced=true in JSON output.")
 	cmd.Flags().Float64Var(&cassSimilarity, "cass-similarity", 0.7, "Similarity threshold for duplicate detection")
 	cmd.Flags().IntVar(&cassCheckDays, "cass-check-days", 7, "Look back N days for duplicates")
 	cmd.Flags().BoolVar(&noHooks, "no-hooks", false, "Disable command hooks")
@@ -755,6 +818,7 @@ func newSendCmd() *cobra.Command {
 	// Randomization flags
 	cmd.Flags().BoolVar(&randomize, "randomize", false, "Randomize send order for individualized prompts (reduces thundering herd)")
 	cmd.Flags().Int64Var(&seed, "seed", 0, "Deterministic seed for --randomize (0 = time-based)")
+	cmd.Flags().BoolVar(&paceDispatch, "pace-dispatch", false, "Include advisory dispatch pacing in JSON and dry-run output without changing send behavior")
 
 	// Priority ordering flag (bd-2wzs)
 	cmd.Flags().BoolVar(&priorityOrder, "priority-order", false, "Sort batch prompts by priority (P0 first, annotate with '# priority: N')")
@@ -774,6 +838,12 @@ func newSendCmd() *cobra.Command {
 	// Project filter (bd-3cu02.14)
 	cmd.Flags().StringVar(&projectFilter, "project", "", "broadcast to all sessions for a base project name")
 
+	// Codex goal-send mode (#165): drive the Codex /goal slash command flow.
+	cmd.Flags().BoolVar(&codexGoal, "codex-goal", false,
+		"Drive the Codex /goal slash-command flow on --pane: type /goal, wait for the "+
+			"goal palette to engage, inject the packet body, submit, and emit a JSON "+
+			"receipt. Requires --pane and a codex-live pane. Use with --file for the packet.")
+
 	cmd.ValidArgsFunction = completeSessionArgs
 	_ = cmd.RegisterFlagCompletionFunc("pane", completePaneIndexes)
 	_ = cmd.RegisterFlagCompletionFunc("panes", completePaneIndexes)
@@ -782,7 +852,7 @@ func newSendCmd() *cobra.Command {
 }
 
 // runSendProject broadcasts a prompt to all sessions matching a base project (bd-3cu02.14).
-func runSendProject(cmd *cobra.Command, project string, args []string, targets SendTargets, targetAll, skipFirst bool, paneIndex int, tags []string, noHooks, dryRun bool) error {
+func runSendProject(cmd *cobra.Command, project string, args []string, targets SendTargets, targetAll, skipFirst bool, paneIndex int, tags []string, noHooks, dryRun, forceNonInteractive bool) error {
 	if err := tmux.EnsureInstalled(); err != nil {
 		return err
 	}
@@ -794,7 +864,7 @@ func runSendProject(cmd *cobra.Command, project string, args []string, targets S
 
 	var matching []tmux.Session
 	for _, s := range sessions {
-		if config.SessionBase(s.Name) == project {
+		if sendValueEqual(config.SessionBase(s.Name), project) {
 			matching = append(matching, s)
 		}
 	}
@@ -819,15 +889,16 @@ func runSendProject(cmd *cobra.Command, project string, args []string, targets S
 	delivered := 0
 	for _, s := range matching {
 		opts := SendOptions{
-			Session:   s.Name,
-			Prompt:    promptText,
-			Targets:   targets,
-			TargetAll: targetAll,
-			SkipFirst: skipFirst,
-			PaneIndex: paneIndex,
-			Tags:      tags,
-			NoHooks:   noHooks,
-			DryRun:    dryRun,
+			Session:             s.Name,
+			Prompt:              promptText,
+			Targets:             targets,
+			TargetAll:           targetAll,
+			SkipFirst:           skipFirst,
+			PaneIndex:           paneIndex,
+			Tags:                tags,
+			NoHooks:             noHooks,
+			DryRun:              dryRun,
+			ForceNonInteractive: forceNonInteractive,
 		}
 		if err := runSendWithTargets(opts); err != nil {
 			sendErrors = append(sendErrors, fmt.Sprintf("%s: %v", s.Name, err))
@@ -1044,6 +1115,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	targetCC := targets.HasTargetsForType(AgentTypeClaude)
 	targetCod := targets.HasTargetsForType(AgentTypeCodex)
 	targetGmi := targets.HasTargetsForType(AgentTypeGemini)
+	targetAgy := targets.HasTargetsForType(AgentTypeAntigravity)
 
 	// Helper for JSON error output
 	var (
@@ -1121,8 +1193,9 @@ func runSendInternal(opts SendOptions) (err error) {
 				code = "SENSITIVE_DATA_BLOCKED"
 			}
 			result := SendResult{
-				Success: false,
-				Session: session,
+				Success:              false,
+				Session:              session,
+				NonInteractiveForced: opts.ForceNonInteractive,
 				Redaction: func() *RedactionSummary {
 					if redactionSummary == nil {
 						return nil
@@ -1135,10 +1208,16 @@ func runSendInternal(opts SendOptions) (err error) {
 				ErrorCode: code,
 				Error:     err.Error(),
 			}
-			_ = json.NewEncoder(os.Stdout).Encode(result)
-			// Return error to ensure non-zero exit code
-			// Since SilenceErrors is true, Cobra won't print the error message again
-			return err
+			// bd-oqwmf: route JSON failure through jsonFailureExit so root
+			// Execute uniformly suppresses duplicate stderr (the JSON
+			// envelope is the canonical surface) and exits non-zero. The
+			// original err is joined into the result so callers using
+			// errors.As (e.g. tests checking for redactionBlockedError)
+			// still see the typed underlying error in the chain.
+			if encErr := json.NewEncoder(os.Stdout).Encode(result); encErr != nil {
+				return encErr
+			}
+			return errors.Join(errJSONFailure, err)
 		}
 		return err
 	}
@@ -1161,7 +1240,7 @@ func runSendInternal(opts SendOptions) (err error) {
 		"prompt_length":  len(prompt),
 		"prompt_source":  promptSource,
 		"template":       templateName,
-		"targets":        buildTargetDescription(targetCC, targetCod, targetGmi, targetAll, skipFirst, paneIndex, tags),
+		"targets":        buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst, paneIndex, tags),
 		"dry_run":        dryRun,
 		"randomize":      opts.Randomize,
 		"seed":           opts.Seed,
@@ -1176,7 +1255,7 @@ func runSendInternal(opts SendOptions) (err error) {
 			"delivered":      delivered,
 			"failed":         failed,
 			"dry_run":        dryRun,
-			"success":        err == nil,
+			"success":        sendErrorIsNil(err),
 			"correlation_id": auditCorrelationID,
 		}
 		if err != nil {
@@ -1248,13 +1327,15 @@ func runSendInternal(opts SendOptions) (err error) {
 			Prompt:   prompt,
 		}
 
-		// Filter by agent type if specified
-		if targetCC && !targetCod && !targetGmi {
+		// Filter by agent type if specified (only when exactly one type is set)
+		if targetCC && !targetCod && !targetGmi && !targetAgy {
 			routeOpts.AgentType = "claude"
-		} else if targetCod && !targetCC && !targetGmi {
+		} else if targetCod && !targetCC && !targetGmi && !targetAgy {
 			routeOpts.AgentType = "codex"
-		} else if targetGmi && !targetCC && !targetCod {
+		} else if targetGmi && !targetCC && !targetCod && !targetAgy {
 			routeOpts.AgentType = "gemini"
+		} else if targetAgy && !targetCC && !targetCod && !targetGmi {
+			routeOpts.AgentType = "antigravity"
 		}
 
 		recommendation, err := robot.GetRouteRecommendation(routeOpts)
@@ -1283,8 +1364,8 @@ func runSendInternal(opts SendOptions) (err error) {
 
 	// CASS Duplicate Detection
 	if opts.CassCheck {
-		if err := checkCassDuplicates(session, sessionInferred, prompt, opts.CassSimilarity, opts.CassCheckDays); err != nil {
-			if err.Error() == "aborted by user" {
+		if err := checkCassDuplicates(session, sessionInferred, prompt, opts.CassSimilarity, opts.CassCheckDays, opts.ForceNonInteractive); err != nil {
+			if strings.Compare(err.Error(), "aborted by user") == 0 {
 				fmt.Println("Aborted.")
 				return nil
 			}
@@ -1311,7 +1392,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	// Build target description for hook environment
-	targetDesc := buildTargetDescription(targetCC, targetCod, targetGmi, targetAll, skipFirst, paneIndex, tags)
+	targetDesc := buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst, paneIndex, tags)
 
 	// Build execution context for hooks
 	hookCtx := hooks.ExecutionContext{
@@ -1323,6 +1404,7 @@ func runSendInternal(opts SendOptions) (err error) {
 			"NTM_TARGET_CC":    boolToStr(targetCC),
 			"NTM_TARGET_COD":   boolToStr(targetCod),
 			"NTM_TARGET_GMI":   boolToStr(targetGmi),
+			"NTM_TARGET_AGY":   boolToStr(targetAgy),
 			"NTM_TARGET_ALL":   boolToStr(targetAll),
 			"NTM_PANE_INDEX":   fmt.Sprintf("%d", paneIndex),
 		},
@@ -1349,7 +1431,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	// Auto-checkpoint before broadcast sends
-	isBroadcast := !opts.PanesSpecified && paneIndex < 0 && (targetAll || (!targetCC && !targetCod && !targetGmi && len(tags) == 0))
+	isBroadcast := !opts.PanesSpecified && paneIndex < 0 && (targetAll || (!targetCC && !targetCod && !targetGmi && !targetAgy && len(tags) == 0))
 	if !dryRun && isBroadcast && cfg != nil && cfg.Checkpoints.Enabled && cfg.Checkpoints.BeforeBroadcast {
 		if !jsonOutput {
 			fmt.Println("Creating auto-checkpoint before broadcast...")
@@ -1386,7 +1468,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	var selectedPanes []tmux.Pane
 	if paneIndex >= 0 {
 		for _, p := range panes {
-			if p.Index == paneIndex {
+			if sendValueEqual(p.Index, paneIndex) {
 				selectedPanes = append(selectedPanes, p)
 				break
 			}
@@ -1422,7 +1504,7 @@ func runSendInternal(opts SendOptions) (err error) {
 			}
 		}
 	} else {
-		noFilter := !targetCC && !targetCod && !targetGmi && !targetAll && len(tags) == 0
+		noFilter := !targetCC && !targetCod && !targetGmi && !targetAgy && !targetAll && len(tags) == 0
 		hasVariantFilter := len(targets) > 0
 		if noFilter {
 			// Default: send to all agent panes (skip user panes)
@@ -1445,7 +1527,7 @@ func runSendInternal(opts SendOptions) (err error) {
 				}
 
 				// Check type filters (only if specified)
-				hasTypeFilter := hasVariantFilter || targetCC || targetCod || targetGmi
+				hasTypeFilter := hasVariantFilter || targetCC || targetCod || targetGmi || targetAgy
 
 				if hasTypeFilter {
 					if hasVariantFilter {
@@ -1461,7 +1543,7 @@ func runSendInternal(opts SendOptions) (err error) {
 				}
 			} else if noFilter {
 				// Default mode: skip non-agent panes
-				if p.Type == tmux.AgentUser {
+				if sendValueEqual(p.Type, tmux.AgentUser) {
 					continue
 				}
 			}
@@ -1485,6 +1567,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 	histTargets = targetPanes
 	histAgentTypes = targetAgentTypes
+	dispatchPacing := buildDispatchPacingDecision(opts, session, selectedPanes)
 
 	if opts.Randomize && len(targetPanes) > 1 && !jsonOutput {
 		fmt.Fprintf(os.Stderr, "Randomized send order (seed=%d): %v\n", seedUsed, targetPanes)
@@ -1498,41 +1581,49 @@ func runSendInternal(opts SendOptions) (err error) {
 	if dryRun {
 		entries := buildSendDryRunEntries(selectedPanes, prompt, promptSource)
 		return printSendDryRunResult(SendDryRunResult{
-			Success:   true,
-			DryRun:    true,
-			Session:   session,
-			Redaction: redactionSummary,
-			Warnings:  redactionWarnings,
-			Blocked:   false,
-			Total:     len(entries),
-			WouldSend: entries,
-			RoutedTo:  opts.routingResult,
-			Message:   "use without --dry-run to execute",
+			Success:              true,
+			DryRun:               true,
+			Session:              session,
+			NonInteractiveForced: opts.ForceNonInteractive,
+			Redaction:            redactionSummary,
+			Warnings:             redactionWarnings,
+			Blocked:              false,
+			Total:                len(entries),
+			WouldSend:            entries,
+			RoutedTo:             opts.routingResult,
+			DispatchPacing:       dispatchPacing,
+			Message:              "use without --dry-run to execute",
 		})
 	}
 
 	// If specific pane requested
 	if paneIndex >= 0 {
 		p := selectedPanes[0]
-		if err := sendPromptToPane(session, p, prompt); err != nil {
+		// Stamp the per-pane NTM-Pane work-token instruction (#199). No-op when
+		// the semantic feature is off, so the dispatched prompt is unchanged.
+		promptForPane := stampMarchingOrders(prompt, session, p.WindowIndex, p.Index)
+		if err := sendPromptToPane(session, p, promptForPane); err != nil {
 			failed++
 			histErr = err
 			if jsonOutput {
 				result := SendResult{
-					Success:       false,
-					Session:       session,
-					PromptPreview: truncatePrompt(prompt, 50),
-					Redaction:     redactionSummary,
-					Warnings:      redactionWarnings,
-					Randomized:    opts.Randomize,
-					SeedUsed:      seedUsed,
-					Targets:       targetPanes,
-					Delivered:     delivered,
-					Failed:        failed,
-					RoutedTo:      opts.routingResult,
-					Error:         err.Error(),
+					Success:              false,
+					Session:              session,
+					PromptPreview:        truncatePrompt(prompt, 50),
+					NonInteractiveForced: opts.ForceNonInteractive,
+					Redaction:            redactionSummary,
+					Warnings:             redactionWarnings,
+					Randomized:           opts.Randomize,
+					SeedUsed:             seedUsed,
+					Targets:              targetPanes,
+					Delivered:            delivered,
+					Failed:               failed,
+					RoutedTo:             opts.routingResult,
+					DispatchPacing:       dispatchPacing,
+					Error:                err.Error(),
 				}
-				return json.NewEncoder(os.Stdout).Encode(result)
+				// bd-oqwmf: signal non-zero exit after the success:false envelope.
+				return emitJSONFailureEnvelope(result)
 			}
 			return err
 		}
@@ -1541,17 +1632,19 @@ func runSendInternal(opts SendOptions) (err error) {
 
 		if jsonOutput {
 			result := SendResult{
-				Success:       true,
-				Session:       session,
-				PromptPreview: truncatePrompt(prompt, 50),
-				Redaction:     redactionSummary,
-				Warnings:      redactionWarnings,
-				Randomized:    opts.Randomize,
-				SeedUsed:      seedUsed,
-				Targets:       targetPanes,
-				Delivered:     delivered,
-				Failed:        failed,
-				RoutedTo:      opts.routingResult,
+				Success:              true,
+				Session:              session,
+				PromptPreview:        truncatePrompt(prompt, 50),
+				NonInteractiveForced: opts.ForceNonInteractive,
+				Redaction:            redactionSummary,
+				Warnings:             redactionWarnings,
+				Randomized:           opts.Randomize,
+				SeedUsed:             seedUsed,
+				Targets:              targetPanes,
+				Delivered:            delivered,
+				Failed:               failed,
+				RoutedTo:             opts.routingResult,
+				DispatchPacing:       dispatchPacing,
 			}
 			return json.NewEncoder(os.Stdout).Encode(result)
 		}
@@ -1566,7 +1659,10 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	for _, p := range selectedPanes {
-		if err := sendPromptToPane(session, p, prompt); err != nil {
+		// Stamp the per-pane NTM-Pane work-token instruction (#199). No-op when
+		// the semantic feature is off, so the dispatched prompt is unchanged.
+		promptForPane := stampMarchingOrders(prompt, session, p.WindowIndex, p.Index)
+		if err := sendPromptToPane(session, p, promptForPane); err != nil {
 			failed++
 			histErr = err
 			if !jsonOutput {
@@ -1615,17 +1711,19 @@ func runSendInternal(opts SendOptions) (err error) {
 	// JSON output mode
 	if jsonOutput {
 		result := SendResult{
-			Success:       failed == 0,
-			Session:       session,
-			PromptPreview: truncatePrompt(prompt, 50),
-			Redaction:     redactionSummary,
-			Warnings:      redactionWarnings,
-			Randomized:    opts.Randomize,
-			SeedUsed:      seedUsed,
-			Targets:       targetPanes,
-			Delivered:     delivered,
-			Failed:        failed,
-			RoutedTo:      opts.routingResult,
+			Success:              sendValueEqual(failed, 0),
+			Session:              session,
+			PromptPreview:        truncatePrompt(prompt, 50),
+			NonInteractiveForced: opts.ForceNonInteractive,
+			Redaction:            redactionSummary,
+			Warnings:             redactionWarnings,
+			Randomized:           opts.Randomize,
+			SeedUsed:             seedUsed,
+			Targets:              targetPanes,
+			Delivered:            delivered,
+			Failed:               failed,
+			RoutedTo:             opts.routingResult,
+			DispatchPacing:       dispatchPacing,
 		}
 		if failed > 0 {
 			result.Error = fmt.Sprintf("%d pane(s) failed", failed)
@@ -1657,10 +1755,10 @@ func runSendInternal(opts SendOptions) (err error) {
 }
 
 func paneAgentLabel(p tmux.Pane) string {
-	if p.Type != tmux.AgentUnknown && p.Type != tmux.AgentUser && p.NTMIndex > 0 {
+	if sendValueNotEqual(p.Type, tmux.AgentUnknown) && sendValueNotEqual(p.Type, tmux.AgentUser) && p.NTMIndex > 0 {
 		return fmt.Sprintf("%s_%d", p.Type, p.NTMIndex)
 	}
-	if p.Type == tmux.AgentUser {
+	if sendValueEqual(p.Type, tmux.AgentUser) {
 		return "user"
 	}
 	if p.Title != "" {
@@ -1684,6 +1782,45 @@ func buildSendDryRunEntries(panes []tmux.Pane, prompt string, source string) []S
 		})
 	}
 	return entries
+}
+
+func buildDispatchPacingDecision(opts SendOptions, session string, panes []tmux.Pane) *coordinator.DispatchPacingDecision {
+	if !opts.PaceDispatch && opts.DispatchPacingInput == nil {
+		return nil
+	}
+
+	input := coordinator.DispatchPacingInput{
+		Session:          session,
+		RequestedTargets: len(panes),
+		PaneHealth:       dispatchPacingPaneHealth(panes),
+	}
+	if opts.DispatchPacingInput != nil {
+		input = *opts.DispatchPacingInput
+		if strings.Compare(strings.TrimSpace(input.Session), "") == 0 {
+			input.Session = session
+		}
+		if input.RequestedTargets <= 0 {
+			input.RequestedTargets = len(panes)
+		}
+		if len(input.PaneHealth) == 0 {
+			input.PaneHealth = dispatchPacingPaneHealth(panes)
+		}
+	}
+
+	decision := coordinator.EvaluateDispatchPacing(input)
+	return &decision
+}
+
+func dispatchPacingPaneHealth(panes []tmux.Pane) []coordinator.DispatchPaneHealth {
+	health := make([]coordinator.DispatchPaneHealth, 0, len(panes))
+	for _, pane := range panes {
+		health = append(health, coordinator.DispatchPaneHealth{
+			PaneIndex: pane.Index,
+			AgentType: pane.Type.Canonical().String(),
+			Healthy:   true,
+		})
+	}
+	return health
 }
 
 func printSendDryRunResult(result SendDryRunResult) error {
@@ -2088,6 +2225,19 @@ func runKill(w io.Writer, session string, force bool, tags []string, noHooks boo
 		}
 	}
 
+	// Collect the agent process subtree of every pane BEFORE killing the
+	// session. Agents (often node/bun launched with --dangerously-skip-
+	// permissions) run as descendants of the pane shell PID; on a tmux
+	// kill-session SIGHUP they can survive, reparent to init, and leak —
+	// holding agent-mail registrations and file locks. We snapshot the subtree
+	// now while the shells are still alive, then reap any survivors after the
+	// session is gone.
+	var panePIDs []int
+	for _, p := range panesForStop {
+		panePIDs = append(panePIDs, p.PID)
+	}
+	orphanCandidates := collectPaneDescendants(panePIDs)
+
 	// Kill the monitor process before destroying the session
 	if output, err := exec.Command("pkill", "-f", monitorProcessPattern(session)).CombinedOutput(); err != nil {
 		// Monitor may not be running — that's fine
@@ -2098,6 +2248,9 @@ func runKill(w io.Writer, session string, force bool, tags []string, noHooks boo
 		return err
 	}
 	auditKilled = true
+
+	// Reap any agent process subtrees that survived kill-session.
+	reapOrphanProcesses(orphanCandidates)
 
 	fmt.Printf("Killed session '%s'\n", session)
 
@@ -2124,6 +2277,107 @@ func runKill(w io.Writer, session string, force bool, tags []string, noHooks boo
 	return nil
 }
 
+// orphanReapGrace is how long we wait between SIGTERM and SIGKILL when reaping
+// agent process subtrees that survived a tmux kill-session.
+const orphanReapGrace = 750 * time.Millisecond
+
+// orphanReapMaxDepth bounds the recursive descendant walk so a pathological or
+// fork-bombing subtree cannot stall the kill path.
+const orphanReapMaxDepth = 4
+
+// orphanReapFanout caps the number of children expanded per node during the
+// recursive walk, a defensive bound against runaway process trees.
+const orphanReapFanout = 64
+
+// orphanReapExcluded reports whether a PID must never be targeted by the orphan
+// reap: init (pid <= 1), the running ntm process itself, and the ntm parent.
+// Targeting any of these would be catastrophic, so the reap walk and the signal
+// loop both gate on this predicate.
+func orphanReapExcluded(pid int) bool {
+	return pid <= 1 || pid == os.Getpid() || pid == os.Getppid()
+}
+
+// collectPaneDescendants gathers the descendant PID subtree of each pane shell
+// PID in `panePIDs`. process.GetChildPIDs returns only ONE level of children,
+// so we walk recursively (depth-bounded by orphanReapMaxDepth, fanout-capped by
+// orphanReapFanout) to capture the whole subtree.
+//
+// The pane shell PIDs themselves are intentionally EXCLUDED from the result:
+// tmux kill-session reaps the pane shells directly; we only need to mop up the
+// agent processes spawned beneath them that can reparent to init and leak.
+//
+// Self (os.Getpid()), the ntm parent (os.Getppid()), and any pid <= 1 are
+// excluded so the reap can never target the running process, its launcher, or
+// init. The returned slice is deduplicated.
+func collectPaneDescendants(panePIDs []int) []int {
+	excluded := orphanReapExcluded
+
+	seen := make(map[int]struct{})
+	var ordered []int
+
+	var walk func(pid, depth int)
+	walk = func(pid, depth int) {
+		if depth > orphanReapMaxDepth {
+			return
+		}
+		children := process.GetChildPIDs(pid, orphanReapFanout)
+		for _, child := range children {
+			if excluded(child) {
+				continue
+			}
+			if _, ok := seen[child]; ok {
+				continue
+			}
+			seen[child] = struct{}{}
+			ordered = append(ordered, child)
+			walk(child, depth+1)
+		}
+	}
+
+	for _, paneShell := range panePIDs {
+		if paneShell <= 1 {
+			continue
+		}
+		// Start the walk at the pane shell so its descendants (the agents) are
+		// collected, but the shell PID itself is never added to `ordered`.
+		walk(paneShell, 1)
+	}
+
+	return ordered
+}
+
+// reapOrphanProcesses sends SIGTERM to each still-alive PID in `pids`, waits a
+// short grace period, then SIGKILLs any that remain. PIDs that have already
+// exited (the common case — most agents die with their pane shell's SIGHUP) are
+// skipped. Errors from kill are ignored: a process may exit between the
+// liveness check and the signal, which is exactly the outcome we want.
+func reapOrphanProcesses(pids []int) {
+	if len(pids) == 0 {
+		return
+	}
+
+	var termed []int
+	for _, pid := range pids {
+		if pid <= 1 || !process.IsAlive(pid) {
+			continue
+		}
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+		termed = append(termed, pid)
+	}
+
+	if len(termed) == 0 {
+		return
+	}
+
+	time.Sleep(orphanReapGrace)
+
+	for _, pid := range termed {
+		if process.IsAlive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+}
+
 // runKillProject kills all sessions matching a base project name (bd-3cu02.14).
 func runKillProject(w io.Writer, project string, force bool, tags []string, noHooks bool, summarize bool) error {
 	if err := tmux.EnsureInstalled(); err != nil {
@@ -2137,7 +2391,7 @@ func runKillProject(w io.Writer, project string, force bool, tags []string, noHo
 
 	var targets []tmux.Session
 	for _, s := range sessions {
-		if config.SessionBase(s.Name) == project {
+		if sendValueEqual(config.SessionBase(s.Name), project) {
 			targets = append(targets, s)
 		}
 	}
@@ -2486,7 +2740,7 @@ func buildObservedTargetTypes(panes []tmux.Pane) string {
 	return strings.Join(targets, ",")
 }
 
-func buildTargetDescription(targetCC, targetCod, targetGmi, targetAll, skipFirst bool, paneIndex int, tags []string) string {
+func buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
 	if paneIndex >= 0 {
 		return fmt.Sprintf("pane:%d", paneIndex)
 	}
@@ -2503,6 +2757,9 @@ func buildTargetDescription(targetCC, targetCod, targetGmi, targetAll, skipFirst
 	}
 	if targetGmi {
 		targets = append(targets, "gmi")
+	}
+	if targetAgy {
+		targets = append(targets, "agy")
 	}
 	if len(tags) > 0 {
 		targets = append(targets, fmt.Sprintf("tags:[%s]", strings.Join(tags, ",")))
@@ -2592,10 +2849,10 @@ func hasNonClaudeTargets(panes []tmux.Pane) bool {
 }
 
 func isNonClaudeAgent(p tmux.Pane) bool {
-	if p.Type == tmux.AgentUser {
+	if sendValueEqual(p.Type, tmux.AgentUser) {
 		return false
 	}
-	return p.Type != tmux.AgentClaude
+	return sendValueNotEqual(p.Type, tmux.AgentClaude)
 }
 
 func extractLikelyCommands(prompt string) []string {
@@ -2654,7 +2911,7 @@ func looksLikeShellCommand(line string) bool {
 }
 
 func sendPromptToPane(session string, p tmux.Pane, prompt string) error {
-	if p.Type == tmux.AgentUser {
+	if sendValueEqual(p.Type, tmux.AgentUser) {
 		if err := tmux.PasteKeys(p.ID, prompt, true); err != nil {
 			return err
 		}
@@ -2667,6 +2924,197 @@ func sendPromptToPane(session string, p tmux.Pane, prompt string) error {
 	return nil
 }
 
+// CodexGoalSendResult is the JSON receipt for `ntm send --codex-goal` (#165).
+type CodexGoalSendResult struct {
+	robot.RobotResponse
+
+	Session string `json:"session"`
+	Pane    int    `json:"pane"`
+
+	// TypedGoal is true once the "/goal" slash command was typed and the goal
+	// palette engaged (Codex showed the /goal command, not literal chat text).
+	TypedGoal bool `json:"typed_goal"`
+	// BodyInjected is true once the packet body was injected after engagement.
+	BodyInjected bool `json:"body_injected"`
+	// Submitted is true once the goal was submitted (Enter sent).
+	Submitted bool `json:"submitted"`
+	// SubmitAttempts counts how many submit (Enter) attempts were made.
+	SubmitAttempts int `json:"submit_attempts"`
+
+	// State is the terminal goal-send state: engaged / submitted / failed.
+	State string `json:"state"`
+	// PaletteEngaged records the palette state observed after typing /goal.
+	PaletteEngaged string `json:"palette_engaged"`
+	// PreflightBefore is the preflight state captured before driving the pane.
+	PreflightBefore string `json:"preflight_before"`
+	// ProvenanceHash is the sha256 of the pre-drive capture (audit trail).
+	ProvenanceHash string `json:"provenance_hash"`
+	// BodyPreview is a short preview of the injected packet body.
+	BodyPreview string `json:"body_preview"`
+	// Reason explains the outcome (especially on refusal/failure).
+	Reason string `json:"reason"`
+}
+
+// codexGoalEngageTimeout bounds the wait for the /goal palette to engage.
+var (
+	codexGoalEngageTimeout = 6 * time.Second
+	codexGoalPollInterval  = 400 * time.Millisecond
+)
+
+// runCodexGoalSend drives the Codex /goal slash-command flow on a single pane and
+// emits a deterministic JSON receipt (#165). It refuses unless the pane is
+// codex-live, types "/goal " as a real slash command, waits (via the palette/
+// preflight classifier) for the goal palette to engage, injects the packet body,
+// submits, and reports engaged / submitted / failed with provenance.
+func runCodexGoalSend(session string, paneIndex int, body string) error {
+	emitJSON := jsonOutput || IsJSONOutput()
+
+	// emit prints the single canonical receipt (JSON or human). On failure it
+	// records error_code/hint/error on the embedded envelope and returns
+	// errJSONFailure (JSON mode) or a plain error so Execute exits non-zero
+	// WITHOUT printing a second envelope.
+	emit := func(res CodexGoalSendResult, failErr error, code, hint string) error {
+		if failErr != nil {
+			res.Success = false
+			res.Error = failErr.Error()
+			res.ErrorCode = code
+			res.Hint = hint
+		}
+		if emitJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(res)
+			if failErr != nil {
+				return errors.Join(errJSONFailure, failErr)
+			}
+			return nil
+		}
+		fmt.Printf("Codex Goal Send\n===============\n\n")
+		fmt.Printf("Session: %s  Pane: %d\n", res.Session, res.Pane)
+		fmt.Printf("State:   %s\n", res.State)
+		fmt.Printf("Typed /goal: %v  Body injected: %v  Submitted: %v (attempts %d)\n",
+			res.TypedGoal, res.BodyInjected, res.Submitted, res.SubmitAttempts)
+		fmt.Printf("Reason:  %s\n", res.Reason)
+		return failErr
+	}
+
+	if err := tmux.EnsureInstalled(); err != nil {
+		return err
+	}
+	if paneIndex < 0 {
+		return robot.RobotError(
+			fmt.Errorf("--codex-goal requires an explicit --pane"),
+			robot.ErrCodeInvalidFlag,
+			"Pass --pane <n> identifying the Codex pane to drive",
+		)
+	}
+	if strings.TrimSpace(body) == "" {
+		return robot.RobotError(
+			fmt.Errorf("goal packet body is empty"),
+			robot.ErrCodeInvalidFlag,
+			"Provide the goal objective via --file <packet> or as the trailing argument",
+		)
+	}
+
+	target, content, err := resolveCodexPane(session, paneIndex, tmux.LinesFullContext)
+	if err != nil {
+		return err
+	}
+
+	sum := sha256.Sum256([]byte(content))
+	res := CodexGoalSendResult{
+		RobotResponse:   robot.NewRobotResponse(false),
+		Session:         session,
+		Pane:            paneIndex,
+		ProvenanceHash:  hex.EncodeToString(sum[:]),
+		BodyPreview:     truncatePrompt(strings.TrimSpace(body), 80),
+		State:           "failed",
+		PaletteEngaged:  "none",
+		PreflightBefore: "",
+	}
+
+	// Gate: refuse unless the pane is codex-live (proceed-class).
+	pf := codex.Preflight(content)
+	res.PreflightBefore = pf.State.String()
+	if pf.Action != codex.ActionProceed {
+		res.Reason = fmt.Sprintf("refused: pane preflight=%s action=%s; not safe to drive a goal here. %s",
+			pf.State, pf.Action, pf.Reason)
+		return emit(res,
+			fmt.Errorf("pane not codex-live (preflight=%s)", pf.State),
+			robot.ErrCodeResourceBusy,
+			"Run 'ntm codex preflight' first; only drive a goal when state is codex-live/goal-completed",
+		)
+	}
+
+	// (1) Type "/goal " as a slash command (literal, no Enter) so Codex opens the
+	// slash palette and selects the /goal command rather than treating it as chat.
+	if err := tmux.SendKeys(target.ID, "/goal ", false); err != nil {
+		res.Reason = fmt.Sprintf("failed to type /goal: %v", err)
+		return emit(res, err, robot.ErrCodePromptSendFailed, "tmux send-keys for /goal failed")
+	}
+	res.TypedGoal = true
+
+	// (2) Wait for the goal palette to engage: Codex shows the /goal command
+	// entry / goal palette. Poll the palette+preflight classifiers until engaged
+	// or the bounded timeout elapses.
+	deadline := time.Now().Add(codexGoalEngageTimeout)
+	engaged := false
+	for time.Now().Before(deadline) {
+		cap2, capErr := tmux.CapturePaneVisible(target.ID)
+		if capErr == nil {
+			cls := codex.Classify(cap2)
+			lower := strings.ToLower(cap2)
+			// Engagement is asserted only by the classifier states or Codex's own
+			// descriptive palette text ("set or view the goal"). Do NOT match a
+			// bare "/goal" substring: that string is the literal we just typed and
+			// is echoed on the visible screen regardless of whether Codex actually
+			// opened the slash palette, which would falsely report engagement.
+			if cls.State == codex.StateGoalPalettePrimed ||
+				cls.State == codex.StateSlashPaletteOpen ||
+				strings.Contains(lower, "set or view the goal") {
+				res.PaletteEngaged = cls.State.String()
+				engaged = true
+				break
+			}
+		}
+		time.Sleep(codexGoalPollInterval)
+	}
+	if !engaged {
+		res.State = "failed"
+		res.Reason = "the /goal palette did not engage within the timeout; Codex may have changed its slash-command UI"
+		return emit(res,
+			fmt.Errorf("goal palette did not engage"),
+			robot.ErrCodeTimeout,
+			"Verify Codex is at a quiescent prompt and that /goal is still a slash command in this Codex version",
+		)
+	}
+	res.State = "engaged"
+
+	// (3) Inject the packet body (single-line objective; literal, no Enter). If
+	// the body has newlines, flatten to spaces — /goal takes a one-line objective.
+	objective := strings.Join(strings.Fields(body), " ")
+	if err := tmux.SendKeys(target.ID, objective, false); err != nil {
+		res.Reason = fmt.Sprintf("failed to inject goal body: %v", err)
+		return emit(res, err, robot.ErrCodePromptSendFailed, "tmux send-keys for goal body failed")
+	}
+	res.BodyInjected = true
+
+	// (4) Submit (Enter). One attempt; /goal is a single-line command.
+	time.Sleep(tmux.DefaultEnterDelay)
+	res.SubmitAttempts = 1
+	if err := tmux.SendKeys(target.ID, "", true); err != nil {
+		res.Reason = fmt.Sprintf("failed to submit goal: %v", err)
+		return emit(res, err, robot.ErrCodePromptSendFailed, "tmux send-keys Enter (submit) failed")
+	}
+	res.Submitted = true
+	res.State = "submitted"
+	res.Success = true
+	res.Reason = "typed /goal, palette engaged, injected objective, and submitted. Use 'ntm codex wait-goal-engaged' to confirm engagement."
+
+	addTimelinePromptMarker(session, *target, "/goal "+objective)
+	return emit(res, nil, "", "")
+}
+
 func sendPromptWithDoubleEnter(paneID, prompt string) error {
 	// Default to AgentUnknown for backward compatibility
 	return tmux.SendKeysForAgentDoubleEnter(paneID, prompt, tmux.AgentUnknown)
@@ -2677,14 +3125,14 @@ func sendPromptWithDoubleEnterForAgent(paneID, prompt string, agentType tmux.Age
 }
 
 func addTimelinePromptMarker(session string, p tmux.Pane, prompt string) {
-	if session == "" {
+	if strings.Compare(session, "") == 0 {
 		return
 	}
-	if p.Type == tmux.AgentUser || p.Type == tmux.AgentUnknown {
+	if sendValueEqual(p.Type, tmux.AgentUser) || sendValueEqual(p.Type, tmux.AgentUnknown) {
 		return
 	}
 	agentID := timelineAgentIDFromPane(p)
-	if agentID == "" {
+	if strings.Compare(agentID, "") == 0 {
 		return
 	}
 	tracker := state.GetGlobalTimelineTracker()
@@ -2726,11 +3174,11 @@ func addTimelineStopMarkers(session string, panes []tmux.Pane) {
 	}
 
 	for _, p := range panes {
-		if p.Type == tmux.AgentUser || p.Type == tmux.AgentUnknown {
+		if sendValueEqual(p.Type, tmux.AgentUser) || sendValueEqual(p.Type, tmux.AgentUnknown) {
 			continue
 		}
 		agentID := timelineAgentIDFromPane(p)
-		if agentID == "" {
+		if strings.Compare(agentID, "") == 0 {
 			continue
 		}
 		tracker.AddMarker(state.TimelineMarker{
@@ -2743,10 +3191,10 @@ func addTimelineStopMarkers(session string, panes []tmux.Pane) {
 }
 
 func timelineAgentIDFromPane(p tmux.Pane) string {
-	if p.NTMIndex > 0 && p.Type != tmux.AgentUnknown && p.Type != tmux.AgentUser {
+	if p.NTMIndex > 0 && sendValueNotEqual(p.Type, tmux.AgentUnknown) && sendValueNotEqual(p.Type, tmux.AgentUser) {
 		return fmt.Sprintf("%s_%d", p.Type, p.NTMIndex)
 	}
-	if p.Title != "" {
+	if strings.Compare(p.Title, "") != 0 {
 		if suffix := tmux.PaneTitleSuffix(p.Title); suffix != "" {
 			return suffix
 		}
@@ -2817,7 +3265,7 @@ func resolveSendSessionForCommand(session string) (string, bool, error) {
 	return res.Session, res.Inferred, nil
 }
 
-func checkCassDuplicates(session string, inferred bool, prompt string, threshold float64, days int) error {
+func checkCassDuplicates(session string, inferred bool, prompt string, threshold float64, days int, forceNonInteractive bool) error {
 	var opts []cass.ClientOption
 	if cfg != nil && cfg.CASS.BinaryPath != "" {
 		opts = append(opts, cass.WithBinaryPath(cfg.CASS.BinaryPath))
@@ -2861,6 +3309,15 @@ func checkCassDuplicates(session string, inferred bool, prompt string, threshold
 	}
 
 	if res.DuplicatesFound {
+		// --force-non-interactive: continue without confirmation, log to stderr so
+		// the warning doesn't leak into machine-readable stdout (JSON pipelines).
+		if forceNonInteractive {
+			fmt.Fprintf(os.Stderr,
+				"warning: CASS duplicate check found %d similar session(s); "+
+					"continuing because --force-non-interactive was used.\n",
+				len(res.SimilarSessions))
+			return nil
+		}
 		if jsonOutput {
 			return fmt.Errorf("duplicates found in CASS: %d similar sessions", len(res.SimilarSessions))
 		}
@@ -3080,7 +3537,7 @@ func runDistributeMode(session, strategy string, limit int, autoExecute bool, dr
 	// Summary
 	if jsonOutput {
 		result := map[string]interface{}{
-			"success":   failed == 0,
+			"success":   sendValueEqual(failed, 0),
 			"session":   session,
 			"delivered": delivered,
 			"failed":    failed,
@@ -3100,18 +3557,19 @@ func runDistributeMode(session, strategy string, limit int, autoExecute bool, dr
 
 // BatchResult represents the JSON output for batch send operations
 type BatchResult struct {
-	Success         bool                `json:"success"`
-	Session         string              `json:"session"`
-	Randomized      bool                `json:"randomized,omitempty"`
-	SeedUsed        int64               `json:"seed_used,omitempty"`
-	PriorityOrdered bool                `json:"priority_ordered,omitempty"`
-	Order           []string            `json:"order,omitempty"` // BatchPrompt.Source in execution order (for debugging/tests)
-	Total           int                 `json:"batch_total"`
-	Delivered       int                 `json:"batch_delivered"`
-	Failed          int                 `json:"batch_failed"`
-	Skipped         int                 `json:"batch_skipped"`
-	Results         []BatchPromptResult `json:"results"`
-	Error           string              `json:"error,omitempty"`
+	Success              bool                `json:"success"`
+	Session              string              `json:"session"`
+	NonInteractiveForced bool                `json:"non_interactive_forced,omitempty"`
+	Randomized           bool                `json:"randomized,omitempty"`
+	SeedUsed             int64               `json:"seed_used,omitempty"`
+	PriorityOrdered      bool                `json:"priority_ordered,omitempty"`
+	Order                []string            `json:"order,omitempty"` // BatchPrompt.Source in execution order (for debugging/tests)
+	Total                int                 `json:"batch_total"`
+	Delivered            int                 `json:"batch_delivered"`
+	Failed               int                 `json:"batch_failed"`
+	Skipped              int                 `json:"batch_skipped"`
+	Results              []BatchPromptResult `json:"results"`
+	Error                string              `json:"error,omitempty"`
 }
 
 // BatchPromptResult represents the result of sending a single prompt in a batch
@@ -3173,7 +3631,7 @@ func parseBatchFile(path string) ([]BatchPrompt, error) {
 		for i, line := range lines {
 			lineNo := i + 1
 			trimmed := strings.TrimSpace(line)
-			if trimmed == "---" {
+			if strings.Compare(trimmed, "---") == 0 {
 				flushBlock()
 				blockLines = nil
 				blockStartLine = 0
@@ -3258,14 +3716,14 @@ func sortBatchByPriority(prompts []BatchPrompt) {
 	sort.SliceStable(prompts, func(i, j int) bool {
 		pi, pj := prompts[i].Priority, prompts[j].Priority
 		// Both unset: preserve order
-		if pi == -1 && pj == -1 {
+		if sendValueEqual(pi, -1) && sendValueEqual(pj, -1) {
 			return false
 		}
 		// Unset sorts last
-		if pi == -1 {
+		if sendValueEqual(pi, -1) {
 			return false
 		}
-		if pj == -1 {
+		if sendValueEqual(pj, -1) {
 			return true
 		}
 		return pi < pj
@@ -3325,14 +3783,14 @@ func filterPanesForBatch(panes []tmux.Pane, opts SendOptions) []tmux.Pane {
 
 		// If no filters specified, include all non-user panes
 		if noFilter {
-			if p.Type != tmux.AgentUser {
+			if sendValueNotEqual(p.Type, tmux.AgentUser) {
 				filtered = append(filtered, p)
 			}
 			continue
 		}
 
 		// Skip user panes unless --all was specified
-		if p.Type == tmux.AgentUser {
+		if sendValueEqual(p.Type, tmux.AgentUser) {
 			continue
 		}
 
@@ -3446,12 +3904,13 @@ func runSendBatch(opts SendOptions) error {
 		}
 
 		return printSendDryRunResult(SendDryRunResult{
-			Success:   true,
-			DryRun:    true,
-			Session:   opts.Session,
-			Total:     len(entries),
-			WouldSend: entries,
-			Message:   "use without --dry-run to execute",
+			Success:              true,
+			DryRun:               true,
+			Session:              opts.Session,
+			NonInteractiveForced: opts.ForceNonInteractive,
+			Total:                len(entries),
+			WouldSend:            entries,
+			Message:              "use without --dry-run to execute",
 		})
 	}
 
@@ -3569,7 +4028,10 @@ func runSendBatch(opts SendOptions) error {
 				sendErr = fmt.Errorf("pane %d not found", paneIdx)
 				continue
 			}
-			if err := sendPromptToPane(opts.Session, p, promptText); err != nil {
+			// Stamp the per-pane NTM-Pane work-token instruction (#199). No-op
+			// when the semantic feature is off (prompt unchanged).
+			promptForPane := stampMarchingOrders(promptText, opts.Session, p.WindowIndex, p.Index)
+			if err := sendPromptToPane(opts.Session, p, promptForPane); err != nil {
 				paneFailed++
 				sendErr = err
 			} else {
@@ -3648,11 +4110,12 @@ summary:
 	// Output results
 	if jsonOutput {
 		batchResult := BatchResult{
-			Success:         failed == 0 && !interrupted,
-			Session:         opts.Session,
-			Randomized:      opts.Randomize,
-			SeedUsed:        seedUsed,
-			PriorityOrdered: opts.PriorityOrder,
+			Success:              failed == 0 && !interrupted,
+			Session:              opts.Session,
+			NonInteractiveForced: opts.ForceNonInteractive,
+			Randomized:           opts.Randomize,
+			SeedUsed:             seedUsed,
+			PriorityOrdered:      opts.PriorityOrder,
 			Order: func() []string {
 				if !opts.Randomize {
 					return nil
@@ -3672,7 +4135,17 @@ summary:
 		if interrupted {
 			batchResult.Error = "interrupted by user"
 		}
-		return json.NewEncoder(os.Stdout).Encode(batchResult)
+		// bd-oqwmf: batch dispatch is dynamic (Success may be false when
+		// any prompt failed or the loop was interrupted). Encode then
+		// route through jsonFailureExit on the failure branch so $? is
+		// honest for partial/total batch failure.
+		if encErr := json.NewEncoder(os.Stdout).Encode(batchResult); encErr != nil {
+			return encErr
+		}
+		if !batchResult.Success {
+			return jsonFailureExit()
+		}
+		return nil
 	}
 
 	// Summary

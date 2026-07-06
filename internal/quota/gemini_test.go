@@ -173,6 +173,8 @@ func TestParseGeminiUsage_FailClosed_NearMissPatterns(t *testing.T) {
 		{"usage without percentage", "Usage: moderate"},
 		{"numeric without context", "70.5"},
 		{"json-like", `{"usage": 50, "quota": 80}`},
+		{"neutral quota prose", "Quota remaining is healthy"},
+		{"unlimited plan prose", "This account has unlimited quota"},
 	}
 
 	for _, nm := range nearMisses {
@@ -187,6 +189,25 @@ func TestParseGeminiUsage_FailClosed_NearMissPatterns(t *testing.T) {
 				t.Errorf("expected found=false for near-miss %q (fail-closed)", nm.input)
 			}
 		})
+	}
+}
+
+func TestParseGeminiUsage_NeutralQuotaTextDoesNotLookLimited(t *testing.T) {
+	t.Parallel()
+
+	info := &QuotaInfo{}
+	found, err := parseGeminiUsage(info, "Quota: 90%\nQuota remaining is healthy\nThis account has unlimited quota")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true from Quota percentage")
+	}
+	if info.WeeklyUsage != 90 {
+		t.Fatalf("WeeklyUsage = %v, want 90", info.WeeklyUsage)
+	}
+	if info.IsLimited {
+		t.Fatal("neutral quota/unlimited text must not set IsLimited")
 	}
 }
 

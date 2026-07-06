@@ -66,6 +66,7 @@ func newResumeCmd() *cobra.Command {
 		ccCount    int
 		codCount   int
 		gmiCount   int
+		agyCount   int
 	)
 
 	cmd := &cobra.Command{
@@ -90,7 +91,7 @@ Examples:
 				sessionName = args[0]
 			}
 			return runResume(cmd, sessionName, fromPath, spawn, inject, dryRun,
-				ccCount, codCount, gmiCount, jsonFormat)
+				ccCount, codCount, gmiCount, agyCount, jsonFormat)
 		},
 	}
 
@@ -102,12 +103,13 @@ Examples:
 	cmd.Flags().IntVar(&ccCount, "cc", 0, "Number of Claude agents to spawn (requires --spawn)")
 	cmd.Flags().IntVar(&codCount, "cod", 0, "Number of Codex agents to spawn (requires --spawn)")
 	cmd.Flags().IntVar(&gmiCount, "gmi", 0, "Number of Gemini agents to spawn (requires --spawn)")
+	cmd.Flags().IntVar(&agyCount, "agy", 0, "Number of Antigravity agents to spawn (requires --spawn)")
 
 	return cmd
 }
 
 func runResume(cmd *cobra.Command, sessionName, fromPath string, spawn, inject, dryRun bool,
-	ccCount, codCount, gmiCount int, jsonFormat bool) error {
+	ccCount, codCount, gmiCount, agyCount int, jsonFormat bool) error {
 
 	// Check global JSON flag
 	if IsJSONOutput() {
@@ -245,7 +247,7 @@ func runResume(cmd *cobra.Command, sessionName, fromPath string, spawn, inject, 
 			}
 		}
 		return spawnWithHandoff(cmd, sessionName, h, path, handoffInfo,
-			ccCount, codCount, gmiCount, projectDir, jsonFormat)
+			ccCount, codCount, gmiCount, agyCount, projectDir, jsonFormat)
 	}
 
 	if inject {
@@ -312,19 +314,20 @@ func displayHandoff(cmd *cobra.Command, h *handoff.Handoff, path string, age tim
 }
 
 func spawnWithHandoff(cmd *cobra.Command, sessionName string, h *handoff.Handoff, path string,
-	info *ResumeHandoffInfo, ccCount, codCount, gmiCount int, projectDir string, jsonFormat bool) error {
+	info *ResumeHandoffInfo, ccCount, codCount, gmiCount, agyCount int, projectDir string, jsonFormat bool) error {
 
 	slog.Info("spawning with handoff",
 		"session", sessionName,
 		"cc", ccCount,
 		"cod", codCount,
 		"gmi", gmiCount,
+		"agy", agyCount,
 	)
 
 	// Validate counts
-	totalAgents := ccCount + codCount + gmiCount
+	totalAgents := ccCount + codCount + gmiCount + agyCount
 	if totalAgents == 0 {
-		return fmt.Errorf("--spawn requires at least one agent count (--cc, --cod, or --gmi)")
+		return fmt.Errorf("--spawn requires at least one agent count (--cc, --cod, --gmi, or --agy)")
 	}
 
 	// Format context for injection
@@ -341,6 +344,7 @@ func spawnWithHandoff(cmd *cobra.Command, sessionName string, h *handoff.Handoff
 		CCCount:            ccCount,
 		CodCount:           codCount,
 		GmiCount:           gmiCount,
+		AgyCount:           agyCount,
 		UserPane:           true,
 		NoHooks:            true,
 	}
@@ -703,5 +707,14 @@ func humanizeDuration(d time.Duration) string {
 func outputResumeJSON(cmd *cobra.Command, result *ResumeResult) error {
 	encoder := json.NewEncoder(cmd.OutOrStdout())
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(result)
+	if err := encoder.Encode(result); err != nil {
+		return err
+	}
+	// bd-oqwmf: signal non-zero exit when the resume envelope reports
+	// failure, so `ntm resume --json` automation gating on `$?` no longer
+	// silently misses "no handoff found" / validation errors.
+	if result != nil && !result.Success {
+		return jsonFailureExit()
+	}
+	return nil
 }

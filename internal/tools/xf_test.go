@@ -1,10 +1,35 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestXFHealthWhenInstalled is an end-to-end regression for issue #202: a
+// healthy xf (installed, responds to --version) must pass even when the default
+// ~/.xf/archive is absent or the archive lives at a custom path (XF_DB/XF_INDEX)
+// and when the removed `xf stats --output json` probe would fail. Runs only
+// where a real xf is installed.
+func TestXFHealthWhenInstalled(t *testing.T) {
+	adapter := NewXFAdapter()
+	if _, installed := adapter.Detect(); !installed {
+		t.Skip("xf not installed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	health, err := adapter.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() returned error: %v", err)
+	}
+	if !health.Healthy {
+		t.Fatalf("installed xf reported unhealthy (over-strict archive/index gating regression): %s", health.Message)
+	}
+}
 
 func TestXFIndexStatusHealthy(t *testing.T) {
 	t.Parallel()

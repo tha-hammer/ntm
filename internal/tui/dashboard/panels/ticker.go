@@ -13,16 +13,17 @@ import (
 // TickerData holds the data displayed in the ticker
 type TickerData struct {
 	// Fleet status
-	TotalAgents   int
-	ActiveAgents  int
-	ClaudeCount   int
-	CodexCount    int
-	GeminiCount   int
-	CursorCount   int
-	WindsurfCount int
-	AiderCount    int
-	OllamaCount   int
-	UserCount     int
+	TotalAgents      int
+	ActiveAgents     int
+	ClaudeCount      int
+	CodexCount       int
+	GeminiCount      int
+	AntigravityCount int
+	CursorCount      int
+	WindsurfCount    int
+	AiderCount       int
+	OllamaCount      int
+	UserCount        int
 
 	// Alerts
 	CriticalAlerts int
@@ -234,6 +235,9 @@ func (m *TickerPanel) buildPlainFleetSegment() string {
 		}
 		if m.data.GeminiCount > 0 {
 			agentParts = append(agentParts, fmt.Sprintf("G:%d", m.data.GeminiCount))
+		}
+		if m.data.AntigravityCount > 0 {
+			agentParts = append(agentParts, fmt.Sprintf("A:%d", m.data.AntigravityCount))
 		}
 		if m.data.CursorCount > 0 {
 			agentParts = append(agentParts, fmt.Sprintf("Cur:%d", m.data.CursorCount))

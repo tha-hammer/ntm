@@ -415,7 +415,7 @@ func TestContextWithCancellation(t *testing.T) {
 	client := NewCLIClient(WithCLIBinaryPath("/nonexistent/cm"))
 
 	// Should handle cancelled context gracefully
-	result, err := client.GetContext(ctx, "test task")
+	result, err := client.GetContext(ctx, "test task", "")
 
 	// With nonexistent binary, should return nil, nil (graceful degradation)
 	if err != nil {
@@ -437,7 +437,7 @@ func TestRecoveryContextTaskFormat(t *testing.T) {
 
 	// Call GetRecoveryContext - this formats the task as "<projectName>: starting new coding session"
 	// Since CM isn't installed, it should return nil, nil
-	result, err := client.GetRecoveryContext(context.Background(), "my-project", 5, 3)
+	result, err := client.GetRecoveryContext(context.Background(), "my-project", "", 5, 3)
 
 	if err != nil {
 		t.Errorf("CM_CONTEXT_TEST: GetRecoveryContext should not error when CM unavailable, got: %v", err)

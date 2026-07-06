@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,17 +100,24 @@ func (s *PendingRotationStore) StoragePath() string {
 
 // Add adds or updates a pending rotation in the store.
 func (s *PendingRotationStore) Add(pending *PendingRotation) error {
+	if pending == nil {
+		return fmt.Errorf("pending rotation is nil")
+	}
+
 	pendingMu.Lock()
 	defer pendingMu.Unlock()
 
 	// Read existing entries (excluding expired and matching agent)
-	entries, _ := s.readAllLocked()
+	entries, err := s.readAllLocked()
+	if err != nil {
+		return fmt.Errorf("reading pending rotations: %w", err)
+	}
 	var newEntries []StoredPendingRotation
 
 	now := time.Now()
 	for _, e := range entries {
 		// Skip expired and skip existing entry for same agent
-		if e.TimeoutAt.After(now) && e.AgentID != pending.AgentID {
+		if e.TimeoutAt.After(now) && !pendingAgentIDEqual(e.AgentID, pending.AgentID) {
 			newEntries = append(newEntries, e)
 		}
 	}
@@ -125,13 +133,16 @@ func (s *PendingRotationStore) Remove(agentID string) error {
 	pendingMu.Lock()
 	defer pendingMu.Unlock()
 
-	entries, _ := s.readAllLocked()
+	entries, err := s.readAllLocked()
+	if err != nil {
+		return fmt.Errorf("reading pending rotations: %w", err)
+	}
 	var newEntries []StoredPendingRotation
 
 	now := time.Now()
 	for _, e := range entries {
 		// Keep non-expired, non-matching entries
-		if e.TimeoutAt.After(now) && e.AgentID != agentID {
+		if e.TimeoutAt.After(now) && !pendingAgentIDEqual(e.AgentID, agentID) {
 			newEntries = append(newEntries, e)
 		}
 	}
@@ -151,7 +162,7 @@ func (s *PendingRotationStore) Get(agentID string) (*PendingRotation, error) {
 
 	now := time.Now()
 	for _, e := range entries {
-		if e.AgentID == agentID && e.TimeoutAt.After(now) {
+		if pendingAgentIDEqual(e.AgentID, agentID) && e.TimeoutAt.After(now) {
 			return e.ToPendingRotation(), nil
 		}
 	}
@@ -193,7 +204,7 @@ func (s *PendingRotationStore) GetForSession(session string) ([]*PendingRotation
 	var result []*PendingRotation
 	now := time.Now()
 	for _, e := range entries {
-		if e.SessionName == session && e.TimeoutAt.After(now) {
+		if pendingSessionNameEqual(e.SessionName, session) && e.TimeoutAt.After(now) {
 			result = append(result, e.ToPendingRotation())
 		}
 	}
@@ -301,6 +312,14 @@ func (s *PendingRotationStore) readAllLocked() ([]StoredPendingRotation, error) 
 	return entries, nil
 }
 
+func pendingAgentIDEqual(left, right string) bool {
+	return strings.Compare(left, right) == 0
+}
+
+func pendingSessionNameEqual(left, right string) bool {
+	return strings.Compare(left, right) == 0
+}
+
 // writeAllLocked writes all entries atomically (caller must hold lock).
 func (s *PendingRotationStore) writeAllLocked(entries []StoredPendingRotation) error {
 	// Ensure directory exists
@@ -314,7 +333,11 @@ func (s *PendingRotationStore) writeAllLocked(entries []StoredPendingRotation) e
 		return err
 	}
 	tmpPath := tmpFile.Name()
+	tmpFileClosed := false
 	defer func() {
+		if !tmpFileClosed {
+			_ = tmpFile.Close()
+		}
 		if tmpPath != "" {
 			_ = os.Remove(tmpPath)
 		}
@@ -324,7 +347,7 @@ func (s *PendingRotationStore) writeAllLocked(entries []StoredPendingRotation) e
 	for _, entry := range entries {
 		data, err := json.Marshal(entry)
 		if err != nil {
-			continue
+			return fmt.Errorf("marshaling pending rotation %q: %w", entry.AgentID, err)
 		}
 		if _, err := writer.Write(data); err != nil {
 			return err
@@ -338,8 +361,10 @@ func (s *PendingRotationStore) writeAllLocked(entries []StoredPendingRotation) e
 		return err
 	}
 	if err := tmpFile.Close(); err != nil {
+		tmpFileClosed = true
 		return err
 	}
+	tmpFileClosed = true
 
 	if err := os.Chmod(tmpPath, 0600); err != nil {
 		return err

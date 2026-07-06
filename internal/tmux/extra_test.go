@@ -1,6 +1,12 @@
 package tmux
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -41,6 +47,123 @@ func TestBuildRemoteShellCommand(t *testing.T) {
 	if !strings.Contains(got, `'x; rm -rf /'`) {
 		t.Fatalf("buildRemoteShellCommand() did not quote dangerous arg: %q", got)
 	}
+}
+
+func TestClassifyCommandError(t *testing.T) {
+	t.Parallel()
+
+	exit1 := commandExitError(t, 1)
+	exit255 := commandExitError(t, 255)
+
+	tests := []struct {
+		name string
+		err  error
+		want CommandErrorClass
+	}{
+		{
+			name: "nil",
+			err:  nil,
+			want: CommandErrorClass{Kind: CommandErrorNone},
+		},
+		{
+			name: "timeout",
+			err:  context.DeadlineExceeded,
+			want: CommandErrorClass{Kind: CommandErrorTimeout, Infrastructure: true, Retryable: true},
+		},
+		{
+			name: "canceled",
+			err:  context.Canceled,
+			want: CommandErrorClass{Kind: CommandErrorCanceled, Infrastructure: true},
+		},
+		{
+			name: "circuit open",
+			err:  ErrCircuitOpen,
+			want: CommandErrorClass{Kind: CommandErrorCircuitOpen, Infrastructure: true, Retryable: true},
+		},
+		{
+			name: "binary unavailable",
+			err:  &exec.Error{Name: "tmux", Err: exec.ErrNotFound},
+			want: CommandErrorClass{Kind: CommandErrorBinaryUnavailable, Infrastructure: true},
+		},
+		{
+			name: "permission denied",
+			err:  &exec.Error{Name: "tmux", Err: os.ErrPermission},
+			want: CommandErrorClass{Kind: CommandErrorPermissionDenied, Infrastructure: true},
+		},
+		{
+			name: "permission denied from stderr",
+			err:  fmt.Errorf("tmux list-sessions: %w: permission denied", exit1),
+			want: CommandErrorClass{Kind: CommandErrorPermissionDenied, Infrastructure: true},
+		},
+		{
+			name: "missing session",
+			err:  fmt.Errorf("tmux list-panes: %w: can't find session: missing", exit1),
+			want: CommandErrorClass{Kind: CommandErrorSessionNotFound},
+		},
+		{
+			name: "missing pane",
+			err:  fmt.Errorf("tmux select-pane: %w: can't find pane: %%99", exit1),
+			want: CommandErrorClass{Kind: CommandErrorPaneNotFound},
+		},
+		{
+			name: "no tmux server",
+			err:  fmt.Errorf("tmux list-sessions: %w: no server running on /tmp/tmux-1000/default", exit1),
+			want: CommandErrorClass{Kind: CommandErrorNoServer, Infrastructure: true, Retryable: true},
+		},
+		{
+			name: "remote unavailable",
+			err:  fmt.Errorf("ssh host: %w: connection timed out", exit255),
+			want: CommandErrorClass{Kind: CommandErrorRemoteUnavailable, Infrastructure: true, Retryable: true},
+		},
+		{
+			name: "malformed output",
+			err:  errors.New("unexpected session format"),
+			want: CommandErrorClass{Kind: CommandErrorMalformedOutput, Infrastructure: true, Retryable: true},
+		},
+		{
+			name: "ordinary tmux command failure",
+			err:  fmt.Errorf("tmux display-message: %w: unknown option: -Z", exit1),
+			want: CommandErrorClass{Kind: CommandErrorCommandFailed},
+		},
+		{
+			name: "unknown error",
+			err:  errors.New("read pipe failed"),
+			want: CommandErrorClass{Kind: CommandErrorUnknown, Infrastructure: true, Retryable: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClassifyCommandError(tt.err); got != tt.want {
+				t.Fatalf("ClassifyCommandError(%v) = %+v, want %+v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func commandExitError(t *testing.T, code int) error {
+	t.Helper()
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestCommandExitErrorHelper")
+	cmd.Env = append(os.Environ(), "NTM_TEST_EXIT_CODE="+strconv.Itoa(code))
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("helper exit error = %T %v, want *exec.ExitError", err, err)
+	}
+	return err
+}
+
+func TestCommandExitErrorHelper(t *testing.T) {
+	code := os.Getenv("NTM_TEST_EXIT_CODE")
+	if code == "" {
+		return
+	}
+	parsed, err := strconv.Atoi(code)
+	if err != nil {
+		os.Exit(2)
+	}
+	os.Exit(parsed)
 }
 
 func TestBuildPaneCommand(t *testing.T) {

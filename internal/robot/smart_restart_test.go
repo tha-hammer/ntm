@@ -1,7 +1,10 @@
 package robot
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // =============================================================================
@@ -885,6 +888,9 @@ func TestRestartCanonicalAgentType(t *testing.T) {
 		{"codex-cli", "cod"},
 		{"openai-codex", "cod"},
 		{"google-gemini", "gmi"},
+		{"antigravity", "agy"},
+		{"agy", "agy"},
+		{"opencode", "oc"},
 		{"ws", "windsurf"},
 		{"ollama", "ollama"},
 		{"mystery-agent", "unknown"},
@@ -910,6 +916,8 @@ func TestRestartLaunchAlias(t *testing.T) {
 		{"codex", "cod"},
 		{"openai-codex", "cod"},
 		{"google-gemini", "gmi"},
+		{"antigravity", "agy"},
+		{"opencode", "oc"},
 		{"ws", "windsurf"},
 		{"aider", "aider"},
 		{"ollama", "ollama"},
@@ -922,6 +930,219 @@ func TestRestartLaunchAlias(t *testing.T) {
 		t.Run(tt.input, func(t *testing.T) {
 			if got := restartLaunchAlias(tt.input); got != tt.want {
 				t.Errorf("restartLaunchAlias(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestConfirmShellReturned verifies the #187 shell-return confirmation logic:
+// process death is the primary signal; the prompt-glyph heuristic is only a
+// fallback when process state is unknowable, and frames a live agent renders
+// (Claude's own "❯" input line) must be rejected there.
+func TestConfirmShellReturned(t *testing.T) {
+	claudeIdleFrame := strings.Join([]string{
+		"● Done. The command ran to completion exactly as expected.",
+		"──────────────────────────────",
+		"❯",
+		"──────────────────────────────",
+		"  ? for shortcuts        Claude Sonnet · 4% context",
+	}, "\n")
+	plainShellPrompt := strings.Join([]string{
+		"some earlier output",
+		"~/projects/demo ❯",
+	}, "\n")
+
+	tests := []struct {
+		name        string
+		childAlive  bool
+		childKnown  bool
+		paneContent string
+		want        bool
+	}{
+		{
+			name:       "agent child alive means not returned regardless of content",
+			childAlive: true, childKnown: true,
+			paneContent: plainShellPrompt,
+			want:        false,
+		},
+		{
+			name:       "process death is authoritative even with agent-looking content",
+			childAlive: false, childKnown: true,
+			paneContent: claudeIdleFrame,
+			want:        true,
+		},
+		{
+			name:       "fallback rejects live Claude frame despite prompt glyph",
+			childAlive: false, childKnown: false,
+			paneContent: claudeIdleFrame,
+			want:        false,
+		},
+		{
+			name:       "fallback accepts a plain shell prompt",
+			childAlive: false, childKnown: false,
+			paneContent: plainShellPrompt,
+			want:        true,
+		},
+		{
+			name:       "fallback rejects mid-teardown output with no prompt",
+			childAlive: false, childKnown: false,
+			paneContent: "Shutting down agent...",
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := confirmShellReturned(tt.childAlive, tt.childKnown, tt.paneContent); got != tt.want {
+				t.Errorf("confirmShellReturned(%v, %v, ...) = %v, want %v", tt.childAlive, tt.childKnown, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPaneShowsLiveAgent(t *testing.T) {
+	claudeFrame := "✻ Churning… (esc to interrupt)\n❯\n  Claude Sonnet"
+	if !paneShowsLiveAgent(claudeFrame) {
+		t.Error("paneShowsLiveAgent should classify a Claude frame as a live agent")
+	}
+	if paneShowsLiveAgent("~/projects/demo ❯") {
+		t.Error("paneShowsLiveAgent should not classify a bare shell prompt as an agent")
+	}
+}
+
+// TestParseNTMPanesCarriesWindowIndex verifies fix #172(b): parseNTMPanes now
+// carries the pane's real WindowIndex so emitted W.P addresses round-trip on
+// multi-window / window-per-agent layouts instead of hardcoding window 0.
+func TestParseNTMPanesCarriesWindowIndex(t *testing.T) {
+	panes := []tmux.Pane{
+		// Window-per-agent: each agent in its own window, all at pane index 0.
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Type: tmux.AgentType("claude"), Title: "s__cc_1"},
+		{ID: "%2", Index: 0, WindowIndex: 1, NTMIndex: 1, Type: tmux.AgentType("codex"), Title: "s__cod_1"},
+		{ID: "%3", Index: 0, WindowIndex: 2, NTMIndex: 1, Type: tmux.AgentType("gemini"), Title: "s__gmi_1"},
+	}
+
+	out := parseNTMPanes(panes)
+
+	wantWindow := map[string]int{"claude": 0, "codex": 1, "gemini": 2}
+	for typ, infos := range out {
+		if len(infos) != 1 {
+			t.Fatalf("expected one pane for type %q, got %d", typ, len(infos))
+		}
+		got := infos[0].WindowIndex
+		if want, ok := wantWindow[typ]; ok && got != want {
+			t.Errorf("type %q: WindowIndex = %d, want %d", typ, got, want)
+		}
+		// The emitted address must be window.pane, not 0.pane.
+		addr := strings.Replace("W.P", "W", string(rune('0'+got)), 1)
+		if got != 0 && addr == "0.P" {
+			t.Errorf("type %q: address collapsed to window 0", typ)
+		}
+	}
+	if out["codex"][0].WindowIndex != 1 {
+		t.Errorf("codex pane should round-trip to window 1, got %d", out["codex"][0].WindowIndex)
+	}
+}
+
+// TestGetSmartRestartUnknownSessionFailsLoud exercises the real GetSmartRestart
+// code path for a session that does not exist: it must propagate
+// success:false / SESSION_NOT_FOUND from the pre-check rather than the default
+// success:true envelope. This needs no live tmux because SessionExists returns
+// false for a random name.
+func TestGetSmartRestartUnknownSessionFailsLoud(t *testing.T) {
+	out, err := GetSmartRestart(SmartRestartOptions{
+		Session:       "ntm-nonexistent-session-for-test-172",
+		LinesCaptured: 10,
+	})
+	if err != nil {
+		t.Fatalf("GetSmartRestart returned unexpected error: %v", err)
+	}
+	if out.Success {
+		t.Errorf("expected success=false for nonexistent session, got true")
+	}
+	if out.ErrorCode != ErrCodeSessionNotFound {
+		t.Errorf("expected error_code=%q, got %q", ErrCodeSessionNotFound, out.ErrorCode)
+	}
+}
+
+// TestSmartRestartTargetingHint verifies the fail-loud remediation hint (#172):
+// it must surface the panes that were actually evaluated, point at
+// --robot-is-working, and warn about window-local --panes addressing only when a
+// --panes filter was supplied.
+func TestSmartRestartTargetingHint(t *testing.T) {
+	t.Run("with panes filter lists evaluated panes and window warning", func(t *testing.T) {
+		opts := SmartRestartOptions{Session: "proj", Panes: []int{2}}
+		out := &SmartRestartOutput{
+			Actions: map[string]RestartAction{
+				"1.0": {Action: ActionFailed},
+				"2.0": {Action: ActionFailed},
+			},
+		}
+		hint := smartRestartTargetingHint(opts, out)
+		if !strings.Contains(hint, "window-local") {
+			t.Errorf("expected window-local warning when --panes set, got %q", hint)
+		}
+		if !strings.Contains(hint, "1.0") || !strings.Contains(hint, "2.0") {
+			t.Errorf("expected evaluated panes 1.0 and 2.0 in hint, got %q", hint)
+		}
+		if !strings.Contains(hint, "--robot-is-working=proj") {
+			t.Errorf("expected --robot-is-working=proj remediation, got %q", hint)
+		}
+	})
+
+	t.Run("no panes filter omits window warning", func(t *testing.T) {
+		opts := SmartRestartOptions{Session: "proj"}
+		out := &SmartRestartOutput{Actions: map[string]RestartAction{}}
+		hint := smartRestartTargetingHint(opts, out)
+		if strings.Contains(hint, "window-local") {
+			t.Errorf("did not expect window-local warning without --panes, got %q", hint)
+		}
+		if !strings.Contains(hint, "No panes were evaluated") {
+			t.Errorf("expected 'No panes were evaluated' note, got %q", hint)
+		}
+	})
+}
+
+// TestSmartRestartFailLoudClassification documents the fail-loud decision the
+// GetSmartRestart tail applies to the assembled summary (#172). It exercises the
+// same branch logic over a synthesized output so we don't need a live tmux.
+func TestSmartRestartFailLoudClassification(t *testing.T) {
+	classify := func(out *SmartRestartOutput, dryRun bool) bool {
+		// Mirror of the fail-loud tail in GetSmartRestart.
+		if dryRun {
+			return out.Success
+		}
+		restartable := out.Summary.Restarted + out.Summary.Failed +
+			out.Summary.Skipped + out.Summary.Waiting
+		if out.Summary.Failed > 0 {
+			return false
+		}
+		if restartable == 0 {
+			return false
+		}
+		return out.Success
+	}
+
+	tests := []struct {
+		name    string
+		summary RestartSummary
+		dryRun  bool
+		want    bool
+	}{
+		{"failed action flips to false", RestartSummary{Failed: 1}, false, false},
+		{"empty target set flips to false", RestartSummary{}, false, false},
+		{"successful restart stays true", RestartSummary{Restarted: 2}, false, true},
+		{"skipped-only stays true (target resolved)", RestartSummary{Skipped: 1}, false, true},
+		{"waiting-only stays true (target resolved)", RestartSummary{Waiting: 1}, false, true},
+		{"dry-run preview stays true", RestartSummary{WouldRestart: 1}, true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := &SmartRestartOutput{
+				RobotResponse: NewRobotResponse(true),
+				Summary:       tt.summary,
+			}
+			if got := classify(out, tt.dryRun); got != tt.want {
+				t.Errorf("classify(%+v, dryRun=%v) = %v, want %v", tt.summary, tt.dryRun, got, tt.want)
 			}
 		})
 	}

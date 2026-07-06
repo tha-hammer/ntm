@@ -349,7 +349,11 @@ func (s *Server) SetRedactionConfig(cfg *RedactionConfig) {
 	s.redactionCfg = cfg
 }
 
-// GetRedactionConfig returns a copy of the current redaction configuration.
+// GetRedactionConfig returns a deep copy of the current redaction
+// configuration. The returned struct's reference-typed fields
+// (Allowlist, ExtraPatterns, DisabledCategories) are independent of
+// the server's live config so a caller may mutate the result freely
+// without affecting in-flight requests (bd-oekc2).
 func (s *Server) GetRedactionConfig() *RedactionConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -357,5 +361,24 @@ func (s *Server) GetRedactionConfig() *RedactionConfig {
 		return nil
 	}
 	cp := *s.redactionCfg
+	// bd-oekc2: redaction.Config carries reference-typed fields that
+	// the shallow struct copy above aliases with the server's live
+	// state. Deep-copy each so the godoc's "copy" promise holds —
+	// callers acting on the returned config (for read-modify-write
+	// via SetRedactionConfig, or for export/diagnostic dumps) cannot
+	// leak mutations back into the running server.
+	if cp.Config.Allowlist != nil {
+		cp.Config.Allowlist = append([]string(nil), cp.Config.Allowlist...)
+	}
+	if cp.Config.ExtraPatterns != nil {
+		patterns := make(map[redaction.Category][]string, len(cp.Config.ExtraPatterns))
+		for k, v := range cp.Config.ExtraPatterns {
+			patterns[k] = append([]string(nil), v...)
+		}
+		cp.Config.ExtraPatterns = patterns
+	}
+	if cp.Config.DisabledCategories != nil {
+		cp.Config.DisabledCategories = append([]redaction.Category(nil), cp.Config.DisabledCategories...)
+	}
 	return &cp
 }

@@ -1071,8 +1071,8 @@ func TestRenderAgentsDiagram(t *testing.T) {
 	if !strings.Contains(stripped, "Codex") {
 		t.Errorf("agents diagram should mention Codex, got %q", stripped)
 	}
-	if !strings.Contains(stripped, "Gemini") {
-		t.Errorf("agents diagram should mention Gemini, got %q", stripped)
+	if !strings.Contains(stripped, "Antigravity") {
+		t.Errorf("agents diagram should mention Antigravity, got %q", stripped)
 	}
 }
 

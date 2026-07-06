@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -98,15 +99,10 @@ func (a *CASSAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 	// AND set a non-zero exit code (3 = "no database — run cass index
 	// --full"), so check the JSON before treating the exit code as
 	// fatal.
-	type cassHealth struct {
-		Status      string `json:"status"`
-		Healthy     bool   `json:"healthy"`
-		Initialized bool   `json:"initialized"`
-	}
 	if body := stdout.Bytes(); len(body) > 0 {
 		var parsed cassHealth
 		if jerr := json.Unmarshal(body, &parsed); jerr == nil {
-			if !parsed.Initialized {
+			if parsed.Initialized != nil && !*parsed.Initialized {
 				return &HealthStatus{
 					Healthy:     false,
 					Message:     "cass installed but not initialized (run: cass index --full)",
@@ -114,10 +110,40 @@ func (a *CASSAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 					Latency:     latency,
 				}, nil
 			}
-			if !parsed.Healthy && err == nil {
+			if !cassHealthIsHealthy(parsed.Status, parsed.Healthy) {
+				message := strings.TrimSpace(parsed.Status)
+				if message == "" {
+					message = "unhealthy"
+				}
+				if len(parsed.Errors) > 0 {
+					message = fmt.Sprintf("%s (%s)", message, strings.Join(parsed.Errors, "; "))
+				}
+				if parsed.RecommendedAction != "" {
+					message = fmt.Sprintf("%s; %s", message, parsed.RecommendedAction)
+				}
+
+				// A stale *derived/search* index is cass's own
+				// "degraded-derived-assets" state: the canonical archive
+				// DB is intact and lexical search still works from the
+				// existing (older) index. cass itself frames this as a
+				// refresh hint ("run cass index"), not a hard failure
+				// (acfs#296). Treat a stale-only blocker as a healthy
+				// degraded warning instead of a hard "unhealthy", but
+				// only when the index exists and the database opened —
+				// so genuine corruption, a missing index, or a DB open
+				// failure still fail closed.
+				if cassDegradedByStaleIndexOnly(parsed.Errors, parsed.State.indexStaleOnly()) {
+					return &HealthStatus{
+						Healthy:     true,
+						Message:     fmt.Sprintf("cass degraded: %s", message),
+						LastChecked: time.Now(),
+						Latency:     latency,
+					}, nil
+				}
+
 				return &HealthStatus{
 					Healthy:     false,
-					Message:     fmt.Sprintf("cass reports unhealthy: %s", parsed.Status),
+					Message:     fmt.Sprintf("cass reports unhealthy: %s", message),
 					LastChecked: time.Now(),
 					Latency:     latency,
 				}, nil
@@ -152,6 +178,124 @@ func (a *CASSAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 		LastChecked: time.Now(),
 		Latency:     latency,
 	}, nil
+}
+
+func cassHealthIsHealthy(status string, healthy *bool) bool {
+	if healthy != nil {
+		return *healthy
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(status))
+	switch normalized {
+	case "healthy", "ok", "ready":
+		return true
+	case "unhealthy", "degraded", "error", "not_initialized", "not-initialized":
+		return false
+	}
+
+	// When `healthy` is absent, fail closed for unknown non-empty status
+	// values so future schema/status additions do not get treated as healthy.
+	if normalized != "" {
+		return false
+	}
+
+	// Empty status + missing healthy should fail closed. A schema-less
+	// success body does not prove cass is healthy.
+	return false
+}
+
+// cassIndexState mirrors the `state.index` block of `cass health --json`.
+type cassIndexState struct {
+	Exists *bool  `json:"exists"`
+	Status string `json:"status"`
+	Stale  *bool  `json:"stale"`
+}
+
+// cassDBState mirrors the `state.database` block of `cass health --json`.
+type cassDBState struct {
+	Exists *bool `json:"exists"`
+	Opened *bool `json:"opened"`
+}
+
+// cassStateBlock mirrors the `state` block of `cass health --json`.
+type cassStateBlock struct {
+	Index    *cassIndexState `json:"index"`
+	Database *cassDBState    `json:"database"`
+}
+
+// cassHealth is the subset of `cass health --json` that ntm relies on for its
+// dependency-health verdict.
+type cassHealth struct {
+	Status            string          `json:"status"`
+	Healthy           *bool           `json:"healthy"`
+	Initialized       *bool           `json:"initialized"`
+	Errors            []string        `json:"errors"`
+	Warnings          []string        `json:"warnings"`
+	RecommendedAction string          `json:"recommended_action"`
+	State             *cassStateBlock `json:"state"`
+}
+
+// cassStaleErrorRe matches the soft "derived index needs a refresh" advisories
+// that cass surfaces in its `errors` array when the only blocker is a stale or
+// pending lexical/search index. These are degraded-but-functional conditions —
+// the canonical archive is intact and lexical search still works — so they must
+// not be conflated with hard failures (corruption, missing index, DB open
+// failure). Matching is conservative: any error that is NOT one of these soft
+// advisories keeps cass classified as unhealthy.
+var cassStaleErrorRe = regexp.MustCompile(`(?i)\b(stale|out[ -]?of[ -]?date|needs?[ -]refresh|pending)\b`)
+
+// cassDegradedByStaleIndexOnly reports whether cass's unhealthy verdict is
+// caused solely by a stale derived/search index. It requires BOTH that every
+// reported error is a recognized soft staleness advisory AND that the
+// structured index/database state confirms the index exists and the DB opened
+// (stateConfirmsStaleOnly). Either guard failing keeps the verdict as
+// hard-unhealthy so genuine corruption never gets downgraded to a warning.
+func cassDegradedByStaleIndexOnly(errs []string, stateConfirmsStaleOnly bool) bool {
+	if !stateConfirmsStaleOnly {
+		return false
+	}
+	if len(errs) == 0 {
+		// No explicit errors but the structured state still says
+		// "exists + stale + db open": a refresh-only degradation.
+		return true
+	}
+	for _, e := range errs {
+		trimmed := strings.TrimSpace(e)
+		if trimmed == "" {
+			continue
+		}
+		if !cassStaleErrorRe.MatchString(trimmed) {
+			return false
+		}
+	}
+	return true
+}
+
+// indexStaleOnly inspects cass's structured `state` block and returns true only
+// when the lexical index physically exists, is flagged stale, and the canonical
+// database both exists and opened. A nil/partial state, a missing index, or a
+// database that failed to open all return false so we fail closed.
+func (s *cassStateBlock) indexStaleOnly() bool {
+	if s == nil || s.Index == nil || s.Database == nil {
+		return false
+	}
+	if !boolDeref(s.Index.Exists) {
+		return false
+	}
+	if !boolDeref(s.Index.Stale) {
+		return false
+	}
+	if !boolDeref(s.Database.Exists) {
+		return false
+	}
+	if !boolDeref(s.Database.Opened) {
+		return false
+	}
+	return true
+}
+
+func boolDeref(b *bool) bool {
+	return b != nil && *b
 }
 
 // HasCapability checks if cass has a specific capability

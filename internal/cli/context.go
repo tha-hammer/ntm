@@ -417,11 +417,21 @@ Use --files to override the file list.`,
 				}
 			}
 
+			// bd-usgfy: emitInjectFailure writes the success:false envelope and
+			// signals non-zero exit so `ntm context inject --json` automation
+			// can gate on $? without re-parsing JSON (parity with #125).
+			emitInjectFailure := func(result ContextInjectResult) error {
+				if encErr := output.PrintJSON(result); encErr != nil {
+					return encErr
+				}
+				return jsonFailureExit()
+			}
+
 			// Build the injection content
 			content, injected, truncated, err := formatContextInjectContent(projectDir, files, maxBytes)
 			if err != nil {
 				if IsJSONOutput() {
-					return output.PrintJSON(ContextInjectResult{
+					return emitInjectFailure(ContextInjectResult{
 						Success: false,
 						Session: session,
 						Error:   err.Error(),
@@ -447,7 +457,7 @@ Use --files to override the file list.`,
 			panes, err := tmux.GetPanes(session)
 			if err != nil {
 				if IsJSONOutput() {
-					return output.PrintJSON(ContextInjectResult{
+					return emitInjectFailure(ContextInjectResult{
 						Success: false,
 						Session: session,
 						Error:   fmt.Sprintf("get panes: %s", err),
@@ -459,7 +469,7 @@ Use --files to override the file list.`,
 			targetPanes, err := selectContextInjectTargetPanes(panes, paneIdx, targetAll, session)
 			if err != nil {
 				if IsJSONOutput() {
-					return output.PrintJSON(ContextInjectResult{
+					return emitInjectFailure(ContextInjectResult{
 						Success: false,
 						Session: session,
 						Error:   err.Error(),

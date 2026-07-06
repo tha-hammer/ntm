@@ -515,7 +515,12 @@ func runContextRotationConfirm(agentID, action string, postponeMinutes int) erro
 			Message: fmt.Sprintf("No pending rotation found for agent %s", agentID),
 		}
 		formatter := output.New(output.WithJSON(jsonOutput))
-		return formatter.Output(result)
+		if encErr := formatter.Output(result); encErr != nil {
+			return encErr
+		}
+		// bd-usgfy: signal non-zero exit after writing the success:false envelope so
+		// `ntm rotate-context --json` automation can gate on $? (parity with #125).
+		return jsonFailureExit()
 	}
 
 	var resultMsg string

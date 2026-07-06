@@ -231,7 +231,7 @@ func TestDashboardPaneTypeSummary(t *testing.T) {
 	}
 
 	got := dashboardPaneTypeSummary(panes)
-	want := "Claude=1 Codex=1 Gemini=0 Cursor=1 Windsurf=1 Aider=1 Ollama=1 User=1 Other=1"
+	want := "Claude=1 Codex=1 Gemini=0 Cursor=1 Windsurf=1 Aider=1 Opencode=0 Ollama=1 User=1 Other=1"
 	if got != want {
 		t.Fatalf("dashboardPaneTypeSummary() = %q, want %q", got, want)
 	}
@@ -250,6 +250,7 @@ func TestPaneOutputPrefixColor(t *testing.T) {
 		{"cursor", tmux.AgentCursor, string(current.Cursor)},
 		{"windsurf", tmux.AgentWindsurf, string(current.Windsurf)},
 		{"aider", tmux.AgentAider, string(current.Aider)},
+		{"opencode", tmux.AgentOpencode, string(current.Opencode)},
 		{"ollama", tmux.AgentOllama, string(current.Ollama)},
 		{"user", tmux.AgentUser, string(current.User)},
 		{"unknown fallback", tmux.AgentUnknown, string(current.Green)},
@@ -277,6 +278,8 @@ func TestShortAgentTypeLocal(t *testing.T) {
 		{"cursor", "cursor", "cur"},
 		{"windsurf alias", "ws", "ws"},
 		{"aider", "aider", "aid"},
+		{"opencode short", "oc", "oc"},
+		{"opencode long", "opencode", "oc"},
 		{"ollama", "ollama", "oll"},
 		{"user", "user", "usr"},
 		{"unknown", "mystery", "mys"},
@@ -306,6 +309,8 @@ func TestLogsAgentTypeColor(t *testing.T) {
 		{"cursor", "cursor", string(current.Cursor)},
 		{"windsurf", "windsurf", string(current.Windsurf)},
 		{"aider", "aider", string(current.Aider)},
+		{"opencode short", "oc", string(current.Opencode)},
+		{"opencode long", "opencode", string(current.Opencode)},
 		{"ollama", "ollama", string(current.Ollama)},
 		{"user", "user", string(current.User)},
 		{"unknown", "mystery", string(current.Text)},
@@ -476,8 +481,8 @@ func TestAgentSpecsValue_SetAndType(t *testing.T) {
 	var specs AgentSpecs
 	val := NewAgentSpecsValue(AgentTypeClaude, &specs)
 
-	if val.Type() != "N[:model]" {
-		t.Errorf("Type() = %q, want %q", val.Type(), "N[:model]")
+	if val.Type() != "N[:model[:effort]]" {
+		t.Errorf("Type() = %q, want %q", val.Type(), "N[:model[:effort]]")
 	}
 
 	if err := val.Set("3"); err != nil {

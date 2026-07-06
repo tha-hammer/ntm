@@ -530,8 +530,8 @@ func TestBindingLineWithVariousFormats(t *testing.T) {
 
 // TestSetupBindingPaletteVsOverlay verifies palette vs overlay binding differences.
 func TestSetupBindingPaletteVsOverlay(t *testing.T) {
-	// Palette uses 90% dimensions and calls "ntm palette"
-	paletteCmd := `bind-key -n F6 display-popup -E -w 90% -h 90% "ntm palette"`
+	// Palette uses a smaller popup than the overlay and calls "ntm palette"
+	paletteCmd := `bind-key -n F6 display-popup -E -w 80% -h 70% "ntm palette"`
 
 	// Overlay uses 95% dimensions and calls "NTM_POPUP=1 ntm dashboard --popup"
 	overlayCmd := overlayBindingCommand("F12")
@@ -540,8 +540,8 @@ func TestSetupBindingPaletteVsOverlay(t *testing.T) {
 	t.Logf("Overlay command: %s", overlayCmd)
 
 	// Verify differences
-	if !strings.Contains(paletteCmd, "90%") {
-		t.Error("palette should use 90% dimensions")
+	if !strings.Contains(paletteCmd, "70%") {
+		t.Error("palette should use reduced-height dimensions")
 	}
 	if !strings.Contains(overlayCmd, "95%") {
 		t.Error("overlay should use 95% dimensions")

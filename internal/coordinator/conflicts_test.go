@@ -62,6 +62,17 @@ func TestMatchesPattern(t *testing.T) {
 		{"file.go", "file.go", true},
 		{"a/b/c.go", "a/b/*.go", true},
 		{"a/b/c.ts", "a/b/*.go", false},
+
+		// bd-eebvt: literal suffix after ** must occupy a whole
+		// basename, not a fragment. Pre-fix, a basename that ends
+		// with the literal mid-filename (e.g. "mytest.go" vs
+		// "**/test.go") was a false-positive match.
+		{"mytest.go", "**/test.go", false},                // basename ends with "test.go" but isn't "test.go"
+		{"xtest.go", "**/test.go", false},                 // same — single char prefix in basename
+		{"internal/xfoo.go", "internal/**/foo.go", false}, // prefixed form: basename "xfoo.go" not "foo.go"
+		{"test.go", "**/test.go", true},                   // exact basename — matches
+		{"foo/test.go", "**/test.go", true},               // basename in subdir — matches
+		{"deep/nested/test.go", "**/test.go", true},       // basename at any depth — matches
 	}
 
 	for _, tt := range tests {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/cass"
 )
 
 func TestNewGenerator(t *testing.T) {
@@ -1069,6 +1070,142 @@ func TestGetInProgressBeadsNoBeads(t *testing.T) {
 	// br not available or no beads - should return nil
 	if len(beads) > 0 {
 		t.Logf("beads found (may be expected in dev environment): %v", beads)
+	}
+}
+
+type mockCASSSearcher struct {
+	installed bool
+	resp      *cass.SearchResponse
+	err       error
+	calls     int
+	lastOpts  cass.SearchOptions
+}
+
+func (m *mockCASSSearcher) IsInstalled() bool {
+	return m.installed
+}
+
+func (m *mockCASSSearcher) Search(_ context.Context, opts cass.SearchOptions) (*cass.SearchResponse, error) {
+	m.calls++
+	m.lastOpts = opts
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.resp, nil
+}
+
+func TestGenerateHandoffWithCASSProvenance(t *testing.T) {
+	tmpDir := t.TempDir()
+	g := NewGenerator(tmpDir)
+	ctx := context.Background()
+
+	includeBeads := false
+	includeAgentMail := false
+	includeCASS := true
+	line := 42
+	client := &mockCASSSearcher{
+		installed: true,
+		resp: &cass.SearchResponse{
+			Hits: []cass.SearchHit{
+				{
+					SourcePath: "sessions/a.jsonl",
+					LineNumber: &line,
+					Agent:      "claude",
+					SessionID:  "sess-a",
+					Score:      0.91,
+					Snippet:    "Fix webhook retry ordering regression.",
+				},
+				{
+					SourcePath: "sessions/a.jsonl",
+					LineNumber: &line,
+					Agent:      "claude",
+					SessionID:  "sess-a",
+					Score:      0.89,
+					Snippet:    "Fix webhook retry ordering regression.",
+				},
+				{
+					SourcePath: "sessions/b.jsonl",
+					Agent:      "codex",
+					SessionID:  "sess-b",
+					Score:      0.71,
+					Snippet:    "Add deterministic queue dry diagnostics.",
+				},
+			},
+		},
+	}
+
+	opts := GenerateHandoffOptions{
+		SessionName:      "test-session",
+		Goal:             "Ship causality feature",
+		Now:              "Write CASS-backed handoff",
+		IncludeBeads:     &includeBeads,
+		IncludeAgentMail: &includeAgentMail,
+		IncludeCASS:      &includeCASS,
+		CASSClient:       client,
+	}
+
+	h, err := g.GenerateHandoff(ctx, opts)
+	if err != nil {
+		t.Fatalf("GenerateHandoff failed: %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("expected 1 CASS call, got %d", client.calls)
+	}
+	if client.lastOpts.Workspace != tmpDir {
+		t.Fatalf("workspace = %q, want %q", client.lastOpts.Workspace, tmpDir)
+	}
+	if client.lastOpts.Since != "30d" {
+		t.Fatalf("since = %q, want 30d", client.lastOpts.Since)
+	}
+	if len(h.CMMemories) != 2 {
+		t.Fatalf("expected 2 deduped cass memories, got %d (%v)", len(h.CMMemories), h.CMMemories)
+	}
+	if !strings.HasPrefix(h.CMMemories[0], "cass:sessions/a.jsonl#L42 [agent=claude, session=sess-a, score=0.91]") {
+		t.Fatalf("unexpected first memory: %q", h.CMMemories[0])
+	}
+	if !strings.HasPrefix(h.CMMemories[1], "cass:sessions/b.jsonl [agent=codex, session=sess-b, score=0.71]") {
+		t.Fatalf("unexpected second memory: %q", h.CMMemories[1])
+	}
+	if got := h.Findings["cass_hit_count"]; got != "2" {
+		t.Fatalf("cass_hit_count = %q, want 2", got)
+	}
+	if strings.TrimSpace(h.Findings["cass_query"]) == "" {
+		t.Fatal("expected cass_query finding to be set")
+	}
+}
+
+func TestGenerateHandoffCASSGracefulDegradation(t *testing.T) {
+	tmpDir := t.TempDir()
+	g := NewGenerator(tmpDir)
+	ctx := context.Background()
+
+	includeBeads := false
+	includeAgentMail := false
+	includeCASS := true
+	client := &mockCASSSearcher{
+		installed: true,
+		err:       cass.ErrNotInitialized,
+	}
+
+	opts := GenerateHandoffOptions{
+		SessionName:      "test-session",
+		Goal:             "Ship feature",
+		Now:              "Continue",
+		IncludeBeads:     &includeBeads,
+		IncludeAgentMail: &includeAgentMail,
+		IncludeCASS:      &includeCASS,
+		CASSClient:       client,
+	}
+
+	h, err := g.GenerateHandoff(ctx, opts)
+	if err != nil {
+		t.Fatalf("GenerateHandoff failed: %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("expected 1 CASS call, got %d", client.calls)
+	}
+	if len(h.CMMemories) != 0 {
+		t.Fatalf("expected no cass memories on degraded mode, got %v", h.CMMemories)
 	}
 }
 

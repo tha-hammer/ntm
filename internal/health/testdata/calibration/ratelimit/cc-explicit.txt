@@ -1,0 +1,4 @@
+Working on the auth refactor.
+Reading internal/auth/session.go
+Editing internal/auth/session.go
+Rate limit reached. Please try again in 60s.

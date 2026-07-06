@@ -173,6 +173,32 @@ func TestProxyAdapterGetAvailability(t *testing.T) {
 	}
 }
 
+// TestProxyHealthWhenInstalledIdle is an end-to-end regression for issue #202:
+// rust_proxy is a proxy *selector* that sits idle (active_proxy: null, status
+// exit 0) when no proxy is activated — the normal state on a host not routing
+// through a proxy. The old probe required a running daemon and reported a
+// permanent "daemon not running" warning. An installed, version-compatible
+// rust_proxy must now report healthy regardless of daemon state. Runs only
+// where rust_proxy is installed.
+func TestProxyHealthWhenInstalledIdle(t *testing.T) {
+	adapter := NewProxyAdapter()
+	adapter.InvalidateAvailabilityCache()
+	if _, installed := adapter.Detect(); !installed {
+		t.Skip("rust_proxy not installed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	health, err := adapter.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() returned error: %v", err)
+	}
+	if !health.Healthy {
+		t.Fatalf("installed rust_proxy reported unhealthy (idle-daemon over-strict regression): %s", health.Message)
+	}
+}
+
 func TestToolProxyInAllTools(t *testing.T) {
 	tools := AllTools()
 	found := false

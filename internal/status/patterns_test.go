@@ -295,7 +295,9 @@ func TestIsPromptLine_AgentTypeFiltering(t *testing.T) {
 }
 
 func TestDetectIdleFromOutput_MultipleLines(t *testing.T) {
-	// Test that we check multiple lines (up to 3 non-empty lines)
+	// DetectIdleFromOutput scans up to maxIdleScanLines (12) trailing
+	// non-empty lines for a prompt, then rejects the verdict if an active
+	// spinner sits below the matched prompt.
 	tests := []struct {
 		name      string
 		output    string
@@ -310,20 +312,73 @@ func TestDetectIdleFromOutput_MultipleLines(t *testing.T) {
 			expected:  true,
 		},
 		{
-			// Prompt within 3 non-empty lines is still detected
-			// "more" is checked (not prompt), "followup" is checked (not prompt),
-			// "claude>" is checked (is prompt!) -> returns true
+			// Prompt within the scan window is still detected
 			name:      "prompt in third line from end",
 			output:    "claude>\nfollowup\nmore",
 			agentType: "cc",
-			expected:  true, // Actually true because we check 3 lines
+			expected:  true,
 		},
 		{
-			// Prompt beyond 3 non-empty lines
-			name:      "prompt beyond 3 lines",
+			// Prompt a handful of lines back (the old 3-line window missed
+			// this; the wider window catches it).
+			name:      "prompt 5 lines from end within window",
 			output:    "claude>\na\nb\nc\nd",
 			agentType: "cc",
-			expected:  false, // Beyond the 3 line check window
+			expected:  true,
+		},
+		{
+			// REAL Claude layout (from internal/cli/outputs/): the "❯ " input
+			// box is pinned to the BOTTOM, with the status footer below it and
+			// the (now finished) turn's content above. No active spinner is the
+			// most-recent dynamic marker, so the pane is idle and dispatchable.
+			name: "cc finished turn with bottom-pinned box is idle",
+			output: "● All changes applied; tests pass.\n" +
+				"\n" +
+				"✻ Cooked for 2m 10s\n" +
+				"───────────\n" +
+				"❯ \n" +
+				"───────────\n" +
+				"  ⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+			agentType: "cc",
+			expected:  true,
+		},
+		{
+			// CRITICAL false-idle guard, REAL layout: the active spinner renders
+			// just ABOVE the bottom-pinned input box while a turn is in flight.
+			// The box is always drawn, so its presence is NOT idleness — the
+			// most-recent dynamic marker is the spinner. MUST NOT report idle.
+			name: "cc working with spinner above bottom box",
+			output: "● Running the suite.\n" +
+				"✻ Scurrying… (ctrl+c to interrupt · 12s · thinking)\n" +
+				"───────────\n" +
+				"❯ \n" +
+				"───────────\n" +
+				"  ⏵⏵ bypass permissions on\n",
+			agentType: "cc",
+			expected:  false,
+		},
+		{
+			// "new task?" footer parked below the box after a turn ends, with no
+			// active spinner — idle and dispatchable.
+			name: "cc new task footer is idle",
+			output: "● Done.\n" +
+				"✻ Baked for 5m 0s\n" +
+				"───────────\n" +
+				"❯ \n" +
+				"───────────\n" +
+				"new task? /clear to save 12.3k tokens\n",
+			agentType: "cc",
+			expected:  true,
+		},
+		{
+			// Prompt beyond the scan window must NOT be detected — guard against
+			// false positives from very-old prompt text deep in scrollback.
+			name: "prompt beyond scan window",
+			output: "claude>\n" +
+				"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n" +
+				"l11\nl12\nl13",
+			agentType: "cc",
+			expected:  false,
 		},
 		{
 			name:      "prompt as last line after work output",

@@ -1303,7 +1303,7 @@ func FormatForAgent(agentType string) InjectionFormat {
 	switch normalizeAgentType(agentType) {
 	case "codex":
 		return FormatMinimal
-	case "gemini":
+	case "gemini", "antigravity":
 		return FormatStructured
 	default: // claude, cc, and others
 		return FormatMarkdown

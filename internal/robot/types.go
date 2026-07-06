@@ -68,6 +68,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -509,17 +510,25 @@ func TerseKeyFor(field string) (key string, ok bool) {
 	return key, ok
 }
 
+var (
+	terseKeyReverseMap     map[string]string
+	terseKeyReverseMapOnce sync.Once
+)
+
 // TerseKeyReverseMap returns the reverse mapping for short keys.
 // It panics if the mapping is not reversible (duplicate short keys).
 func TerseKeyReverseMap() map[string]string {
-	reverse := make(map[string]string, len(TerseKeyMap))
-	for longKey, shortKey := range TerseKeyMap {
-		if existing, ok := reverse[shortKey]; ok {
-			panic(fmt.Sprintf("terse key map collision: %q and %q both map to %q", existing, longKey, shortKey))
+	terseKeyReverseMapOnce.Do(func() {
+		reverse := make(map[string]string, len(TerseKeyMap))
+		for longKey, shortKey := range TerseKeyMap {
+			if existing, ok := reverse[shortKey]; ok {
+				panic(fmt.Sprintf("terse key map collision: %q and %q both map to %q", existing, longKey, shortKey))
+			}
+			reverse[shortKey] = longKey
 		}
-		reverse[shortKey] = longKey
-	}
-	return reverse
+		terseKeyReverseMap = reverse
+	})
+	return terseKeyReverseMap
 }
 
 // ExpandTerseKey converts a short key back to its long form.
@@ -598,6 +607,35 @@ func NewErrorResponse(err error, code, hint string) RobotResponse {
 	resp.ErrorCode = code
 	resp.Hint = hint
 	return resp
+}
+
+// ExitCodeForResponse maps a robot response envelope to the process exit code
+// documented in AGENTS.md ("Robot Command Exit Codes"):
+//
+//	0 — success
+//	2 — feature unavailable / not implemented (NOT_IMPLEMENTED)
+//	1 — any other failure (success:false)
+//
+// A robot command that emits `success:false` MUST make the process exit
+// nonzero so agents branching on the shell exit status don't treat a failed
+// call (e.g. SESSION_NOT_FOUND) as success. Previously the oauth/health family
+// printed the failure envelope but still returned nil, so the process exited 0
+// and callers silently proceeded on bad data (ntm#207). CLI dispatch passes the
+// embedded RobotResponse through this helper to derive the real exit code.
+//
+// When a command has already recorded a concrete exit code in its metadata
+// (via WithExitCode), that value wins so bespoke conventions are preserved.
+func ExitCodeForResponse(resp RobotResponse) int {
+	if resp.Meta != nil && resp.Meta.ExitCode != 0 {
+		return resp.Meta.ExitCode
+	}
+	if resp.Success {
+		return 0
+	}
+	if resp.ErrorCode == ErrCodeNotImplemented {
+		return 2
+	}
+	return 1
 }
 
 // RobotError outputs a standardized error response as JSON and returns the original error.

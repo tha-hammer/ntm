@@ -219,10 +219,10 @@ func TestResolveRotationProjectDirAllowsWorkspaceFallbackForInferredSession(t *t
 		}
 	})
 
-	projectsBase := t.TempDir()
+	projectsBase := canonicalTempDir(t)
 	cfg = &config.Config{ProjectsBase: projectsBase}
 
-	cwdRepo := t.TempDir()
+	cwdRepo := canonicalTempDir(t)
 	if err := os.MkdirAll(filepath.Join(cwdRepo, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}

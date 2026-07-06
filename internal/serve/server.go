@@ -533,6 +533,7 @@ type WSHub struct {
 	register     chan *WSClient
 	unregister   chan *WSClient
 	broadcast    chan *WSEvent
+	dropped      atomic.Int64
 	seq          int64
 	seqMu        sync.Mutex
 	done         chan struct{}
@@ -627,8 +628,8 @@ func (h *WSHub) broadcastEvent(event *WSEvent) {
 			select {
 			case client.send <- data:
 			default:
-				// Client buffer full, skip
-				log.Printf("ws client buffer full id=%s", client.id)
+				dropped := h.dropped.Add(1)
+				log.Printf("ws client buffer full id=%s surface=websocket session= pane= queue_depth=%d dropped_count=%d latency_ms=0 decision=coalesce reason_codes=queue_depth,dropped_output", client.id, len(client.send), dropped)
 			}
 		}
 	}
@@ -675,7 +676,8 @@ func (h *WSHub) Publish(topic, eventType string, data interface{}) {
 		return
 	case h.broadcast <- event:
 	default:
-		log.Printf("ws broadcast buffer full, dropping event topic=%s", topic)
+		dropped := h.dropped.Add(1)
+		log.Printf("ws broadcast buffer full, dropping event topic=%s surface=websocket session= pane= queue_depth=%d dropped_count=%d latency_ms=0 decision=coalesce reason_codes=queue_depth,dropped_output", topic, len(h.broadcast), dropped)
 	}
 }
 
@@ -3291,8 +3293,14 @@ func (s *Server) handlePaneInputV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build pane target
-	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
+	// Build pane target. Resolve via the pane's tmux ID (the `%N` form) so
+	// the target is base-index-independent — `<session>:<paneIdx>` looks
+	// like a pane index but tmux interprets it as a window index, which
+	// breaks on hosts with `base-index = 1` (see #141).
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
 
 	if err := tmux.SendKeys(paneTarget, req.Text, req.Enter); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
@@ -3324,8 +3332,10 @@ func (s *Server) handlePaneInterruptV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build pane target
-	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
 
 	// Send Ctrl+c to interrupt
 	if err := tmux.SendKeys(paneTarget, "C-c", false); err != nil {
@@ -3367,8 +3377,10 @@ func (s *Server) handlePaneOutputV1(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build pane target
-	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
 
 	if err := s.streamManager.StartStream(paneTarget); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
@@ -3403,8 +3415,10 @@ func (s *Server) handleGetPaneTitleV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build pane target
-	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
 
 	title, err := tmux.GetPaneTitle(paneTarget)
 	if err != nil {
@@ -3444,8 +3458,10 @@ func (s *Server) handleSetPaneTitleV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build pane target
-	paneTarget := paneTargetForIndex(r.Context(), sessionID, paneIdx)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
 
 	if err := tmux.SetPaneTitle(paneTarget, req.Title); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
@@ -3477,8 +3493,10 @@ func (s *Server) handleStartPaneStreamV1(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Stream manager targets use raw tmux-style "session:pane_idx".
-	target := paneTargetForIndex(r.Context(), sessionID, paneIdx)
+	target, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
 	topic := streamTopicForTarget(target)
 
 	if err := s.streamManager.StartStream(target); err != nil {
@@ -3508,7 +3526,10 @@ func (s *Server) handleStopPaneStreamV1(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	target := paneTargetForIndex(r.Context(), sessionID, paneIdx)
+	target, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
 	s.streamManager.StopStream(target)
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
@@ -3583,6 +3604,7 @@ type AgentSpawnRequest struct {
 	CCCount   int    `json:"cc_count,omitempty"`
 	CodCount  int    `json:"cod_count,omitempty"`
 	GmiCount  int    `json:"gmi_count,omitempty"`
+	AgyCount  int    `json:"agy_count,omitempty"`
 	Preset    string `json:"preset,omitempty"`
 	WaitReady bool   `json:"wait_ready,omitempty"`
 	Label     string `json:"label,omitempty"` // Goal label for multi-session support
@@ -3604,8 +3626,8 @@ func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// At least one agent count or preset must be specified
-	if req.CCCount == 0 && req.CodCount == 0 && req.GmiCount == 0 && req.Preset == "" {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "at least one agent count (cc_count, cod_count, gmi_count) or preset required", nil, reqID)
+	if req.CCCount == 0 && req.CodCount == 0 && req.GmiCount == 0 && req.AgyCount == 0 && req.Preset == "" {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "at least one agent count (cc_count, cod_count, gmi_count, agy_count) or preset required", nil, reqID)
 		return
 	}
 
@@ -3615,6 +3637,7 @@ func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
 		CCCount:   req.CCCount,
 		CodCount:  req.CodCount,
 		GmiCount:  req.GmiCount,
+		AgyCount:  req.AgyCount,
 		Preset:    req.Preset,
 		WaitReady: req.WaitReady,
 	}
@@ -5887,6 +5910,38 @@ func matchesAttentionFilters(event robot.AttentionEvent, categoryFilter []string
 	}
 
 	return true
+}
+
+// resolvePaneTargetByIndex looks up the tmux pane in the given session whose
+// `pane_index` matches `paneIdx` and returns its tmux pane ID (the `%N`
+// form), which is base-index-independent. The naive `<session>:<paneIdx>`
+// target form looks like a pane index but tmux interprets the second
+// component as a *window* index, so hosts with `base-index = 1` see
+// `can't find window: N` (#141). Using the pane ID avoids the entire
+// window/pane ambiguity. The context is honored so the HTTP layer can
+// cancel a slow tmux ListPanes call, matching the rest of the handlers
+// (`handleGetPaneV1` etc.).
+func resolvePaneTargetByIndex(ctx context.Context, session string, paneIdx int) (string, error) {
+	panes, err := tmux.GetPanesContext(ctx, session)
+	if err != nil {
+		return "", fmt.Errorf("list panes: %w", err)
+	}
+	for _, p := range panes {
+		if p.Index == paneIdx {
+			return p.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no pane with index %d in session %q", paneIdx, session)
+}
+
+func (s *Server) resolvePaneTargetForRequest(w http.ResponseWriter, r *http.Request, session string, paneIdx int, reqID string) (string, bool) {
+	target, err := resolvePaneTargetByIndex(r.Context(), session, paneIdx)
+	if err != nil {
+		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
+			fmt.Sprintf("pane not found: %v", err), nil, reqID)
+		return "", false
+	}
+	return target, true
 }
 
 // parseCSVParam parses a comma-separated query parameter into a slice.

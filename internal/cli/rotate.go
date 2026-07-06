@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/auth"
 	"github.com/Dicklesworthstone/ntm/internal/quota"
 	"github.com/Dicklesworthstone/ntm/internal/rotation"
+	"github.com/Dicklesworthstone/ntm/internal/swarm"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -72,11 +74,13 @@ Examples:
 			}
 			var paneID string
 			var provider string
+			var agentTypeStr string
 			var modelAlias string
 			for _, p := range panes {
 				if p.Index == paneIndex {
 					paneID = p.ID
 					provider = normalizedProviderName(p.Type)
+					agentTypeStr = string(p.Type.Canonical())
 					modelAlias = p.Variant
 					break
 				}
@@ -111,7 +115,7 @@ Examples:
 			if preserveContext {
 				return executeReauthRotation(session, paneIndex, paneID, provider, time.Duration(timeout)*time.Second)
 			}
-			return executeRestartRotation(session, paneIndex, paneID, provider, targetAccount, modelAlias, res.Inferred)
+			return executeRestartRotation(session, paneIndex, paneID, provider, agentTypeStr, targetAccount, modelAlias, res.Inferred)
 		},
 	}
 
@@ -127,6 +131,157 @@ Examples:
 	// Add context rotation management subcommand
 	cmd.AddCommand(newRotateContextCmd())
 
+	// Add account pin (lock/unlock/status) management subcommands. These control
+	// whether automatic account rotation (the caam-switch path triggered on a
+	// usage-limit hit) is allowed to rotate away from an operator-pinned account.
+	cmd.AddCommand(newRotateLockCmd())
+	cmd.AddCommand(newRotateUnlockCmd())
+	cmd.AddCommand(newRotateStatusCmd())
+
+	return cmd
+}
+
+// rotatePinDataDir resolves the directory whose .ntm/account_pins.json holds the
+// shared account pins. Honors an explicit override, else the current directory.
+func rotatePinDataDir(override string) (string, error) {
+	if override != "" {
+		return override, nil
+	}
+	return os.Getwd()
+}
+
+func newRotateLockCmd() *cobra.Command {
+	var dataDir string
+	cmd := &cobra.Command{
+		Use:   "lock <provider> <account>",
+		Short: "Pin a provider to an account so auto-rotation won't switch away from it",
+		Long: `Pin (lock) an account for a provider so the automatic account rotator refuses
+to rotate away from it on a usage-limit hit. The pin is persisted to
+<data-dir>/.ntm/account_pins.json and is honored by any running swarm.
+
+provider may be an agent type (cc, cod, gmi) or a caam provider (claude, openai, google).
+
+Example:
+  ntm rotate lock cod acctB    # never auto-rotate Codex away from acctB`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, err := rotatePinDataDir(dataDir)
+			if err != nil {
+				return err
+			}
+			rotator := swarm.NewAccountRotator()
+			if err := rotator.LoadPins(dir); err != nil {
+				return err
+			}
+			rotator.PinAccount(args[0], args[1])
+			if err := rotator.SavePins(dir); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Pinned %s to %q; automatic rotation will refuse to switch away (use --force-global-auth-clobber or 'ntm rotate unlock' to override).\n", args[0], args[1])
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dataDir, "data-dir", "", "Directory holding .ntm/account_pins.json (default: current directory)")
+	return cmd
+}
+
+func newRotateUnlockCmd() *cobra.Command {
+	var dataDir string
+	cmd := &cobra.Command{
+		Use:   "unlock <provider>",
+		Short: "Remove an account pin, re-enabling automatic rotation for the provider",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, err := rotatePinDataDir(dataDir)
+			if err != nil {
+				return err
+			}
+			rotator := swarm.NewAccountRotator()
+			if err := rotator.LoadPins(dir); err != nil {
+				return err
+			}
+			rotator.UnpinAccount(args[0])
+			if err := rotator.SavePins(dir); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Unpinned %s; automatic rotation re-enabled.\n", args[0])
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dataDir, "data-dir", "", "Directory holding .ntm/account_pins.json (default: current directory)")
+	return cmd
+}
+
+func newRotateStatusCmd() *cobra.Command {
+	var dataDir string
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show account pins and caam safe-restore capability that gate automatic rotation",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, err := rotatePinDataDir(dataDir)
+			if err != nil {
+				return err
+			}
+			rotator := swarm.NewAccountRotator()
+			if err := rotator.LoadPins(dir); err != nil {
+				return err
+			}
+			pins := rotator.PinnedAccounts()
+
+			// Probe caam for the safe-restore capability (caam #19) so operators can
+			// see whether a global Codex rotation would be permitted.
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
+			defer cancel()
+			safeRestore := false
+			capErr := ""
+			if rotator.IsAvailable() {
+				ok, probeErr := rotator.CaamSupportsSafeRestore(ctx)
+				if probeErr != nil {
+					capErr = probeErr.Error()
+				} else {
+					safeRestore = ok
+				}
+			} else {
+				capErr = "caam not available"
+			}
+
+			if jsonOut {
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				out := map[string]interface{}{
+					"pins":                  pins,
+					"caam_safe_restore":     safeRestore,
+					"global_rotation_safe":  safeRestore,
+					"safe_restore_required": true,
+				}
+				if capErr != "" {
+					out["caam_capability_error"] = capErr
+				}
+				return enc.Encode(out)
+			}
+			if len(pins) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No account pins set; automatic rotation is unrestricted by pins.")
+			} else {
+				fmt.Fprintln(cmd.OutOrStdout(), "Pinned providers (auto-rotation refused for these):")
+				for provider, account := range pins {
+					fmt.Fprintf(cmd.OutOrStdout(), "  %s -> %s\n", provider, account)
+				}
+			}
+			switch {
+			case capErr != "":
+				fmt.Fprintf(cmd.OutOrStdout(), "caam safe-restore: UNKNOWN (%s) — global Codex rotation refused without --force-global-auth-clobber.\n", capErr)
+			case safeRestore:
+				fmt.Fprintln(cmd.OutOrStdout(), "caam safe-restore: AVAILABLE — global Codex rotation permitted (caam #19 satisfied).")
+			default:
+				fmt.Fprintln(cmd.OutOrStdout(), "caam safe-restore: MISSING — global Codex rotation refused; upgrade caam (#19) or use --force-global-auth-clobber.")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dataDir, "data-dir", "", "Directory holding .ntm/account_pins.json (default: current directory)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output as JSON")
 	return cmd
 }
 
@@ -242,6 +397,7 @@ func rotateAllLimited(session, targetAccount string, dryRun bool, inferred bool)
 		ctx := auth.RestartContext{
 			PaneID:      p.ID,
 			Provider:    normalizedProviderName(p.Type),
+			AgentType:   string(p.Type.Canonical()),
 			TargetEmail: targetAccount,
 			ModelAlias:  p.Variant,
 			SessionName: session,
@@ -265,7 +421,7 @@ func resolveRotationProjectDir(session string, inferred bool) (string, error) {
 	return projectDir, nil
 }
 
-func executeRestartRotation(session string, paneIdx int, paneID, provider, targetAccount, modelAlias string, inferred bool) error {
+func executeRestartRotation(session string, paneIdx int, paneID, provider, agentType, targetAccount, modelAlias string, inferred bool) error {
 	// Initialize Orchestrator
 	orchestrator := auth.NewOrchestrator(cfg)
 	projectDir, err := resolveRotationProjectDir(session, inferred)
@@ -284,6 +440,7 @@ func executeRestartRotation(session string, paneIdx int, paneID, provider, targe
 	ctx := auth.RestartContext{
 		PaneID:      paneID,
 		Provider:    provider,
+		AgentType:   agentType,
 		TargetEmail: targetAccount,
 		ModelAlias:  modelAlias,
 		SessionName: session,

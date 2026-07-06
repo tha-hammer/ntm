@@ -452,7 +452,20 @@ func matchesPattern(path, pattern string) bool {
 			return matchesSuffixPattern(remaining, suffix)
 		}
 
-		return strings.HasSuffix(remaining, suffix)
+		// bd-eebvt: a literal suffix must occupy a whole basename, not a
+		// fragment of one — `**/test.go` should match files named test.go
+		// at any depth, NOT files like "mytest.go" whose basename merely
+		// ends with the byte sequence "test.go". Require the suffix to
+		// either equal `remaining` exactly OR be preceded by a path
+		// separator.
+		if !strings.HasSuffix(remaining, suffix) {
+			return false
+		}
+		if remaining == suffix {
+			return true
+		}
+		cut := len(remaining) - len(suffix)
+		return cut > 0 && remaining[cut-1] == '/'
 	}
 
 	// Handle single * patterns (match single path segment)

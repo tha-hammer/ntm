@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -1004,6 +1005,168 @@ func TestDetermineAgentState_NormalizesAliasHints(t *testing.T) {
 	}
 }
 
+func TestClassifyTriageRecForAssignment(t *testing.T) {
+	type testCase struct {
+		name              string
+		rec               bv.TriageRecommendation
+		activeAssignments map[string]struct{}
+		wantSkip          bool
+		wantReason        string
+	}
+
+	tests := []testCase{
+		{
+			name:     "open with no blockers is assignable",
+			rec:      bv.TriageRecommendation{ID: "bd-1", Status: "open"},
+			wantSkip: false,
+		},
+		{
+			name:     "empty status is treated as assignable",
+			rec:      bv.TriageRecommendation{ID: "bd-2"},
+			wantSkip: false,
+		},
+		{
+			name:       "dependency blocker wins over status",
+			rec:        bv.TriageRecommendation{ID: "bd-3", Status: "open", BlockedBy: []string{"bd-99"}},
+			wantSkip:   true,
+			wantReason: "blocked_by_dependency",
+		},
+		{
+			name:       "in_progress is skipped",
+			rec:        bv.TriageRecommendation{ID: "bd-4", Status: "in_progress"},
+			wantSkip:   true,
+			wantReason: "already_in_progress",
+		},
+		{
+			name:       "blocked status is skipped",
+			rec:        bv.TriageRecommendation{ID: "bd-5", Status: "blocked"},
+			wantSkip:   true,
+			wantReason: "blocked_status",
+		},
+		{
+			name:       "closed status is skipped",
+			rec:        bv.TriageRecommendation{ID: "bd-6", Status: "closed"},
+			wantSkip:   true,
+			wantReason: "closed_status",
+		},
+		{
+			name:       "operator_gated label beats open status",
+			rec:        bv.TriageRecommendation{ID: "bd-7", Status: "open", Labels: []string{"operator-gated"}},
+			wantSkip:   true,
+			wantReason: "operator_gated",
+		},
+		{
+			name:       "human-input label is operator gated",
+			rec:        bv.TriageRecommendation{ID: "bd-8", Status: "open", Labels: []string{"foo", "human-input"}},
+			wantSkip:   true,
+			wantReason: "operator_gated",
+		},
+		{
+			name:              "already-claimed bead is suppressed",
+			rec:               bv.TriageRecommendation{ID: "bd-9", Status: "open"},
+			activeAssignments: map[string]struct{}{"bd-9": {}},
+			wantSkip:          true,
+			wantReason:        "already_assigned",
+		},
+		{
+			name:       "status case + delimiter variation still classifies",
+			rec:        bv.TriageRecommendation{ID: "bd-10", Status: "In-Progress"},
+			wantSkip:   true,
+			wantReason: "already_in_progress",
+		},
+		{
+			name:              "blockedBy beats already_assigned",
+			rec:               bv.TriageRecommendation{ID: "bd-11", Status: "open", BlockedBy: []string{"bd-x"}},
+			activeAssignments: map[string]struct{}{"bd-11": {}},
+			wantSkip:          true,
+			wantReason:        "blocked_by_dependency",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTriageRecForAssignment(tc.rec, tc.activeAssignments)
+			if tc.wantSkip {
+				if got == nil {
+					t.Fatalf("expected skip with reason %q, got nil (assignable)", tc.wantReason)
+				}
+				if got.Reason != tc.wantReason {
+					t.Fatalf("reason = %q, want %q", got.Reason, tc.wantReason)
+				}
+				if got.BeadID != tc.rec.ID {
+					t.Fatalf("BeadID = %q, want %q", got.BeadID, tc.rec.ID)
+				}
+				if tc.wantReason == "blocked_by_dependency" && len(got.BlockedByIDs) == 0 {
+					t.Fatalf("blocked_by_dependency must populate BlockedByIDs")
+				}
+			} else if got != nil {
+				t.Fatalf("expected assignable, got skip with reason %q", got.Reason)
+			}
+		})
+	}
+}
+
+func TestCountSkippedByReason(t *testing.T) {
+	items := []SkippedItem{
+		{BeadID: "a", Reason: "blocked_by_dependency"},
+		{BeadID: "b", Reason: "blocked_by_dependency"},
+		{BeadID: "c", Reason: "operator_gated"},
+		{BeadID: "d", Reason: "already_in_progress"},
+	}
+	if got := countSkippedByReason(items, "blocked_by_dependency"); got != 2 {
+		t.Fatalf("countSkippedByReason(blocked_by_dependency) = %d, want 2", got)
+	}
+	if got := countSkippedByReason(items, "operator_gated"); got != 1 {
+		t.Fatalf("countSkippedByReason(operator_gated) = %d, want 1", got)
+	}
+	if got := countSkippedByReason(items, "nonexistent"); got != 0 {
+		t.Fatalf("countSkippedByReason(nonexistent) = %d, want 0", got)
+	}
+}
+
+func TestNormalizeBeadStatus(t *testing.T) {
+	tests := map[string]string{
+		"open":         "open",
+		"In Progress":  "in_progress",
+		"in-progress":  "in_progress",
+		" CLOSED ":     "closed",
+		"":             "",
+		"ready-for-qa": "ready_for_qa",
+	}
+	for in, want := range tests {
+		if got := normalizeBeadStatus(in); got != want {
+			t.Errorf("normalizeBeadStatus(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeAgentTypeAlias(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty string is no filter", raw: "", want: ""},
+		{name: "any is no filter", raw: "any", want: ""},
+		{name: "ANY is no filter", raw: "ANY", want: ""},
+		{name: "all is no filter", raw: "all", want: ""},
+		{name: "star is no filter", raw: "*", want: ""},
+		{name: "whitespace around any", raw: "  any  ", want: ""},
+		{name: "claude resolves to claude", raw: "claude", want: "claude"},
+		{name: "codex alias cod resolves", raw: "cod", want: "codex"},
+		{name: "gemini alias gmi resolves", raw: "gmi", want: "gemini"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeAgentTypeAlias(tc.raw)
+			if got != tc.want {
+				t.Fatalf("normalizeAgentTypeAlias(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParsePriorityString(t *testing.T) {
 
 	tests := []struct {
@@ -1038,5 +1201,108 @@ func TestParsePriorityString(t *testing.T) {
 				t.Errorf("parsePriorityString(%q) = %d; want %d", tc.input, result, tc.expected)
 			}
 		})
+	}
+}
+
+// TestDetermineAgentStateLiveBusyOverride verifies the #124 fix: when the
+// pane scrollback's trailing live-window contains a THINKING-category pattern
+// (e.g. codex's "• Working (4m 51s • esc to interrupt)") the verdict must be
+// "working" regardless of what the legacy parser concludes — the pane is
+// busy and watch-mode autonomous dispatch must not target it.
+func TestDetermineAgentStateLiveBusyOverride(t *testing.T) {
+	// A scrollback that ends with a codex working bullet inside the
+	// live-window. Without the override, the legacy parser sometimes
+	// classifies this as idle when there's no fresh prompt yet.
+	scrollback := strings.Repeat("filler line\n", 200) +
+		"\n• Working (4m 51s • esc to interrupt)\n"
+
+	got := determineAgentState(scrollback, "codex")
+	if got != "working" {
+		t.Errorf("determineAgentState(busy codex pane) = %q, want \"working\"", got)
+	}
+}
+
+// TestDetermineAgentStateIgnoresStaleThinking verifies the override does NOT
+// trigger when a thinking pattern only exists deep in the scrollback (outside
+// the live-window). That historical bullet is from a completed tool call and
+// must not lock the agent in "working" forever.
+func TestDetermineAgentStateIgnoresStaleThinking(t *testing.T) {
+	// Thinking pattern early in the buffer, then enough trailing content to
+	// push it outside the live-window (15 trailing lines).
+	scrollback := "• Working (10s • esc to interrupt)\n" +
+		strings.Repeat("filler line that is unambiguously not thinking\n", 200) +
+		"\n>>>" // codex-shaped idle prompt
+
+	// We don't assert "idle" here (that depends on the legacy parser's
+	// agent-specific prompt detection), but we must NOT see "working" be
+	// forced by the override path on stale scrollback content.
+	got := determineAgentState(scrollback, "codex")
+	if got == "working" {
+		t.Errorf("determineAgentState(stale thinking pattern) = %q, must not be forced to working", got)
+	}
+}
+
+// ============================================================================
+// FIX C: Active-assignment idle-pool guard
+// ============================================================================
+
+// TestLoadActiveAssignmentPanes_ExcludesBetweenTurnsPane verifies that a pane
+// holding an active assignment (StatusAssigned or StatusWorking) is reported by
+// loadActiveAssignmentPanes even when it would momentarily look idle between
+// turns. The idle-collection paths exclude these panes so a pane mid-flight on
+// bead A is never handed bead B (double-dispatch) just because it briefly shows
+// an idle prompt.
+func TestLoadActiveAssignmentPanes_ExcludesBetweenTurnsPane(t *testing.T) {
+	isolateSessionAgentStorage(t)
+
+	const session = "fixc"
+	store := assignment.NewStore(session)
+
+	// Pane 1: mid-flight on bead A, status Working — the "between turns" pane.
+	if _, err := store.Assign("bd-A", "Task A", 1, "claude", "fixc_claude_1", "do A"); err != nil {
+		t.Fatalf("assign bd-A: %v", err)
+	}
+	if err := store.MarkWorking("bd-A"); err != nil {
+		t.Fatalf("mark working bd-A: %v", err)
+	}
+	// Pane 2: freshly assigned, status Assigned.
+	if _, err := store.Assign("bd-B", "Task B", 2, "codex", "fixc_codex_2", "do B"); err != nil {
+		t.Fatalf("assign bd-B: %v", err)
+	}
+	// Pane 3: a completed assignment — NOT active, must NOT be excluded.
+	if _, err := store.Assign("bd-C", "Task C", 3, "claude", "fixc_claude_3", "do C"); err != nil {
+		t.Fatalf("assign bd-C: %v", err)
+	}
+	if err := store.MarkCompleted("bd-C"); err != nil {
+		t.Fatalf("mark completed bd-C: %v", err)
+	}
+	if err := store.Save(); err != nil {
+		t.Fatalf("save store: %v", err)
+	}
+
+	active := loadActiveAssignmentPanes(session)
+
+	if _, ok := active[1]; !ok {
+		t.Errorf("pane 1 (StatusWorking) must be in the active set — it is mid-flight and not dispatchable")
+	}
+	if _, ok := active[2]; !ok {
+		t.Errorf("pane 2 (StatusAssigned) must be in the active set — it holds an active assignment")
+	}
+	if _, ok := active[3]; ok {
+		t.Errorf("pane 3 (StatusCompleted) must NOT be in the active set — completed work frees the pane")
+	}
+	if len(active) != 2 {
+		t.Errorf("active pane count = %d, want 2", len(active))
+	}
+}
+
+// TestLoadActiveAssignmentPanes_EmptyStore returns an empty set (and never
+// errors) when no store exists for the session — idle collection then proceeds
+// with no exclusions.
+func TestLoadActiveAssignmentPanes_EmptyStore(t *testing.T) {
+	isolateSessionAgentStorage(t)
+	active := loadActiveAssignmentPanes("no-such-session")
+	if len(active) != 0 {
+		t.Errorf("expected empty active set for missing store, got %d entries", len(active))
 	}
 }

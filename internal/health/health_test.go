@@ -1,9 +1,16 @@
 package health
 
 import (
+	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func TestParseWaitTime(t *testing.T) {
@@ -60,6 +67,101 @@ func TestDetectErrors(t *testing.T) {
 	}
 }
 
+func TestDetectErrors_IgnoresStaleHistoryBeyondLookback(t *testing.T) {
+	t.Parallel()
+
+	output := "panic: old crash message\n" +
+		strings.Repeat("working normally\n", errorLookbackLines+5) +
+		"claude>\n"
+
+	issues := detectErrors(output)
+	if len(issues) != 0 {
+		t.Fatalf("detectErrors returned %d issue(s) from stale history, want 0: %+v", len(issues), issues)
+	}
+}
+
+func TestDetectErrorsForAgent_DetectsCrashBeyondShortLookbackWithoutPrompt(t *testing.T) {
+	t.Parallel()
+
+	output := "panic: unrecovered crash\n" +
+		strings.Repeat("compilation output\n", errorLookbackLines+5)
+
+	issues := detectErrorsForAgent(output, "cc")
+	if !hasIssueType(issues, "crash") {
+		t.Fatalf("detectErrorsForAgent missed unrecovered crash beyond short lookback: %+v", issues)
+	}
+}
+
+func TestCheckAgentCopiesPaneShellPIDBeforeCapture(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got := checkAgent(ctx, tmux.PaneActivity{
+		Pane: tmux.Pane{
+			ID:    "%not-real",
+			Index: 7,
+			Type:  tmux.AgentCodex,
+			PID:   4242,
+		},
+	})
+
+	if got.ShellPID != 4242 {
+		t.Fatalf("ShellPID = %d, want 4242", got.ShellPID)
+	}
+	if got.Pane != 7 {
+		t.Fatalf("Pane = %d, want 7", got.Pane)
+	}
+}
+
+func TestDetectErrorsForAgent_IgnoresRecoveredCrashAtPrompt(t *testing.T) {
+	t.Parallel()
+
+	output := "panic: recovered crash\n" +
+		strings.Repeat("working normally\n", errorLookbackLines+5) +
+		"claude>\n"
+
+	issues := detectErrorsForAgent(output, "cc")
+	if len(issues) != 0 {
+		t.Fatalf("detectErrorsForAgent returned %d issue(s) from recovered history, want 0: %+v", len(issues), issues)
+	}
+}
+
+func TestDetectErrorsForAgent_DetectsErrorAfterPrompt(t *testing.T) {
+	t.Parallel()
+
+	output := "panic: recovered crash\n" +
+		strings.Repeat("working normally\n", errorLookbackLines+5) +
+		"claude>\n" +
+		"error: command failed\n"
+
+	issues := detectErrorsForAgent(output, "cc")
+	if !hasIssueType(issues, "error") {
+		t.Fatalf("detectErrorsForAgent missed error after prompt: %+v", issues)
+	}
+	if hasIssueType(issues, "crash") {
+		t.Fatalf("detectErrorsForAgent revived crash before prompt: %+v", issues)
+	}
+}
+
+// bd-9b0et: agent panicked, recovered (prompt visible), then resumed
+// productive work that pushed the prompt out of the trailing-3-line
+// window status.DetectIdleFromOutput uses. The recovered crash must
+// stay suppressed regardless of how far the prompt has scrolled,
+// because a prompt anywhere in the buffer is proof of recovery.
+func TestDetectErrorsForAgent_IgnoresRecoveredCrashWhenPromptScrolledPastTrailingWindow(t *testing.T) {
+	t.Parallel()
+
+	output := "panic: old crash\n" +
+		strings.Repeat("compilation output\n", 30) +
+		"claude>\n" + // recovery marker
+		strings.Repeat("Working on file\n", 10) // pushes prompt past the trailing 3-line window
+
+	issues := detectErrorsForAgent(output, "cc")
+	if hasIssueType(issues, "crash") {
+		t.Fatalf("detectErrorsForAgent re-fired recovered crash after prompt scrolled: %+v", issues)
+	}
+}
+
 func TestDetectRateLimitWithAgentContext(t *testing.T) {
 	t.Parallel()
 
@@ -73,6 +175,48 @@ func TestDetectRateLimitWithAgentContext(t *testing.T) {
 	nonCodex := detectRateLimit(output, "cc")
 	if nonCodex.RateLimited {
 		t.Fatalf("did not expect Claude agent to match Codex-specific rate limit pattern for %q", output)
+	}
+}
+
+func TestDetectRateLimit_IgnoresStaleHistoryBeyondLookback(t *testing.T) {
+	t.Parallel()
+
+	output := "Rate limit exceeded, try again in 60s\n" +
+		strings.Repeat("working normally\n", rateLimitLookbackLines+5)
+
+	detection := detectRateLimit(output, "cc")
+	if detection.RateLimited {
+		t.Fatalf("detectRateLimit detected stale rate limit beyond lookback: %+v", detection)
+	}
+}
+
+func TestDetectRateLimit_DetectsCurrentRateLimitFromFullInput(t *testing.T) {
+	t.Parallel()
+
+	output := strings.Repeat("working normally\n", rateLimitLookbackLines+5) +
+		"Rate limit exceeded, try again in 60s\n"
+
+	detection := detectRateLimit(output, "cc")
+	if !detection.RateLimited {
+		t.Fatalf("detectRateLimit missed current rate limit in tail: %+v", detection)
+	}
+	if detection.WaitSeconds != 60 {
+		t.Fatalf("detectRateLimit WaitSeconds = %d, want 60", detection.WaitSeconds)
+	}
+}
+
+func TestDetectRateLimit_ExtendsContextForRetryChatter(t *testing.T) {
+	t.Parallel()
+
+	output := "Rate limit exceeded, try again in 60s\n" +
+		strings.Repeat("retrying request\n", rateLimitLookbackLines+5)
+
+	detection := detectRateLimit(output, "cc")
+	if !detection.RateLimited {
+		t.Fatalf("detectRateLimit missed rate limit followed by retry chatter: %+v", detection)
+	}
+	if detection.WaitSeconds != 60 {
+		t.Fatalf("detectRateLimit WaitSeconds = %d, want 60", detection.WaitSeconds)
 	}
 }
 
@@ -369,13 +513,47 @@ func TestDetectProcessStatus(t *testing.T) {
 func TestDetectProcessStatus_PIDBasedCurrentProcess(t *testing.T) {
 	t.Parallel()
 
-	// Use the current process PID as the "shell". The test runner is our
-	// child, so HasChildAlive should return true for any PID that has
-	// children. We use PID 1 (init/systemd) which always has children.
-	// With a valid shell PID that has children, text patterns are ignored.
-	got := detectProcessStatus("exit status 1", "python", 1)
+	// We previously used PID 1 here, but on macOS-latest CI runners
+	// launchd's children are not visible via pgrep to the unprivileged
+	// test user, so HasChildAlive(1) returned false and the test
+	// flipped to ProcessExited. Spawning our own long-lived child
+	// guarantees a child is visible regardless of platform.
+	//
+	// The sleep budget is generous (30s) so that even under heavy
+	// parallel-test load the child survives well past the
+	// detectProcessStatus call.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot spawn child for the PID-has-children scenario: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	got := detectProcessStatus("exit status 1", "python", os.Getpid())
 	if got != ProcessRunning {
-		t.Errorf("detectProcessStatus with PID 1 (has children) = %v, want ProcessRunning", got)
+		t.Errorf("detectProcessStatus with current PID (has children) = %v, want ProcessRunning", got)
+	}
+}
+
+func TestDetectProcessStatusForAgent_PromptOverridesExitText(t *testing.T) {
+	t.Parallel()
+
+	output := "connection closed by remote host\nclaude>\n"
+	got := detectProcessStatusForAgent(output, "python", 0, "cc")
+	if got != ProcessRunning {
+		t.Fatalf("detectProcessStatusForAgent(prompt+exit-text) = %v, want %v", got, ProcessRunning)
+	}
+}
+
+func TestDetectProcessStatus_IgnoresStaleExitTextBeyondLookback(t *testing.T) {
+	t.Parallel()
+
+	output := "session ended\n" + strings.Repeat("still running\n", processExitLookbackLines+2)
+	got := detectProcessStatus(output, "python", 0)
+	if got != ProcessRunning {
+		t.Fatalf("detectProcessStatus(stale-exit-history) = %v, want %v", got, ProcessRunning)
 	}
 }
 
@@ -513,5 +691,84 @@ func TestDetectProgress_ConfidenceAndIndicators(t *testing.T) {
 	}
 	if len(p.Indicators) == 0 {
 		t.Error("Expected non-empty indicators")
+	}
+}
+
+// bd-v9sbz: hasRateLimitChatter must catch the phrasings of the
+// major agent CLIs (claude/cc, codex/cod, gemini/gmi) so the
+// 50-line second-chance scan in detectRateLimit doesn't miss
+// rate-limit messages that are common in the wild.
+func TestHasRateLimitChatter_CoversCommonAgentPhrasings(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, input string
+		want        bool
+	}{
+		{"empty", "", false},
+		{"unrelated", "the build completed normally", false},
+
+		{"throttle marker", "API throttled, slow down", true},
+		{"retry word", "Please retry the request", true},
+		{"try again", "rate-limited; try again later", true},
+		{"cooldown", "in cooldown for 60s", true},
+
+		// New agent-specific phrasings added by bd-v9sbz.
+		{"claude rate limit", "Rate limit reached; please retry", true},
+		{"openai too many", "429 Too Many Requests", true},
+		{"gemini quota", "Quota exceeded for this model", true},
+		{"google resource exhausted", "RESOURCE_EXHAUSTED: try again", true},
+		{"codex rate exceeded", "rate exceeded; backing off", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasRateLimitChatter(c.input); got != c.want {
+				t.Errorf("hasRateLimitChatter(%q) = %v, want %v", c.input, got, c.want)
+			}
+		})
+	}
+}
+
+// bd-brr6h: CheckSession's parallel checkAgent goroutines append to
+// health.Agents in completion order. The function sorts the result by
+// (Pane, PaneID) before returning so JSON output is byte-stable across
+// calls. This test pins the expected post-sort ordering by exercising
+// the same comparator on a hand-shuffled slice.
+func TestCheckSession_AgentsAreSortedByPaneIndex(t *testing.T) {
+	t.Parallel()
+
+	// Hand-shuffled Agents — completion-order arrival from concurrent
+	// goroutines.
+	got := []AgentHealth{
+		{Pane: 3, PaneID: "%30"},
+		{Pane: 1, PaneID: "%10"},
+		{Pane: 0, PaneID: "%0"},
+		{Pane: 2, PaneID: "%20"},
+		// Same Pane, different PaneID — secondary sort key.
+		{Pane: 1, PaneID: "%11"},
+	}
+
+	// Mirror the inline comparator from CheckSession (bd-brr6h).
+	sort.SliceStable(got, func(i, j int) bool {
+		if got[i].Pane != got[j].Pane {
+			return got[i].Pane < got[j].Pane
+		}
+		return got[i].PaneID < got[j].PaneID
+	})
+
+	want := []struct {
+		pane   int
+		paneID string
+	}{
+		{0, "%0"},
+		{1, "%10"},
+		{1, "%11"},
+		{2, "%20"},
+		{3, "%30"},
+	}
+	for i, w := range want {
+		if got[i].Pane != w.pane || got[i].PaneID != w.paneID {
+			t.Errorf("post-sort[%d] = (Pane=%d PaneID=%q), want (Pane=%d PaneID=%q)",
+				i, got[i].Pane, got[i].PaneID, w.pane, w.paneID)
+		}
 	}
 }

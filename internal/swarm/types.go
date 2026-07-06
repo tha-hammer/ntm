@@ -16,6 +16,7 @@ type ProjectAllocation struct {
 	CCAgents    int              `json:"cc_agents"`
 	CodAgents   int              `json:"cod_agents"`
 	GmiAgents   int              `json:"gmi_agents"`
+	AgyAgents   int              `json:"agy_agents"`
 	TotalAgents int              `json:"total_agents"`
 }
 
@@ -32,6 +33,7 @@ type SwarmPlan struct {
 	TotalCC     int `json:"total_cc"`
 	TotalCod    int `json:"total_cod"`
 	TotalGmi    int `json:"total_gmi"`
+	TotalAgy    int `json:"total_agy"`
 	TotalAgents int `json:"total_agents"`
 
 	// AutoRotateAccounts enables automatic account rotation on limit hit (requires caam).

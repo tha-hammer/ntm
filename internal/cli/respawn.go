@@ -23,9 +23,10 @@ func newRespawnCmd() *cobra.Command {
 		Short:   "Kill and restart worker agents in a session",
 		Long: `Kill and restart worker agents in a tmux session.
 
-This command uses tmux's respawn-pane -k to cycle the process in each
-selected pane, effectively killing the current agent and starting a
-fresh instance with the same command.
+This command uses tmux's respawn-pane -k to kill each selected pane's
+process and restore a fresh shell, then relaunches the pane's agent CLI
+(agent CLIs are started by keystroke after spawn, so a bare respawn
+would otherwise leave an empty shell) and waits for it to become ready.
 
 By default, only agent panes are restarted (not the user pane at index 0).
 Use --all to include all panes, or --panes to target specific indices.
@@ -45,7 +46,7 @@ Examples:
 
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "skip confirmation")
 	cmd.Flags().StringVarP(&panes, "panes", "p", "", "comma-separated pane indices to restart (e.g., 1,2,3)")
-	cmd.Flags().StringVarP(&agentType, "type", "t", "", "filter by agent type (cc, claude, cod, codex, gmi, gemini)")
+	cmd.Flags().StringVarP(&agentType, "type", "t", "", "filter by agent type (cc, claude, cod, codex, gmi, gemini, agy, antigravity)")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "include all panes (including user pane)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview which panes would be restarted")
 
@@ -110,36 +111,46 @@ func runRespawn(session string, force bool, panesFlag string, agentType string, 
 	// Confirmation
 	if !force {
 		title := fmt.Sprintf("Restart %d pane(s)?", len(targetPanes))
-		desc := fmt.Sprintf("Agents in session '%s' will be restarted with fresh shells.", session)
+		desc := fmt.Sprintf("Agents in session '%s' will be killed and relaunched.", session)
 		if !confirmHuh(title, desc) {
 			fmt.Println("Aborted.")
 			return nil
 		}
 	}
 
-	// Restart targets
-	var restarted []string
-	var failed []string
-	for _, pane := range targetPanes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
-		err := tmux.RespawnPane(pane.ID, true)
-		if err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", paneKey, err))
-		} else {
-			restarted = append(restarted, paneKey)
-		}
+	// Restart targets via the shared robot engine, which relaunches agent
+	// CLIs after the respawn and ready-gates them (#187) — respawn-pane -k
+	// alone only restores the pane's default command (the login shell).
+	fmt.Printf("Restarting %d pane(s) (relaunching agent CLIs)...\n", len(targetPanes))
+	out, err := robot.GetRestartPane(robot.RestartPaneOptions{
+		Session: session,
+		Panes:   paneFilter,
+		Type:    agentType,
+		All:     all,
+	})
+	if err != nil {
+		return err
 	}
 
 	// Report results
-	if len(restarted) > 0 {
-		fmt.Printf("Restarted panes: %s\n", strings.Join(restarted, ", "))
-	}
-	if len(failed) > 0 {
-		fmt.Printf("Failed to restart:\n")
-		for _, f := range failed {
-			fmt.Printf("  - %s\n", f)
+	if len(out.Restarted) > 0 {
+		fmt.Printf("Restarted panes: %s\n", strings.Join(out.Restarted, ", "))
+		for _, paneKey := range out.Restarted {
+			if relaunched, ok := out.AgentRelaunched[paneKey]; ok {
+				status := "agent relaunched"
+				if !relaunched {
+					status = "agent relaunch FAILED (pane left at a shell)"
+				}
+				fmt.Printf("  - Pane %s: %s\n", paneKey, status)
+			}
 		}
-		return fmt.Errorf("%d pane(s) failed to restart", len(failed))
+	}
+	if len(out.Failed) > 0 {
+		fmt.Printf("Failed to restart:\n")
+		for _, f := range out.Failed {
+			fmt.Printf("  - %s: %s\n", f.Pane, f.Reason)
+		}
+		return fmt.Errorf("%d pane(s) failed to restart cleanly", len(out.Failed))
 	}
 
 	return nil

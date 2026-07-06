@@ -125,20 +125,33 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 		paneFilterMap[p] = true
 	}
 
+	// Topology-aware keys (#172): on a multi-window session every key is the
+	// canonical "window.pane" address so panes never collapse onto one entry.
+	multiWindow := paneSessionIsMultiWindow(panes)
 	targetPanes := selectInterruptTargets(panes, paneFilterMap, opts.All)
 	targetKeys := make([]string, 0, len(targetPanes))
 	for _, pane := range targetPanes {
-		targetKeys = append(targetKeys, fmt.Sprintf("%d", pane.Index))
+		targetKeys = append(targetKeys, paneTargetKey(pane, multiWindow))
 	}
 
 	if len(targetPanes) == 0 {
+		// Fail loud (#172): nothing matched the request, so do not report
+		// success:true while interrupting nothing. On multi-window /
+		// window-per-agent layouts a window-local --panes index frequently
+		// resolves to an empty set; surface the panes that DO exist so the
+		// caller can re-target precisely.
+		output.RobotResponse = NewErrorResponse(
+			fmt.Errorf("no panes matched the interrupt request"),
+			ErrCodePaneNotFound,
+			interruptEmptyTargetHint(opts, panes),
+		)
 		output.CompletedAt = time.Now().UTC()
 		return finalizeTerminalInterruptActuation(trace, opts, targetKeys, output), nil
 	}
 
 	// Capture previous state for each pane before interrupting
 	for _, pane := range targetPanes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		paneKey := paneTargetKey(pane, multiWindow)
 
 		captured, err := tmux.CapturePaneOutput(pane.ID, 20)
 		if err != nil {
@@ -170,7 +183,7 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 	if opts.DryRun {
 		output.DryRun = true
 		for _, pane := range targetPanes {
-			paneKey := fmt.Sprintf("%d", pane.Index)
+			paneKey := paneTargetKey(pane, multiWindow)
 			output.WouldAffect = append(output.WouldAffect, paneKey)
 		}
 		output.CompletedAt = time.Now().UTC()
@@ -181,7 +194,7 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 
 	// Send Ctrl+C to all targets
 	for _, pane := range targetPanes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
+		paneKey := paneTargetKey(pane, multiWindow)
 		prevState := output.PreviousStates[paneKey]
 
 		// Skip if not forced and already idle
@@ -204,6 +217,7 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 
 	// If we have nothing to wait for, finish early
 	if len(output.Interrupted) == 0 && opts.Message == "" {
+		markInterruptFailures(opts, output)
 		publishInterruptActuationOutcome(trace, opts, targetKeys, output)
 		publishInterruptActuationVerification(trace, opts, targetKeys, output)
 		output.CompletedAt = time.Now().UTC()
@@ -228,7 +242,7 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 				// Find the pane
 				var targetPane *tmux.Pane
 				for i := range targetPanes {
-					if fmt.Sprintf("%d", targetPanes[i].Index) == paneKey {
+					if paneTargetKey(targetPanes[i], multiWindow) == paneKey {
 						targetPane = &targetPanes[i]
 						break
 					}
@@ -287,7 +301,7 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 			// Find the pane
 			var targetPane *tmux.Pane
 			for i := range targetPanes {
-				if fmt.Sprintf("%d", targetPanes[i].Index) == paneKey {
+				if paneTargetKey(targetPanes[i], multiWindow) == paneKey {
 					targetPane = &targetPanes[i]
 					break
 				}
@@ -309,10 +323,50 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 		}
 	}
 
+	markInterruptFailures(opts, output)
 	publishInterruptActuationOutcome(trace, opts, targetKeys, output)
 	publishInterruptActuationVerification(trace, opts, targetKeys, output)
 	output.CompletedAt = time.Now().UTC()
 	return output, nil
+}
+
+// markInterruptFailures flips the envelope to success:false when one or more
+// interrupt/message-send actions FAILED (#172) but the envelope is otherwise
+// still reporting success. It must not clobber an already-set error envelope
+// (e.g. a timeout, which is reported separately), so it only acts when
+// output.Success is still true and at least one failure was recorded.
+func markInterruptFailures(opts InterruptOptions, output *InterruptOutput) {
+	if !output.Success || len(output.Failed) == 0 {
+		return
+	}
+	output.Success = false
+	output.ErrorCode = ErrCodeInternalError
+	output.Error = fmt.Sprintf("%d interrupt action(s) failed", len(output.Failed))
+	output.Hint = "Inspect the 'failed' array for per-pane reasons; verify pane addresses with --robot-is-working"
+}
+
+// interruptEmptyTargetHint builds an actionable remediation hint for the
+// empty-target fail-loud path. It lists the pane indices that DO exist so the
+// caller can re-target, and warns that on multi-window layouts a window-local
+// --panes index may need a window.pane address.
+func interruptEmptyTargetHint(opts InterruptOptions, panes []tmux.Pane) string {
+	multiWindow := paneSessionIsMultiWindow(panes)
+	existing := make([]string, 0, len(panes))
+	for _, p := range panes {
+		existing = append(existing, paneTargetKey(p, multiWindow))
+	}
+	var b strings.Builder
+	if len(opts.Panes) > 0 {
+		b.WriteString("On multi-window / window-per-agent layouts a bare --panes index is window-local; ")
+		b.WriteString("the pane may need a window.pane address. ")
+	}
+	if len(existing) > 0 {
+		b.WriteString("Panes present in this session: ")
+		b.WriteString(strings.Join(existing, ", "))
+		b.WriteString(". ")
+	}
+	b.WriteString("Use --robot-is-working to see live pane addresses, or drop --panes to target all agent panes.")
+	return b.String()
 }
 
 // PrintInterrupt sends Ctrl+C to panes and optionally a follow-up message.
@@ -327,11 +381,18 @@ func PrintInterrupt(opts InterruptOptions) error {
 
 func selectInterruptTargets(panes []tmux.Pane, paneFilterMap map[string]bool, all bool) []tmux.Pane {
 	hasPaneFilter := len(paneFilterMap) > 0
+	// Match the filter topology-aware (#172): on a multi-window / window-per-agent
+	// layout a bare --panes index selects a whole window rather than broadcasting
+	// to every window's same-indexed pane (or no-op'ing when the index is the
+	// window number).
+	multiWindow := paneSessionIsMultiWindow(panes)
+	filterTokens := make([]string, 0, len(paneFilterMap))
+	for k := range paneFilterMap {
+		filterTokens = append(filterTokens, k)
+	}
 	var targetPanes []tmux.Pane
 	for _, pane := range panes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
-
-		if hasPaneFilter && !paneFilterMap[paneKey] && !paneFilterMap[pane.ID] {
+		if hasPaneFilter && !paneMatchesAnyToken(pane, filterTokens, multiWindow) {
 			continue
 		}
 

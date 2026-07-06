@@ -635,7 +635,11 @@ func runUpgrade(checkOnly, force, yes, strict, verbose bool) error {
 	}
 	defer os.RemoveAll(tempDir)
 
-	downloadPath := filepath.Join(tempDir, asset.Name)
+	downloadPath, err := safeJoinUnder(tempDir, asset.Name, "release asset")
+	if err != nil {
+		fmt.Println(errorStyle.Render("✗"))
+		return err
+	}
 	if err := downloadFile(downloadPath, asset.BrowserDownloadURL, asset.Size); err != nil {
 		fmt.Println(errorStyle.Render("✗"))
 		return fmt.Errorf("failed to download: %w", err)
@@ -1056,6 +1060,40 @@ func verifyChecksum(filePath string, expectedHash string) error {
 	return nil
 }
 
+// maxArchiveEntryBytes caps the decompressed size of a single entry in a
+// release archive. Set well above any realistic ntm binary so legitimate
+// upgrades pass while a malicious or corrupted release artifact whose entry
+// expands pathologically fails fast rather than exhausting disk. Mirrors
+// the per-entry caps in internal/bundle/verify.go (100MB) and
+// internal/checkpoint/export.go (maxImportEntrySize) — bd-i7w7q.
+//
+// Declared as var so tests can override with a small ceiling and exercise
+// the bomb-detection path without authoring a 1GB fixture.
+var maxArchiveEntryBytes int64 = 1 << 30 // 1 GB
+
+// archiveModeMask is stripped from archive-supplied mode bits during
+// extraction. setuid/setgid/sticky from a release tarball must never
+// persist onto disk: a compromised release pipeline could otherwise ship
+// a setuid binary that, once moved into root-owned /usr/local/bin by an
+// upgrade run as sudo, escalates privilege for every later invocation
+// (bd-o7fx1).
+const archiveModeMask = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+
+func safeJoinUnder(baseDir, name, label string) (string, error) {
+	cleanName := filepath.Clean(strings.TrimSpace(name))
+	if cleanName == "." || !filepath.IsLocal(cleanName) {
+		return "", fmt.Errorf("illegal %s path: %s", label, name)
+	}
+
+	cleanBase := filepath.Clean(baseDir)
+	target := filepath.Join(cleanBase, cleanName)
+	rel, err := filepath.Rel(cleanBase, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("illegal %s path: %s", label, name)
+	}
+	return target, nil
+}
+
 // extractTarGz extracts a tar.gz file and returns the path to the ntm binary
 func extractTarGz(archivePath, destDir string) (string, error) {
 	f, err := os.Open(archivePath)
@@ -1082,10 +1120,9 @@ func extractTarGz(archivePath, destDir string) (string, error) {
 			return "", err
 		}
 
-		target := filepath.Join(destDir, header.Name)
-		// Check for Zip Slip vulnerability
-		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(os.PathSeparator)) {
-			return "", fmt.Errorf("illegal file path in archive: %s", header.Name)
+		target, err := safeJoinUnder(destDir, header.Name, "archive entry")
+		if err != nil {
+			return "", err
 		}
 
 		switch header.Typeflag {
@@ -1099,13 +1136,32 @@ func extractTarGz(archivePath, destDir string) (string, error) {
 				binaryPath = target
 			}
 
-			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.FileMode(header.Mode))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return "", err
+			}
+
+			// bd-o7fx1: defense-in-depth — strip setuid/setgid/sticky.
+			// Currently os.FileMode(header.Mode) (a uint32 cast) does
+			// not flip the Go-level ModeSetuid bit, so os.OpenFile
+			// already drops those bits during its syscall translation.
+			// But anyone refactoring to header.FileInfo().Mode() would
+			// reintroduce the gap; this mask guards against that.
+			outMode := os.FileMode(header.Mode) &^ archiveModeMask
+			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR|os.O_TRUNC, outMode)
 			if err != nil {
 				return "", err
 			}
-			if _, err := io.Copy(outFile, tr); err != nil {
+			// bd-i7w7q: cap per-entry decompression so a malicious or
+			// corrupted artifact cannot expand pathologically. Read at
+			// most maxArchiveEntryBytes+1 to detect overflow.
+			n, copyErr := io.CopyN(outFile, tr, maxArchiveEntryBytes+1)
+			if copyErr != nil && copyErr != io.EOF {
 				outFile.Close()
-				return "", err
+				return "", copyErr
+			}
+			if n > maxArchiveEntryBytes {
+				outFile.Close()
+				return "", fmt.Errorf("archive entry %q exceeds %d bytes — possible decompression bomb", header.Name, maxArchiveEntryBytes)
 			}
 			outFile.Close()
 		}
@@ -1133,10 +1189,9 @@ func extractZip(archivePath, destDir string) (string, error) {
 	}
 
 	for _, f := range r.File {
-		target := filepath.Join(destDir, f.Name)
-		// Check for Zip Slip vulnerability
-		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(os.PathSeparator)) {
-			return "", fmt.Errorf("illegal file path in archive: %s", f.Name)
+		target, err := safeJoinUnder(destDir, f.Name, "archive entry")
+		if err != nil {
+			return "", err
 		}
 
 		if f.FileInfo().IsDir() {
@@ -1155,7 +1210,12 @@ func extractZip(archivePath, destDir string) (string, error) {
 			return "", err
 		}
 
-		outFile, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR|os.O_TRUNC, f.Mode())
+		// bd-o7fx1: zip's f.Mode() translates external_attr to os.FileMode
+		// with ModeSetuid/Setgid/Sticky set. Without masking, os.OpenFile
+		// would honor them and produce a setuid binary on disk — which a
+		// later sudo-driven rename into /usr/local/bin/ntm escalates.
+		outMode := f.Mode() &^ archiveModeMask
+		outFile, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR|os.O_TRUNC, outMode)
 		if err != nil {
 			return "", err
 		}
@@ -1166,11 +1226,17 @@ func extractZip(archivePath, destDir string) (string, error) {
 			return "", err
 		}
 
-		_, err = io.Copy(outFile, rc)
+		// bd-i7w7q: same per-entry cap as extractTarGz — read at most
+		// maxArchiveEntryBytes+1 so we can detect when a single entry
+		// exceeds the safe limit.
+		n, copyErr := io.CopyN(outFile, rc, maxArchiveEntryBytes+1)
 		rc.Close()
 		outFile.Close()
-		if err != nil {
-			return "", err
+		if copyErr != nil && copyErr != io.EOF {
+			return "", copyErr
+		}
+		if n > maxArchiveEntryBytes {
+			return "", fmt.Errorf("archive entry %q exceeds %d bytes — possible decompression bomb", f.Name, maxArchiveEntryBytes)
 		}
 	}
 

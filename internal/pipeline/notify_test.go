@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -853,5 +856,47 @@ func TestNotifyWebhook_Success(t *testing.T) {
 
 	if receivedPayload.WorkflowName != "test-workflow" {
 		t.Errorf("expected workflow 'test-workflow', got %q", receivedPayload.WorkflowName)
+	}
+}
+
+// TestNotifyMacOS_BoundedByContextTimeout covers bd-coq43: notifyMacOS
+// must not block the pipeline thread indefinitely when osascript stalls
+// (modal Apple permission dialog, wedged NotificationCenter, TCC
+// authorization stall). Same contract bd-7ramj.1 established for
+// notifyLinux's notify-send. We exercise the bound by overriding PATH so
+// the only "osascript" exec.LookPath finds is a sleep-30 stub; the call
+// must return within roughly the 2 s ceiling instead of hanging the
+// duration of the stub.
+func TestNotifyMacOS_BoundedByContextTimeout(t *testing.T) {
+	// Stub-script approach is POSIX-only. Skip on platforms where exec
+	// can't run a /bin/sh shebang or PATH overrides don't apply cleanly
+	// to the spawned osascript child.
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH-stub approach unsupported on Windows")
+	}
+
+	tmpDir := t.TempDir()
+	stub := filepath.Join(tmpDir, "osascript")
+	stubBody := "#!/bin/sh\nsleep 30\n"
+	if err := os.WriteFile(stub, []byte(stubBody), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	t.Setenv("PATH", tmpDir)
+
+	start := time.Now()
+	err := notifyMacOS("test-title", "test-body")
+	elapsed := time.Since(start)
+
+	// We expect the 2 s context timeout to fire and exec.CommandContext
+	// to kill the stub. cmd.Run returns a non-nil err in that case
+	// (signal: killed). The contract we're locking is the elapsed
+	// ceiling, not the specific error type.
+	if err == nil {
+		t.Errorf("notifyMacOS returned nil err after sleep stub; expected non-nil from killed osascript")
+	}
+	// Allow generous slack above the 2 s ceiling for CI variance, but
+	// reject anything close to the stub's 30 s sleep.
+	if elapsed > 5*time.Second {
+		t.Fatalf("notifyMacOS elapsed = %v, want <= 5s (2s ceiling + slack); osascript stub blocks pipeline thread", elapsed)
 	}
 }

@@ -398,17 +398,18 @@ func (m Model) renderFooterSection() string {
 	// STATUS BAR (session info, focused panel, layout tier)
 	// ═══════════════════════════════════════════════════════════════
 	b.WriteString(components.RenderStatusBar(components.StatusBarOptions{
-		Width:           m.width,
-		Session:         m.session,
-		ClaudeCount:     m.claudeCount,
-		CodexCount:      m.codexCount,
-		GeminiCount:     m.geminiCount,
-		UserCount:       m.userCount,
-		FocusedPanel:    panelIDString(m.focusedPanel),
-		LayoutTier:      tierLabel(m.tier),
-		Paused:          m.refreshPaused,
-		CurrentVelocity: m.currentAggregateVelocity(),
-		VelocityHistory: m.aggregateVelocityHistory,
+		Width:            m.width,
+		Session:          m.session,
+		ClaudeCount:      m.claudeCount,
+		CodexCount:       m.codexCount,
+		GeminiCount:      m.geminiCount,
+		AntigravityCount: m.antigravityCount,
+		UserCount:        m.userCount,
+		FocusedPanel:     panelIDString(m.focusedPanel),
+		LayoutTier:       tierLabel(m.tier),
+		Paused:           m.refreshPaused,
+		CurrentVelocity:  m.currentAggregateVelocity(),
+		VelocityHistory:  m.aggregateVelocityHistory,
 	}) + "\n")
 
 	// ═══════════════════════════════════════════════════════════════
@@ -497,6 +498,14 @@ func (m Model) renderStatsBar() string {
 			Bold(true).
 			Padding(0, 1).
 			Render(fmt.Sprintf("%s %d", ic.Gemini, m.geminiCount)))
+	}
+	if m.antigravityCount > 0 {
+		parts = append(parts, lipgloss.NewStyle().
+			Background(t.Lavender).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %d", ic.Gemini, m.antigravityCount)))
 	}
 	if m.cursorCount > 0 {
 		parts = append(parts, lipgloss.NewStyle().

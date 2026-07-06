@@ -21,7 +21,7 @@ func newAgentsCmd() *cobra.Command {
 		Long: `Manage agent capability profiles for intelligent task assignment.
 
 Agent profiles define the capabilities, specializations, and preferences
-of different AI agents (Claude, Codex, Gemini). Use these commands to:
+of different AI agents (Claude, Codex, Gemini, Antigravity). Use these commands to:
   - View available agent profiles
   - Check agent performance statistics
   - Get recommendations for task assignment
@@ -75,8 +75,8 @@ func newAgentsShowCmd() *cobra.Command {
 		Short:   "Show details of a specific agent profile",
 		Long: `Show detailed information about a specific agent profile.
 
-Agent types: claude, codex, gemini
-Aliases are supported (cc for claude, cod for codex, gmi for gemini).
+Agent types: claude, codex, gemini, antigravity
+Aliases are supported (cc for claude, cod for codex, gmi for gemini, agy for antigravity).
 
 Examples:
   ntm agents show claude
@@ -160,10 +160,33 @@ Examples:
 	return cmd
 }
 
+// effectiveAgentModel resolves the model an agent of the given profile type
+// will actually be spawned with, honoring active config overrides (the same
+// `cfg.Models.GetModelName(type, "")` chain the spawn launcher uses). It falls
+// back to the profile's baked-in default only when config resolution yields
+// nothing (e.g. an unmapped agent type or no loaded config). Without this,
+// `ntm agents show`/`list` print the static constant and misreport which model
+// the next spawn uses. See ntm#192.
+func effectiveAgentModel(profile *agents.AgentProfile) string {
+	if profile == nil {
+		return ""
+	}
+	if resolved := ResolveModel(AgentType(profile.Type), ""); resolved != "" {
+		return resolved
+	}
+	return profile.Model
+}
+
 // runAgentsList displays all agent profiles.
 func runAgentsList() error {
 	pm := agents.NewProfileMatcher()
 	profiles := pm.AllProfiles()
+
+	// Reflect the config-resolved spawn model rather than the baked-in default
+	// so the listing matches what `ntm spawn` actually launches (ntm#192).
+	for _, p := range profiles {
+		p.Model = effectiveAgentModel(p)
+	}
 
 	// Sort by type for consistent output
 	sort.Slice(profiles, func(i, j int) bool {
@@ -199,6 +222,12 @@ func runAgentsShow(agentName string) error {
 	if profile == nil {
 		return fmt.Errorf("unknown agent type: %s", agentName)
 	}
+
+	// Reflect the config-resolved spawn model rather than the baked-in default
+	// so the displayed Model matches what `ntm spawn` actually launches and
+	// what Agent Mail registers (ntm#192). GetProfileByName returns a copy, so
+	// overwriting Model here does not mutate shared matcher state.
+	profile.Model = effectiveAgentModel(profile)
 
 	if IsJSONOutput() {
 		return output.PrintJSON(profile)
@@ -293,7 +322,7 @@ func runAgentsRecommend(task agents.TaskInfo) error {
 	}
 	var scores []agentScore
 
-	for _, t := range []agents.AgentType{agents.AgentTypeClaude, agents.AgentTypeCodex, agents.AgentTypeGemini} {
+	for _, t := range []agents.AgentType{agents.AgentTypeClaude, agents.AgentTypeCodex, agents.AgentTypeGemini, agents.AgentTypeAntigravity} {
 		result := pm.ScoreAssignment(t, task)
 		scores = append(scores, agentScore{Agent: t, Result: result})
 	}

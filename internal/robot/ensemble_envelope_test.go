@@ -143,8 +143,13 @@ func TestEnvelope_EnsembleSynthesize(t *testing.T) {
 }
 
 func TestGetEnsemble_UsesPersistedStateWhenSessionOffline(t *testing.T) {
+	// bd-uizon: clear ambient NTM_CONFIG so DefaultPath uses the hermetic
+	// XDG_CONFIG_HOME below instead of inheriting a developer's local
+	// /nonexistent/config.toml fixture (parity with bd-ev740/bd-xkls4).
+	t.Setenv("NTM_CONFIG", "")
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("NTM_CONFIG", "")
 	ensemble.CloseDefaultStateStore()
 	t.Cleanup(ensemble.CloseDefaultStateStore)
 
@@ -178,8 +183,11 @@ func TestGetEnsemble_UsesPersistedStateWhenSessionOffline(t *testing.T) {
 }
 
 func TestGetEnsembleStop_MarksOfflineActiveStateStopped(t *testing.T) {
+	// bd-uizon: clear ambient NTM_CONFIG (see sibling test).
+	t.Setenv("NTM_CONFIG", "")
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("NTM_CONFIG", "")
 	ensemble.CloseDefaultStateStore()
 	t.Cleanup(ensemble.CloseDefaultStateStore)
 

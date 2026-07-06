@@ -403,24 +403,107 @@ func IsNameTakenError(err error) bool {
 // for a session. This enables message routing and reservation management across
 // session restarts.
 type SessionAgentRegistry struct {
-	SessionName  string            `json:"session_name"`
-	ProjectKey   string            `json:"project_key"`
-	Agents       map[string]string `json:"agents"`      // pane_title -> agent_name
-	PaneIDMap    map[string]string `json:"pane_id_map"` // pane_id -> agent_name (backup)
-	RegisteredAt time.Time         `json:"registered_at"`
-	UpdatedAt    time.Time         `json:"updated_at"`
+	SessionName string            `json:"session_name"`
+	ProjectKey  string            `json:"project_key"`
+	Agents      map[string]string `json:"agents"`      // pane_title -> agent_name
+	PaneIDMap   map[string]string `json:"pane_id_map"` // pane_id -> agent_name (backup)
+	// RegistrationTokens maps agent_name -> registration_token returned
+	// by create_agent_identity / register_agent on mcp-agent-mail
+	// >=2.13. The token must be supplied to identity-scoped MCP calls
+	// across process restarts, so we persist it next to the agent_name
+	// mapping (ntm#146). Keyed by agent_name (not pane title) so it
+	// survives pane renames. `omitempty` + map-pointer treats old
+	// registries that predate this field as if no tokens were known.
+	RegistrationTokens map[string]string `json:"registration_tokens,omitempty"`
+	RegisteredAt       time.Time         `json:"registered_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
 }
 
 // NewSessionAgentRegistry creates a new empty registry.
 func NewSessionAgentRegistry(sessionName, projectKey string) *SessionAgentRegistry {
 	now := time.Now()
 	return &SessionAgentRegistry{
-		SessionName:  sessionName,
-		ProjectKey:   projectKey,
-		Agents:       make(map[string]string),
-		PaneIDMap:    make(map[string]string),
-		RegisteredAt: now,
-		UpdatedAt:    now,
+		SessionName:        sessionName,
+		ProjectKey:         projectKey,
+		Agents:             make(map[string]string),
+		PaneIDMap:          make(map[string]string),
+		RegistrationTokens: make(map[string]string),
+		RegisteredAt:       now,
+		UpdatedAt:          now,
+	}
+}
+
+// HydrateClientTokensForProject scans every session under the ntm
+// sessions base dir for an agent_registry.json that targets the given
+// projectKey and pushes each (agent_name, registration_token) pair
+// into the Client's per-agent token cache. This lets `ntm mail inbox`,
+// `ntm mail send`, and other commands that don't carry session context
+// still authenticate as their existing agents on mcp-agent-mail >=2.13
+// (ntm#146). Errors enumerating sessions are non-fatal — the function
+// just hydrates whatever it can find.
+func HydrateClientTokensForProject(c *Client, projectKey string) {
+	if c == nil || projectKey == "" {
+		return
+	}
+	base := getSessionsBaseDir()
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+	target := filepath.Clean(projectKey)
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		registry, err := LoadSessionAgentRegistry(ent.Name(), projectKey)
+		if err != nil || registry == nil {
+			continue
+		}
+		if filepath.Clean(registry.ProjectKey) != target {
+			continue
+		}
+		registry.HydrateClientTokens(c)
+	}
+}
+
+// SetRegistrationToken stores the token for an agent on the registry
+// (in-memory). Callers must Save() afterwards to persist.
+func (r *SessionAgentRegistry) SetRegistrationToken(agentName, token string) {
+	if r == nil || agentName == "" {
+		return
+	}
+	if r.RegistrationTokens == nil {
+		r.RegistrationTokens = make(map[string]string)
+	}
+	if token == "" {
+		delete(r.RegistrationTokens, agentName)
+		return
+	}
+	r.RegistrationTokens[agentName] = token
+}
+
+// RegistrationToken returns the cached token for agent_name, or "".
+// Nil-receiver safe.
+func (r *SessionAgentRegistry) RegistrationToken(agentName string) string {
+	if r == nil {
+		return ""
+	}
+	return r.RegistrationTokens[agentName]
+}
+
+// HydrateClientTokens pushes every (agent_name, token) pair in this
+// registry into the given Client's per-agent token cache so later
+// identity-scoped MCP calls can attach the token automatically. Use
+// at startup / after LoadSessionAgentRegistry.
+func (r *SessionAgentRegistry) HydrateClientTokens(c *Client) {
+	if r == nil || c == nil || r.ProjectKey == "" {
+		return
+	}
+	for agentName, token := range r.RegistrationTokens {
+		if agentName == "" || token == "" {
+			continue
+		}
+		c.SetRegistrationToken(r.ProjectKey, agentName, token)
 	}
 }
 

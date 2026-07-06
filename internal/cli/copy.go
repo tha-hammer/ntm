@@ -27,6 +27,7 @@ func newCopyCmd() *cobra.Command {
 		ccFlag   bool
 		codFlag  bool
 		gmiFlag  bool
+		agyFlag  bool
 		codeFlag bool
 		headers  bool
 		outFile  string
@@ -65,10 +66,11 @@ Examples:
 			}
 
 			filter := AgentFilter{
-				All:    allFlag,
-				Claude: ccFlag,
-				Codex:  codFlag,
-				Gemini: gmiFlag,
+				All:         allFlag,
+				Claude:      ccFlag,
+				Codex:       codFlag,
+				Gemini:      gmiFlag,
+				Antigravity: agyFlag,
 			}
 
 			options := CopyOptions{
@@ -93,6 +95,7 @@ Examples:
 	cmd.Flags().BoolVar(&ccFlag, "cc", false, "Copy from Claude panes")
 	cmd.Flags().BoolVar(&codFlag, "cod", false, "Copy from Codex panes")
 	cmd.Flags().BoolVar(&gmiFlag, "gmi", false, "Copy from Gemini panes")
+	cmd.Flags().BoolVar(&agyFlag, "agy", false, "Copy from Antigravity panes")
 	cmd.Flags().StringVarP(&outFile, "output", "o", "", "Write output to file instead of clipboard")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress confirmation output")
 	cmd.ValidArgsFunction = completeSessionColonPane
@@ -102,14 +105,15 @@ Examples:
 
 // AgentFilter specifies which agent types to target
 type AgentFilter struct {
-	All    bool
-	Claude bool
-	Codex  bool
-	Gemini bool
+	All         bool
+	Claude      bool
+	Codex       bool
+	Gemini      bool
+	Antigravity bool
 }
 
 func (f AgentFilter) IsEmpty() bool {
-	return !f.All && !f.Claude && !f.Codex && !f.Gemini
+	return !f.All && !f.Claude && !f.Codex && !f.Gemini && !f.Antigravity
 }
 
 func (f AgentFilter) Matches(agentType tmux.AgentType) bool {
@@ -123,6 +127,8 @@ func (f AgentFilter) Matches(agentType tmux.AgentType) bool {
 		return f.Codex
 	case tmux.AgentGemini:
 		return f.Gemini
+	case tmux.AgentAntigravity:
+		return f.Antigravity
 	default:
 		return false
 	}

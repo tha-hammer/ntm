@@ -2,6 +2,7 @@ package redaction
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -117,6 +118,61 @@ func sortPatternsByPriority(patterns []pattern) {
 			j--
 		}
 	}
+}
+
+// extraPatternPriority is the deterministic priority assigned to user-
+// configured ExtraPatterns. Set below every built-in default-patterns
+// priority (the lowest is CategoryGenericSecret at 30) so a string that
+// matches BOTH a built-in and an extra resolves to the built-in via the
+// existing deduplicateMatches priority sort. bd-ztb6a.
+const extraPatternPriority = 25
+
+// compileExtraPatterns compiles user-configured ExtraPatterns from a
+// Config into the runtime []pattern shape. Each extra pattern uses the
+// caller's Category as its category, no literal-prefilter requirement
+// (so the regex always runs), and a fixed sub-default priority. Compile
+// errors on individual patterns are skipped silently — the matching
+// rules from the user's other patterns and the built-ins still run.
+//
+// Returned slice is empty when extras is nil/empty.
+func compileExtraPatterns(extras map[Category][]string) []pattern {
+	if len(extras) == 0 {
+		return nil
+	}
+	// Iterate in deterministic key order so the resulting pattern slice
+	// is identical across calls with the same input — matters for the
+	// deduplicate path, where ties at the same priority resolve by
+	// earliest start (independent of order), but lock-step output keeps
+	// debug logs stable.
+	keys := make([]Category, 0, len(extras))
+	for k := range extras {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	out := make([]pattern, 0, len(extras))
+	for _, cat := range keys {
+		for _, raw := range extras[cat] {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			re, err := regexp.Compile(raw)
+			if err != nil {
+				// Skip silently — a malformed user pattern must not
+				// disable the rest of the user's patterns or the
+				// built-ins. A future enhancement could surface this
+				// as a Result.Warnings entry.
+				continue
+			}
+			out = append(out, pattern{
+				category: cat,
+				regex:    re,
+				priority: extraPatternPriority,
+			})
+		}
+	}
+	return out
 }
 
 // getPatterns returns the compiled patterns, initializing if needed.

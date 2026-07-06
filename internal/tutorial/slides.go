@@ -318,7 +318,7 @@ func (m Model) renderConceptsSlide(tick int) string {
 		delay int
 	}{
 		{"[]", "SESSION", "A tmux container for all your work", "#89b4fa", 0},
-		{"AI", "AGENTS", "AI assistants (Claude, Codex, Gemini)", "#cba6f7", 25},
+		{"AI", "AGENTS", "AI assistants (Claude, Codex, Antigravity)", "#cba6f7", 25},
 		{"|>", "PANES", "Individual terminals within a session", "#a6e3a1", 50},
 	}
 
@@ -392,7 +392,7 @@ func (m Model) renderQuickStartSlide(tick int) string {
 		b.WriteString(step2 + "\n\n")
 
 		code2 := []string{
-			"$ ntm spawn myproject --cc=3 --cod=2 --gmi=1",
+			"$ ntm spawn myproject --cc=3 --cod=2 --agy=1",
 		}
 		b.WriteString("      " + RenderCommandCode(code2, tick-50, true) + "\n\n")
 	}
@@ -539,7 +539,7 @@ func (m Model) renderWorkflowsSlide(tick int) string {
 		desc  string
 		color string
 	}{
-		{"Divide & Conquer", "*", "Claude designs, Codex implements, Gemini tests", "#89b4fa"},
+		{"Divide & Conquer", "*", "Claude designs, Codex implements, Antigravity tests", "#89b4fa"},
 		{"Competitive", "*", "Same task to all agents, compare results", "#a6e3a1"},
 		{"Specialist Teams", "*", "Assign roles: architect, coder, reviewer", "#cba6f7"},
 		{"Review Pipeline", "*", "Agent 1 codes, Agent 2 reviews, Agent 3 tests", "#f9e2af"},

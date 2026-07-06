@@ -292,12 +292,16 @@ func shortAgentType(agentType string) string {
 		return "cod"
 	case "gemini":
 		return "gmi"
+	case "antigravity":
+		return "agy"
 	case "cursor":
 		return "cur"
 	case "windsurf":
 		return "ws"
 	case "aider":
 		return "aid"
+	case "oc", "opencode":
+		return "oc"
 	case "ollama":
 		return "oll"
 	case "user":

@@ -294,7 +294,7 @@ This is also called by the installed hook script.`,
 
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 	cmd.Flags().BoolVar(&failOnWarning, "fail-on-warning", true, "Fail on warnings")
-	cmd.Flags().IntVar(&timeout, "timeout", 60, "Timeout in seconds")
+	cmd.Flags().IntVar(&timeout, "timeout", 120, "Timeout in seconds")
 
 	return cmd
 }
@@ -390,7 +390,7 @@ func runHooksGuardInstall(warnOnly bool) error {
 
 	client := newAgentMailClient(repoPath)
 	if !client.IsAvailable() {
-		return fmt.Errorf("agent mail server not available at %s\nstart the server with: mcp-agent-mail serve", agentmail.DefaultBaseURL)
+		return fmt.Errorf("agent mail server not available at %s\nstart the server with: am serve-http --host 127.0.0.1 --no-tui --no-auth", agentmail.DefaultBaseURL)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -441,7 +441,7 @@ func runHooksGuardUninstall() error {
 
 	client := newAgentMailClient(repoPath)
 	if !client.IsAvailable() {
-		return fmt.Errorf("agent mail server not available at %s\nstart the server with: mcp-agent-mail serve", agentmail.DefaultBaseURL)
+		return fmt.Errorf("agent mail server not available at %s\nstart the server with: am serve-http --host 127.0.0.1 --no-tui --no-auth", agentmail.DefaultBaseURL)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

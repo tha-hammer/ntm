@@ -131,6 +131,58 @@ func TestInjectFilesWithLineRange(t *testing.T) {
 	}
 }
 
+// bd-4we2d: readFileRange's no-range branch used unbounded io.ReadAll(f).
+// Even though InjectFiles tries to Stat() first, the file can grow (or a
+// symlink can be swapped) between Stat and Open+Read, allocating the full
+// post-growth content into memory before the post-check fires. The fix
+// wraps the read with io.LimitReader(f, MaxFileSize+1) and rejects
+// overflow inside readFileRange itself — independent of the pre-Stat
+// check.
+func TestReadFileRange_RejectsOversizeFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "big.txt")
+	// Write MaxFileSize+1 bytes — should trip the cap by exactly 1 byte.
+	body := make([]byte, MaxFileSize+1)
+	for i := range body {
+		body[i] = 'a'
+	}
+	if err := os.WriteFile(testFile, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := readFileRange(FileSpec{Path: testFile})
+	if err == nil {
+		t.Fatalf("readFileRange returned nil error for oversize file, want cap error")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Errorf("error = %q, want it to mention the cap", err.Error())
+	}
+}
+
+// Pin the happy path: a file exactly at MaxFileSize must still read
+// successfully. This guards against accidentally tightening the cap to
+// MaxFileSize-1 when wiring io.LimitReader.
+func TestReadFileRange_AllowsExactlyAtCap(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "atcap.txt")
+	body := make([]byte, MaxFileSize)
+	for i := range body {
+		body[i] = 'b'
+	}
+	if err := os.WriteFile(testFile, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readFileRange(FileSpec{Path: testFile})
+	if err != nil {
+		t.Fatalf("readFileRange at exactly MaxFileSize errored: %v", err)
+	}
+	// Trailing newlines are stripped; we wrote no '\n' so length should match.
+	if len(got) != MaxFileSize {
+		t.Errorf("returned content len = %d, want %d", len(got), MaxFileSize)
+	}
+}
+
 func TestIsBinary(t *testing.T) {
 	tests := []struct {
 		name    string

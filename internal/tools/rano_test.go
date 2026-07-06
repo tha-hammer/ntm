@@ -157,6 +157,30 @@ func TestRanoAdapterHealthWhenNotInstalled(t *testing.T) {
 	}
 }
 
+// TestRanoHealthWhenInstalled is an end-to-end regression for issue #202: the
+// probe ran the removed `rano status --json` (now "Unknown status flag: --json",
+// exit 1), which made a healthy rano report a false "lacks CAP_NET_ADMIN"
+// warning and silently disabled rano integration. A healthy, installed rano
+// (whose `rano status` exits 0) must now report healthy. Runs only where rano
+// is installed.
+func TestRanoHealthWhenInstalled(t *testing.T) {
+	adapter := NewRanoAdapter()
+	if _, installed := adapter.Detect(); !installed {
+		t.Skip("rano not installed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	health, err := adapter.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() returned error: %v", err)
+	}
+	if !health.Healthy {
+		t.Fatalf("installed rano reported unhealthy (stale `status --json` probe regression): %s", health.Message)
+	}
+}
+
 func TestRanoAdapterIsAvailable(t *testing.T) {
 	adapter := NewRanoAdapter()
 

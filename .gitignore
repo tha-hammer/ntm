@@ -10,6 +10,9 @@ coverage.html
 # IDE
 .idea/
 .vscode/
+web/node_modules/
+web/.next/
+web/coverage/
 vscode/node_modules/
 vscode/out/
 vscode/package-lock.json
@@ -71,6 +74,7 @@ rustc-ice-*.txt
 *.snap.new
 sweep_*.png
 test_screenshot.png
+claude-upgrade-progress.json
 
 # E2E runtime lockfiles
 e2e/*.lock
@@ -124,3 +128,6 @@ storage.sqlite3-wal.corrupt-*
 # Ephemeral debug output files at repo root
 /*.txt
 /*.py
+
+# Agent scratch/debug test files (machine-local, never tracked)
+**/zz_live_debug_test.go

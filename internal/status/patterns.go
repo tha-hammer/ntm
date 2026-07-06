@@ -150,11 +150,77 @@ var knownAgentTypes = map[string]bool{
 // When agentType is empty, the generic ">" pattern should not match these.
 var knownAgentPromptPrefixes = regexp.MustCompile(`(?i)^(claude|codex|gemini|cursor|windsurf|aider|ollama)>\s*$`)
 
-// DetectIdleFromOutput analyzes output to determine if agent is idle.
-// It checks up to 3 non-empty lines from the end for prompt patterns.
-// This window allows detecting idle state even when there's trailing output.
+// ccActiveSpinnerPatterns detect Claude Code's "actively working" indicators
+// (randomized timing spinners like "Scurrying… (12s)", the extended-thinking
+// line, and the explicit "Running…" spinner). When one of these appears on a
+// line *below* the matched idle prompt, the agent is mid-task — its persistent
+// input box is still rendered, but it is not waiting for input.
+//
+// Kept in sync with internal/agent.ccSpinnerActivePatterns; duplicated here to
+// avoid a status -> agent dependency cycle (agent already imports nothing from
+// status but the prompt-detection split keeps these packages independent).
+var ccActiveSpinnerPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\S+…\s+\(`),         // Timing spinners: "Scurrying… (12s)"
+	regexp.MustCompile(`·\s*thinking`),      // Extended thinking indicator
+	regexp.MustCompile(`·\s*thought\s+for`), // Past thinking indicator (still active context)
+	regexp.MustCompile(`Running…`),          // Explicit running spinner
+	regexp.MustCompile(`esc to interrupt`),  // Footer hint shown only while a turn is in flight
+}
+
+// maxIdleScanLines bounds how many trailing non-empty lines DetectIdleFromOutput
+// inspects for a prompt pattern.
+//
+// The previous 3-line window was too narrow for modern agent TUIs: Claude
+// Code keeps a persistent footer (status bar, permission-mode hint, separator,
+// input-box border, thinking-budget indicator) rendered *below* the actual
+// "❯ " prompt. In narrow tiled-pane swarms (many panes per session) that footer
+// pushes the prompt well past the bottom 3 lines, so a freshly-idle pane was
+// misclassified as active forever — starving downstream dispatchers that key on
+// the `activity == "idle"` signal.
+//
+// 12 mirrors the empirically-validated CC window already used by
+// internal/agent.detectIdle (the CC footer is ~6–12 lines) while staying well
+// short of the 50-line health capture buffer so stale scrollback prompts are
+// not matched.
+const maxIdleScanLines = 12
+
+// DetectIdleFromOutput analyzes output to determine if an agent is idle.
+//
+// It scans up to maxIdleScanLines trailing non-empty lines for a prompt
+// pattern. The wider window is necessary because agent TUIs (notably Claude
+// Code) render several lines of decorative footer below the real prompt.
+//
+// A wider window alone is unsafe: an agent's input box (e.g. CC's "❯ ") stays
+// rendered while the agent is actively working, so a naive scan would report a
+// busy pane as idle. To prevent that, when a prompt is found we reject the idle
+// verdict if an active-work spinner appears on a line *below* the prompt — the
+// same "most recent marker wins" ordering rule used by internal/agent.detectIdle.
 func DetectIdleFromOutput(output string, agentType string) bool {
 	agentType = string(agent.AgentType(agentType).Canonical())
+
+	// Claude Code: the shared classifier (internal/agent.ClaudeActivelyWorking)
+	// owns the working verdict and is authoritative. Claude pins its "❯ " input
+	// box to the BOTTOM of the screen at all times, so an idle-prompt match
+	// alone is NOT idleness — the live spinner renders just above the box. The
+	// helper inspects spinner-vs-turn-ended ordering in the live tail and is
+	// biased to false-WORKING, so gating on it here can never report a busy
+	// Claude pane as idle.
+	if agentType == string(agent.AgentTypeClaudeCode) {
+		if agent.ClaudeActivelyWorking(output) {
+			return false
+		}
+		// Not actively working → idle iff a finished-turn prompt is showing.
+		// ClaudeIdlePromptShowing recognizes the empty chevron, queued text /
+		// "…" ellipsis boxes, the glyph-led completion line, and the
+		// "new task?" footer — broader than the empty-chevron-only patterns.
+		if agent.ClaudeIdlePromptShowing(output) {
+			return true
+		}
+		// Fall through to the generic line-scan below so well-formed Claude
+		// prompts the shared recognizer doesn't enumerate (e.g. "claude>") are
+		// still caught, but without the activeWorkBelow guard — Claude work is
+		// already ruled out by ClaudeActivelyWorking above.
+	}
 
 	// Strip ANSI first for cleaner processing
 	clean := StripANSI(output)
@@ -164,17 +230,23 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 		return false
 	}
 
-	// Check up to 3 non-empty lines from the end for prompt patterns.
-	// This window allows detecting idle state even with some trailing output.
-	const maxLinesToCheck = 3
 	linesChecked := 0
-	for i := len(lines) - 1; i >= 0 && linesChecked < maxLinesToCheck; i-- {
+	for i := len(lines) - 1; i >= 0 && linesChecked < maxIdleScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
 		}
 		linesChecked++
 		if IsPromptLine(line, agentType) {
+			// Guard against false idle: if the agent is actively working its
+			// input box is still drawn, but a spinner sits below the prompt.
+			// Only treat the prompt as authoritative when nothing below it
+			// indicates ongoing work. (Claude already short-circuits above via
+			// ClaudeActivelyWorking, which uses spinner-vs-completion ordering
+			// rather than this below-the-prompt heuristic.)
+			if activeWorkBelow(lines, i) {
+				return false
+			}
 			return true
 		}
 	}
@@ -182,6 +254,24 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 	// If there was no output at all, treat user panes as idle (empty buffer, likely waiting at prompt)
 	if linesChecked == 0 && (agentType == "" || agentType == "user") {
 		return true
+	}
+	return false
+}
+
+// activeWorkBelow reports whether any line after promptIdx (already-stripped
+// `lines`) matches an active-work spinner. A spinner below the prompt means the
+// most recent on-screen state is "working", so the prompt above it is stale.
+func activeWorkBelow(lines []string, promptIdx int) bool {
+	for j := promptIdx + 1; j < len(lines); j++ {
+		line := strings.TrimSpace(lines[j])
+		if line == "" {
+			continue
+		}
+		for _, p := range ccActiveSpinnerPatterns {
+			if p.MatchString(line) {
+				return true
+			}
+		}
 	}
 	return false
 }

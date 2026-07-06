@@ -80,6 +80,7 @@ type AggregateTotals struct {
 	TotalCC     int
 	TotalCod    int
 	TotalGmi    int
+	TotalAgy    int
 	TotalAgents int
 }
 
@@ -90,6 +91,7 @@ func (ac *AllocationCalculator) CalculateTotals(allocations []ProjectAllocation)
 		totals.TotalCC += alloc.CCAgents
 		totals.TotalCod += alloc.CodAgents
 		totals.TotalGmi += alloc.GmiAgents
+		totals.TotalAgy += alloc.AgyAgents
 		totals.TotalAgents += alloc.TotalAgents
 	}
 	return totals
@@ -134,7 +136,7 @@ func (ac *AllocationCalculator) GenerateSwarmPlan(scanDir string, projects []Pro
 	sessionsPerType := ac.Config.SessionsPerType
 	panesPerSession := ac.Config.PanesPerSession
 	if panesPerSession == 0 {
-		maxAgentsPerType := max(result.Totals.TotalCC, result.Totals.TotalCod, result.Totals.TotalGmi)
+		maxAgentsPerType := max(result.Totals.TotalCC, result.Totals.TotalCod, result.Totals.TotalGmi, result.Totals.TotalAgy)
 		if sessionsPerType > 0 && maxAgentsPerType > 0 {
 			panesPerSession = (maxAgentsPerType + sessionsPerType - 1) / sessionsPerType // Ceiling division
 		}
@@ -150,6 +152,7 @@ func (ac *AllocationCalculator) GenerateSwarmPlan(scanDir string, projects []Pro
 		TotalCC:            result.Totals.TotalCC,
 		TotalCod:           result.Totals.TotalCod,
 		TotalGmi:           result.Totals.TotalGmi,
+		TotalAgy:           result.Totals.TotalAgy,
 		TotalAgents:        result.Totals.TotalAgents,
 		AutoRotateAccounts: ac.Config.AutoRotateAccounts,
 		SessionsPerType:    sessionsPerType,
@@ -176,6 +179,11 @@ func (ac *AllocationCalculator) generateSessions(allocations []ProjectAllocation
 	gmiSessions := ac.generateSessionsForType("gmi", allocations, sessionsPerType, panesPerSession,
 		func(a ProjectAllocation) int { return a.GmiAgents })
 	sessions = append(sessions, gmiSessions...)
+
+	// Generate Antigravity sessions
+	agySessions := ac.generateSessionsForType("agy", allocations, sessionsPerType, panesPerSession,
+		func(a ProjectAllocation) int { return a.AgyAgents })
+	sessions = append(sessions, agySessions...)
 
 	return sessions
 }

@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -819,6 +820,259 @@ func TestFilterThinkingToLive_KeepsCurrentBullets(t *testing.T) {
 	}
 }
 
+// TestFilterErrorToLiveWhenIdle_DropsHistoricalErrorAboveLivePrompt is the
+// regression test for ntm#118: codex panes were reported as ERROR when a
+// stale "failed" or "api error" line sat high in scrollback above a current
+// chevron prompt. The classifier's unconditional ERROR-priority rule
+// promoted the historical match over the live idle signal and pinned the
+// pane to ERROR until a human poked it. The fix mirrors the existing
+// CategoryThinking live-window filter: when the live tail contains an idle
+// prompt and the error pattern only appears in the older scrollback,
+// classifyState should land on WAITING.
+func TestFilterErrorToLiveWhenIdle_DropsHistoricalErrorAboveLivePrompt(t *testing.T) {
+	// "failed" 40 lines above an idle codex chevron.
+	var b strings.Builder
+	b.WriteString("Error: failed to upload chunk 17 with: connection reset\n")
+	b.WriteString("\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString("    additional output line that scrolled past the live window\n")
+	}
+	b.WriteString("• I retried successfully and have no more actions to run.\n")
+	b.WriteString("\n")
+	b.WriteString("› Summarize recent commits\n")
+	b.WriteString("\n")
+	b.WriteString("  gpt-5.5 high · 47% left\n")
+	content := b.String()
+
+	lib := NewPatternLibrary()
+	full := lib.Match(content, "codex")
+	live := lib.Match(lastNLines(content, liveThinkingWindowLines), "codex")
+
+	// Sanity: full-capture scan SHOULD see the historical failed_text
+	// match (this is the bug being fixed).
+	sawHistoricalError := false
+	for _, m := range full {
+		if m.Category == CategoryError && m.Pattern == "failed_text" {
+			sawHistoricalError = true
+			break
+		}
+	}
+	if !sawHistoricalError {
+		t.Fatalf("expected historical failed_text in full-capture scan (test premise broken); got %+v", full)
+	}
+
+	// Live-window scan must NOT see the failed_text — it scrolled past.
+	for _, m := range live {
+		if m.Category == CategoryError && m.Pattern == "failed_text" {
+			t.Fatalf("live-window scan unexpectedly saw historical failed_text: %+v", live)
+		}
+	}
+
+	// Live tail must contain the codex chevron (idle prompt) so the
+	// debounce predicate fires.
+	sawLiveIdle := false
+	for _, m := range live {
+		if m.Category == CategoryIdle {
+			sawLiveIdle = true
+			break
+		}
+	}
+	if !sawLiveIdle {
+		t.Fatalf("expected idle prompt in live tail (test premise broken); got %+v", live)
+	}
+
+	// The filter should drop the stale error match entirely.
+	filtered := filterErrorToLiveWhenIdle(full, live)
+	for _, m := range filtered {
+		if m.Category == CategoryError && m.Pattern == "failed_text" {
+			t.Fatalf("filterErrorToLiveWhenIdle failed to drop stale failed_text: %+v", filtered)
+		}
+	}
+
+	// And now the full classifier run: with the stale error filtered,
+	// classifyState should see only the idle chevron + context line and
+	// return WAITING.
+	sc := NewStateClassifier("test", nil)
+	state, _, trigger := sc.classifyState(0.0, filtered)
+	if state != StateWaiting {
+		t.Fatalf("classifier returned %s (trigger=%q) on idle codex pane with historical failed_text; want WAITING", state, trigger)
+	}
+}
+
+// TestFilterErrorToLiveWhenIdle_KeepsFreshErrorInLiveTail is the inverse:
+// when the failure is currently visible in the live tail (e.g. a fresh API
+// error that just landed alongside the chevron), the filter must NOT drop
+// it. The pane is genuinely in trouble and should classify as ERROR.
+func TestFilterErrorToLiveWhenIdle_KeepsFreshErrorInLiveTail(t *testing.T) {
+	content := "" +
+		"  Read connection.rs\n" +
+		"  Edited connection.rs\n" +
+		"\n" +
+		"Error: failed to commit changes: write conflict\n" +
+		"› Please fix the merge conflict and continue\n" +
+		"\n" +
+		"  gpt-5.5 high · ~/Developer/flywheel\n"
+
+	lib := NewPatternLibrary()
+	full := lib.Match(content, "codex")
+	live := lib.Match(lastNLines(content, liveThinkingWindowLines), "codex")
+
+	// Both error and idle prompt are in the live tail.
+	sawLiveError := false
+	sawLiveIdle := false
+	for _, m := range live {
+		if m.Category == CategoryError && m.Pattern == "failed_text" {
+			sawLiveError = true
+		}
+		if m.Category == CategoryIdle {
+			sawLiveIdle = true
+		}
+	}
+	if !sawLiveError || !sawLiveIdle {
+		t.Fatalf("test premise broken: liveError=%v liveIdle=%v live=%+v", sawLiveError, sawLiveIdle, live)
+	}
+
+	filtered := filterErrorToLiveWhenIdle(full, live)
+	sawError := false
+	for _, m := range filtered {
+		if m.Category == CategoryError && m.Pattern == "failed_text" {
+			sawError = true
+			break
+		}
+	}
+	if !sawError {
+		t.Fatalf("filterErrorToLiveWhenIdle dropped a fresh in-live-tail failed_text: %+v", filtered)
+	}
+
+	sc := NewStateClassifier("test", nil)
+	state, _, _ := sc.classifyState(0.0, filtered)
+	if state != StateError {
+		t.Fatalf("classifier returned %s on fresh failed_text in live tail; want ERROR", state)
+	}
+}
+
+// TestFilterErrorToLiveWhenIdle_NoIdlePromptKeepsHistoricalError ensures the
+// debounce only fires when the live tail actually shows the pane is
+// currently waiting at a prompt. A pane that is generating output (no idle
+// match) with an error somewhere in the buffer should keep ERROR priority,
+// since "no live prompt + historical error" is not the false-positive shape
+// the issue describes — it could just be a stalled error mid-output.
+func TestFilterErrorToLiveWhenIdle_NoIdlePromptKeepsHistoricalError(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("Error: failed to acquire lock on resource\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString("    streaming output without an idle chrome line yet\n")
+	}
+	content := b.String()
+
+	lib := NewPatternLibrary()
+	full := lib.Match(content, "codex")
+	live := lib.Match(lastNLines(content, liveThinkingWindowLines), "codex")
+
+	// Premise: live tail has neither a fresh error nor an idle prompt.
+	for _, m := range live {
+		if m.Category == CategoryError && m.Pattern == "failed_text" {
+			t.Fatalf("test premise broken: live tail unexpectedly contains failed_text; got %+v", live)
+		}
+		if m.Category == CategoryIdle {
+			t.Fatalf("test premise broken: live tail unexpectedly contains an idle prompt; got %+v", live)
+		}
+	}
+
+	// With no idle prompt in the live tail the filter must be a no-op
+	// and the historical error must survive.
+	filtered := filterErrorToLiveWhenIdle(full, live)
+	sawError := false
+	for _, m := range filtered {
+		if m.Category == CategoryError && m.Pattern == "failed_text" {
+			sawError = true
+			break
+		}
+	}
+	if !sawError {
+		t.Fatalf("filterErrorToLiveWhenIdle wrongly dropped historical error with no live idle prompt; got %+v", filtered)
+	}
+}
+
+// TestActivity_RateLimitedFlagFollowsLiveWindow asserts that the
+// activity-level RateLimited flag stays consistent with the classified
+// state when a stale rate-limit pattern scrolled above a current idle
+// prompt: the pane has recovered and downstream consumers
+// (resilience monitor, health surface) must no longer treat it as
+// throttled. Without the fix, `rate_limit_text` matched anywhere in the
+// capture would keep `RateLimited: true` even though `State: WAITING` —
+// the resilience monitor would then continue applying rate-limit
+// recovery against an already-healthy pane.
+func TestActivity_RateLimitedFlagFollowsLiveWindow(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("Error: rate limit exceeded — back off and retry\n")
+	b.WriteString("\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString("    additional output line that scrolled past the live window\n")
+	}
+	b.WriteString("• Recovered after rate-limit cooldown.\n")
+	b.WriteString("\n")
+	b.WriteString("› Continue the previous task\n")
+	b.WriteString("\n")
+	b.WriteString("  gpt-5.5 high · 47% left\n")
+	content := b.String()
+
+	lib := NewPatternLibrary()
+	full := lib.Match(content, "codex")
+	live := lib.Match(lastNLines(content, liveThinkingWindowLines), "codex")
+
+	// Test premise: rate_limit_text only appears in `full`, not `live`,
+	// and `live` carries an idle prompt (codex chevron) so the filter
+	// debounce predicate fires.
+	sawFullRateLimit := false
+	for _, m := range full {
+		if m.Pattern == "rate_limit_text" {
+			sawFullRateLimit = true
+			break
+		}
+	}
+	if !sawFullRateLimit {
+		t.Fatalf("test premise broken: rate_limit_text not in full-capture matches; got %+v", full)
+	}
+	for _, m := range live {
+		if m.Pattern == "rate_limit_text" {
+			t.Fatalf("test premise broken: rate_limit_text leaked into live-window matches; got %+v", live)
+		}
+	}
+	sawLiveIdle := false
+	for _, m := range live {
+		if m.Category == CategoryIdle {
+			sawLiveIdle = true
+			break
+		}
+	}
+	if !sawLiveIdle {
+		t.Fatalf("test premise broken: no idle prompt in live tail; got %+v", live)
+	}
+
+	// Pre-filter: isRateLimitPatternMatch over the unfiltered set still
+	// flags rate_limit_text — that's the inconsistent reading we no
+	// longer want to see propagated.
+	if !isRateLimitPatternMatch(full) {
+		t.Fatalf("isRateLimitPatternMatch over `full` should still observe rate_limit_text (sanity)")
+	}
+
+	// Post-filter (what activity.go actually feeds the flag now): the
+	// stale rate_limit_text is dropped, so the flag must read false.
+	filtered := filterErrorToLiveWhenIdle(full, live)
+	if isRateLimitPatternMatch(filtered) {
+		t.Fatalf("isRateLimitPatternMatch(filtered) returned true; rate_limit_text leaked through filter on a recovered pane: %+v", filtered)
+	}
+
+	// And the classifier on the filtered set must land on WAITING — the
+	// pane is healthy.
+	sc := NewStateClassifier("test", nil)
+	state, _, trigger := sc.classifyState(0.0, filtered)
+	if state != StateWaiting {
+		t.Fatalf("classifier returned %s (trigger=%q); want WAITING for a recovered-from-rate-limit pane", state, trigger)
+	}
+}
+
 // TestLastNLines covers the off-by-one edges of the helper that feeds
 // the live-window thinking filter.
 func TestLastNLines(t *testing.T) {
@@ -1194,6 +1448,159 @@ func TestAgentActivityInfo(t *testing.T) {
 	if info.Confidence != 0.85 {
 		t.Errorf("expected confidence 0.85, got %f", info.Confidence)
 	}
+}
+
+// TestAgentActivityInfo_CaptureProvenance covers the per-pane capture
+// metadata added for ntm#117 deferred item #1. The fields are additive
+// and `omitempty`-tagged, so they must round-trip through JSON without
+// breaking consumers that don't know about them; they must also identify
+// pane-specific failures distinct from output-level source-health drops.
+func TestAgentActivityInfo_CaptureProvenance(t *testing.T) {
+	t.Run("live capture omits error and serializes provenance", func(t *testing.T) {
+		info := AgentActivityInfo{
+			Pane:               "0",
+			PaneIdx:            0,
+			AgentType:          "claude",
+			State:              "WAITING",
+			Confidence:         0.95,
+			PanePID:            12345,
+			CaptureCollectedAt: "2026-05-03T20:30:00Z",
+			CaptureProvenance:  "live",
+		}
+		blob, err := json.Marshal(info)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		s := string(blob)
+		if !strings.Contains(s, `"capture_provenance":"live"`) {
+			t.Errorf("expected capture_provenance=live in JSON, got %s", s)
+		}
+		if !strings.Contains(s, `"capture_collected_at":"2026-05-03T20:30:00Z"`) {
+			t.Errorf("expected capture_collected_at in JSON, got %s", s)
+		}
+		if strings.Contains(s, "capture_error") {
+			t.Errorf("happy-path live capture must omit capture_error, got %s", s)
+		}
+	})
+
+	t.Run("failed capture preserves error string", func(t *testing.T) {
+		info := AgentActivityInfo{
+			Pane:               "1",
+			PaneIdx:            1,
+			AgentType:          "codex",
+			State:              "UNKNOWN",
+			PanePID:            6789,
+			CaptureCollectedAt: "2026-05-03T20:30:01Z",
+			CaptureProvenance:  "unavailable",
+			CaptureError:       "tmux capture-pane: pane not found",
+		}
+		blob, err := json.Marshal(info)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		s := string(blob)
+		if !strings.Contains(s, `"capture_provenance":"unavailable"`) {
+			t.Errorf("expected capture_provenance=unavailable, got %s", s)
+		}
+		// CaptureCollectedAt is populated on the failure path too — that's
+		// the load-bearing fact for a watchdog correlating the failure
+		// with what was happening at that moment. Lock it down.
+		if !strings.Contains(s, `"capture_collected_at":"2026-05-03T20:30:01Z"`) {
+			t.Errorf("expected capture_collected_at on failure path, got %s", s)
+		}
+		if !strings.Contains(s, "tmux capture-pane: pane not found") {
+			t.Errorf("expected capture_error preserved, got %s", s)
+		}
+	})
+
+	t.Run("zero values omit all capture fields", func(t *testing.T) {
+		info := AgentActivityInfo{Pane: "2", PaneIdx: 2, AgentType: "gemini", State: "WAITING"}
+		blob, err := json.Marshal(info)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		s := string(blob)
+		// Backwards-compat: a consumer pinned to the pre-#117 shape sees
+		// nothing new in their JSON unless the producer populates the fields.
+		for _, key := range []string{"capture_provenance", "capture_collected_at", "capture_error"} {
+			if strings.Contains(s, key) {
+				t.Errorf("zero-value AgentActivityInfo must omit %q (omitempty), got %s", key, s)
+			}
+		}
+	})
+}
+
+// TestPaneOutput_CaptureProvenance mirrors the activity-side test above
+// for `--robot-tail` (ntm#117 deferred item #1).
+func TestPaneOutput_CaptureProvenance(t *testing.T) {
+	t.Run("live capture", func(t *testing.T) {
+		p := PaneOutput{
+			Type:               "claude",
+			State:              "active",
+			Lines:              []string{"hello"},
+			PanePID:            42,
+			CaptureCollectedAt: "2026-05-03T20:31:00Z",
+			CaptureProvenance:  "live",
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		s := string(blob)
+		if !strings.Contains(s, `"capture_provenance":"live"`) {
+			t.Errorf("expected capture_provenance=live, got %s", s)
+		}
+		if !strings.Contains(s, `"capture_collected_at":"2026-05-03T20:31:00Z"`) {
+			t.Errorf("expected capture_collected_at in JSON, got %s", s)
+		}
+		if strings.Contains(s, "capture_error") {
+			t.Errorf("happy path must omit capture_error, got %s", s)
+		}
+	})
+
+	t.Run("failed capture", func(t *testing.T) {
+		p := PaneOutput{
+			Type:               "claude",
+			State:              "unknown",
+			Lines:              []string{},
+			PanePID:            42,
+			CaptureCollectedAt: "2026-05-03T20:31:01Z",
+			CaptureProvenance:  "unavailable",
+			CaptureError:       "exit status 1",
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		s := string(blob)
+		if !strings.Contains(s, `"capture_provenance":"unavailable"`) {
+			t.Errorf("expected capture_provenance=unavailable, got %s", s)
+		}
+		// CaptureCollectedAt is populated on the failure path too — locking
+		// this down so a future refactor that drops it isn't silent.
+		if !strings.Contains(s, `"capture_collected_at":"2026-05-03T20:31:01Z"`) {
+			t.Errorf("expected capture_collected_at on failure path, got %s", s)
+		}
+		if !strings.Contains(s, "exit status 1") {
+			t.Errorf("expected capture_error preserved, got %s", s)
+		}
+	})
+
+	t.Run("zero values omit all capture fields", func(t *testing.T) {
+		// Backwards-compat: a consumer pinned to the pre-#117 shape sees
+		// nothing new in their JSON unless the producer populates the fields.
+		p := PaneOutput{Type: "claude", State: "active", Lines: []string{}}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		s := string(blob)
+		for _, key := range []string{"capture_provenance", "capture_collected_at", "capture_error"} {
+			if strings.Contains(s, key) {
+				t.Errorf("zero-value PaneOutput must omit %q (omitempty), got %s", key, s)
+			}
+		}
+	})
 }
 
 func TestActivitySummary(t *testing.T) {

@@ -219,6 +219,100 @@ func TestBulkAssignTemplateLoadingFromFile(t *testing.T) {
 	}
 }
 
+// TestLoadBulkAssignTemplatePrecedence verifies the resolution order for the
+// dispatch prompt template (#153): explicit --bulk-assign-template path beats a
+// configured default file, which beats a configured inline default, which beats
+// the built-in const.
+func TestLoadBulkAssignTemplatePrecedence(t *testing.T) {
+	readers := func(byPath map[string]string) func(string) ([]byte, error) {
+		return func(path string) ([]byte, error) {
+			if content, ok := byPath[path]; ok {
+				return []byte(content), nil
+			}
+			return nil, fmt.Errorf("unexpected ReadFile(%q)", path)
+		}
+	}
+
+	cases := []struct {
+		name string
+		opts BulkAssignOptions
+		read func(string) ([]byte, error)
+		want string
+	}{
+		{
+			name: "explicit path wins over configured defaults",
+			opts: BulkAssignOptions{
+				PromptTemplatePath:  "explicit.txt",
+				DefaultTemplatePath: "configured.txt",
+				DefaultTemplate:     "inline default",
+			},
+			read: readers(map[string]string{"explicit.txt": "explicit template", "configured.txt": "configured template"}),
+			want: "explicit template",
+		},
+		{
+			name: "configured file wins over inline default",
+			opts: BulkAssignOptions{
+				DefaultTemplatePath: "configured.txt",
+				DefaultTemplate:     "inline default",
+			},
+			read: readers(map[string]string{"configured.txt": "configured template"}),
+			want: "configured template",
+		},
+		{
+			name: "blank configured file falls through to inline default",
+			opts: BulkAssignOptions{
+				DefaultTemplatePath: "configured.txt",
+				DefaultTemplate:     "inline default",
+			},
+			read: readers(map[string]string{"configured.txt": "   \n"}),
+			want: "inline default",
+		},
+		{
+			name: "inline default used when no files configured",
+			opts: BulkAssignOptions{DefaultTemplate: "inline default"},
+			want: "inline default",
+		},
+		{
+			name: "built-in const when nothing configured",
+			opts: BulkAssignOptions{},
+			want: defaultBulkAssignTemplate,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := bulkAssignDeps(nil)
+			if tc.read != nil {
+				deps.ReadFile = tc.read
+			}
+			got, err := loadBulkAssignTemplate(tc.opts, deps)
+			if err != nil {
+				t.Fatalf("loadBulkAssignTemplate failed: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("template mismatch: got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadBulkAssignTemplateConfiguredFileError surfaces a read error for a
+// configured default file rather than silently falling back, so a misconfigured
+// path is visible to the operator.
+func TestLoadBulkAssignTemplateConfiguredFileError(t *testing.T) {
+	deps := bulkAssignDeps(nil)
+	deps.ReadFile = func(path string) ([]byte, error) {
+		return nil, fmt.Errorf("boom")
+	}
+	_, err := loadBulkAssignTemplate(BulkAssignOptions{DefaultTemplatePath: "missing.txt"}, deps)
+	if err == nil {
+		t.Fatal("expected error for unreadable configured template file, got nil")
+	}
+	if !strings.Contains(err.Error(), "missing.txt") {
+		t.Fatalf("expected error to mention the path, got %v", err)
+	}
+}
+
 func TestBulkAssignSequentialDeliveryOrdering(t *testing.T) {
 	allocation := `{"2":"bd-2","1":"bd-1"}`
 	panes := mockPanes("proj", []int{1, 2})

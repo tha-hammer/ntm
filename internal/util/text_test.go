@@ -326,3 +326,44 @@ func TestSafeSlice(t *testing.T) {
 		})
 	}
 }
+
+// bd-itfik: GetLastNLines must match GNU `tail -n` semantics — a single
+// trailing newline is the EOL of the last line, not the start of an
+// (N+1)-th empty line. Pre-fix the reverse scan counted the trailing
+// '\n' as the first separator and returned N-1 actual lines.
+func TestGetLastNLines_TrailingNewlineDoesNotShrinkWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		n    int
+		want string
+	}{
+		// Trailing-newline cases — these were broken pre-fix.
+		{"two lines, trailing nl, n=2", "L1\nL2\n", 2, "L1\nL2\n"},
+		{"three lines, trailing nl, n=2", "L1\nL2\nL3\n", 2, "L2\nL3\n"},
+		{"single line, trailing nl, n=1", "abc\n", 1, "abc\n"},
+		{"single line, trailing nl, n=2 (more than available)", "abc\n", 2, "abc\n"},
+
+		// No-trailing-newline cases — already worked, pin them.
+		{"two lines, no trailing nl, n=1", "L1\nL2", 1, "L2"},
+		{"two lines, no trailing nl, n=2", "L1\nL2", 2, "L1\nL2"},
+		{"single line, no trailing nl, n=1", "abc", 1, "abc"},
+
+		// Empty text and zero-n.
+		{"empty text", "", 1, ""},
+		{"zero n", "anything\n", 0, ""},
+
+		// Multi-trailing newlines: the inner '\n' marks an empty line.
+		{"two trailing newlines, n=1", "L1\n\n", 1, "\n"},
+		{"two trailing newlines, n=2", "L1\n\n", 2, "L1\n\n"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := GetLastNLines(tc.text, tc.n)
+			if got != tc.want {
+				t.Errorf("GetLastNLines(%q, %d) = %q, want %q", tc.text, tc.n, got, tc.want)
+			}
+		})
+	}
+}

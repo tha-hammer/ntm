@@ -54,6 +54,9 @@ func TestDefault(t *testing.T) {
 	if cfg.Routing.ExcludeIfErrorState != true {
 		t.Errorf("Routing.ExcludeIfErrorState = %t, want true", cfg.Routing.ExcludeIfErrorState)
 	}
+	if cfg.AgentMail.SupervisorEnabledOrDefault() {
+		t.Error("Agent Mail supervisor should be disabled by default so ntm does not own user am processes")
+	}
 }
 
 func TestLoadRoutingBoolOnlyOverridesPreserveDefaults(t *testing.T) {
@@ -231,6 +234,7 @@ enabled = true
 url = "http://localhost:9999/mcp/"
 auto_register = false
 program_name = "test-ntm"
+supervisor_enabled = true
 `
 	path := createTempConfig(t, content)
 
@@ -259,6 +263,9 @@ program_name = "test-ntm"
 	}
 	if cfg.Tmux.PaneInitDelayMs != 1500 {
 		t.Errorf("Expected pane_init_delay_ms 1500, got %d", cfg.Tmux.PaneInitDelayMs)
+	}
+	if !cfg.AgentMail.SupervisorEnabledOrDefault() {
+		t.Error("Expected supervisor_enabled true from config")
 	}
 	if cfg.AgentMail.URL != "http://localhost:9999/mcp/" {
 		t.Errorf("Expected URL http://localhost:9999/mcp/, got %s", cfg.AgentMail.URL)
@@ -473,6 +480,10 @@ func TestLoadDefaultsForMissingFields(t *testing.T) {
 }
 
 func TestDefaultPath(t *testing.T) {
+	// bd-xkls4: clear ambient NTM_CONFIG so the HOME/XDG default-path
+	// resolver isn't preempted by a hostile outer-shell value (e.g.
+	// /nonexistent/config.toml) and the default shape assertions hold.
+	t.Setenv("NTM_CONFIG", "")
 	path := DefaultPath()
 	if !strings.Contains(path, "config.toml") {
 		t.Errorf("DefaultPath should contain config.toml: %s", path)
@@ -483,6 +494,9 @@ func TestDefaultPath(t *testing.T) {
 }
 
 func TestDefaultPathWithXDG(t *testing.T) {
+	// bd-xkls4: clear ambient NTM_CONFIG; otherwise it shadows
+	// XDG_CONFIG_HOME and the test's /custom/xdg path expectation breaks.
+	t.Setenv("NTM_CONFIG", "")
 	original := os.Getenv("XDG_CONFIG_HOME")
 	defer os.Setenv("XDG_CONFIG_HOME", original)
 	os.Setenv("XDG_CONFIG_HOME", "/custom/xdg")
@@ -569,7 +583,7 @@ func TestGetModelName(t *testing.T) {
 		{"cc", "", models.DefaultClaude},
 		{"codex", "", models.DefaultCodex},
 		{"gemini", "", models.DefaultGemini},
-		{"claude", "opus", "claude-opus-4-6"},
+		{"claude", "opus", "claude-opus-4-8"},
 		{"codex", "gpt4", "gpt-4"},
 		{"gemini", "flash", "gemini-3-flash"},
 		{"claude", "custom-model", "custom-model"},
@@ -657,6 +671,9 @@ func TestPrint(t *testing.T) {
 		if !strings.Contains(output, section) {
 			t.Errorf("Expected output to contain %s", section)
 		}
+	}
+	if !strings.Contains(output, "supervisor_enabled = false") {
+		t.Error("Expected printed config to make Agent Mail supervisor ownership explicit")
 	}
 }
 
@@ -830,6 +847,10 @@ func TestCreateDefaultAlreadyExists(t *testing.T) {
 
 func TestCreateDefaultSuccess(t *testing.T) {
 	tmpDir := t.TempDir()
+	// bd-xkls4: clear ambient NTM_CONFIG so DefaultPath resolves through
+	// the test XDG_CONFIG_HOME and CreateDefault writes inside the temp
+	// dir instead of trying to mkdir /nonexistent.
+	t.Setenv("NTM_CONFIG", "")
 	origXDG := os.Getenv("XDG_CONFIG_HOME")
 	os.Setenv("XDG_CONFIG_HOME", tmpDir)
 	defer os.Setenv("XDG_CONFIG_HOME", origXDG)

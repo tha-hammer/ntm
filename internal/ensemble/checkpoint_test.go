@@ -155,6 +155,68 @@ func TestCheckpointStore_LoadMetadata_RejectsRunIDMismatch(t *testing.T) {
 	}
 }
 
+// bd-du7e5: NormalizeCheckpointRunID is the load-bearing guard
+// against path traversal in every cli/ensemble caller that joins a
+// runID into a filesystem path. The function exists and is called
+// throughout (including from cli/ensemble.go::resolveEnsembleCheckpoint
+// StoreForRunID) but had no focused unit test pinning the rejection
+// contract — a future refactor that loosens the validation could go
+// unnoticed. This test pins every documented-malformed shape.
+func TestNormalizeCheckpointRunID_RejectsTraversalAndPathSeparators(t *testing.T) {
+	t.Parallel()
+	rejectCases := []struct {
+		name  string
+		runID string
+	}{
+		{"empty", ""},
+		{"whitespace_only", "   "},
+		{"single_dot", "."},
+		{"double_dot", ".."},
+		{"parent_then_subdir", "../foo"},
+		{"deep_traversal", "../../../etc/passwd"},
+		{"absolute_unix", "/abs/path"},
+		{"absolute_root", "/"},
+		{"contains_forward_slash", "a/b"},
+		{"contains_backslash", "a\\b"},
+		{"contains_nul_byte", "run\x00id"},
+		{"trailing_slash", "trailing/"},
+		{"leading_slash", "/leading"},
+		{"dot_dot_in_middle", "foo/../bar"},
+	}
+	for _, c := range rejectCases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NormalizeCheckpointRunID(c.runID)
+			if err == nil {
+				t.Errorf("NormalizeCheckpointRunID(%q) = (%q, nil); want non-nil error", c.runID, got)
+			}
+		})
+	}
+
+	acceptCases := []struct {
+		name  string
+		runID string
+		want  string
+	}{
+		{"alphanumeric", "abc123", "abc123"},
+		{"with_dash", "run-2026-05-08", "run-2026-05-08"},
+		{"with_underscore", "run_42", "run_42"},
+		{"leading_dot_dot_basename", "..hidden_id", "..hidden_id"},
+		{"trimmed_whitespace", "   ok   ", "ok"},
+		{"single_dot_in_middle", "v1.0.beta", "v1.0.beta"},
+	}
+	for _, c := range acceptCases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NormalizeCheckpointRunID(c.runID)
+			if err != nil {
+				t.Errorf("NormalizeCheckpointRunID(%q) error = %v, want nil", c.runID, err)
+			}
+			if got != c.want {
+				t.Errorf("NormalizeCheckpointRunID(%q) = %q, want %q", c.runID, got, c.want)
+			}
+		})
+	}
+}
+
 func TestCheckpointStore_RejectsInvalidRunID(t *testing.T) {
 	t.Logf("TEST: %s - starting", t.Name())
 

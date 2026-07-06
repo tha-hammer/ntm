@@ -86,6 +86,30 @@ func DefaultConfig() Config {
 	}
 }
 
+// DeepCopy returns an independent copy of the receiver. The reference-
+// typed fields (Allowlist, ExtraPatterns, DisabledCategories) are copied
+// so a caller mutating the returned value cannot reach back into the
+// original config — used by the SetRedactionConfig / GetRedactionConfig
+// helpers in audit, checkpoint, events, history, serve, and session
+// (bd-pmdpn, mirror of bd-oekc2).
+func (c Config) DeepCopy() Config {
+	out := c
+	if c.Allowlist != nil {
+		out.Allowlist = append([]string(nil), c.Allowlist...)
+	}
+	if c.ExtraPatterns != nil {
+		patterns := make(map[Category][]string, len(c.ExtraPatterns))
+		for k, v := range c.ExtraPatterns {
+			patterns[k] = append([]string(nil), v...)
+		}
+		out.ExtraPatterns = patterns
+	}
+	if c.DisabledCategories != nil {
+		out.DisabledCategories = append([]Category(nil), c.DisabledCategories...)
+	}
+	return out
+}
+
 // Validate checks if the config is valid.
 func (c *Config) Validate() error {
 	switch c.Mode {

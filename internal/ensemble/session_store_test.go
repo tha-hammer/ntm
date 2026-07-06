@@ -18,6 +18,12 @@ func resetDefaultStateStoreForTest() {
 func TestSessionStore_SaveLoad_DefaultPath(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	// bd-vqs4c: clear ambient XDG_CONFIG_HOME / NTM_CONFIG so DefaultPath
+	// resolves through the test HOME and not whatever the CI/agent shell
+	// happens to have set (an invalid NTM_CONFIG=/nonexistent/config.toml
+	// caused mkdir /nonexistent: permission denied here).
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("NTM_CONFIG", "")
 
 	resetDefaultStateStoreForTest()
 
@@ -54,6 +60,10 @@ func TestSessionStore_SaveLoad_DefaultPath(t *testing.T) {
 func TestSessionStore_ReopensAfterCloseDefaultStateStore(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	// bd-vqs4c: clear ambient XDG_CONFIG_HOME / NTM_CONFIG (see
+	// TestSessionStore_SaveLoad_DefaultPath comment).
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("NTM_CONFIG", "")
 
 	resetDefaultStateStoreForTest()
 

@@ -357,6 +357,37 @@ func DefaultRoutingConfig() RoutingConfig {
 type RobotConfig struct {
 	Verbosity string            `toml:"verbosity"` // terse, default, or debug
 	Output    RobotOutputConfig `toml:"output"`    // Output format configuration
+	Semantic  SemanticConfig    `toml:"semantic"`  // Opt-in semantic-progress signal (#199)
+}
+
+// SemanticConfig configures the optional dispatch-time pane work-token
+// semantic-progress signal (#199). Every field defaults OFF/conservative so the
+// default --robot-is-working / --robot-activity poll path and the default
+// send/assign dispatch prompts are entirely unchanged when the feature is off.
+//
+// Safety: the semantic signal is advisory only. It never flips is_working from
+// true to false and never produces a kill/reassign recommendation on its own.
+type SemanticConfig struct {
+	// Stamp, when true, makes `ntm send` / `ntm assign` inject a per-pane
+	// `NTM-Pane: <session>/<window>.<pane>` commit-trailer instruction into the
+	// dispatched marching orders (and, when a bead id is cleanly known, a
+	// best-effort bead label carrying the same pane identity). Default false, so
+	// prompts are never polluted unless explicitly opted in. No git hooks or git
+	// config are ever installed; the trailer is a marching-orders instruction.
+	Stamp bool `toml:"stamp"`
+	// WindowMinutes is the default look-back window (in minutes) used by
+	// `--robot-is-working --semantic` when `--semantic-window` is not supplied.
+	// Conservative by default so a legitimately-slow pane that simply hasn't
+	// committed recently is not flagged as a suspected wedge.
+	WindowMinutes int `toml:"window_minutes"`
+}
+
+// DefaultSemanticConfig returns the conservative, fully-off semantic defaults.
+func DefaultSemanticConfig() SemanticConfig {
+	return SemanticConfig{
+		Stamp:         false, // opt-in: never pollute dispatch prompts by default
+		WindowMinutes: 30,    // conservative look-back for the stale-commit tell
+	}
 }
 
 // RobotOutputConfig holds configuration for robot mode output format.
@@ -395,6 +426,7 @@ func DefaultRobotConfig() RobotConfig {
 	return RobotConfig{
 		Verbosity: "default",
 		Output:    DefaultRobotOutputConfig(),
+		Semantic:  DefaultSemanticConfig(),
 	}
 }
 
@@ -556,16 +588,17 @@ type AccountEntry struct {
 
 // AccountsConfig holds multi-account management configuration
 type AccountsConfig struct {
-	StateFile          string         `toml:"state_file"`           // Path to account state JSON
-	AutoRotate         bool           `toml:"auto_rotate"`          // Auto-rotate on limit detection
-	ResetBufferMinutes int            `toml:"reset_buffer_minutes"` // Minutes before reset to consider available
-	Claude             []AccountEntry `toml:"claude"`               // Claude accounts
-	Codex              []AccountEntry `toml:"codex"`                // Codex accounts
-	Gemini             []AccountEntry `toml:"gemini"`               // Gemini accounts
-	Cursor             []AccountEntry `toml:"cursor,omitempty"`     // Cursor accounts
-	Windsurf           []AccountEntry `toml:"windsurf,omitempty"`   // Windsurf accounts
-	Aider              []AccountEntry `toml:"aider,omitempty"`      // Aider accounts
-	Ollama             []AccountEntry `toml:"ollama,omitempty"`     // Ollama accounts
+	StateFile          string         `toml:"state_file"`            // Path to account state JSON
+	AutoRotate         bool           `toml:"auto_rotate"`           // Auto-rotate on limit detection
+	ResetBufferMinutes int            `toml:"reset_buffer_minutes"`  // Minutes before reset to consider available
+	Claude             []AccountEntry `toml:"claude"`                // Claude accounts
+	Codex              []AccountEntry `toml:"codex"`                 // Codex accounts
+	Gemini             []AccountEntry `toml:"gemini"`                // Gemini accounts
+	Antigravity        []AccountEntry `toml:"antigravity,omitempty"` // Antigravity (agy) accounts
+	Cursor             []AccountEntry `toml:"cursor,omitempty"`      // Cursor accounts
+	Windsurf           []AccountEntry `toml:"windsurf,omitempty"`    // Windsurf accounts
+	Aider              []AccountEntry `toml:"aider,omitempty"`       // Aider accounts
+	Ollama             []AccountEntry `toml:"ollama,omitempty"`      // Ollama accounts
 }
 
 // DefaultAccountsConfig returns the default accounts configuration
@@ -689,6 +722,9 @@ func ValidateAccountsConfig(cfg *AccountsConfig) error {
 	if err := validateEntries("gemini", cfg.Gemini); err != nil {
 		return err
 	}
+	if err := validateEntries("antigravity", cfg.Antigravity); err != nil {
+		return err
+	}
 	if err := validateEntries("cursor", cfg.Cursor); err != nil {
 		return err
 	}
@@ -723,9 +759,9 @@ func ValidateRotationConfig(cfg *RotationConfig) error {
 	}
 	for i, account := range cfg.Accounts {
 		switch account.Provider {
-		case "claude", "codex", "gemini":
+		case "claude", "codex", "gemini", "antigravity":
 		default:
-			return fmt.Errorf("accounts[%d].provider: must be claude, codex, or gemini, got %q", i, account.Provider)
+			return fmt.Errorf("accounts[%d].provider: must be claude, codex, gemini, or antigravity, got %q", i, account.Provider)
 		}
 		if strings.TrimSpace(account.Email) == "" {
 			return fmt.Errorf("accounts[%d].email: must not be empty", i)
@@ -833,10 +869,12 @@ type AgentConfig struct {
 	Claude       string            `toml:"claude"`
 	Codex        string            `toml:"codex"`
 	Gemini       string            `toml:"gemini"`
+	Antigravity  string            `toml:"antigravity"` // Antigravity (agy) launch command — successor to the Gemini CLI
 	Ollama       string            `toml:"ollama"`
 	Cursor       string            `toml:"cursor"`
 	Windsurf     string            `toml:"windsurf"`
 	Aider        string            `toml:"aider"`
+	Opencode     string            `toml:"oc"`      // Opencode (https://opencode.ai) launch command — see ntm#116
 	Plugins      map[string]string `toml:"plugins"` // Custom agent commands keyed by type
 	DefaultCount int               `toml:"default_count"`
 }
@@ -855,15 +893,51 @@ func DefaultContextConfig() ContextConfig {
 
 // ContextRotationConfig holds configuration for automatic context window rotation
 type ContextRotationConfig struct {
-	Enabled              bool    `toml:"enabled"`                // Top-level toggle for context rotation
-	WarningThreshold     float64 `toml:"warning_threshold"`      // 0.0-1.0, warn when context usage exceeds this
-	RotateThreshold      float64 `toml:"rotate_threshold"`       // 0.0-1.0, rotate agent when usage exceeds this
-	SummaryMaxTokens     int     `toml:"summary_max_tokens"`     // Max tokens for handoff summary
-	MinSessionAgeSec     int     `toml:"min_session_age_sec"`    // Don't rotate agents younger than this
-	TryCompactFirst      bool    `toml:"try_compact_first"`      // Try to compact before rotating
-	RequireConfirm       bool    `toml:"require_confirm"`        // Require user confirmation before rotating
-	ConfirmTimeoutSec    int     `toml:"confirm_timeout_sec"`    // Seconds to wait for confirmation (0 = no auto-rotate)
-	DefaultConfirmAction string  `toml:"default_confirm_action"` // Action if timeout expires: "rotate", "ignore", "compact"
+	Enabled              bool                     `toml:"enabled"`                // Top-level toggle for context rotation
+	WarningThreshold     float64                  `toml:"warning_threshold"`      // 0.0-1.0, warn when context usage exceeds this
+	RotateThreshold      float64                  `toml:"rotate_threshold"`       // 0.0-1.0, rotate agent when usage exceeds this
+	SummaryMaxTokens     int                      `toml:"summary_max_tokens"`     // Max tokens for handoff summary
+	MinSessionAgeSec     int                      `toml:"min_session_age_sec"`    // Don't rotate agents younger than this
+	TryCompactFirst      bool                     `toml:"try_compact_first"`      // Try to compact before rotating
+	RequireConfirm       bool                     `toml:"require_confirm"`        // Require user confirmation before rotating
+	ConfirmTimeoutSec    int                      `toml:"confirm_timeout_sec"`    // Seconds to wait for confirmation (0 = no auto-rotate)
+	DefaultConfirmAction string                   `toml:"default_confirm_action"` // Action if timeout expires: "rotate", "ignore", "compact"
+	Recovery             CompactionRecoveryConfig `toml:"recovery"`               // Compaction-recovery prompt behaviour (issue #113)
+}
+
+// CompactionRecoveryConfig holds configuration for the compaction recovery
+// surface — i.e. the prompt that gets re-sent to a pane after a context
+// rotation/compaction so the agent re-reads its setup. The runtime side
+// of this lives in internal/status/recovery.go (RecoveryConfig); this
+// type is the TOML bridge that #113 was asking for.
+//
+// Mapping back to the runtime fields:
+//
+//	cooldown_seconds        -> RecoveryConfig.Cooldown (time.Duration)
+//	prompt                  -> RecoveryConfig.Prompt
+//	max_recoveries_per_pane -> RecoveryConfig.MaxRecoveries
+//	include_bead_context    -> RecoveryConfig.IncludeBeadContext
+//	enabled                 -> gate before invoking recovery at all
+type CompactionRecoveryConfig struct {
+	Enabled              bool   `toml:"enabled"`                 // Top-level toggle for compaction recovery prompts
+	CooldownSeconds      int    `toml:"cooldown_seconds"`        // Minimum seconds between recovery prompts per pane (0 = engine default)
+	IncludeBeadContext   bool   `toml:"include_bead_context"`    // Include current Beads task context in the recovery prompt
+	MaxRecoveriesPerPane int    `toml:"max_recoveries_per_pane"` // Cap on recovery prompts per pane before giving up (0 = engine default)
+	Prompt               string `toml:"prompt"`                  // Override the recovery prompt sent on rotation
+}
+
+// DefaultCompactionRecoveryConfig returns sensible defaults for the recovery
+// integration. The numeric zero values are treated by the runtime as "use the
+// engine's hardcoded fallback", so emitting them here keeps DefaultLayer()
+// minimal while still exposing the surface in configuration tooling.
+func DefaultCompactionRecoveryConfig() CompactionRecoveryConfig {
+	return CompactionRecoveryConfig{
+		Enabled:              true,
+		CooldownSeconds:      0,
+		IncludeBeadContext:   true,
+		MaxRecoveriesPerPane: 0,
+		Prompt:               "",
+	}
 }
 
 // DefaultContextRotationConfig returns sensible defaults for context rotation
@@ -878,6 +952,7 @@ func DefaultContextRotationConfig() ContextRotationConfig {
 		RequireConfirm:       false,    // Don't require confirmation by default
 		ConfirmTimeoutSec:    60,       // 60 seconds timeout for confirmation
 		DefaultConfirmAction: "rotate", // Auto-rotate on timeout
+		Recovery:             DefaultCompactionRecoveryConfig(),
 	}
 }
 
@@ -1234,6 +1309,22 @@ type AgentMailConfig struct {
 	Token        string `toml:"token"`         // Bearer token
 	AutoRegister bool   `toml:"auto_register"` // Auto-register sessions as agents
 	ProgramName  string `toml:"program_name"`  // Program identifier for registration
+	// SupervisorEnabled controls whether ntm spawns and manages the
+	// `am serve-http` daemon under its supervisor. Default false keeps
+	// Agent Mail ownership external: ntm may use the configured MCP URL,
+	// but it will not start, stop, restart, or compete with a user-owned
+	// `am` process on port 8765. Set to true only when you explicitly want
+	// ntm to own the Agent Mail daemon lifecycle for a session.
+	SupervisorEnabled *bool `toml:"supervisor_enabled,omitempty"`
+}
+
+// SupervisorEnabledOrDefault returns the effective value of
+// SupervisorEnabled with the documented default-false semantics applied.
+func (a AgentMailConfig) SupervisorEnabledOrDefault() bool {
+	if a.SupervisorEnabled == nil {
+		return false
+	}
+	return *a.SupervisorEnabled
 }
 
 // IntegrationsConfig holds external tool integration settings.
@@ -1252,15 +1343,25 @@ type IntegrationsConfig struct {
 type DCGConfig struct {
 	Enabled         bool     `toml:"enabled"`
 	BinaryPath      string   `toml:"binary_path"`
-	CustomBlocklist []string `toml:"custom_blocklist"`
-	CustomWhitelist []string `toml:"custom_whitelist"`
-	AuditLog        string   `toml:"audit_log"`
+	CustomBlocklist []string `toml:"custom_blocklist"` // Legacy: configure modern dcg packs directly
+	CustomWhitelist []string `toml:"custom_whitelist"` // Legacy: configure modern dcg allowlists directly
+	AuditLog        string   `toml:"audit_log"`        // Legacy: configure modern dcg logging directly
 	AllowOverride   bool     `toml:"allow_override"`
 }
 
 // AssignConfig holds configuration for the ntm assign command
 type AssignConfig struct {
 	Strategy string `toml:"strategy"` // Default strategy: balanced, speed, quality, dependency, round-robin
+	// PromptTemplate is an inline project/user-level default for the bulk-assign
+	// dispatch prompt. When set (and no per-invocation --bulk-assign-template file
+	// is supplied), it overrides the built-in template. Placeholders follow the
+	// bulk-assign convention: {bead_id} {bead_title} {bead_type} {bead_deps}
+	// {session} {pane}. Empty means "use the built-in default".
+	PromptTemplate string `toml:"prompt_template"`
+	// PromptTemplateFile points at a file holding the default bulk-assign dispatch
+	// prompt. It takes precedence over PromptTemplate when both are set, and is
+	// itself overridden by a per-invocation --bulk-assign-template path.
+	PromptTemplateFile string `toml:"prompt_template_file"`
 }
 
 // ValidAssignStrategies are the recognized assignment strategies
@@ -1421,7 +1522,7 @@ type RCHConfig struct {
 	FallbackLocal     bool     `toml:"fallback_local"`     // Fallback to local build on RCH failure
 	ShowLocation      bool     `toml:"show_location"`      // Show build location in output
 	PreferredWorker   string   `toml:"preferred_worker"`   // Worker preference (by name or "auto")
-	DCGWhitelist      bool     `toml:"dcg_whitelist"`      // Whitelist RCH wrapper commands in DCG checks
+	DCGWhitelist      bool     `toml:"dcg_whitelist"`      // Legacy no-op: modern DCG handles RCH hook commands directly
 }
 
 // DefaultRCHConfig returns sensible defaults for RCH integration.
@@ -1439,7 +1540,7 @@ func DefaultRCHConfig() RCHConfig {
 		FallbackLocal:   true,   // Fallback to local if remote fails
 		ShowLocation:    true,   // Show where build ran
 		PreferredWorker: "auto", // Auto-select best worker
-		DCGWhitelist:    true,   // Allow RCH wrapper commands in DCG checks
+		DCGWhitelist:    true,   // Legacy no-op retained in config files
 	}
 }
 
@@ -1706,6 +1807,7 @@ type ModelsConfig struct {
 	Cursor        map[string]string `toml:"cursor"`         // Cursor model aliases
 	Windsurf      map[string]string `toml:"windsurf"`       // Windsurf model aliases
 	Aider         map[string]string `toml:"aider"`          // Aider model aliases
+	Opencode      map[string]string `toml:"opencode"`       // Opencode (oc) model aliases — see ntm#116
 	// ContextLimits allows overriding built-in context window sizes for models.
 	// Keys are model names (e.g., "claude-opus-4-6"), values are token counts.
 	// These override the built-in defaults in internal/models/registry.go.
@@ -1716,24 +1818,24 @@ type ModelsConfig struct {
 // Model IDs should match those in internal/agents/profiles.go (no date suffixes).
 func DefaultModels() ModelsConfig {
 	return ModelsConfig{
-		DefaultClaude: "claude-opus-4-6",
-		DefaultCodex:  "gpt-5.3-codex",
+		DefaultClaude: "claude-opus-4-8",
+		DefaultCodex:  "gpt-5.5",
 		DefaultGemini: "gemini-3-pro-preview",
 		DefaultOllama: "llama3",
 		Claude: map[string]string{
-			"opus":      "claude-opus-4-6",
+			"opus":      "claude-opus-4-8",
 			"sonnet":    "claude-sonnet-4-6",
 			"haiku":     "claude-haiku-4-5",
-			"architect": "claude-opus-4-6",
+			"architect": "claude-opus-4-8",
 			"fast":      "claude-sonnet-4-6",
 		},
 		Codex: map[string]string{
 			"gpt4":  "gpt-4",
-			"gpt5":  "gpt-5.3-codex",
+			"gpt5":  "gpt-5.5",
 			"o1":    "o1",
 			"o3":    "o3",
 			"turbo": "gpt-4-turbo",
-			"codex": "gpt-5.3-codex",
+			"codex": "gpt-5.5",
 		},
 		Gemini: map[string]string{
 			"pro":    "gemini-3-pro-preview",
@@ -1754,6 +1856,8 @@ func canonicalModelLookupAgentType(agentType string) string {
 		return "codex"
 	case agent.AgentTypeGemini:
 		return "gemini"
+	case agent.AgentTypeAntigravity:
+		return "antigravity"
 	case agent.AgentTypeOllama:
 		return "ollama"
 	case agent.AgentTypeCursor:
@@ -1762,15 +1866,28 @@ func canonicalModelLookupAgentType(agentType string) string {
 		return "windsurf"
 	case agent.AgentTypeAider:
 		return "aider"
+	case agent.AgentTypeOpencode:
+		return "opencode"
 	default:
 		return strings.ToLower(strings.TrimSpace(agentType))
 	}
 }
 
+// AntigravityRequiredModel is the ONLY model agy (Antigravity CLI) may run on.
+// agy is hard-pinned to it everywhere (never a Flash/Anthropic/other tier) per
+// the model guard (bd-47kjh.1.7); it is intentionally NOT user-configurable.
+const AntigravityRequiredModel = "Gemini 3.1 Pro (High)"
+
 // GetModelName resolves a model alias to its full model name.
 // Returns the alias itself if no mapping is found.
 func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 	normalizedAgentType := canonicalModelLookupAgentType(agentType)
+
+	// agy is hard-pinned: ignore any requested alias/model and always resolve to
+	// the single allowed model (model guard, bd-47kjh.1.7).
+	if normalizedAgentType == "antigravity" {
+		return AntigravityRequiredModel
+	}
 
 	if alias == "" {
 		// Return default if no alias specified.
@@ -1804,6 +1921,8 @@ func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 		aliases = m.Windsurf
 	case "aider":
 		aliases = m.Aider
+	case "opencode":
+		aliases = m.Opencode
 	}
 
 	if aliases != nil {
@@ -2307,6 +2426,8 @@ type PromptsConfig struct {
 	CodDefaultFile string `toml:"cod_default_file"` // File path for Codex default prompt
 	GmiDefault     string `toml:"gmi_default"`      // Default prompt for Gemini agents
 	GmiDefaultFile string `toml:"gmi_default_file"` // File path for Gemini default prompt
+	AgyDefault     string `toml:"agy_default"`      // Default prompt for Antigravity (agy) agents
+	AgyDefaultFile string `toml:"agy_default_file"` // File path for Antigravity default prompt
 }
 
 // ResolveForType returns the default prompt for a given agent type string (cc, cod, gmi).
@@ -2320,6 +2441,8 @@ func (p PromptsConfig) ResolveForType(agentType string) (string, error) {
 		val, filePath = p.CodDefault, p.CodDefaultFile
 	case "gmi":
 		val, filePath = p.GmiDefault, p.GmiDefaultFile
+	case "agy":
+		val, filePath = p.AgyDefault, p.AgyDefaultFile
 	default:
 		return "", nil
 	}
@@ -2978,6 +3101,9 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "claude = %q\n", cfg.Agents.Claude)
 	fmt.Fprintf(w, "codex = %q\n", cfg.Agents.Codex)
 	fmt.Fprintf(w, "gemini = %q\n", cfg.Agents.Gemini)
+	if cfg.Agents.Antigravity != "" {
+		fmt.Fprintf(w, "antigravity = %q\n", cfg.Agents.Antigravity)
+	}
 	if cfg.Agents.Cursor != "" {
 		fmt.Fprintf(w, "cursor = %q\n", cfg.Agents.Cursor)
 	}
@@ -2986,6 +3112,9 @@ func Print(cfg *Config, w io.Writer) error {
 	}
 	if cfg.Agents.Aider != "" {
 		fmt.Fprintf(w, "aider = %q\n", cfg.Agents.Aider)
+	}
+	if cfg.Agents.Opencode != "" {
+		fmt.Fprintf(w, "oc = %q\n", cfg.Agents.Opencode)
 	}
 	fmt.Fprintln(w)
 
@@ -3038,6 +3167,9 @@ func Print(cfg *Config, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "auto_register = %t\n", cfg.AgentMail.AutoRegister)
 	fmt.Fprintf(w, "program_name = %q\n", cfg.AgentMail.ProgramName)
+	fmt.Fprintln(w, "# If true, ntm starts/stops `am serve-http` for session monitors.")
+	fmt.Fprintln(w, "# Default false prevents ntm from hijacking a user-owned Agent Mail server.")
+	fmt.Fprintf(w, "supervisor_enabled = %t\n", cfg.AgentMail.SupervisorEnabledOrDefault())
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations]")
@@ -3062,7 +3194,7 @@ func Print(cfg *Config, w io.Writer) error {
 	} else {
 		fmt.Fprintln(w, "custom_whitelist = []")
 	}
-	fmt.Fprintln(w, "# RCH wrapper commands are allowlisted when integrations.rch.dcg_whitelist = true")
+	fmt.Fprintln(w, "# dcg_whitelist is legacy; modern DCG handles RCH hook commands directly")
 	if cfg.Integrations.DCG.AuditLog != "" {
 		fmt.Fprintf(w, "audit_log = %q\n", cfg.Integrations.DCG.AuditLog)
 	} else {
@@ -3298,6 +3430,16 @@ func Print(cfg *Config, w io.Writer) error {
 	} else {
 		fmt.Fprintln(w, "# gmi_default_file = \"\"")
 	}
+	if cfg.Prompts.AgyDefault != "" {
+		fmt.Fprintf(w, "agy_default = %q\n", cfg.Prompts.AgyDefault)
+	} else {
+		fmt.Fprintln(w, "# agy_default = \"\"")
+	}
+	if cfg.Prompts.AgyDefaultFile != "" {
+		fmt.Fprintf(w, "agy_default_file = %q\n", cfg.Prompts.AgyDefaultFile)
+	} else {
+		fmt.Fprintln(w, "# agy_default_file = \"\"")
+	}
 	fmt.Fprintln(w)
 
 	// Write models configuration
@@ -3494,6 +3636,7 @@ func Print(cfg *Config, w io.Writer) error {
 	writeAccountEntries("claude", cfg.Accounts.Claude)
 	writeAccountEntries("codex", cfg.Accounts.Codex)
 	writeAccountEntries("gemini", cfg.Accounts.Gemini)
+	writeAccountEntries("antigravity", cfg.Accounts.Antigravity)
 
 	// Write rotation configuration
 	fmt.Fprintln(w, "[rotation]")
@@ -3698,6 +3841,11 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "[assign]")
 	fmt.Fprintln(w, "# Default ntm assign strategy")
 	fmt.Fprintf(w, "strategy = %q\n", cfg.Assign.Strategy)
+	fmt.Fprintln(w, "# Default bulk-assign dispatch prompt (inline). Empty = built-in template.")
+	fmt.Fprintln(w, "# Placeholders: {bead_id} {bead_title} {bead_type} {bead_deps} {session} {pane}")
+	fmt.Fprintf(w, "prompt_template = %q\n", cfg.Assign.PromptTemplate)
+	fmt.Fprintln(w, "# File holding the default bulk-assign dispatch prompt (takes precedence over prompt_template).")
+	fmt.Fprintf(w, "prompt_template_file = %q\n", cfg.Assign.PromptTemplateFile)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[spawn_pacing]")
@@ -4073,12 +4221,16 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Agents.Codex, nil
 		case "gemini":
 			return cfg.Agents.Gemini, nil
+		case "antigravity":
+			return cfg.Agents.Antigravity, nil
 		case "cursor":
 			return cfg.Agents.Cursor, nil
 		case "windsurf":
 			return cfg.Agents.Windsurf, nil
 		case "aider":
 			return cfg.Agents.Aider, nil
+		case "oc":
+			return cfg.Agents.Opencode, nil
 		case "plugins":
 			return cfg.Agents.Plugins, nil
 		case "default_count":
@@ -4147,6 +4299,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.AgentMail.AutoRegister, nil
 		case "program_name":
 			return cfg.AgentMail.ProgramName, nil
+		case "supervisor_enabled":
+			return cfg.AgentMail.SupervisorEnabledOrDefault(), nil
 		}
 	case "integrations":
 		if len(parts) < 2 {
@@ -4543,6 +4697,10 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 		switch parts[1] {
 		case "strategy":
 			return cfg.Assign.Strategy, nil
+		case "prompt_template":
+			return cfg.Assign.PromptTemplate, nil
+		case "prompt_template_file":
+			return cfg.Assign.PromptTemplateFile, nil
 		}
 	case "file_reservation":
 		if len(parts) < 2 {
@@ -4685,6 +4843,10 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Prompts.GmiDefault, nil
 		case "gmi_default_file":
 			return cfg.Prompts.GmiDefaultFile, nil
+		case "agy_default":
+			return cfg.Prompts.AgyDefault, nil
+		case "agy_default_file":
+			return cfg.Prompts.AgyDefaultFile, nil
 		}
 	case "spawn_pacing":
 		if len(parts) < 2 {
@@ -5057,6 +5219,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Accounts.Codex, nil
 		case "gemini":
 			return cfg.Accounts.Gemini, nil
+		case "antigravity":
+			return cfg.Accounts.Antigravity, nil
 		}
 	case "rotation":
 		if len(parts) < 2 {
@@ -5234,6 +5398,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agent_mail.url", defaults.AgentMail.URL, cfg.AgentMail.URL)
 	addDiff("agent_mail.auto_register", defaults.AgentMail.AutoRegister, cfg.AgentMail.AutoRegister)
 	addDiff("agent_mail.program_name", defaults.AgentMail.ProgramName, cfg.AgentMail.ProgramName)
+	addDiff("agent_mail.supervisor_enabled", defaults.AgentMail.SupervisorEnabledOrDefault(), cfg.AgentMail.SupervisorEnabledOrDefault())
 
 	// Integrations (DCG)
 	addDiff("integrations.dcg.enabled", defaults.Integrations.DCG.Enabled, cfg.Integrations.DCG.Enabled)
@@ -5361,6 +5526,8 @@ func Diff(cfg *Config) []ConfigDiff {
 
 	// Assign defaults
 	addDiff("assign.strategy", defaults.Assign.Strategy, cfg.Assign.Strategy)
+	addDiff("assign.prompt_template", defaults.Assign.PromptTemplate, cfg.Assign.PromptTemplate)
+	addDiff("assign.prompt_template_file", defaults.Assign.PromptTemplateFile, cfg.Assign.PromptTemplateFile)
 
 	// File reservation
 	addDiff("file_reservation.enabled", defaults.FileReservation.Enabled, cfg.FileReservation.Enabled)
@@ -5413,6 +5580,8 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("prompts.cod_default_file", defaults.Prompts.CodDefaultFile, cfg.Prompts.CodDefaultFile)
 	addDiff("prompts.gmi_default", defaults.Prompts.GmiDefault, cfg.Prompts.GmiDefault)
 	addDiff("prompts.gmi_default_file", defaults.Prompts.GmiDefaultFile, cfg.Prompts.GmiDefaultFile)
+	addDiff("prompts.agy_default", defaults.Prompts.AgyDefault, cfg.Prompts.AgyDefault)
+	addDiff("prompts.agy_default_file", defaults.Prompts.AgyDefaultFile, cfg.Prompts.AgyDefaultFile)
 
 	// Context Rotation
 	addDiff("context_rotation.enabled", defaults.ContextRotation.Enabled, cfg.ContextRotation.Enabled)
@@ -5502,6 +5671,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("accounts.claude", defaults.Accounts.Claude, cfg.Accounts.Claude)
 	addDiff("accounts.codex", defaults.Accounts.Codex, cfg.Accounts.Codex)
 	addDiff("accounts.gemini", defaults.Accounts.Gemini, cfg.Accounts.Gemini)
+	addDiff("accounts.antigravity", defaults.Accounts.Antigravity, cfg.Accounts.Antigravity)
 	addDiff("rotation.enabled", defaults.Rotation.Enabled, cfg.Rotation.Enabled)
 	addDiff("rotation.prefer_restart", defaults.Rotation.PreferRestart, cfg.Rotation.PreferRestart)
 	addDiff("rotation.auto_open_browser", defaults.Rotation.AutoOpenBrowser, cfg.Rotation.AutoOpenBrowser)

@@ -114,18 +114,22 @@ func (a *ProxyAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 		}, nil
 	}
 
-	if !availability.Running {
-		return &HealthStatus{
-			Healthy:     false,
-			Message:     "rust_proxy daemon not running",
-			LastChecked: time.Now(),
-			Latency:     latency,
-		}, nil
+	// A live daemon is an OPERATIONAL state, not a health signal. rust_proxy is a
+	// machine-wide proxy *selector*: with no proxy activated it sits idle
+	// (`status` reports active_proxy: null, exit 0) — the normal state on any host
+	// not currently routing through a proxy. Requiring a running daemon forced a
+	// permanent, unfixable "daemon not running" warning short of activating a
+	// proxy + daemon (which rewrites machine-wide network routing) (issue #202).
+	// Health = installed + version-compatible + status responded; the daemon /
+	// active-proxy state is surfaced as advisory context.
+	message := "rust_proxy is healthy (idle — no active proxy)"
+	if availability.Running {
+		message = "rust_proxy is healthy (daemon running)"
 	}
 
 	return &HealthStatus{
 		Healthy:     true,
-		Message:     "rust_proxy is healthy",
+		Message:     message,
 		LastChecked: time.Now(),
 		Latency:     latency,
 	}, nil
@@ -212,12 +216,18 @@ func (a *ProxyAdapter) GetAvailability(ctx context.Context) (*ProxyAvailability,
 	}
 	proxyAvailabilityMutex.RUnlock()
 
+	proxyAvailabilityMutex.Lock()
+	defer proxyAvailabilityMutex.Unlock()
+
+	if time.Now().Before(proxyAvailabilityExpiry) {
+		availability := proxyAvailabilityCache
+		return &availability, nil
+	}
+
 	availability := a.fetchAvailability(ctx)
 
-	proxyAvailabilityMutex.Lock()
 	proxyAvailabilityCache = *availability
 	proxyAvailabilityExpiry = time.Now().Add(proxyAvailabilityTTL)
-	proxyAvailabilityMutex.Unlock()
 
 	return availability, nil
 }

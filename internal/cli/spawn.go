@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -151,7 +152,7 @@ func parseEnvDurationMs(key string) (time.Duration, error) {
 	return time.Duration(ms) * time.Millisecond, nil
 }
 
-func resolveSpawnAssignAgentType(agent string, ccOnly, codOnly, gmiOnly bool) string {
+func resolveSpawnAssignAgentType(agent string, ccOnly, codOnly, gmiOnly, agyOnly bool) string {
 	if strings.TrimSpace(agent) != "" {
 		return robot.ResolveAgentType(agent)
 	}
@@ -163,6 +164,9 @@ func resolveSpawnAssignAgentType(agent string, ccOnly, codOnly, gmiOnly bool) st
 	}
 	if gmiOnly {
 		return "gemini"
+	}
+	if agyOnly {
+		return "antigravity"
 	}
 	return ""
 }
@@ -179,8 +183,10 @@ func parseLocalFallbackProvider(raw string) (AgentType, error) {
 		return AgentTypeCodex, nil
 	case agentpkg.AgentTypeGemini:
 		return AgentTypeGemini, nil
+	case agentpkg.AgentTypeAntigravity:
+		return AgentTypeAntigravity, nil
 	default:
-		return "", fmt.Errorf("invalid --local-fallback-provider %q (expected one of: cc|cod|gmi)", raw)
+		return "", fmt.Errorf("invalid --local-fallback-provider %q (expected one of: cc|cod|gmi|agy)", raw)
 	}
 }
 
@@ -192,12 +198,16 @@ func canonicalSpawnAgentType(raw string) (AgentType, bool) {
 		return AgentTypeCodex, true
 	case agentpkg.AgentTypeGemini:
 		return AgentTypeGemini, true
+	case agentpkg.AgentTypeAntigravity:
+		return AgentTypeAntigravity, true
 	case agentpkg.AgentTypeCursor:
 		return AgentTypeCursor, true
 	case agentpkg.AgentTypeWindsurf:
 		return AgentTypeWindsurf, true
 	case agentpkg.AgentTypeAider:
 		return AgentTypeAider, true
+	case agentpkg.AgentTypeOpencode:
+		return AgentTypeOpencode, true
 	case agentpkg.AgentTypeOllama:
 		return AgentTypeOllama, true
 	default:
@@ -210,9 +220,11 @@ func orderedSpawnAgentTypes() []AgentType {
 		AgentTypeClaude,
 		AgentTypeCodex,
 		AgentTypeGemini,
+		AgentTypeAntigravity,
 		AgentTypeCursor,
 		AgentTypeWindsurf,
 		AgentTypeAider,
+		AgentTypeOpencode,
 		AgentTypeOllama,
 	}
 }
@@ -344,9 +356,11 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 	opts.CCCount = 0
 	opts.CodCount = 0
 	opts.GmiCount = 0
+	opts.AgyCount = 0
 	opts.CursorCount = 0
 	opts.WindsurfCount = 0
 	opts.AiderCount = 0
+	opts.OpencodeCount = 0
 	opts.OllamaCount = 0
 
 	for _, agent := range opts.Agents {
@@ -357,12 +371,16 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 			opts.CodCount++
 		case AgentTypeGemini:
 			opts.GmiCount++
+		case AgentTypeAntigravity:
+			opts.AgyCount++
 		case AgentTypeCursor:
 			opts.CursorCount++
 		case AgentTypeWindsurf:
 			opts.WindsurfCount++
 		case AgentTypeAider:
 			opts.AiderCount++
+		case AgentTypeOpencode:
+			opts.OpencodeCount++
 		case AgentTypeOllama:
 			opts.OllamaCount++
 		}
@@ -382,9 +400,11 @@ func populateSpawnAgentsFromCounts(opts *SpawnOptions) {
 		{agentType: AgentTypeClaude, count: opts.CCCount},
 		{agentType: AgentTypeCodex, count: opts.CodCount},
 		{agentType: AgentTypeGemini, count: opts.GmiCount},
+		{agentType: AgentTypeAntigravity, count: opts.AgyCount},
 		{agentType: AgentTypeCursor, count: opts.CursorCount},
 		{agentType: AgentTypeWindsurf, count: opts.WindsurfCount},
 		{agentType: AgentTypeAider, count: opts.AiderCount},
+		{agentType: AgentTypeOpencode, count: opts.OpencodeCount},
 		{agentType: AgentTypeOllama, count: opts.OllamaCount},
 	}
 	for _, entry := range legacyCounts {
@@ -406,15 +426,103 @@ func normalizeSpawnOptions(opts *SpawnOptions) {
 	}
 }
 
-func profileAssignmentWarning(profileCount, agentCount int) string {
-	if profileCount == 0 || agentCount == 0 || profileCount == agentCount {
-		return ""
+// expandProfileAgents converts an ordered persona list (from --profile-set or
+// --profiles) into concrete spawn agents — one agent per persona, in
+// persona-set order, with each agent's Type taken from the persona's own
+// agent_type and the persona attached. This makes --profile-set a first-class
+// spawn contract (persona drives the agent) instead of an order-dependent
+// overlay on generic agents (ntm#149).
+//
+// When the caller also supplied explicit generic counts (--cc/--cod/--gmi/...),
+// the persona set's per-type distribution must match those counts exactly;
+// otherwise expansion fails closed so a pane can never silently run the wrong
+// agent CLI or receive the wrong persona.
+func expandProfileAgents(profiles []*persona.Persona, requested AgentSpecs) ([]FlatAgent, error) {
+	if len(profiles) == 0 {
+		return nil, nil
 	}
-	return fmt.Sprintf("Warning: %d profiles for %d agents; profiles will be assigned in order", profileCount, agentCount)
+
+	agents := make([]FlatAgent, 0, len(profiles))
+	indices := make(map[AgentType]int)
+	personaCounts := make(map[AgentType]int)
+	for _, p := range profiles {
+		if p == nil {
+			continue
+		}
+		at := AgentType(p.AgentTypeFlag())
+		indices[at]++
+		personaCounts[at]++
+		agents = append(agents, FlatAgent{
+			Type:            at,
+			Index:           indices[at],
+			Model:           p.Model,
+			ReasoningEffort: p.ReasoningEffort,
+			Persona:         p,
+		})
+	}
+
+	// Validate against any explicitly requested generic counts. An empty
+	// request means "let the persona set fully drive the spawn".
+	requestedCounts := make(map[AgentType]int)
+	for _, s := range requested {
+		requestedCounts[s.Type] += s.Count
+	}
+	if len(requestedCounts) > 0 {
+		if err := validateProfileAgentDistribution(personaCounts, requestedCounts); err != nil {
+			return nil, err
+		}
+	}
+
+	return agents, nil
+}
+
+// validateProfileAgentDistribution fails closed when the per-type agent
+// distribution implied by a persona set does not match the explicitly
+// requested generic counts. This catches both a raw count mismatch
+// (--cod=3 vs a 2-codex set) and an agent-type conflict (a claude persona
+// dropped into a codex-only request).
+func validateProfileAgentDistribution(personaCounts, requestedCounts map[AgentType]int) error {
+	typeSet := make(map[AgentType]struct{})
+	for t := range personaCounts {
+		typeSet[t] = struct{}{}
+	}
+	for t := range requestedCounts {
+		typeSet[t] = struct{}{}
+	}
+	types := make([]string, 0, len(typeSet))
+	for t := range typeSet {
+		types = append(types, string(t))
+	}
+	sort.Strings(types)
+
+	var mismatches []string
+	for _, ts := range types {
+		t := AgentType(ts)
+		if personaCounts[t] != requestedCounts[t] {
+			mismatches = append(mismatches, fmt.Sprintf("%s: profile-set defines %d, you requested %d", ts, personaCounts[t], requestedCounts[t]))
+		}
+	}
+	if len(mismatches) > 0 {
+		return fmt.Errorf("profile-set agent distribution conflicts with the requested agent counts (%s); either drop the per-type counts and let --profile-set drive the spawn, or make the counts match the persona set exactly", strings.Join(mismatches, "; "))
+	}
+	return nil
+}
+
+// sortPanesForAssignment orders panes deterministically — by window index, then
+// pane index — so agent[i] always lands on the same pane regardless of the
+// order tmux list-panes happens to return. This is what makes persona→pane
+// assignment reproducible for role-based --profile-set spawns (ntm#149).
+func sortPanesForAssignment(panes []tmux.Pane) {
+	sort.SliceStable(panes, func(i, j int) bool {
+		if panes[i].WindowIndex != panes[j].WindowIndex {
+			return panes[i].WindowIndex < panes[j].WindowIndex
+		}
+		return panes[i].Index < panes[j].Index
+	})
 }
 
 func legacySpawnTotalAgentCount(opts SpawnOptions) int {
-	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OllamaCount
+	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OllamaCount
 }
 
 func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
@@ -422,9 +530,11 @@ func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
 		"NTM_AGENT_COUNT_CC":       fmt.Sprintf("%d", opts.CCCount),
 		"NTM_AGENT_COUNT_COD":      fmt.Sprintf("%d", opts.CodCount),
 		"NTM_AGENT_COUNT_GMI":      fmt.Sprintf("%d", opts.GmiCount),
+		"NTM_AGENT_COUNT_AGY":      fmt.Sprintf("%d", opts.AgyCount),
 		"NTM_AGENT_COUNT_CURSOR":   fmt.Sprintf("%d", opts.CursorCount),
 		"NTM_AGENT_COUNT_WINDSURF": fmt.Sprintf("%d", opts.WindsurfCount),
 		"NTM_AGENT_COUNT_AIDER":    fmt.Sprintf("%d", opts.AiderCount),
+		"NTM_AGENT_COUNT_OC":       fmt.Sprintf("%d", opts.OpencodeCount),
 		"NTM_AGENT_COUNT_OLLAMA":   fmt.Sprintf("%d", opts.OllamaCount),
 		"NTM_AGENT_COUNT_TOTAL":    fmt.Sprintf("%d", totalAgents),
 	}
@@ -438,9 +548,11 @@ func spawnSessionCreatedEventFields(opts SpawnOptions, dir string) map[string]st
 		"agent_cc":       fmt.Sprintf("%d", opts.CCCount),
 		"agent_cod":      fmt.Sprintf("%d", opts.CodCount),
 		"agent_gmi":      fmt.Sprintf("%d", opts.GmiCount),
+		"agent_agy":      fmt.Sprintf("%d", opts.AgyCount),
 		"agent_cursor":   fmt.Sprintf("%d", opts.CursorCount),
 		"agent_windsurf": fmt.Sprintf("%d", opts.WindsurfCount),
 		"agent_aider":    fmt.Sprintf("%d", opts.AiderCount),
+		"agent_oc":       fmt.Sprintf("%d", opts.OpencodeCount),
 		"agent_ollama":   fmt.Sprintf("%d", opts.OllamaCount),
 	}
 }
@@ -529,7 +641,7 @@ func resolveStaggerInterval(mode string, opts SpawnOptions, tracker *ratelimit.R
 
 			hasAnthropic := opts.CCCount > 0
 			hasOpenAI := opts.CodCount > 0
-			hasGoogle := opts.GmiCount > 0
+			hasGoogle := opts.GmiCount > 0 || opts.AgyCount > 0
 
 			// Check detailed agent list if available (source of truth)
 			if len(opts.Agents) > 0 {
@@ -543,6 +655,8 @@ func resolveStaggerInterval(mode string, opts SpawnOptions, tracker *ratelimit.R
 					case AgentTypeCodex:
 						hasOpenAI = true
 					case AgentTypeGemini:
+						hasGoogle = true
+					case AgentTypeAntigravity:
 						hasGoogle = true
 					}
 				}
@@ -590,9 +704,11 @@ type SpawnOptions struct {
 	CCCount            int
 	CodCount           int
 	GmiCount           int
+	AgyCount           int
 	CursorCount        int
 	WindsurfCount      int
 	AiderCount         int
+	OpencodeCount      int
 	OllamaCount        int
 	UserPane           bool
 	AutoRestart        bool
@@ -600,21 +716,31 @@ type SpawnOptions struct {
 	PersonaMap         map[string]*persona.Persona
 	PluginMap          map[string]plugins.AgentPlugin
 
-	// Profile mapping: list of persona names to map to agents in order
-	ProfileList []*persona.Persona
+	// Profiles from --profile-set/--profiles are expanded into concrete ordered
+	// agents (each carrying its persona) via expandProfileAgents before this
+	// struct is built, so they ride in Agents — there is no separate list here.
+	//
+	// ProfileSetName is the --profile-set name, surfaced in the post-launch
+	// persona→pane mapping. Empty for --profiles (comma list) spawns.
+	ProfileSetName string
 
 	// CASS Context
 	CassContextQuery string
 	NoCassContext    bool
 
 	// Recovery suppression (independent of CASS)
-	NoRecovery            bool
-	Prompt                string
-	InitPrompt            string
-	LocalModel            string
-	LocalHost             string
-	LocalFallback         bool
-	LocalFallbackProvider AgentType
+	NoRecovery bool
+	Prompt     string
+	InitPrompt string
+	// InitPromptWithAgentName, when true, prepends a deterministic
+	// `You are agent <session>_<type>_<idx>` preamble to the init prompt
+	// for each pane. Helps multi-agent prompts that key off identity
+	// (Agent Mail handles, beads ownership, etc.). See ntm#138.
+	InitPromptWithAgentName bool
+	LocalModel              string
+	LocalHost               string
+	LocalFallback           bool
+	LocalFallbackProvider   AgentType
 
 	// Hooks
 	NoHooks bool
@@ -646,9 +772,19 @@ type SpawnOptions struct {
 	AssignCCOnly       bool          // Only assign to Claude agents (alias for --assign-agent=claude)
 	AssignCodOnly      bool          // Only assign to Codex agents (alias for --assign-agent=codex)
 	AssignGmiOnly      bool          // Only assign to Gemini agents (alias for --assign-agent=gemini)
+	AssignAgyOnly      bool          // Only assign to Antigravity agents (alias for --assign-agent=antigravity)
 
 	// Git worktree isolation configuration
 	UseWorktrees bool // Enable git worktree isolation for agents
+	// WorktreeName, when set, overrides the auto-derived worktree directory
+	// name (the default is `<agent-type>_<index>`, e.g., `cc_1`). External
+	// orchestrators that drive ntm spawn for multiple labels but share an
+	// agent slot (`--cc=1` across `--label foo|bar|baz`) get matching
+	// `cc_1` directory names and silently share a single worktree — see
+	// ntm#145. Passing `--worktree-name foo` per spawn keeps the paths
+	// distinct. Only honored when len(Agents) == 1 (multi-agent spawns
+	// still need per-agent paths for the isolation contract to hold).
+	WorktreeName string
 
 	// Privacy mode configuration (bd-2u3tv)
 	PrivacyMode  bool // Enable privacy mode (no persistence)
@@ -710,6 +846,7 @@ type RecoveryCheckpoint struct {
 	CreatedAt   time.Time                  `json:"created_at"`
 	PaneCount   int                        `json:"pane_count"`
 	HasGitPatch bool                       `json:"has_git_patch"`
+	WorkingDir  string                     `json:"working_dir,omitempty"`
 	Assignments *RecoveryAssignmentSummary `json:"assignments_summary,omitempty"`
 	BVSummary   *RecoveryBVSummary         `json:"bv_summary,omitempty"`
 }
@@ -785,6 +922,7 @@ func newSpawnCmd() *cobra.Command {
 	var contextDays int
 	var prompt string
 	var initPrompt string
+	var initPromptWithAgentName bool
 	var noHooks bool
 	var profilesFlag string
 	var profileSetFlag string
@@ -815,9 +953,11 @@ func newSpawnCmd() *cobra.Command {
 	var assignCCOnly bool
 	var assignCodOnly bool
 	var assignGmiOnly bool
+	var assignAgyOnly bool
 
 	// Git worktree isolation flag
 	var useWorktrees bool
+	var worktreeName string
 
 	// Privacy mode flag (bd-2u3tv)
 	var privacyMode bool
@@ -920,7 +1060,7 @@ Worktree isolation (--worktrees):
 Local fallback (--local-fallback):
   If Ollama is unavailable or model preflight fails, local agents can be
   converted to cloud agents instead of failing spawn.
-  --local-fallback-provider selects fallback target (cc, cod, gmi).
+  --local-fallback-provider selects fallback target (cc, cod, gmi, agy).
 
 For running multiple agent swarms on the same project with different goals,
 use --label:
@@ -933,7 +1073,8 @@ share the same project directory. Use ntm list --project myproject to see all.
 
 Examples:
   ntm spawn myproject --cc=2 --cod=2           # 2 Claude, 2 Codex + user pane
-  ntm spawn myproject --cc=3 --cod=3 --gmi=1   # 3 Claude, 3 Codex, 1 Gemini
+  ntm spawn myproject --cc=3 --cod=3 --agy=1   # 3 Claude, 3 Codex, 1 Antigravity
+  ntm spawn myproject --cc=3 --cod=3 --gmi=1   # legacy: Gemini CLI instead of Antigravity
   ntm spawn myproject --cc=4 --no-user         # 4 Claude, no user pane
   ntm spawn myproject -r full-stack            # Use full-stack recipe
   ntm spawn myproject -t red-green             # Use red-green workflow template
@@ -1076,8 +1217,12 @@ Examples:
 			codCount := agentSpecs.ByType(AgentTypeCodex).TotalCount()
 			gmiCount := agentSpecs.ByType(AgentTypeGemini).TotalCount()
 
-			// Apply defaults
-			if len(agentSpecs) == 0 && len(cfg.ProjectDefaults) > 0 {
+			// Apply implicit project count defaults only when the user did not
+			// request a persona set/list. With --profile-set/--profiles the
+			// persona set is the authoritative agent spec (ntm#149), so folding
+			// in ProjectDefaults here would make expandProfileAgents validate
+			// the set against counts the user never asked for and fail closed.
+			if len(agentSpecs) == 0 && len(cfg.ProjectDefaults) > 0 && profilesFlag == "" && profileSetFlag == "" {
 				appendMissingCountMapAgentSpecs(&agentSpecs, cfg.ProjectDefaults)
 				ccCount = agentSpecs.ByType(AgentTypeClaude).TotalCount()
 				codCount = agentSpecs.ByType(AgentTypeCodex).TotalCount()
@@ -1143,48 +1288,65 @@ Examples:
 				}
 			}
 
-			assignAgentFilter := resolveSpawnAssignAgentType(assignAgentType, assignCCOnly, assignCodOnly, assignGmiOnly)
+			assignAgentFilter := resolveSpawnAssignAgentType(assignAgentType, assignCCOnly, assignCodOnly, assignGmiOnly, assignAgyOnly)
+
+			// Build the concrete agent list. When a persona set/list is
+			// requested (--profile-set/--profiles), expand it into ordered
+			// concrete agents (ntm#149); the persona drives each agent's type,
+			// model, and prompt. normalizeSpawnOptions recomputes per-type
+			// counts from this list, so pane creation/preflight stay consistent.
+			agentsFlat := agentSpecs.Flatten()
+			if len(profileList) > 0 {
+				expanded, expandErr := expandProfileAgents(profileList, agentSpecs)
+				if expandErr != nil {
+					return expandErr
+				}
+				agentsFlat = expanded
+			}
+
 			opts := SpawnOptions{
-				Session:               sessionName,
-				Agents:                agentSpecs.Flatten(),
-				CCCount:               ccCount,
-				CodCount:              codCount,
-				GmiCount:              gmiCount,
-				UserPane:              !noUserPane,
-				AutoRestart:           autoRestart,
-				RecipeName:            recipeName,
-				PersonaMap:            personaMap,
-				PluginMap:             pluginMap,
-				CassContextQuery:      contextQuery,
-				NoCassContext:         noCassContext,
-				NoRecovery:            noRecovery,
-				Prompt:                prompt,
-				InitPrompt:            initPrompt,
-				LocalModel:            localModel,
-				LocalHost:             localHost,
-				LocalFallback:         localFallback,
-				LocalFallbackProvider: fallbackProvider,
-				NoHooks:               noHooks,
-				Safety:                safety,
-				StaggerMode:           staggerMode,
-				StaggerDelay:          staggerDelay,
-				Stagger:               staggerDuration,
-				StaggerEnabled:        staggerEnabled,
-				ProfileList:           profileList,
-				Assign:                assignEnabled,
-				AssignStrategy:        assignStrategy,
-				AssignLimit:           assignLimit,
-				AssignReadyTimeout:    assignReadyTimeout,
-				AssignVerbose:         assignVerbose,
-				AssignQuiet:           assignQuiet,
-				AssignTimeout:         assignTimeout,
-				AssignAgentType:       assignAgentFilter,
-				UseWorktrees:          useWorktrees,
-				PrivacyMode:           privacyMode,
-				AllowPersist:          allowPersist,
-				MarchingOrders:        marchingOrders,
-				DefaultPrompts:        cfg.Prompts,
-				Label:                 label,
+				Session:                 sessionName,
+				Agents:                  agentsFlat,
+				CCCount:                 ccCount,
+				CodCount:                codCount,
+				GmiCount:                gmiCount,
+				UserPane:                !noUserPane,
+				AutoRestart:             autoRestart,
+				RecipeName:              recipeName,
+				PersonaMap:              personaMap,
+				PluginMap:               pluginMap,
+				CassContextQuery:        contextQuery,
+				NoCassContext:           noCassContext,
+				NoRecovery:              noRecovery,
+				Prompt:                  prompt,
+				InitPrompt:              initPrompt,
+				InitPromptWithAgentName: initPromptWithAgentName,
+				LocalModel:              localModel,
+				LocalHost:               localHost,
+				LocalFallback:           localFallback,
+				LocalFallbackProvider:   fallbackProvider,
+				NoHooks:                 noHooks,
+				Safety:                  safety,
+				StaggerMode:             staggerMode,
+				StaggerDelay:            staggerDelay,
+				Stagger:                 staggerDuration,
+				StaggerEnabled:          staggerEnabled,
+				ProfileSetName:          profileSetFlag,
+				Assign:                  assignEnabled,
+				AssignStrategy:          assignStrategy,
+				AssignLimit:             assignLimit,
+				AssignReadyTimeout:      assignReadyTimeout,
+				AssignVerbose:           assignVerbose,
+				AssignQuiet:             assignQuiet,
+				AssignTimeout:           assignTimeout,
+				AssignAgentType:         assignAgentFilter,
+				UseWorktrees:            useWorktrees,
+				WorktreeName:            worktreeName,
+				PrivacyMode:             privacyMode,
+				AllowPersist:            allowPersist,
+				MarchingOrders:          marchingOrders,
+				DefaultPrompts:          cfg.Prompts,
+				Label:                   label,
 			}
 
 			normalizeSpawnOptions(&opts)
@@ -1199,10 +1361,6 @@ Examples:
 				ApplySessionProfileToSpawnOptions(&opts, profile)
 				normalizeSpawnOptions(&opts)
 			}
-			if msg := profileAssignmentWarning(len(profileList), len(opts.Agents)); msg != "" && !IsJSONOutput() {
-				fmt.Println(msg)
-			}
-
 			return spawnSessionLogic(opts)
 		},
 	}
@@ -1211,15 +1369,17 @@ Examples:
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model is pinned to Gemini 3.1 Pro (High))")
 	cmd.Flags().IntVar(&localCount, "local", 0, "Local agents via Ollama (alias: --ollama)")
 	cmd.Flags().IntVar(&ollamaCount, "ollama", 0, "Alias for --local (explicit Ollama)")
 	cmd.Flags().StringVar(&localModel, "local-model", "codellama:latest", "Ollama model to run for --local/--ollama agents")
 	cmd.Flags().StringVar(&localHost, "local-host", "", "Ollama host URL for --local/--ollama agents (overrides OLLAMA_HOST/NTM_OLLAMA_HOST)")
 	cmd.Flags().BoolVar(&localFallback, "local-fallback", false, "Fallback local Ollama agents to cloud provider when preflight fails")
-	cmd.Flags().StringVar(&localFallbackProvider, "local-fallback-provider", "cod", "Provider for --local-fallback: cc|cod|gmi")
+	cmd.Flags().StringVar(&localFallbackProvider, "local-fallback-provider", "cod", "Provider for --local-fallback: cc|cod|gmi|agy")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "cursor", "Cursor agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeWindsurf, &agentSpecs), "windsurf", "Windsurf agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAider, &agentSpecs), "aider", "Aider agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOpencode, &agentSpecs), "oc", "Opencode agents (N or N:model)")
 	cmd.Flags().Var(&personaSpecs, "persona", "Persona-defined agents (name or name:count)")
 	cmd.Flags().BoolVar(&noUserPane, "no-user", false, "don't reserve a pane for the user")
 	cmd.Flags().StringVarP(&recipeName, "recipe", "r", "", "use a recipe for agent configuration")
@@ -1246,6 +1406,7 @@ Examples:
 	cmd.Flags().IntVar(&contextDays, "cass-context-days", 0, "Look back N days")
 	cmd.Flags().StringVar(&prompt, "prompt", "", "Prompt to initialize agents with")
 	cmd.Flags().StringVar(&initPrompt, "init-prompt", "", "Prompt to send after agents are ready (used with --assign)")
+	cmd.Flags().BoolVar(&initPromptWithAgentName, "with-agent-name", false, "Prepend a `You are agent <name>` preamble to --init-prompt for each pane so agents know their deterministic identity. See ntm#138.")
 	cmd.Flags().BoolVar(&noHooks, "no-hooks", false, "Disable command hooks")
 	cmd.Flags().BoolVar(&safety, "safety", false, "Fail if session already exists (prevents accidental reuse)")
 
@@ -1257,13 +1418,15 @@ Examples:
 	cmd.Flags().BoolVarP(&assignVerbose, "assign-verbose", "", false, "Show detailed scoring/decision logs during assignment")
 	cmd.Flags().BoolVarP(&assignQuiet, "assign-quiet", "", false, "Suppress non-essential assignment output")
 	cmd.Flags().DurationVar(&assignTimeout, "assign-timeout", 30*time.Second, "Timeout for external calls during assignment (bv, br, Agent Mail)")
-	cmd.Flags().StringVar(&assignAgentType, "assign-agent", "", "Filter assignment to specific agent type: claude, codex, gemini")
+	cmd.Flags().StringVar(&assignAgentType, "assign-agent", "", "Filter assignment to specific agent type: claude, codex, gemini, antigravity")
 	cmd.Flags().BoolVar(&assignCCOnly, "assign-cc-only", false, "Only assign to Claude agents (alias for --assign-agent=claude)")
 	cmd.Flags().BoolVar(&assignCodOnly, "assign-cod-only", false, "Only assign to Codex agents (alias for --assign-agent=codex)")
 	cmd.Flags().BoolVar(&assignGmiOnly, "assign-gmi-only", false, "Only assign to Gemini agents (alias for --assign-agent=gemini)")
+	cmd.Flags().BoolVar(&assignAgyOnly, "assign-agy-only", false, "Only assign to Antigravity agents (alias for --assign-agent=antigravity)")
 
 	// Git worktree isolation flag
 	cmd.Flags().BoolVar(&useWorktrees, "worktrees", false, "Enable git worktree isolation for agents (each agent gets isolated working directory)")
+	cmd.Flags().StringVar(&worktreeName, "worktree-name", "", "Override the auto-derived worktree directory name (single-agent spawns only). Use this when external orchestrators spawn the same agent slot across multiple --label values — without it, the `cc_1` / `cod_1` paths collide. See ntm#145.")
 
 	// Privacy mode flags (bd-2u3tv)
 	cmd.Flags().BoolVar(&privacyMode, "privacy", false, "Enable privacy mode (disables persistence of session data)")
@@ -1285,15 +1448,45 @@ Examples:
 	// Register plugin flags dynamically
 	// Note: We scan for plugins here to register flags.
 	for _, p := range loadedPlugins {
-		// Use p.Name as the AgentType so we can identify it later
-		agentType := AgentType(p.Name)
-		cmd.Flags().Var(NewAgentSpecsValue(agentType, &agentSpecs), p.Name, p.Description)
-		if p.Alias != "" {
-			cmd.Flags().Var(NewAgentSpecsValue(agentType, &agentSpecs), p.Alias, p.Description+" (alias)")
-		}
+		registerPluginAgentFlags(cmd, p, &agentSpecs)
 	}
 
 	return cmd
+}
+
+// registerPluginAgentFlags registers a plugin's --<name> (and optional
+// --<alias>) agent-spec flags on cmd, skipping any that would collide with a
+// flag that is already defined.
+//
+// Without this guard a user-installed agent plugin whose name or alias matches
+// a built-in agent flag makes pflag panic with "flag redefined: <name>" while
+// the command tree is constructed at process startup. The most common trigger
+// is a leftover "oc" (Opencode) plugin from before Opencode became a
+// first-class agent type: the static --oc flag and the plugin's --oc flag
+// collide. Because the command tree is built in init(), that panic crashes
+// *every* ntm invocation, not just `spawn`/`add` — and in particular it makes
+// `ntm update` roll back, since the freshly installed binary aborts during
+// post-install verification (see #200).
+//
+// Built-ins win: when a plugin name/alias already exists as a flag we keep the
+// built-in and drop the colliding plugin flag with a warning rather than
+// panicking.
+func registerPluginAgentFlags(cmd *cobra.Command, p plugins.AgentPlugin, specs *AgentSpecs) {
+	agentType := AgentType(p.Name)
+	if cmd.Flags().Lookup(p.Name) == nil {
+		cmd.Flags().Var(NewAgentSpecsValue(agentType, specs), p.Name, p.Description)
+	} else {
+		slog.Warn("skipping agent plugin flag that collides with an existing flag; keeping built-in",
+			"plugin", p.Name, "flag", "--"+p.Name)
+	}
+	if p.Alias != "" {
+		if cmd.Flags().Lookup(p.Alias) == nil {
+			cmd.Flags().Var(NewAgentSpecsValue(agentType, specs), p.Alias, p.Description+" (alias)")
+		} else {
+			slog.Warn("skipping agent plugin alias that collides with an existing flag; keeping built-in",
+				"plugin", p.Name, "alias", "--"+p.Alias)
+		}
+	}
 }
 
 // spawnSessionLogic handles the creation of the session and spawning of agents
@@ -1333,12 +1526,22 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		return outputError(fmt.Errorf("session '%s' already exists (--safety mode prevents reuse; use 'ntm kill %s' first)", opts.Session, opts.Session))
 	}
 
+	// Codex/ChatGPT preflight: when spawning an explicit `gpt-*-codex` Codex
+	// agent on a ChatGPT-billed login, advise about the "pane looks alive but
+	// rejects the first prompt" failure mode some accounts hit (ntm#142). It is
+	// only an advisory by default — that failure is not universal (ntm#155), so
+	// we let the local Codex CLI be the source of truth and proceed. Returns an
+	// error only in strict opt-in mode (NTM_CODEX_PREFLIGHT_STRICT).
+	if err := preflightCodexAccountSupport(opts.Agents); err != nil {
+		return outputError(err)
+	}
+
 	// Calculate total agents - either from Agents slice or explicit counts (legacy path)
 	var totalAgents int
 	if len(opts.Agents) == 0 {
 		totalAgents = legacySpawnTotalAgentCount(opts)
 		if totalAgents == 0 {
-			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --cursor, --windsurf, --aider, --ollama or plugin flags)"))
+			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --agy, --cursor, --windsurf, --aider, --ollama or plugin flags)"))
 		}
 	} else {
 		totalAgents = len(opts.Agents)
@@ -1509,13 +1712,21 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	var worktreeManager *worktrees.WorktreeManager
 	if opts.UseWorktrees {
 		worktreeManager = worktrees.NewManager(dir, opts.Session)
+		// Reject `--worktree-name` for multi-agent spawns: it can't serve
+		// every agent without collapsing the isolation contract. See ntm#145.
+		if opts.WorktreeName != "" && len(opts.Agents) > 1 {
+			return outputError(fmt.Errorf(
+				"--worktree-name is only valid for single-agent spawns; got %d agents",
+				len(opts.Agents),
+			))
+		}
 		if !IsJSONOutput() {
 			steps.Start("Creating Git worktrees for agent isolation")
 		}
 
 		// Create worktree for each agent
 		for _, agent := range opts.Agents {
-			agentName := fmt.Sprintf("%s_%d", strings.ToLower(string(agent.Type)), agent.Index)
+			agentName := worktreeAgentName(agent, opts.WorktreeName)
 			if _, err := worktreeManager.CreateForAgent(agentName); err != nil {
 				if !IsJSONOutput() {
 					steps.Fail()
@@ -1589,6 +1800,11 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		return outputError(err)
 	}
 
+	// Assign panes in a deterministic order rather than relying on tmux
+	// list-panes ordering, so agent[i] always lands on the same pane and
+	// persona→pane assignment is reproducible for --profile-set spawns (ntm#149).
+	sortPanesForAssignment(panes)
+
 	// Start assigning agents (skip first pane if user pane)
 	startIdx := 0
 	if opts.UserPane {
@@ -1596,7 +1812,6 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	}
 
 	agentNum := startIdx
-	profileIdx := 0 // Track which profile from ProfileList to assign
 	if !IsJSONOutput() {
 		steps.Start(fmt.Sprintf("Launching %d agent(s)", len(opts.Agents)))
 	}
@@ -1609,8 +1824,14 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		agentType     string
 		model         string // alias
 		resolvedModel string // full name
-		command       string
-		promptDelay   time.Duration // Stagger delay before prompt delivery
+		persona       string // persona name when launched from --profile-set/--profiles (ntm#149)
+		// personaPromptSource is the prepared system-prompt file path so the
+		// spawn JSON output can surface *which* prompt source seeded each pane,
+		// not just the persona's display name. Lets orchestrators verify the
+		// persona→pane→prompt mapping after a --profile-set launch (ntm#159).
+		personaPromptSource string
+		command             string
+		promptDelay         time.Duration // Stagger delay before prompt delivery
 	}
 	var launchedAgents []launchedAgent
 
@@ -1726,6 +1947,15 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			agentCmdTemplate = cfg.Agents.Codex
 		case AgentTypeGemini:
 			agentCmdTemplate = cfg.Agents.Gemini
+		case AgentTypeAntigravity:
+			agentCmdTemplate = cfg.Agents.Antigravity
+			if agentCmdTemplate == "" {
+				// Default when [agents] antigravity isn't configured (e.g. a
+				// config.toml that predates this provider). The model is pinned by
+				// ResolveModel; --dangerously-skip-permissions is agy's autonomous
+				// flag, which the dcg agy guard (F5) backstops.
+				agentCmdTemplate = `agy --model {{shellQuote .Model}} --dangerously-skip-permissions`
+			}
 		case AgentTypeOllama:
 			agentCmdTemplate = cfg.Agents.Ollama
 			if ollamaHost != "" {
@@ -1737,6 +1967,13 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			agentCmdTemplate = cfg.Agents.Windsurf
 		case AgentTypeAider:
 			agentCmdTemplate = cfg.Agents.Aider
+		case AgentTypeOpencode:
+			// Falls back to the model-aware default when [agents] oc is unset,
+			// so `--oc=N:provider/model` works and Agent Mail registration
+			// receives a non-empty model. Users can override via
+			// `[agents] oc = "..."` to point at a wrapper script or pin a
+			// specific provider/model. See ntm#193.
+			agentCmdTemplate = opencodeCommandOrDefault(cfg.Agents.Opencode)
 		default:
 			// Check plugins
 			if p, ok := opts.PluginMap[string(agent.Type)]; ok {
@@ -1755,16 +1992,12 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			var hookSources []string
 
 			if cfg.Integrations.DCG.Enabled && dcg.ShouldConfigureHooks(cfg.Integrations.DCG.Enabled, cfg.Integrations.DCG.BinaryPath) {
-				customWhitelist := cfg.Integrations.DCG.CustomWhitelist
-				if cfg.Integrations.RCH.Enabled && cfg.Integrations.RCH.DCGWhitelist {
-					customWhitelist = dcg.AppendRCHWhitelist(customWhitelist)
-				}
 				dcgOpts := dcg.DCGHookOptions{
 					BinaryPath:      cfg.Integrations.DCG.BinaryPath,
 					AuditLog:        cfg.Integrations.DCG.AuditLog,
-					Timeout:         5000, // 5 second timeout for hook
+					Timeout:         5,
 					CustomBlocklist: cfg.Integrations.DCG.CustomBlocklist,
-					CustomWhitelist: customWhitelist,
+					CustomWhitelist: cfg.Integrations.DCG.CustomWhitelist,
 				}
 				dcgConfig, err := dcg.GenerateHookConfig(dcgOpts)
 				if err == nil {
@@ -1779,7 +2012,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 				rchHook, err := dcg.GenerateRCHHookEntry(dcg.RCHHookOptions{
 					BinaryPath: cfg.Integrations.RCH.BinaryPath,
 					Patterns:   cfg.Integrations.RCH.InterceptPatterns,
-					Timeout:    5000,
+					Timeout:    5,
 				})
 				if err == nil {
 					preToolHooks = append(preToolHooks, rchHook)
@@ -1810,9 +2043,18 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			}
 		}
 
-		// Resolve model alias to full model name
-		resolvedModel := ResolveModel(agent.Type, agent.Model)
+		// Resolve model alias to full model name (falling back to the plugin's
+		// declared default for bare plugin specs — see resolveAgentModel).
+		resolvedModel := resolveAgentModel(agent.Type, agent.Model, opts.PluginMap)
 		modelRequested := strings.TrimSpace(agent.Model) != ""
+		// agy is hard-pinned: ResolveModel always returns the required model. If
+		// the user explicitly requested a different one, surface that it was
+		// ignored (model guard, bd-47kjh.1.7) rather than silently overriding.
+		if agent.Type == AgentTypeAntigravity && modelRequested &&
+			!strings.EqualFold(strings.TrimSpace(agent.Model), resolvedModel) && !IsJSONOutput() {
+			output.PrintWarningf("agy model is pinned to %q; ignoring requested %q (agent %d)",
+				resolvedModel, agent.Model, agent.Index)
+		}
 		if agent.Type == AgentTypeOllama && resolvedModel == "" {
 			resolvedModel = strings.TrimSpace(opts.LocalModel)
 			if resolvedModel == "" {
@@ -1820,13 +2062,24 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			}
 		}
 
-		// Check if this is a persona agent and prepare system prompt
+		// Check if this is a persona agent and prepare system prompt.
+		// The model-keyed PersonaMap (recipe/quick-spawn personas) is skipped
+		// when this agent already carries a persona from --profile-set/--profiles
+		// expansion (handled below), so the two persona sources never overlap.
 		var systemPromptFile string
 		var personaName string
-		if opts.PersonaMap != nil {
+		// Reasoning effort resolves from the persona when this agent carries one,
+		// otherwise from the (direct-spec) value already on the FlatAgent. The
+		// persona's setting always wins so `reasoning_effort` in personas.toml is
+		// honored for both PersonaMap and --profile-set spawns (ntm#171).
+		resolvedReasoningEffort := agent.ReasoningEffort
+		if agent.Persona == nil && opts.PersonaMap != nil {
 			if p, ok := opts.PersonaMap[agent.Model]; ok {
 				personaName = p.Name
 				modelRequested = strings.TrimSpace(p.Model) != ""
+				if strings.TrimSpace(p.ReasoningEffort) != "" {
+					resolvedReasoningEffort = p.ReasoningEffort
+				}
 				// Prepare system prompt file
 				promptFile, err := persona.PrepareSystemPrompt(p, dir)
 				if err != nil {
@@ -1837,18 +2090,24 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 					systemPromptFile = promptFile
 				}
 				// For persona agents, resolve the model from the persona config
-				resolvedModel = ResolveModel(agent.Type, p.Model)
+				resolvedModel = resolveAgentModel(agent.Type, p.Model, opts.PluginMap)
 			}
 		}
 
-		// Check if there's a profile to assign from ProfileList (--profiles/--profile-set)
-		// ProfileList takes precedence over PersonaMap for system prompt
-		if len(opts.ProfileList) > profileIdx {
-			profile := opts.ProfileList[profileIdx]
+		// Persona attached during --profile-set/--profiles expansion (ntm#149).
+		// agent.Type already reflects the persona's own agent_type, so the
+		// command template selected above launches the right CLI. This is the
+		// counterpart to the PersonaMap branch above (the two are mutually
+		// exclusive: PersonaMap is skipped whenever agent.Persona is set).
+		if agent.Persona != nil {
+			profile := agent.Persona
 			personaName = profile.Name
 			if strings.TrimSpace(profile.Model) != "" {
 				modelRequested = true
-				resolvedModel = ResolveModel(agent.Type, profile.Model)
+				resolvedModel = resolveAgentModel(agent.Type, profile.Model, opts.PluginMap)
+			}
+			if strings.TrimSpace(profile.ReasoningEffort) != "" {
+				resolvedReasoningEffort = profile.ReasoningEffort
 			}
 			// Prepare system prompt file for the profile
 			promptFile, err := persona.PrepareSystemPrompt(profile, dir)
@@ -1860,7 +2119,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 				systemPromptFile = promptFile
 			}
 			if !IsJSONOutput() {
-				fmt.Printf("  → Assigning profile '%s' to agent %d\n", profile.Name, profileIdx+1)
+				fmt.Printf("  → persona '%s' → pane %s_%d\n", profile.Name, agent.Type, agent.Index)
 			}
 		}
 
@@ -1885,6 +2144,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			ProjectDir:       dir,
 			SystemPromptFile: systemPromptFile,
 			PersonaName:      personaName,
+			ReasoningEffort:  resolvedReasoningEffort,
 		})
 		if err != nil {
 			return outputError(fmt.Errorf("generating command for %s agent: %w", agent.Type, err))
@@ -1920,7 +2180,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		// Use worktree directory if worktree isolation is enabled
 		workingDir := dir
 		if opts.UseWorktrees && worktreeManager != nil {
-			agentName := fmt.Sprintf("%s_%d", strings.ToLower(string(agent.Type)), agent.Index)
+			agentName := worktreeAgentName(agent, opts.WorktreeName)
 			if wtInfo, err := worktreeManager.GetWorktreeForAgent(agentName); err == nil && wtInfo.Created && wtInfo.Error == "" {
 				workingDir = wtInfo.Path
 			}
@@ -2044,8 +2304,17 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 					// Importantly, this ensures we never send BEFORE the context/recovery steps above.
 					time.Sleep(promptDelay)
 				} else {
-					// Immediate delivery: small delay to ensure shell is ready
-					time.Sleep(200 * time.Millisecond)
+					// Immediate delivery: poll the pane's scrollback until the
+					// agent reaches `idle` (welcome banner has been replaced by
+					// the input prompt) instead of sleeping a fixed 200ms,
+					// which races CC's welcome on cold-cache hosts and gets the
+					// prompt swallowed by the splash screen. Falls back to
+					// fire-and-forget on timeout so we keep the original
+					// "always send" behavior — better to over-deliver than to
+					// silently drop. (#158)
+					if !waitForPaneAgentIdle(paneID, string(agentType), 30*time.Second) && !IsJSONOutput() {
+						fmt.Printf("⚠ Warning: timed out waiting for %s agent %d to become idle; sending prompt anyway\n", agentType, idx)
+					}
 				}
 
 				if err := sendPromptWithDoubleEnterForAgent(paneID, finalPrompt, tmux.AgentType(agentType)); err != nil {
@@ -2084,19 +2353,20 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 
 		// Track for resilience monitor
 		launchedAgents = append(launchedAgents, launchedAgent{
-			paneID:        pane.ID,
-			paneIndex:     pane.Index,
-			paneTitle:     title,
-			agentType:     string(agent.Type),
-			model:         agent.Model,
-			resolvedModel: resolvedModel,
-			command:       safeAgentCmd,
-			promptDelay:   promptDelay,
+			paneID:              pane.ID,
+			paneIndex:           pane.Index,
+			paneTitle:           title,
+			agentType:           string(agent.Type),
+			model:               agent.Model,
+			resolvedModel:       resolvedModel,
+			persona:             personaName,
+			personaPromptSource: systemPromptFile,
+			command:             safeAgentCmd,
+			promptDelay:         promptDelay,
 		})
 		auditAgentsLaunched = len(launchedAgents)
 
 		staggerAgentIdx++
-		profileIdx++
 		agentNum++
 	}
 
@@ -2220,6 +2490,10 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 
 	// Get final pane list for output
 	finalPanes, _ := tmux.GetPanes(opts.Session)
+	// Order deterministically so the emitted panes array (and the post-launch
+	// persona→pane mapping) is reproducible across runs rather than dependent
+	// on tmux list-panes ordering (ntm#149).
+	sortPanesForAssignment(finalPanes)
 
 	// Enable project webhooks (if configured) for this session and emit
 	// webhook-compatible lifecycle events (always, regardless of JSON mode).
@@ -2262,7 +2536,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	}
 
 	// Emit analytics events (JSONL) for session creation and agent spawns.
-	events.EmitSessionCreate(opts.Session, opts.CCCount, opts.CodCount, opts.GmiCount, opts.CursorCount, opts.WindsurfCount, opts.AiderCount, opts.OllamaCount, dir, opts.RecipeName)
+	events.EmitSessionCreate(opts.Session, opts.CCCount, opts.CodCount, opts.GmiCount, opts.AgyCount, opts.CursorCount, opts.WindsurfCount, opts.AiderCount, opts.OpencodeCount, opts.OllamaCount, dir, opts.RecipeName)
 	for _, agent := range launchedAgents {
 		events.Emit(events.EventAgentSpawn, opts.Session, events.AgentSpawnData{
 			AgentType: agent.agentType,
@@ -2274,25 +2548,37 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 
 	// JSON output mode
 	if IsJSONOutput() {
-		// Build map of pane index -> stagger delay for lookup
+		// Build maps of pane index -> stagger delay and -> persona name for
+		// lookup. The persona map yields the deterministic persona→pane
+		// mapping orchestrators need after a --profile-set launch (ntm#149).
 		paneDelays := make(map[int]time.Duration)
+		panePersonas := make(map[int]string)
+		panePersonaPromptSources := make(map[int]string)
 		for _, agent := range launchedAgents {
 			paneDelays[agent.paneIndex] = agent.promptDelay
+			if agent.persona != "" {
+				panePersonas[agent.paneIndex] = agent.persona
+			}
+			if agent.personaPromptSource != "" {
+				panePersonaPromptSources[agent.paneIndex] = agent.personaPromptSource
+			}
 		}
 
 		paneResponses := make([]output.PaneResponse, len(finalPanes))
 		agentCounts := output.AgentCountsResponse{}
 		for i, p := range finalPanes {
 			paneResponses[i] = output.PaneResponse{
-				Index:         p.Index,
-				Title:         p.Title,
-				Type:          agentTypeToString(p.Type),
-				Variant:       p.Variant, // Model alias or persona name
-				Active:        p.Active,
-				Width:         p.Width,
-				Height:        p.Height,
-				Command:       p.Command,
-				PromptDelayMs: paneDelays[p.Index].Milliseconds(),
+				Index:               p.Index,
+				Title:               p.Title,
+				Type:                agentTypeToString(p.Type),
+				Variant:             p.Variant, // Model alias or persona name
+				Persona:             panePersonas[p.Index],
+				PersonaPromptSource: panePersonaPromptSources[p.Index],
+				Active:              p.Active,
+				Width:               p.Width,
+				Height:              p.Height,
+				Command:             p.Command,
+				PromptDelayMs:       paneDelays[p.Index].Milliseconds(),
 			}
 			incrementAgentCounts(&agentCounts, p.Type)
 		}
@@ -2335,6 +2621,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			AgentCounts:         agentCounts,
 			Stagger:             staggerCfg,
 			AgentMail:           agentMailStatus,
+			ProfileSet:          opts.ProfileSetName,
 		}
 
 		// If assignment is enabled, wait for agents and run assignment phase
@@ -2351,7 +2638,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 
 			var initResult *SpawnInitResult
 			if opts.InitPrompt != "" {
-				agentsReached, initErr := sendInitPromptToReadyAgents(opts.Session, opts.InitPrompt)
+				agentsReached, initErr := sendInitPromptToReadyAgents(opts.Session, opts.InitPrompt, opts.InitPromptWithAgentName)
 				initResult = &SpawnInitResult{
 					PromptSent:    initErr == nil,
 					AgentsReached: agentsReached,
@@ -2491,7 +2778,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 
 		if opts.InitPrompt != "" {
 			steps.Start("Sending init prompt to ready agents")
-			agentsReached, initErr := sendInitPromptToReadyAgents(opts.Session, opts.InitPrompt)
+			agentsReached, initErr := sendInitPromptToReadyAgents(opts.Session, opts.InitPrompt, opts.InitPromptWithAgentName)
 			if initErr != nil {
 				steps.Warn()
 				output.PrintWarningf("Init prompt failed: %v", initErr)
@@ -2941,6 +3228,12 @@ func registerSpawnedAgents(workingDir, sessionName string, agents []spawnedAgent
 
 		// Add to registry for persistence
 		registry.AddAgent(agent.paneTitle, agent.paneID, registered.Name)
+		// Persist the registration_token alongside the agent name so
+		// later ntm processes can re-authenticate as this agent on
+		// mcp-agent-mail >=2.13 (ntm#146).
+		if registered.RegistrationToken != "" {
+			registry.SetRegistrationToken(registered.Name, registered.RegistrationToken)
+		}
 
 		if !IsJSONOutput() {
 			output.PrintInfof("Registered agent pane %d as %s", agent.paneIndex, registered.Name)
@@ -2974,6 +3267,8 @@ func agentTypeToProgram(agentType string) string {
 		return "windsurf"
 	case "aider":
 		return "aider"
+	case "oc":
+		return "opencode"
 	default:
 		return agentType
 	}
@@ -3023,7 +3318,11 @@ func getMemoryContext(projectName, task string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := cmClient.GetRecoveryContext(ctx, queryTask, maxRules, maxSnippets)
+	// `getMemoryContext` is invoked from a path that doesn't carry the absolute
+	// workspace; an empty workspace falls through to CM's unscoped query, which
+	// preserves prior behavior for this surface (the workspace-scoped path is
+	// `loadRecoveryCMMemories`, which carries `workingDir`).
+	result, err := cmClient.GetRecoveryContext(ctx, queryTask, "", maxRules, maxSnippets)
 	if err != nil {
 		// Log warning but don't fail - graceful degradation
 		if !IsJSONOutput() {
@@ -3147,11 +3446,13 @@ func buildRecoveryContext(ctx context.Context, sessionName, workingDir string, r
 		}()
 	}
 
-	// Load latest checkpoint if available
+	// Load latest checkpoint if available. Pass the spawn working directory
+	// so a session-name collision across repos cannot surface a checkpoint
+	// recorded against a different working directory (#131).
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		cp, err := loadRecoveryCheckpoint(sessionName)
+		cp, err := loadRecoveryCheckpoint(sessionName, workingDir)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
@@ -3165,6 +3466,14 @@ func buildRecoveryContext(ctx context.Context, sessionName, workingDir string, r
 	}()
 
 	wg.Wait()
+
+	// bd-wnzhl: errs accumulates from 4 parallel goroutines under a
+	// mutex, so without sorting it ends up in goroutine-completion
+	// order — sibling of bd-brr6h / bd-c9wr1 / bd-aj2qv. Sort
+	// alphabetically so rc.Error.Details (and the printed warnings
+	// below) are byte-stable across runs with the same set of source
+	// failures.
+	sort.Strings(errs)
 
 	// Estimate tokens and truncate if needed
 	rc.TokenCount = estimateRecoveryTokens(rc)
@@ -3194,8 +3503,19 @@ func buildRecoveryContext(ctx context.Context, sessionName, workingDir string, r
 }
 
 // loadRecoveryBeads loads in-progress, completed, and blocked beads from BV.
+//
+// Recovery context is trust-sensitive — surfacing rows from a parent repo's
+// .beads/ to a child directory's spawn would steer the new agent toward
+// unrelated work. We refuse to walk up: if the spawn working directory has
+// no local .beads/, return empty lists rather than letting br discover the
+// parent workspace. Generic bv list helpers preserve the walk-up behavior
+// for non-recovery callers (alerts, status displays). See #130.
 func loadRecoveryBeads(workingDir string) (inProgress, completed, blocked []RecoveryBead, err error) {
 	const limit = 10 // reasonable limit for recovery context
+
+	if !bv.HasLocalBeadsDB(workingDir) {
+		return nil, nil, nil, nil
+	}
 
 	// Get in-progress beads
 	ipList := bv.GetInProgressList(workingDir, limit)
@@ -3447,15 +3767,27 @@ func attemptReservationTransfer(ctx context.Context, client *agentmail.Client, s
 }
 
 // loadRecoveryCMMemories loads procedural memories from CM.
+//
+// The absolute `workingDir` is passed through to CM as the workspace scope so
+// same-basename workspaces (e.g. `/clientA/app` and `/clientB/app`) do not
+// share recovery memories — the basename-derived projectName alone would
+// produce identical task text and silently bleed context across unrelated
+// projects (#132).
 func loadRecoveryCMMemories(ctx context.Context, workingDir string) (*RecoveryCMMemories, error) {
 	client := cm.NewCLIClient()
 	if !client.IsInstalled() {
 		return nil, nil // Graceful degradation
 	}
 
-	// Get recovery context with reasonable limits
+	// Get recovery context with reasonable limits. Use the absolute working
+	// directory as the workspace scope so basename collisions across repos
+	// are kept distinct.
 	projectName := filepath.Base(workingDir)
-	result, err := client.GetRecoveryContext(ctx, projectName, 10, 3)
+	absWorkspace := workingDir
+	if abs, err := filepath.Abs(workingDir); err == nil {
+		absWorkspace = abs
+	}
+	result, err := client.GetRecoveryContext(ctx, projectName, absWorkspace, 10, 3)
 	if err != nil {
 		return nil, fmt.Errorf("get recovery context: %w", err)
 	}
@@ -3482,8 +3814,18 @@ func loadRecoveryCMMemories(ctx context.Context, workingDir string) (*RecoveryCM
 	return memories, nil
 }
 
-// loadRecoveryCheckpoint loads the latest checkpoint for a session.
-func loadRecoveryCheckpoint(sessionName string) (*RecoveryCheckpoint, error) {
+// loadRecoveryCheckpoint loads the latest checkpoint for a session, but only
+// when the checkpoint's recorded working directory matches the spawn's current
+// working directory. This prevents a session-name collision across repos from
+// cross-contaminating recovery context (#131).
+//
+// Working-dir matching rules:
+//   - Both empty (legacy data): accept the checkpoint.
+//   - Checkpoint has empty working_dir, current spawn has one: accept (legacy).
+//   - Both non-empty: accept iff cleaned absolute paths are equal.
+//   - Checkpoint has working_dir, current spawn has none: accept (caller did
+//     not supply enough context to reject; they will be opting into trust).
+func loadRecoveryCheckpoint(sessionName, workingDir string) (*RecoveryCheckpoint, error) {
 	storage := checkpoint.NewStorage()
 	cp, err := storage.GetLatest(sessionName)
 	if err != nil {
@@ -3493,6 +3835,22 @@ func loadRecoveryCheckpoint(sessionName string) (*RecoveryCheckpoint, error) {
 		return nil, err
 	}
 	if cp == nil {
+		return nil, nil
+	}
+
+	if !checkpointWorkingDirMatches(cp.WorkingDir, workingDir) {
+		// Recorded working dir disagrees with the spawn directory — refuse to
+		// surface the checkpoint as recovery context for a different repo.
+		// bd-1cr5k: emit a Warn-level diagnostic so operators investigating
+		// "where did my recovery context go?" can correlate the silent drop
+		// with a working-dir mismatch instead of staring at empty output.
+		slog.Warn("recovery checkpoint rejected: working_dir mismatch",
+			"session", sessionName,
+			"checkpoint_working_dir", cp.WorkingDir,
+			"spawn_working_dir", workingDir,
+			"checkpoint_id", cp.ID,
+			"hint", "checkpoint was recorded against a different repo with the same session name; recovery context is intentionally suppressed (#131)",
+		)
 		return nil, nil
 	}
 
@@ -3516,9 +3874,40 @@ func loadRecoveryCheckpoint(sessionName string) (*RecoveryCheckpoint, error) {
 		CreatedAt:   cp.CreatedAt,
 		PaneCount:   cp.PaneCount,
 		HasGitPatch: cp.HasGitPatch(),
+		WorkingDir:  cp.WorkingDir,
 		Assignments: assignSummary,
 		BVSummary:   bvSummary,
 	}, nil
+}
+
+// checkpointWorkingDirMatches returns true when the checkpoint's recorded
+// working directory is compatible with the current spawn working directory.
+// Empty values on either side are treated as a legacy match — only two
+// non-empty paths that disagree are rejected.
+func checkpointWorkingDirMatches(checkpointDir, spawnDir string) bool {
+	checkpointDir = strings.TrimSpace(checkpointDir)
+	spawnDir = strings.TrimSpace(spawnDir)
+	if checkpointDir == "" || spawnDir == "" {
+		return true
+	}
+
+	// bd-5n28k: resolve symlinks so the same physical directory reached via
+	// two different paths (symlink, bind mount, macOS /Users vs
+	// /private/var/Users, container workspace volumes) compares equal. Fall
+	// back to the abs+clean path when EvalSymlinks fails (target gone,
+	// permission denied) so we don't regress the symlink-free contract.
+	canonical := func(p string) string {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return filepath.Clean(p)
+		}
+		if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
+			return filepath.Clean(resolved)
+		}
+		return filepath.Clean(abs)
+	}
+
+	return canonical(checkpointDir) == canonical(spawnDir)
 }
 
 func summarizeCheckpointAssignments(assignments []checkpoint.AssignmentSnapshot) *RecoveryAssignmentSummary {
@@ -3849,6 +4238,165 @@ type SpawnInitResult struct {
 	AgentsReached int  `json:"agents_reached"`
 }
 
+// codexPreflightDecision is the outcome of the Codex/ChatGPT preflight for a
+// spawn batch that requests a gpt-*-codex model on a ChatGPT-billed login.
+type codexPreflightDecision int
+
+const (
+	codexAllow codexPreflightDecision = iota // proceed silently
+	codexWarn                                // proceed, but surface a non-blocking advisory
+	codexBlock                               // refuse the spawn (strict opt-in)
+)
+
+// decideCodexPreflight chooses how to handle a spawn that requests a
+// gpt-*-codex model on a ChatGPT-billed Codex login.
+//
+// This is deliberately NOT a hard rejection by default. The original guard
+// (ntm#142) assumed OpenAI rejects every gpt-*-codex id with HTTP 400 on
+// ChatGPT-billed accounts, but that is not universally true: recent Codex CLI
+// + ChatGPT plans run gpt-5.3-codex and answer prompts fine (proven in
+// ntm#155), while only some accounts/plans/regions still get the 400. The
+// local Codex CLI is the real source of truth, so blanket-refusing would strip
+// capability from operators who can use the model. We default to a
+// non-blocking advisory and let Codex return the real error if the account
+// can't use it. Operators who want fail-fast (e.g. unattended swarms where a
+// silently-rejecting pane is costly) opt into a hard block via strict.
+func decideCodexPreflight(unsafeCodexOnChatGPT, strict bool) codexPreflightDecision {
+	if !unsafeCodexOnChatGPT {
+		return codexAllow
+	}
+	if strict {
+		return codexBlock
+	}
+	return codexWarn
+}
+
+// preflightCodexAccountSupport advises (or, in strict mode, refuses) when a
+// Codex agent in the spawn batch requests a gpt-*-codex model on a
+// ChatGPT-billed login — the "pane looks alive but rejects the first prompt"
+// failure mode some accounts hit (ntm#142). Because that failure is not
+// universal (ntm#155), the default is a non-blocking advisory; see
+// decideCodexPreflight.
+//
+// Detection: run `codex login status`. The CLI prints `Logged in using
+// ChatGPT` for ChatGPT-billed accounts. When the local codex binary is missing
+// or the command fails for any other reason, we silently allow the spawn — we
+// don't want to break setups where the operator has a working flow we can't
+// introspect.
+func preflightCodexAccountSupport(agents []FlatAgent) error {
+	// Escape hatches so tests and operators with bespoke Codex setups
+	// can opt out entirely:
+	//   - `NTM_DISABLE_CODEX_PREFLIGHT=1` skips the check (no advisory, no block)
+	//   - presence of the `test.v` flag (i.e. `go test`) — the test
+	//     harness has no business shelling out to a real codex CLI and
+	//     test machines may legitimately be ChatGPT-billed without it
+	//     being a real spawn.
+	if os.Getenv("NTM_DISABLE_CODEX_PREFLIGHT") != "" {
+		return nil
+	}
+	if flag.Lookup("test.v") != nil {
+		return nil
+	}
+
+	// A Codex agent only risks the ChatGPT-billed-account failure mode if
+	// the effective resolved model is a `gpt-*-codex` family id. A bare
+	// `--cod=N` with `a.Model == ""` only means "no CLI override" — the
+	// resolved model still comes from `cfg.Models.DefaultCodex` (or, if
+	// that's unset, from `config.DefaultModels().DefaultCodex`). The default
+	// is `gpt-5.5`, so a bare `--cod=N` is fine even on a ChatGPT account
+	// (#147); this only fires for an explicit gpt-*-codex choice.
+	hasUnsafeCodex := false
+	for _, a := range agents {
+		if a.Type != AgentTypeCodex {
+			continue
+		}
+		if isCodexFamilyModel(effectiveCodexModel(a.Model)) {
+			hasUnsafeCodex = true
+			break
+		}
+	}
+	if !hasUnsafeCodex {
+		return nil
+	}
+
+	// `codex login status` is fast (<1s) but bound the wait anyway so a
+	// broken/hung binary doesn't stall the spawn indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "codex", "login", "status").CombinedOutput()
+	if err != nil {
+		// codex CLI missing or errored — don't second-guess the operator's setup.
+		return nil
+	}
+	isChatGPT := strings.Contains(string(out), "Logged in using ChatGPT")
+
+	strict := strings.TrimSpace(os.Getenv("NTM_CODEX_PREFLIGHT_STRICT")) != ""
+	n := countDefaultCodex(agents)
+	switch decideCodexPreflight(hasUnsafeCodex && isChatGPT, strict) {
+	case codexBlock:
+		return fmt.Errorf(
+			"refusing to spawn %d `gpt-*-codex` Codex agent(s) on a ChatGPT-billed account (NTM_CODEX_PREFLIGHT_STRICT is set). Some ChatGPT plans reject `gpt-*-codex` with HTTP 400; if yours supports it, unset NTM_CODEX_PREFLIGHT_STRICT, or use `--cod=%d:gpt-5.5` / a Codex API key (see ntm#155, ntm#142)",
+			n, n,
+		)
+	case codexWarn:
+		if !IsJSONOutput() {
+			output.PrintWarningf(
+				"%d Codex agent(s) request a `gpt-*-codex` model on a ChatGPT-billed login. Most ChatGPT plans run it fine, but some accounts get HTTP 400 — if a pane stays alive yet rejects the first prompt, switch to `--cod=N:gpt-5.5` or use a Codex API key (see ntm#155). Set NTM_CODEX_PREFLIGHT_STRICT=1 to fail fast instead.",
+				n,
+			)
+		}
+	}
+	return nil
+}
+
+func countDefaultCodex(agents []FlatAgent) int {
+	n := 0
+	for _, a := range agents {
+		if a.Type == AgentTypeCodex && isCodexFamilyModel(effectiveCodexModel(a.Model)) {
+			n++
+		}
+	}
+	return n
+}
+
+// effectiveCodexModel resolves the Codex model that will actually be
+// used for an agent: the explicit CLI override if present, otherwise the
+// configured default, otherwise the compiled-in default. Mirrors the
+// resolution in modelNameForPane so the preflight check and the actual
+// spawn agree on which model the agent will run as.
+func effectiveCodexModel(cliModel string) string {
+	if cliModel != "" {
+		return cliModel
+	}
+	if cfg != nil && cfg.Models.DefaultCodex != "" {
+		return cfg.Models.DefaultCodex
+	}
+	return config.DefaultModels().DefaultCodex
+}
+
+// isCodexFamilyModel reports whether a model id is a `gpt-*-codex`
+// family id that OpenAI rejects with HTTP 400 on ChatGPT-billed
+// accounts. The check is suffix-based ("-codex") so it matches
+// gpt-5-codex, gpt-5.2-codex, gpt-5.3-codex, and any future
+// gpt-5.X-codex without an explicit allow-list update. Plain
+// `gpt-5`, `gpt-5.5`, etc. do not match and are considered safe.
+func isCodexFamilyModel(model string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(model)), "-codex")
+}
+
+// worktreeAgentName builds the directory-name component for an agent's
+// worktree. The default is `<agent-type>_<index>` (e.g., `cc_1`), but when
+// `override` is non-empty (set via `--worktree-name`), that takes
+// precedence. The override is the escape hatch for external orchestrators
+// that spawn the same agent slot across multiple `--label` values: see
+// ntm#145 for the cross-contamination scenario.
+func worktreeAgentName(a FlatAgent, override string) string {
+	if override != "" {
+		return override
+	}
+	return fmt.Sprintf("%s_%d", strings.ToLower(string(a.Type)), a.Index)
+}
+
 // waitForAgentsReady waits for spawned agents to show ready/idle prompts.
 // Returns the number of ready agents and any error.
 func waitForAgentsReady(session string, timeout time.Duration) (int, error) {
@@ -3884,7 +4432,12 @@ func waitForAgentsReady(session string, timeout time.Duration) (int, error) {
 
 // sendInitPromptToReadyAgents sends the init prompt to agents that appear idle.
 // Returns the number of agents that received the prompt.
-func sendInitPromptToReadyAgents(session, prompt string) (int, error) {
+//
+// When `withAgentName` is true, each pane receives a per-pane preamble
+// `You are agent <session>_<type>_<idx>. Use this name when registering
+// with Agent Mail or referring to yourself.` prepended to `prompt`.
+// See ntm#138.
+func sendInitPromptToReadyAgents(session, prompt string, withAgentName bool) (int, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return 0, nil
 	}
@@ -3900,7 +4453,18 @@ func sendInitPromptToReadyAgents(session, prompt string) (int, error) {
 	var errs []string
 
 	for _, pane := range readyPanes {
-		if err := sendPromptWithDoubleEnterForAgent(pane.ID, prompt, pane.Type); err != nil {
+		paneAgentType := detectAgentTypeFromPane(pane)
+		perPanePrompt := prompt
+		if withAgentName {
+			name := assignmentAgentName(session, paneAgentType, pane.Index)
+			if name != "" {
+				perPanePrompt = fmt.Sprintf(
+					"You are agent `%s`. Use this name when registering with Agent Mail or referring to yourself.\n\n%s",
+					name, prompt,
+				)
+			}
+		}
+		if err := sendPromptWithDoubleEnterForAgent(pane.ID, perPanePrompt, pane.Type); err != nil {
 			errs = append(errs, fmt.Sprintf("pane %d: %v", pane.Index, err))
 			continue
 		}
@@ -3932,6 +4496,26 @@ func collectReadyAgentPanes(panes []tmux.Pane, capture func(string) (string, err
 	}
 
 	return readyPanes, agentCount
+}
+
+// waitForPaneAgentIdle polls a single pane's scrollback until the agent
+// reaches "idle" (i.e. its welcome banner has been replaced by the input
+// prompt) or the timeout expires. Returns true if the pane became idle in
+// time. Used by the immediate-prompt path in spawn so we no longer race
+// CC's welcome with a fixed 200ms sleep. (#158)
+func waitForPaneAgentIdle(paneID, agentTypeStr string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	pollInterval := 200 * time.Millisecond
+	for {
+		scrollback, _ := tmux.CaptureForStatusDetection(paneID)
+		if determineAgentState(scrollback, agentTypeStr) == "idle" {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 // runAssignmentPhase executes the assignment phase after spawn.

@@ -29,13 +29,15 @@ The safety system blocks or warns about dangerous commands like:
 
 Use 'ntm safety status' to see current protection status.
 Use 'ntm safety blocked' to view blocked command history.
-Use 'ntm safety check <command>' to test a command against the policy.`,
+Use 'ntm safety check <command>' to test a command against the policy.
+Use 'ntm safety simulate <command>' to dry-run a multi-step plan.`,
 	}
 
 	cmd.AddCommand(
 		newSafetyStatusCmd(),
 		newSafetyBlockedCmd(),
 		newSafetyCheckCmd(),
+		newSafetySimulateCmd(),
 		newSafetyInstallCmd(),
 		newSafetyUninstallCmd(),
 	)
@@ -212,6 +214,41 @@ func newSafetyCheckCmd() *cobra.Command {
 	}
 }
 
+func newSafetySimulateCmd() *cobra.Command {
+	var steps []string
+
+	cmd := &cobra.Command{
+		Use:   "simulate [command]",
+		Short: "Simulate a command plan against safety policy",
+		Long: `Simulate one or more proposed shell commands against the safety policy.
+
+The simulator is a dry-run surface: it reports allow/block/approval decisions,
+policy provenance, and safer alternatives without executing any command.`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 && len(steps) == 0 {
+				return fmt.Errorf("provide at least one command or --step")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSafetySimulate(safetySimulationCommands(strings.Join(args, " "), steps))
+		},
+	}
+
+	cmd.Flags().StringArrayVar(&steps, "step", nil, "Command step to simulate; repeat for multi-step plans")
+
+	return cmd
+}
+
+func safetySimulationCommands(command string, steps []string) []string {
+	commands := make([]string, 0, len(steps)+1)
+	if strings.TrimSpace(command) != "" {
+		commands = append(commands, command)
+	}
+	commands = append(commands, steps...)
+	return commands
+}
+
 // CheckResponse is the JSON output for safety check.
 type CheckResponse struct {
 	output.TimestampedResponse
@@ -305,6 +342,86 @@ func runSafetyCheck(command string) error {
 	}
 
 	return nil
+}
+
+func runSafetySimulate(commands []string) error {
+	report, err := evaluateSafetySimulation(commands)
+	if err != nil {
+		return err
+	}
+
+	if IsJSONOutput() {
+		return output.PrintJSON(report)
+	}
+
+	renderSafetySimulation(report)
+	return nil
+}
+
+func evaluateSafetySimulation(commands []string) (policy.SimulationReport, error) {
+	p, err := policy.LoadOrDefault()
+	if err != nil {
+		return policy.SimulationReport{}, fmt.Errorf("loading policy: %w", err)
+	}
+	return policy.SimulatePlan(p, commands), nil
+}
+
+func renderSafetySimulation(report policy.SimulationReport) {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+	fmt.Println()
+	fmt.Printf("  %s\n", titleStyle.Render("Safety Policy Simulation"))
+	fmt.Printf("  %s %d steps, %d allowed, %d blocked, %d approval, %d invalid\n",
+		labelStyle.Render("Summary:"),
+		report.Summary.TotalSteps,
+		report.Summary.AllowedSteps,
+		report.Summary.BlockedSteps,
+		report.Summary.ApprovalSteps,
+		report.Summary.InvalidSteps,
+	)
+	if report.SafeToRun {
+		fmt.Printf("  %s %s\n", labelStyle.Render("Verdict:"), okStyle.Render("safe to run"))
+	} else {
+		fmt.Printf("  %s %s\n", labelStyle.Render("Verdict:"), warnStyle.Render("not safe to run without changes or approval"))
+	}
+	fmt.Println()
+
+	for _, step := range report.Steps {
+		decisionStyle := okStyle
+		switch step.Decision {
+		case policy.SimulationDecisionBlock, policy.SimulationDecisionInvalid:
+			decisionStyle = errorStyle
+		case policy.SimulationDecisionApproval:
+			decisionStyle = warnStyle
+		}
+		fmt.Printf("  %d. %s %s\n", step.Index, decisionStyle.Render(step.Decision), step.Command)
+		if step.Policy != nil {
+			if step.Policy.Reason != "" {
+				fmt.Printf("     %s %s\n", labelStyle.Render("Reason:"), step.Policy.Reason)
+			}
+			if step.Policy.Pattern != "" {
+				fmt.Printf("     %s %s\n", labelStyle.Render("Pattern:"), mutedStyle.Render(step.Policy.Pattern))
+			}
+			if step.RequiresSLB {
+				fmt.Printf("     %s %s\n", labelStyle.Render("Approval:"), warnStyle.Render("SLB required"))
+			}
+		}
+		if step.Error != "" {
+			fmt.Printf("     %s %s\n", labelStyle.Render("Error:"), step.Error)
+		}
+		for _, alt := range step.SaferAlternatives {
+			fmt.Printf("     %s %s\n", labelStyle.Render("Alternative:"), alt)
+		}
+	}
+	for _, note := range report.Notes {
+		fmt.Printf("  %s %s\n", labelStyle.Render("Note:"), mutedStyle.Render(note))
+	}
+	fmt.Println()
 }
 
 func evaluateSafetyCheck(command string) (CheckResponse, int, error) {
@@ -704,14 +821,29 @@ const claudeHookScript = `#!/bin/bash
 # NTM Safety Hook for Claude Code
 # PreToolUse hook that validates Bash commands
 
+# Claude Code command hooks receive the event payload as JSON on stdin.
+HOOK_INPUT="$(cat)"
+if [ -n "$HOOK_INPUT" ] && command -v jq >/dev/null 2>&1; then
+    TOOL_NAME="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_name // empty' 2>/dev/null)"
+    COMMAND="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
+else
+    TOOL_NAME=""
+    COMMAND=""
+fi
+
+# Fall back to legacy env vars if a caller still provides them directly.
+if [ -z "$TOOL_NAME" ]; then
+    TOOL_NAME="${CLAUDE_TOOL_NAME:-}"
+fi
+if [ -z "$COMMAND" ]; then
+    COMMAND="${CLAUDE_TOOL_INPUT_command:-}"
+fi
+
 # Only process Bash tool calls
-TOOL_NAME="${CLAUDE_TOOL_NAME:-}"
 if [ "$TOOL_NAME" != "Bash" ]; then
     exit 0
 fi
 
-# Get the command from the tool input
-COMMAND="${CLAUDE_TOOL_INPUT_command:-}"
 if [ -z "$COMMAND" ]; then
     exit 0
 fi
@@ -744,12 +876,12 @@ if [ $exit_code -ne 0 ]; then
 
     # Return error to Claude Code
     if [ "$action" = "approve" ]; then
-        echo "APPROVAL REQUIRED: $reason"
-        echo "Run 'ntm approve list' to see pending requests."
+        echo "APPROVAL REQUIRED: $reason" >&2
+        echo "Run 'ntm approve list' to see pending requests." >&2
     else
-        echo "BLOCKED: $reason"
+        echo "BLOCKED: $reason" >&2
     fi
-    exit 1
+    exit 2
 fi
 
 exit 0

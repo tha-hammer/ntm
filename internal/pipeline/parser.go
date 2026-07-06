@@ -2,10 +2,13 @@ package pipeline
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -16,6 +19,7 @@ import (
 type ParseError struct {
 	File    string `json:"file,omitempty"`
 	Line    int    `json:"line,omitempty"`
+	Column  int    `json:"column,omitempty"`
 	Field   string `json:"field,omitempty"`
 	Message string `json:"message"`
 	Hint    string `json:"hint,omitempty"`
@@ -27,7 +31,11 @@ func (e ParseError) Error() string {
 		parts = append(parts, e.File)
 	}
 	if e.Line > 0 {
-		parts = append(parts, fmt.Sprintf("line %d", e.Line))
+		if e.Column > 0 {
+			parts = append(parts, fmt.Sprintf("line %d, column %d", e.Line, e.Column))
+		} else {
+			parts = append(parts, fmt.Sprintf("line %d", e.Line))
+		}
 	}
 	if e.Field != "" {
 		parts = append(parts, e.Field)
@@ -38,6 +46,89 @@ func (e ParseError) Error() string {
 		return fmt.Sprintf("%s: %s", location, e.Message)
 	}
 	return e.Message
+}
+
+var (
+	parseErrorLinePattern     = regexp.MustCompile(`(?i)\bline\s+([0-9]+)`)
+	parseErrorColumnPattern   = regexp.MustCompile(`(?i)\bcolumn\s+([0-9]+)`)
+	yamlUnknownFieldPattern   = regexp.MustCompile(`field ([^[:space:]]+) not found`)
+	workflowSchemaDocsSection = "docs/WORKFLOW_SCHEMA.md"
+)
+
+func buildYAMLParseError(path string, err error) *ParseError {
+	message := err.Error()
+	var typeErr *yaml.TypeError
+	if errors.As(err, &typeErr) && len(typeErr.Errors) > 0 {
+		message = strings.Join(typeErr.Errors, "; ")
+	}
+
+	parseErr := &ParseError{
+		File:    path,
+		Message: fmt.Sprintf("YAML parse error: %s", message),
+		Hint:    fmt.Sprintf("Check YAML syntax at the reported location and verify fields against %s", workflowSchemaDocsSection),
+	}
+	parseErr.Line, parseErr.Column = extractParseErrorLocation(message)
+	if field := extractYAMLUnknownField(message); field != "" {
+		parseErr.Field = field
+		parseErr.Hint = fmt.Sprintf("Remove or rename %q; supported workflow fields are documented in %s", field, workflowSchemaDocsSection)
+	}
+	return parseErr
+}
+
+func buildTOMLParseError(path string, err error) *ParseError {
+	parseErr := &ParseError{
+		File:    path,
+		Message: fmt.Sprintf("TOML parse error: %v", err),
+		Hint:    fmt.Sprintf("Check TOML syntax at the reported location and verify fields against %s", workflowSchemaDocsSection),
+	}
+
+	var tomlErr toml.ParseError
+	if errors.As(err, &tomlErr) {
+		if tomlErr.Message != "" {
+			parseErr.Message = fmt.Sprintf("TOML parse error: %s", tomlErr.Message)
+		}
+		parseErr.Line = tomlErr.Position.Line
+		parseErr.Column = tomlErr.Position.Col
+		parseErr.Field = tomlErr.LastKey
+		if tomlErr.Usage != "" {
+			parseErr.Hint = tomlErr.Usage
+		}
+	}
+	return parseErr
+}
+
+func buildUnknownTOMLFieldError(path string, undecoded []toml.Key) *ParseError {
+	field := undecoded[0].String()
+	return &ParseError{
+		File:    path,
+		Field:   field,
+		Message: fmt.Sprintf("unknown TOML field(s): %s", formatUndecodedTOMLKeys(undecoded)),
+		Hint:    fmt.Sprintf("Remove or rename %q; supported workflow fields are documented in %s", field, workflowSchemaDocsSection),
+	}
+}
+
+func extractParseErrorLocation(message string) (int, int) {
+	return firstIntSubmatch(parseErrorLinePattern, message), firstIntSubmatch(parseErrorColumnPattern, message)
+}
+
+func firstIntSubmatch(pattern *regexp.Regexp, s string) int {
+	match := pattern.FindStringSubmatch(s)
+	if len(match) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func extractYAMLUnknownField(message string) string {
+	match := yamlUnknownFieldPattern.FindStringSubmatch(message)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.Trim(match[1], "`\"'")
 }
 
 // ValidationResult contains the result of validating a workflow
@@ -71,6 +162,76 @@ func formatUndecodedTOMLKeys(keys []toml.Key) string {
 	return strings.Join(parts, ", ")
 }
 
+func filterUndecodedTOMLKeys(keys []toml.Key) []toml.Key {
+	filtered := make([]toml.Key, 0, len(keys))
+	for _, key := range keys {
+		if isKnownParallelInlineStepKey(key) {
+			continue
+		}
+		filtered = append(filtered, key)
+	}
+	return filtered
+}
+
+// isKnownParallelInlineStepKey reports whether an undecoded key is a leftover
+// from the canonical inline-step shape `[[steps.parallel.steps]]`. After
+// ParallelSpec.UnmarshalTOML consumes those entries via JSON round-trip, the
+// BurntSushi decoder still considers them undecoded because UnmarshalTOML
+// cannot mark child keys as consumed; we suppress only those (and only when
+// they match a known step field) so genuine config errors still surface.
+//
+// bd-k44ib: previously this matched any `steps.parallel.<known-step-field>`
+// key, which silently swallowed malformed `[steps.parallel] id=... prompt=...`
+// shapes. The narrowed check now requires the path to begin with the
+// canonical `steps.parallel.steps.*` so unrelated shapes get a real error.
+func isKnownParallelInlineStepKey(key toml.Key) bool {
+	if len(key) < 4 || key[0] != "steps" || key[1] != "parallel" || key[2] != "steps" {
+		return false
+	}
+	return knownStepTOMLFields[key[3]]
+}
+
+var knownStepTOMLFields = map[string]bool{
+	"id":                       true,
+	"name":                     true,
+	"description":              true,
+	"agent":                    true,
+	"pane":                     true,
+	"route":                    true,
+	"prompt":                   true,
+	"prompt_file":              true,
+	"command":                  true,
+	"args":                     true,
+	"template":                 true,
+	"params":                   true,
+	"template_params":          true,
+	"wait":                     true,
+	"timeout":                  true,
+	"depends_on":               true,
+	"after":                    true,
+	"on_error":                 true,
+	"on_failure":               true,
+	"on_success":               true,
+	"retry_count":              true,
+	"retry_delay":              true,
+	"retry_backoff":            true,
+	"when":                     true,
+	"branch":                   true,
+	"branches":                 true,
+	"bead_query":               true,
+	"output_var":               true,
+	"output_parse":             true,
+	"parallel":                 true,
+	"loop":                     true,
+	"loop_control":             true,
+	"foreach":                  true,
+	"foreach_pane":             true,
+	"mail_send":                true,
+	"file_reservation_paths":   true,
+	"mail_inbox_check":         true,
+	"file_reservation_release": true,
+}
+
 // ParseFile parses a workflow file (YAML or TOML) and returns the workflow
 func ParseFile(path string) (*Workflow, error) {
 	data, err := os.ReadFile(path)
@@ -84,28 +245,15 @@ func ParseFile(path string) (*Workflow, error) {
 	switch ext {
 	case ".yaml", ".yml":
 		if err := parseYAMLWorkflow(data, &workflow); err != nil {
-			return nil, &ParseError{
-				File:    path,
-				Message: fmt.Sprintf("YAML parse error: %v", err),
-				Hint:    "Check YAML syntax and remove unsupported fields",
-			}
+			return nil, buildYAMLParseError(path, err)
 		}
 	case ".toml":
 		md, err := toml.Decode(string(data), &workflow)
 		if err != nil {
-			return nil, &ParseError{
-				File:    path,
-				Message: fmt.Sprintf("TOML parse error: %v", err),
-				Hint:    "Check TOML syntax - keys and values must be properly formatted",
-			}
+			return nil, buildTOMLParseError(path, err)
 		}
-		if undecoded := md.Undecoded(); len(undecoded) > 0 {
-			return nil, &ParseError{
-				File:    path,
-				Field:   undecoded[0].String(),
-				Message: fmt.Sprintf("unknown TOML field(s): %s", formatUndecodedTOMLKeys(undecoded)),
-				Hint:    "Remove or rename unsupported fields",
-			}
+		if undecoded := filterUndecodedTOMLKeys(md.Undecoded()); len(undecoded) > 0 {
+			return nil, buildUnknownTOMLFieldError(path, undecoded)
 		}
 	default:
 		return nil, &ParseError{
@@ -115,6 +263,9 @@ func ParseFile(path string) (*Workflow, error) {
 		}
 	}
 
+	// Fold alias / convenience fields into their canonical counterparts so
+	// downstream validation, deps, and execution only need one path.
+	workflow.Normalize()
 	return &workflow, nil
 }
 
@@ -125,23 +276,15 @@ func ParseString(content string, format string) (*Workflow, error) {
 	switch strings.ToLower(format) {
 	case "yaml", "yml":
 		if err := parseYAMLWorkflow([]byte(content), &workflow); err != nil {
-			return nil, &ParseError{
-				Message: fmt.Sprintf("YAML parse error: %v", err),
-			}
+			return nil, buildYAMLParseError("", err)
 		}
 	case "toml":
 		md, err := toml.Decode(content, &workflow)
 		if err != nil {
-			return nil, &ParseError{
-				Message: fmt.Sprintf("TOML parse error: %v", err),
-			}
+			return nil, buildTOMLParseError("", err)
 		}
-		if undecoded := md.Undecoded(); len(undecoded) > 0 {
-			return nil, &ParseError{
-				Field:   undecoded[0].String(),
-				Message: fmt.Sprintf("unknown TOML field(s): %s", formatUndecodedTOMLKeys(undecoded)),
-				Hint:    "Remove or rename unsupported fields",
-			}
+		if undecoded := filterUndecodedTOMLKeys(md.Undecoded()); len(undecoded) > 0 {
+			return nil, buildUnknownTOMLFieldError("", undecoded)
 		}
 	default:
 		return nil, &ParseError{
@@ -150,6 +293,7 @@ func ParseString(content string, format string) (*Workflow, error) {
 		}
 	}
 
+	workflow.Normalize()
 	return &workflow, nil
 }
 
@@ -196,6 +340,16 @@ func Validate(w *Workflow) ValidationResult {
 		validateStep(&step, fmt.Sprintf("steps[%d]", i), stepIDs, &result)
 	}
 
+	// bd-tpz1a: validate settings.on_cancel cleanup steps with the same rules
+	// and the same global step-ID namespace as normal steps. Without this,
+	// (a) malformed cleanup steps (no kind, missing required fields) only fail
+	// during cancellation cleanup at runtime and (b) cleanup IDs that collide
+	// with a normal step ID silently overwrite the cancelled step's persisted
+	// result inside runOnCancelSteps. validateOnCancelSteps assigns synthetic
+	// "on_cancel_N" IDs to bare entries before validation so duplicates with
+	// regular steps using those names are still detected.
+	validateOnCancelSteps(w.Settings.OnCancel, stepIDs, &result)
+
 	// Check for dependency cycles
 	if cycles := detectCycles(w.Steps); len(cycles) > 0 {
 		for _, cycle := range cycles {
@@ -220,6 +374,22 @@ func validateSettings(settings WorkflowSettings, result *ValidationResult) {
 			Message: fmt.Sprintf("invalid on_error value: %s", settings.OnError),
 			Hint:    "Valid values: fail, fail_fast, continue, retry",
 		})
+	}
+}
+
+// validateOnCancelSteps applies the regular validateStep rules to cleanup
+// steps declared under settings.on_cancel and registers their IDs in the
+// workflow-wide stepIDs map so collisions with regular step IDs surface as
+// validation errors. Empty IDs get the synthetic "on_cancel_N" identity that
+// runOnCancelSteps already assigns at runtime, keeping validation and
+// execution aligned.
+func validateOnCancelSteps(onCancel []Step, stepIDs map[string]bool, result *ValidationResult) {
+	for i := range onCancel {
+		step := onCancel[i]
+		if step.ID == "" {
+			step.ID = fmt.Sprintf("on_cancel_%d", i+1)
+		}
+		validateStep(&step, fmt.Sprintf("settings.on_cancel[%d]", i), stepIDs, result)
 	}
 }
 
@@ -262,9 +432,21 @@ func validateStep(step *Step, stepField string, stepIDs map[string]bool, result 
 		stepIDs[step.ID] = true
 	}
 
-	// Check for parallel vs prompt mutual exclusivity
+	// Check for parallel vs prompt mutual exclusivity. Each step must do one
+	// (and only one) of: agent prompt, shell command, template render, foreach
+	// fan-out, parallel sub-steps, loop, or branch dispatch. Treat `parallel:
+	// true` as a flag rather than work; only inline parallel sub-steps count.
 	hasPrompt := step.Prompt != "" || step.PromptFile != ""
-	hasParallel := len(step.Parallel) > 0
+	hasCommand := step.Command != ""
+	hasTemplate := step.Template != ""
+	hasParallel := len(step.Parallel.Steps) > 0
+	hasForeach := step.Foreach != nil || step.ForeachPane != nil
+	hasBranchPredicate := step.Branch != ""
+	hasBranchesMap := len(step.Branches) > 0
+	hasBranch := hasBranchPredicate || hasBranchesMap
+	hasBeadQuery := step.BeadQuery != nil
+	mailStepKinds := step.mailStepKindNames()
+	hasMailStep := len(mailStepKinds) > 0
 
 	if hasPrompt && hasParallel {
 		result.addError(ParseError{
@@ -273,12 +455,89 @@ func validateStep(step *Step, stepField string, stepIDs map[string]bool, result 
 			Hint:    "Use prompt for single-agent steps, parallel for concurrent steps",
 		})
 	}
-
-	if !hasPrompt && !hasParallel && step.Loop == nil {
+	if hasPrompt && hasCommand {
 		result.addError(ParseError{
 			Field:   stepField,
-			Message: "step must have prompt, prompt_file, parallel, or loop",
-			Hint:    "Add a prompt, parallel steps, or loop for this step",
+			Message: "step cannot have both prompt and command",
+			Hint:    "Use prompt for agent dispatch, command for shell execution",
+		})
+	}
+	if hasPrompt && hasTemplate {
+		result.addError(ParseError{
+			Field:   stepField,
+			Message: "step cannot have both prompt and template",
+			Hint:    "Use prompt for inline text, template for an MO file rendered with --params",
+		})
+	}
+	if hasCommand && hasTemplate {
+		result.addError(ParseError{
+			Field:   stepField,
+			Message: "step cannot have both command and template",
+			Hint:    "Pick one: command runs a shell command; template renders an MO and dispatches it",
+		})
+	}
+	if len(mailStepKinds) > 1 {
+		result.addError(ParseError{
+			Field:   stepField,
+			Message: fmt.Sprintf("step can only use one Agent Mail step kind, got: %s", strings.Join(mailStepKinds, ", ")),
+			Hint:    "Choose one of mail_send, file_reservation_paths, mail_inbox_check, or file_reservation_release",
+		})
+	}
+	if hasMailStep && (hasPrompt || hasParallel || hasCommand || hasTemplate || hasForeach || hasBranch || step.Loop != nil) {
+		result.addError(ParseError{
+			Field:   stepField,
+			Message: "step cannot combine Agent Mail step kind with prompt, command, template, parallel, loop, foreach, or branch",
+			Hint:    "Agent Mail step kinds run through MCP Agent Mail rather than tmux pane dispatch",
+		})
+	}
+	// bd-vv7ij: surface required-field errors for the chosen Agent Mail
+	// step kind so an empty mail_send / paths-less reservation fails up
+	// front instead of becoming a confusing runtime no-op once execution
+	// is wired (bd-hz1tl).
+	if hasMailStep && len(mailStepKinds) == 1 {
+		validateMailStepPayload(step, stepField, result)
+	}
+	if hasBeadQuery && (hasPrompt || hasParallel || hasCommand || hasTemplate || hasForeach || hasBranch || hasMailStep || step.Loop != nil) {
+		result.addError(ParseError{
+			Field:   stepField,
+			Message: "step cannot combine bead_query with prompt, command, template, parallel, loop, foreach, branch, or Agent Mail step kinds",
+			Hint:    "bead_query runs a structured br query and stores its result through output_var",
+		})
+	}
+
+	// bd-nz63w: branch steps must have both the selector predicate and a
+	// branches map. The executor only dispatches when step.Branch is set, so
+	// a step with branches: but no branch: would silently fall through to
+	// resolvePrompt and fail with a misleading missing-prompt error.
+	if hasBranchesMap && !hasBranchPredicate {
+		result.addError(ParseError{
+			Field:   stepField + ".branch",
+			Message: "step has branches but no branch predicate; the runtime cannot pick a branch without one",
+			Hint:    "Set branch: <shell command whose stdout selects a branches[] entry> or remove the branches map.",
+		})
+	}
+	if hasBranchPredicate && !hasBranchesMap {
+		result.addError(ParseError{
+			Field:   stepField + ".branches",
+			Message: "step has branch predicate but no branches map; the predicate would have nothing to select from",
+			Hint:    "Add a branches: map with at least one entry (or a default key) keyed by the predicate's stdout.",
+		})
+	}
+
+	// Loop-control-only steps are a first-class step kind for foreach/loop
+	// bodies (bd-oqv4c). The runtime already supports
+	// `{loop_control: break/continue, when: ...}` via foreachControlOnlyStep
+	// in foreach.go; validation must accept it without requiring the author
+	// to attach loop_control to an unrelated work step.
+	hasLoopControlOnly := step.LoopControl == LoopControlBreak || step.LoopControl == LoopControlContinue
+
+	if !hasPrompt && !hasParallel && !hasCommand && !hasTemplate &&
+		!hasForeach && !hasBranch && !hasBeadQuery && !hasMailStep &&
+		!hasLoopControlOnly && step.Loop == nil {
+		result.addError(ParseError{
+			Field:   stepField,
+			Message: "step must have prompt, prompt_file, command, template, parallel, loop, foreach, branch, bead_query, or loop_control",
+			Hint:    "Pick the step kind that matches the work you want done.",
 		})
 	}
 
@@ -294,7 +553,7 @@ func validateStep(step *Step, stepField string, stepIDs map[string]bool, result 
 			})
 		}
 	}
-	if step.Pane > 0 {
+	if !step.Pane.IsZero() {
 		agentMethods++
 	}
 	if step.Route != "" {
@@ -353,21 +612,65 @@ func validateStep(step *Step, stepField string, stepIDs map[string]bool, result 
 		})
 	}
 
+	validateOutputVarCollisions(step, stepField, result)
+
 	// Validate parallel sub-steps
-	for j, pStep := range step.Parallel {
+	for j, pStep := range step.Parallel.Steps {
 		validateStep(&pStep, fmt.Sprintf("%s.parallel[%d]", stepField, j), stepIDs, result)
+	}
+
+	// bd-ytp3e: loop_control:break inside a parallel foreach cannot
+	// reliably stop later iterations because the dispatcher launches all
+	// non-filtered iterations concurrently and only learns about break
+	// after one of them returns. Late iterations can complete (with side
+	// effects) before the cancellation reaches them. Reject the
+	// combination at validation time.
+	for _, fc := range []*ForeachConfig{step.Foreach, step.ForeachPane} {
+		if fc == nil || !fc.Parallel {
+			continue
+		}
+		for j, body := range foreachBodyStepsForValidation(fc) {
+			if body.LoopControl == LoopControlBreak {
+				result.addError(ParseError{
+					Field:   fmt.Sprintf("%s.foreach.steps[%d].loop_control", stepField, j),
+					Message: "loop_control: break is not supported inside a parallel foreach",
+					Hint:    "Use sequential foreach (parallel: false) when iterations need to short-circuit, or switch break to continue if you only want to skip the current iteration.",
+				})
+			}
+		}
+	}
+
+	// bd-ltghx: validate foreach.max_rounds. The runtime resolver in
+	// foreach_max_rounds.go silently defaults `<= 0` literals to 1 round, so
+	// `max_rounds: -5` would otherwise compile clean and surface no
+	// diagnostic. Mirror the loop.max_iterations contract: reject negative
+	// literals at parse time. Zero is left alone because IntOrExpr has no
+	// IsSet flag — `MaxRounds.Value == 0` is the default zero value when
+	// max_rounds is omitted entirely, so we can't distinguish "explicitly
+	// typed 0" from "not set".
+	for _, fc := range []*ForeachConfig{step.Foreach, step.ForeachPane} {
+		if fc == nil {
+			continue
+		}
+		if fc.MaxRounds.Expr == "" && fc.MaxRounds.Value < 0 {
+			result.addError(ParseError{
+				Field:   stepField + ".foreach.max_rounds",
+				Message: "max_rounds cannot be negative",
+				Hint:    "Omit max_rounds for the historical single-round default, or set a positive integer to repeat the iteration body N times.",
+			})
+		}
 	}
 
 	// Validate loop configuration
 	if step.Loop != nil {
-		if step.Loop.Items == "" && step.Loop.While == "" && step.Loop.Times <= 0 {
+		if step.Loop.Items == "" && step.Loop.While == "" && step.Loop.Until == "" && step.Loop.Times <= 0 {
 			result.addError(ParseError{
 				Field:   stepField + ".loop",
-				Message: "loop must specify items, while, or times",
-				Hint:    "Set items for for-each, while for condition loop, or times for count loop",
+				Message: "loop must specify items, while, until, or times",
+				Hint:    "Set items for for-each, while for condition loop, until for predicate-exit loop, or times for count loop",
 			})
 		}
-		if step.Loop.MaxIterations < 0 {
+		if step.Loop.MaxIterations.Value < 0 {
 			result.addError(ParseError{
 				Field:   stepField + ".loop.max_iterations",
 				Message: "max_iterations cannot be negative",
@@ -389,8 +692,8 @@ func detectCycles(steps []Step) [][]string {
 		for _, step := range steps {
 			graph[step.ID] = step.DependsOn
 			// Include parallel sub-steps
-			if len(step.Parallel) > 0 {
-				addToGraph(step.Parallel)
+			if len(step.Parallel.Steps) > 0 {
+				addToGraph(step.Parallel.Steps)
 			}
 			// Include loop sub-steps
 			if step.Loop != nil {
@@ -502,8 +805,8 @@ func validateVariableRefs(w *Workflow, result *ValidationResult) {
 				checkString(step.When, stepField+".when")
 			}
 			// Check parallel sub-steps
-			if len(step.Parallel) > 0 {
-				checkSteps(step.Parallel, stepField+".parallel")
+			if len(step.Parallel.Steps) > 0 {
+				checkSteps(step.Parallel.Steps, stepField+".parallel")
 			}
 			// Check loop sub-steps
 			if step.Loop != nil {
@@ -576,4 +879,18 @@ func LoadAndValidate(path string) (*Workflow, ValidationResult, error) {
 
 	result := Validate(workflow)
 	return workflow, result, nil
+}
+
+// foreachBodyStepsForValidation returns the effective body steps for a
+// ForeachConfig regardless of whether the YAML used the canonical Steps
+// field or the convenience Body alias. Used by parallel-foreach
+// validation in bd-ytp3e.
+func foreachBodyStepsForValidation(fc *ForeachConfig) []Step {
+	if fc == nil {
+		return nil
+	}
+	if len(fc.Steps) > 0 {
+		return fc.Steps
+	}
+	return fc.Body
 }

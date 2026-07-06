@@ -246,12 +246,16 @@ func ackPaneTMUXAgentType(pane tmux.Pane) tmux.AgentType {
 		return tmux.AgentCodex
 	case "gemini":
 		return tmux.AgentGemini
+	case "antigravity":
+		return tmux.AgentAntigravity
 	case "cursor":
 		return tmux.AgentCursor
 	case "windsurf":
 		return tmux.AgentWindsurf
 	case "aider":
 		return tmux.AgentAider
+	case "oc":
+		return tmux.AgentOpencode
 	case "ollama":
 		return tmux.AgentOllama
 	case "user":

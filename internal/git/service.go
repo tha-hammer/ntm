@@ -126,8 +126,9 @@ func (ws *WorktreeService) AutoProvisionSession(ctx context.Context, sessionName
 
 	// Provision worktrees for each agent pane
 	for _, agentPane := range agentPanes {
-		// Generate a unique session ID for this agent
-		sessionID := fmt.Sprintf("%s-%s-%d", sessionName, agentPane.AgentType, agentPane.AgentNum)
+		// Generate a session ID that uses the same canonical agent key as
+		// branch/worktree naming so cleanup/status matching remains consistent.
+		sessionID := buildSessionWorktreeID(sessionName, agentPane.AgentType, agentPane.AgentNum)
 
 		// Provision worktree
 		worktreeInfo, err := manager.ProvisionWorktree(ctx, agentPane.AgentType, sessionID)
@@ -167,47 +168,58 @@ func (ws *WorktreeService) AutoProvisionSession(ctx context.Context, sessionName
 	return response, nil
 }
 
-// CleanupSessionWorktrees removes worktrees associated with a specific session
-func (ws *WorktreeService) CleanupSessionWorktrees(ctx context.Context, sessionName string) error {
+// CleanupSessionWorktrees removes worktrees associated with a specific session.
+// It returns the number of worktrees actually removed so callers can
+// distinguish a real cleanup from a no-op (#151).
+func (ws *WorktreeService) CleanupSessionWorktrees(ctx context.Context, sessionName string) (int, error) {
 	projectDir := ws.config.GetProjectDir(sessionName)
 	if projectDir == "" || !IsGitRepository(projectDir) {
-		return nil // Nothing to clean up
+		return 0, nil // Nothing to clean up
 	}
 
 	manager, err := ws.getManager(projectDir)
 	if err != nil {
-		return fmt.Errorf("failed to create worktree manager: %w", err)
+		return 0, fmt.Errorf("failed to create worktree manager: %w", err)
 	}
 
 	// List all worktrees and find ones associated with this session
 	worktrees, err := manager.ListWorktrees(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list worktrees: %w", err)
+		return 0, fmt.Errorf("failed to list worktrees: %w", err)
 	}
 
+	removed := 0
 	for _, wt := range worktrees {
 		// Check if this worktree is associated with the session
 		// Branch format: agent/<agent-type>/<session-id>
-		if len(wt.Branch) > 6 && wt.Branch[:6] == "agent/" {
+		if strings.HasPrefix(wt.Branch, "agent/") {
 			parts := strings.SplitN(wt.Branch[6:], "/", 2)
 
 			if len(parts) >= 2 {
 				agentType := parts[0]
 				sessionID := parts[1]
 
-				// Extract session name from session ID (format: sessionName-agentType-num)
-				// Ensure we match the full session name prefix (avoid matching "app" with "app2").
-				if sessionName != "" && strings.HasPrefix(sessionID, sessionName+"-") {
-					// This worktree belongs to our session
-					if err := manager.RemoveWorktree(ctx, agentType, sessionID); err != nil {
+				// bd-y9ndb: sessionID format is <sessionName>-<agentType>-<num>.
+				// HasPrefix(sessionID, sessionName+"-") alone matched
+				// "my-app-claude-1" against sessionName="my", causing cleanup
+				// of "my-app"'s worktree (data loss). Anchor on the known
+				// agentType and require the trailing portion to be all
+				// digits so "my" cannot match a "my-app-..." sessionID.
+				if sessionMatchesWorktree(sessionName, agentType, sessionID) {
+					// This worktree belongs to our session. Remove the exact
+					// path reported by git so cleanup still works for
+					// renamed or older worktree basename schemes.
+					if err := manager.removeWorktreePathAndBranch(ctx, wt.Path, wt.Branch); err != nil {
 						log.Printf("Warning: failed to remove worktree for %s: %v", sessionID, err)
+					} else {
+						removed++
 					}
 				}
 			}
 		}
 	}
 
-	return nil
+	return removed, nil
 }
 
 // GetSessionWorktreeStatus returns the status of worktrees for a session
@@ -231,12 +243,15 @@ func (ws *WorktreeService) GetSessionWorktreeStatus(ctx context.Context, session
 
 	for _, wt := range worktrees {
 		// Check if this worktree belongs to the session
-		if len(wt.Branch) > 6 && wt.Branch[:6] == "agent/" {
+		if strings.HasPrefix(wt.Branch, "agent/") {
 			parts := strings.SplitN(wt.Branch[6:], "/", 2)
 
 			if len(parts) >= 2 {
+				agentType := parts[0]
 				sessionID := parts[1]
-				if sessionName != "" && strings.HasPrefix(sessionID, sessionName+"-") {
+				// bd-y9ndb: anchor match on known agentType + all-digit
+				// suffix to avoid sessionName="my" matching "my-app-…".
+				if sessionMatchesWorktree(sessionName, agentType, sessionID) {
 					sessionWorktrees[wt.Agent] = wt
 				}
 			}
@@ -247,6 +262,55 @@ func (ws *WorktreeService) GetSessionWorktreeStatus(ctx context.Context, session
 }
 
 // Helper methods
+
+// sessionMatchesWorktree reports whether sessionID corresponds to a
+// worktree owned by (sessionName, agentType). AutoProvisionSession
+// builds buildSessionWorktreeID(...) (session + canonical agent key +
+// pane number), then ProvisionWorktree stores canonicalSessionKey(...) in
+// the branch path.
+func sessionMatchesWorktree(sessionName, agentType, sessionID string) bool {
+	if sessionName == "" || agentType == "" || sessionID == "" {
+		return false
+	}
+
+	// Manual `worktree provision <agent> <sessionID>` stores the sessionID
+	// verbatim (canonicalized) as the branch's session segment, without the
+	// auto-provision "-<agentType>-<num>" suffix. Match those by exact
+	// canonical equality so manually-provisioned worktrees are cleanable
+	// (#150). Exact match (not prefix) keeps the bd-y9ndb anchoring intact:
+	// "my" still cannot match a "my-app-…" sessionID.
+	if sessionID == canonicalSessionKey(sessionName) {
+		return true
+	}
+
+	expectedPrefix := canonicalSessionKey(sessionName+"-"+agentType) + "-"
+	if !strings.HasPrefix(sessionID, expectedPrefix) {
+		return false
+	}
+	rest := sessionID[len(expectedPrefix):]
+	if rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func buildSessionWorktreeID(sessionName, agentType string, agentNum int) string {
+	return canonicalSessionKey(fmt.Sprintf("%s-%s-%d", sessionName, canonicalAgentKey(agentType), agentNum))
+}
+
+func isUserAgentType(agentType tmux.AgentType) bool {
+	switch agentType {
+	case tmux.AgentUser:
+		return true
+	default:
+		return false
+	}
+}
 
 // getManager gets or creates a worktree manager for a project.
 // Thread-safe: protects the managers map with a mutex.
@@ -281,8 +345,8 @@ func (ws *WorktreeService) detectAgentPanes(sessionName string) ([]AgentPane, er
 	var agentPanes []AgentPane
 
 	for _, pane := range panes {
-		// Skip user panes or panes that didn't parse as NTM agents
-		if pane.Type == tmux.AgentUser || pane.NTMIndex == 0 {
+		// Skip user panes or panes that didn't parse as NTM agents.
+		if isUserAgentType(pane.Type) || pane.NTMIndex == 0 {
 			continue
 		}
 

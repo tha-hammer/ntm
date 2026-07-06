@@ -4,9 +4,11 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -53,17 +55,18 @@ func Capture(sessionName string) (state *SessionState, err error) {
 	// Count agents by type
 	agents := countAgents(panes)
 
-	// Map pane states
-	paneStates := mapPaneStates(panes)
-
 	// Detect working directory from active pane, first pane, or process
 	cwd := detectWorkDir(sessionName, panes)
+
+	// Map pane states (enriches each agent pane with its resumable session id)
+	paneStates := mapPaneStates(panes, cwd)
 
 	// Get git info if in a repo
 	gitBranch, gitRemote, gitCommit := getGitInfo(cwd)
 
-	// Get layout
+	// Get layout (whole-session fallback) and per-window fidelity metadata.
 	layout := getLayout(sessionName)
+	windows := captureWindows(sessionName)
 
 	// Parse session creation time (tmux format varies, try common formats)
 	var createdAt time.Time
@@ -93,11 +96,59 @@ func Capture(sessionName string) (state *SessionState, err error) {
 		Agents:    agents,
 		Panes:     paneStates,
 		Layout:    layout,
+		Windows:   windows,
 		CreatedAt: createdAt,
 		Version:   StateVersion,
 	}
 
 	return state, nil
+}
+
+// captureWindows records per-window metadata (name, exact geometry, active and
+// zoom state) so restore can reproduce the full topology faithfully, not just
+// the active window's layout. Returns nil if the session cannot be listed; the
+// caller then relies on the whole-session Layout fallback.
+func captureWindows(sessionName string) []WindowState {
+	// Use the same printable delimiter as GetPanes: tmux escapes non-printable
+	// bytes (e.g. \x1f) in format output, so a control-char separator would not
+	// survive. Window names/layouts will not contain this token.
+	sep := tmux.FieldSeparator
+	format := "#{window_index}" + sep + "#{window_name}" + sep +
+		"#{window_active}" + sep + "#{window_zoomed_flag}" + sep + "#{window_layout}"
+	output, err := tmux.DefaultClient.Run("list-windows", "-t", sessionName, "-F", format)
+	if err != nil {
+		return nil
+	}
+	return parseWindowList(output, sep)
+}
+
+// parseWindowList parses the sep-delimited `list-windows` output produced by
+// captureWindows into WindowState records. Split out as a pure function so the
+// parsing is unit-testable without a live tmux server. Lines that are blank,
+// under-delimited, or carry a non-numeric window index are skipped.
+func parseWindowList(output, sep string) []WindowState {
+	var windows []WindowState
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.SplitN(line, sep, 5)
+		if len(fields) < 5 {
+			continue
+		}
+		idx, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+		if err != nil {
+			continue
+		}
+		windows = append(windows, WindowState{
+			Index:  idx,
+			Name:   fields[1],
+			Active: strings.TrimSpace(fields[2]) == "1",
+			Zoomed: strings.TrimSpace(fields[3]) == "1",
+			Layout: strings.TrimSpace(fields[4]),
+		})
+	}
+	return windows
 }
 
 // countAgents counts agents by type from pane list.
@@ -111,12 +162,16 @@ func countAgents(panes []tmux.Pane) AgentConfig {
 			config.Codex++
 		case tmux.AgentGemini:
 			config.Gemini++
+		case tmux.AgentAntigravity:
+			config.Antigravity++
 		case tmux.AgentCursor:
 			config.Cursor++
 		case tmux.AgentWindsurf:
 			config.Windsurf++
 		case tmux.AgentAider:
 			config.Aider++
+		case tmux.AgentOpencode:
+			config.Opencode++
 		case tmux.AgentOllama:
 			config.Ollama++
 		case tmux.AgentUser:
@@ -126,8 +181,10 @@ func countAgents(panes []tmux.Pane) AgentConfig {
 	return config
 }
 
-// mapPaneStates converts tmux panes to PaneState.
-func mapPaneStates(panes []tmux.Pane) []PaneState {
+// mapPaneStates converts tmux panes to PaneState. sessionCwd is the session's
+// detected working directory, used as a fallback when a pane's own current path
+// cannot be read, for discovering each agent pane's resumable session id.
+func mapPaneStates(panes []tmux.Pane, sessionCwd string) []PaneState {
 	states := make([]PaneState, len(panes))
 	for i, p := range panes {
 		states[i] = PaneState{
@@ -141,8 +198,33 @@ func mapPaneStates(panes []tmux.Pane) []PaneState {
 			Height:      p.Height,
 			PaneID:      p.ID,
 		}
+
+		// Best-effort: link each agent pane to its provider session id so it
+		// can be resumed later. User/editor panes return no provider.
+		if agentsession.ResumeProvider(string(p.Type)) == "" {
+			continue
+		}
+		paneCwd := paneCurrentPath(p.ID)
+		if paneCwd == "" {
+			paneCwd = sessionCwd
+		}
+		if info := agentsession.Discover(string(p.Type), paneCwd); info != nil {
+			states[i].SessionID = info.SessionID
+			states[i].SessionProvider = info.Provider
+			states[i].SessionFile = info.SourcePath
+		}
 	}
 	return states
+}
+
+// paneCurrentPath reads a single pane's current working directory via tmux.
+// Returns "" on any failure.
+func paneCurrentPath(paneID string) string {
+	output, err := tmux.DefaultClient.Run("display-message", "-t", paneID, "-p", "#{pane_current_path}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(output)
 }
 
 // detectWorkDir attempts to detect the working directory for the session.

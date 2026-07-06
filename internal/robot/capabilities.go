@@ -837,7 +837,8 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "session", Flag: "--robot-spawn", Type: "string", Required: true, Description: "Session name to create"},
 				{Name: "spawn-cc", Flag: "--spawn-cc", Type: "int", Required: false, Description: "Number of Claude agents"},
 				{Name: "spawn-cod", Flag: "--spawn-cod", Type: "int", Required: false, Description: "Number of Codex agents"},
-				{Name: "spawn-gmi", Flag: "--spawn-gmi", Type: "int", Required: false, Description: "Number of Gemini agents"},
+				{Name: "spawn-gmi", Flag: "--spawn-gmi", Type: "int", Required: false, Description: "Number of Gemini agents (legacy)"},
+				{Name: "spawn-agy", Flag: "--spawn-agy", Type: "int", Required: false, Description: "Number of Antigravity (agy) agents"},
 				{Name: "spawn-preset", Flag: "--spawn-preset", Type: "string", Required: false, Description: "Use recipe preset instead of counts"},
 				{Name: "spawn-no-user", Flag: "--spawn-no-user", Type: "bool", Required: false, Description: "Skip user pane creation"},
 				{Name: "spawn-wait", Flag: "--spawn-wait", Type: "bool", Required: false, Description: "Wait for agents to show ready state before returning"},
@@ -1456,6 +1457,20 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Examples: []string{"ntm --robot-dcg-check --command='rm -rf /tmp'"},
 		},
 		{
+			Name:        "safety-simulate",
+			Flag:        "--robot-safety-simulate",
+			Category:    "utility",
+			Description: "Simulate a multi-step command plan against the NTM safety policy without executing any command.",
+			Parameters: []RobotParameter{
+				{Name: "command", Flag: "--command", Type: "string", Required: false, Description: "Single command to simulate"},
+				{Name: "step", Flag: "--step", Type: "string", Required: false, Description: "Command step to simulate; repeat for multi-step plans"},
+			},
+			Examples: []string{
+				"ntm --robot-safety-simulate --command='git reset --hard HEAD~1'",
+				"ntm --robot-safety-simulate --step='git status' --step='git reset --hard HEAD~1'",
+			},
+		},
+		{
 			Name:        "slb-pending",
 			Flag:        "--robot-slb-pending",
 			Category:    "utility",
@@ -1747,6 +1762,28 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Examples: []string{
 				"ntm --robot-history=myproject --last=10",
 				"ntm --robot-history=myproject --since=1h --type=claude",
+			},
+		},
+		{
+			Name:        "causality",
+			Flag:        "--robot-causality",
+			Category:    "utility",
+			Description: "Get unified causality timeline across audit, Agent Mail, and pipeline/session state. Count semantics: total=post-dedupe pre-filter events, available=post-filter pre-limit events, filtered=returned events.",
+			Parameters: []RobotParameter{
+				{Name: "session", Flag: "--robot-causality", Type: "string", Required: true, Description: "Session name"},
+				{Name: "causality-project", Flag: "--causality-project", Type: "string", Required: false, Description: "Project path override for Agent Mail and pipeline state lookup"},
+				{Name: "causality-agent", Flag: "--causality-agent", Type: "string", Required: false, Description: "Agent Mail identity for inbox reads"},
+				{Name: "causality-bead", Flag: "--causality-bead", Type: "string", Required: false, Description: "Filter by bead/thread id"},
+				{Name: "causality-pane", Flag: "--causality-pane", Type: "string", Required: false, Description: "Filter by pane id/index"},
+				{Name: "causality-type", Flag: "--causality-type", Type: "string", Required: false, Description: "Filter by normalized event type"},
+				{Name: "causality-chain", Flag: "--causality-chain", Type: "string", Required: false, Description: "Filter by correlation/chain id"},
+				{Name: "causality-since", Flag: "--causality-since", Type: "string", Required: false, Description: "Lower time bound (duration or RFC3339)"},
+				{Name: "causality-until", Flag: "--causality-until", Type: "string", Required: false, Description: "Upper time bound (duration or RFC3339)"},
+				{Name: "causality-limit", Flag: "--causality-limit", Type: "int", Required: false, Default: "200", Description: "Max events to return"},
+			},
+			Examples: []string{
+				"ntm --robot-causality=myproject --causality-bead=bd-2mb03.4",
+				"ntm --robot-causality=myproject --causality-since=1h --causality-type=reservation_active",
 			},
 		},
 		{

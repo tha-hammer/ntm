@@ -67,7 +67,10 @@ func newMemoryContextCmd() *cobra.Command {
 				return err
 			}
 
-			ctxResult, err := client.GetContext(context.Background(), task)
+			// `dir` is the project directory the user invoked us from; pass it
+			// as the workspace scope so same-basename projects don't bleed
+			// memory results into each other (#132).
+			ctxResult, err := client.GetContext(context.Background(), task, dir)
 			if err != nil {
 				return err
 			}

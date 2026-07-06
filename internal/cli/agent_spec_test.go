@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/plugins"
 )
 
 func TestParseAgentSpec_ModelValidation(t *testing.T) {
@@ -29,6 +30,47 @@ func TestParseAgentSpec_ModelValidation(t *testing.T) {
 		}
 		if !tt.expectError && err != nil {
 			t.Fatalf("unexpected error for %q: %v", tt.value, err)
+		}
+	}
+}
+
+// ntm#140: the N:model:effort form threads a reasoning-effort hint
+// through to the agent template.
+func TestParseAgentSpec_ReasoningEffort(t *testing.T) {
+	tests := []struct {
+		value       string
+		wantCount   int
+		wantModel   string
+		wantEffort  string
+		expectError bool
+	}{
+		{"1", 1, "", "", false},
+		{"2:gpt-5", 2, "gpt-5", "", false},
+		{"1:gpt-5:medium", 1, "gpt-5", "medium", false},
+		{"3:gpt-5-codex:xhigh", 3, "gpt-5-codex", "xhigh", false},
+		{"1:gpt-5:", 1, "", "", true}, // empty effort segment rejected
+		{"1:gpt-5:bad effort", 1, "", "", true},
+		{"1:gpt-5:$(pwn)", 1, "", "", true},
+	}
+	for _, tt := range tests {
+		spec, err := ParseAgentSpec(tt.value)
+		if tt.expectError {
+			if err == nil {
+				t.Fatalf("expected error for %q; got spec=%+v", tt.value, spec)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", tt.value, err)
+		}
+		if spec.Count != tt.wantCount {
+			t.Errorf("%q: count=%d want %d", tt.value, spec.Count, tt.wantCount)
+		}
+		if spec.Model != tt.wantModel {
+			t.Errorf("%q: model=%q want %q", tt.value, spec.Model, tt.wantModel)
+		}
+		if spec.ReasoningEffort != tt.wantEffort {
+			t.Errorf("%q: effort=%q want %q", tt.value, spec.ReasoningEffort, tt.wantEffort)
 		}
 	}
 }
@@ -150,6 +192,56 @@ func TestResolveModel_EmptySpecReturnsDefault(t *testing.T) {
 	got := ResolveModel(AgentTypeClaude, "")
 	// Just verify it doesn't panic; the result depends on whether cfg is set
 	_ = got
+}
+
+// TestResolveAgentModel_Precedence verifies the three-tier precedence for
+// plugin-aware model resolution (ntm#203): explicit spec model, then the global
+// config default for the agent type, then the plugin's declared default.
+func TestResolveAgentModel_Precedence(t *testing.T) {
+	oldCfg := cfg
+	defer func() { cfg = oldCfg }()
+	cfg = config.Default()
+
+	hermes := plugins.AgentPlugin{Name: "hermes"}
+	hermes.Defaults.Model = "google/gemini-2.5-flash"
+	// A plugin entry keyed to a built-in type proves the global default wins
+	// over a plugin default (this branch is never reached for built-ins).
+	ccPlugin := plugins.AgentPlugin{Name: "cc"}
+	ccPlugin.Defaults.Model = "plugin/should-not-win"
+	pluginMap := map[string]plugins.AgentPlugin{
+		"hermes": hermes,
+		"cc":     ccPlugin,
+	}
+
+	// 1. Explicit model on the spec wins over the plugin default.
+	if got := resolveAgentModel(AgentType("hermes"), "anthropic/claude-opus-4", pluginMap); got != "anthropic/claude-opus-4" {
+		t.Errorf("explicit model: got %q, want %q", got, "anthropic/claude-opus-4")
+	}
+
+	// 2. Global config default for a built-in type wins over any plugin default.
+	wantDefault := cfg.Models.DefaultClaude
+	if wantDefault == "" {
+		t.Fatal("expected a non-empty default claude model in config.Default()")
+	}
+	if got := resolveAgentModel(AgentTypeClaude, "", pluginMap); got != wantDefault {
+		t.Errorf("global default: got %q, want %q", got, wantDefault)
+	}
+
+	// 3. Plugin default is used when there is no explicit model and no global
+	//    default (the bare `--hermes=1` case that previously spawned empty).
+	if got := resolveAgentModel(AgentType("hermes"), "", pluginMap); got != "google/gemini-2.5-flash" {
+		t.Errorf("plugin default: got %q, want %q", got, "google/gemini-2.5-flash")
+	}
+
+	// 4. An agent type absent from the plugin map yields empty.
+	if got := resolveAgentModel(AgentType("nonexistent"), "", pluginMap); got != "" {
+		t.Errorf("missing plugin: got %q, want empty", got)
+	}
+
+	// A nil plugin map also yields empty for an otherwise-unknown plugin type.
+	if got := resolveAgentModel(AgentType("hermes"), "", nil); got != "" {
+		t.Errorf("nil plugin map: got %q, want empty", got)
+	}
 }
 
 func TestValidateModelAlias_EmptyAlias(t *testing.T) {
@@ -335,13 +427,13 @@ func TestResolveModel_WithConfig(t *testing.T) {
 		modelSpec string
 		want      string
 	}{
-		{"claude alias opus", AgentTypeClaude, "opus", "claude-opus-4-6"},
+		{"claude alias opus", AgentTypeClaude, "opus", "claude-opus-4-8"},
 		{"claude alias sonnet", AgentTypeClaude, "sonnet", "claude-sonnet-4-6"},
 		{"codex alias o3", AgentTypeCodex, "o3", "o3"},
 		{"gemini alias flash", AgentTypeGemini, "flash", "gemini-3-flash"},
 		{"unknown alias passthrough", AgentTypeClaude, "unknown-custom", "unknown-custom"},
-		{"claude default", AgentTypeClaude, "", "claude-opus-4-6"},
-		{"codex default", AgentTypeCodex, "", "gpt-5.3-codex"},
+		{"claude default", AgentTypeClaude, "", "claude-opus-4-8"},
+		{"codex default", AgentTypeCodex, "", "gpt-5.5"},
 		{"gemini default", AgentTypeGemini, "", "gemini-3-pro-preview"},
 	}
 
@@ -490,8 +582,8 @@ func TestAgentSpecsValue_SetWithType(t *testing.T) {
 	var specs AgentSpecs
 	v := NewAgentSpecsValue(AgentTypeClaude, &specs)
 
-	if v.Type() != "N[:model]" {
-		t.Errorf("Type() = %q, want N[:model]", v.Type())
+	if v.Type() != "N[:model[:effort]]" {
+		t.Errorf("Type() = %q, want N[:model[:effort]]", v.Type())
 	}
 
 	err := v.Set("2:opus")

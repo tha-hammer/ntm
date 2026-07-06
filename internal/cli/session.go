@@ -92,6 +92,10 @@ func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (
 		return string(th.Codex), ic.AgentIcon(string(agentpkg.AgentTypeCodex))
 	case agentpkg.AgentTypeGemini:
 		return string(th.Gemini), ic.AgentIcon(string(agentpkg.AgentTypeGemini))
+	case agentpkg.AgentTypeAntigravity:
+		// agy (Antigravity) gets the lavender accent (matching the semantic
+		// theme palette); AgentIcon maps antigravity → the Gemini glyph.
+		return string(th.Lavender), ic.AgentIcon(string(agentpkg.AgentTypeAntigravity))
 	case agentpkg.AgentTypeCursor:
 		return string(th.Cursor), ic.AgentIcon(string(agentpkg.AgentTypeCursor))
 	case agentpkg.AgentTypeWindsurf:
@@ -445,6 +449,9 @@ func runList(tags []string, project ...string) error {
 				}
 				if s.AgentCounts.Gemini > 0 {
 					parts = append(parts, fmt.Sprintf("%d GMI", s.AgentCounts.Gemini))
+				}
+				if s.AgentCounts.Antigravity > 0 {
+					parts = append(parts, fmt.Sprintf("%d AGY", s.AgentCounts.Antigravity))
 				}
 				if s.AgentCounts.Ollama > 0 {
 					parts = append(parts, fmt.Sprintf("%d OLL", s.AgentCounts.Ollama))
@@ -1051,6 +1058,7 @@ func runStatusOnce(w io.Writer, session string, opts statusOptions) error {
 	ccCount := counts.Claude
 	codCount := counts.Codex
 	gmiCount := counts.Gemini
+	agyCount := counts.Antigravity
 	ollamaCount := counts.Ollama
 	cursorCount := counts.Cursor
 	windsurfCount := counts.Windsurf
@@ -1103,6 +1111,7 @@ func runStatusOnce(w io.Writer, session string, opts statusOptions) error {
 	claude := color(t.Claude)
 	codex := color(t.Codex)
 	gemini := color(t.Gemini)
+	antigravity := color(t.Lavender)
 	ollama := color(t.Ollama)
 
 	ic := icons.Current()
@@ -1334,6 +1343,10 @@ func runStatusOnce(w io.Writer, session string, opts statusOptions) error {
 	if gmiCount > 0 {
 		fmt.Fprintf(w, "    %s%s Gemini%s  %s%d instance(s)%s\n", gemini, ic.Gemini, reset, text, gmiCount, reset)
 	}
+	if agyCount > 0 {
+		agyColorKey, agyIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentAntigravity}, t, ic)
+		fmt.Fprintf(w, "    %s%s Antigravity%s %s%d instance(s)%s\n", color(agyColorKey), agyIcon, reset, text, agyCount, reset)
+	}
 	if ollamaCount > 0 {
 		fmt.Fprintf(w, "    %s%s Ollama%s %s%d instance(s)%s\n", ollama, ic.Ollama, reset, text, ollamaCount, reset)
 	}
@@ -1358,7 +1371,7 @@ func runStatusOnce(w io.Writer, session string, opts statusOptions) error {
 		fmt.Fprintf(w, "    %s%s Other%s   %s%d pane(s)%s\n", color(otherColorKey), otherIcon, reset, text, otherCount, reset)
 	}
 
-	totalAgents := ccCount + codCount + gmiCount + ollamaCount + cursorCount + windsurfCount + aiderCount + otherCount
+	totalAgents := ccCount + codCount + gmiCount + agyCount + ollamaCount + cursorCount + windsurfCount + aiderCount + otherCount
 	if totalAgents == 0 {
 		fmt.Fprintf(w, "    %sNo agents running%s\n", overlay, reset)
 	}
@@ -1453,6 +1466,8 @@ func runStatusOnce(w io.Writer, session string, opts statusOptions) error {
 						agentColor = codex
 					case "gemini":
 						agentColor = gemini
+					case "antigravity":
+						agentColor = antigravity
 					default:
 						agentColor = text
 					}
@@ -1699,7 +1714,9 @@ func modelNameForPane(p tmux.Pane) string {
 			if cfg.Models.DefaultCodex != "" {
 				return cfg.Models.DefaultCodex
 			}
-		case tmux.AgentGemini:
+		case tmux.AgentGemini, tmux.AgentAntigravity:
+			// agy (Antigravity) shares Gemini-class models, so it mirrors
+			// Gemini's default model selection.
 			if cfg.Models.DefaultGemini != "" {
 				return cfg.Models.DefaultGemini
 			}
@@ -1717,7 +1734,7 @@ func modelNameForPane(p tmux.Pane) string {
 		return defaults.DefaultClaude
 	case tmux.AgentCodex:
 		return defaults.DefaultCodex
-	case tmux.AgentGemini:
+	case tmux.AgentGemini, tmux.AgentAntigravity:
 		return defaults.DefaultGemini
 	case tmux.AgentOllama:
 		return defaults.DefaultOllama

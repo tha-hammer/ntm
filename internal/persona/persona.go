@@ -26,8 +26,13 @@ type Persona struct {
 	Model        string   `toml:"model"`         // Model alias or full name
 	SystemPrompt string   `toml:"system_prompt"` // System prompt to inject
 	Temperature  *float64 `toml:"temperature,omitempty"`
-	ContextFiles []string `toml:"context_files,omitempty"` // Globs of files to include in context
-	Tags         []string `toml:"tags,omitempty"`
+
+	// ReasoningEffort sets the model's reasoning budget, rendered into the
+	// Codex `model_reasoning_effort` flag at spawn time. Empty falls back to the
+	// agent-command template default. See FlatAgent.ReasoningEffort.
+	ReasoningEffort string   `toml:"reasoning_effort,omitempty"`
+	ContextFiles    []string `toml:"context_files,omitempty"` // Globs of files to include in context
+	Tags            []string `toml:"tags,omitempty"`
 
 	// FocusPatterns are glob patterns indicating which files this persona "owns".
 	// Used for routing hints, dashboard display, and alert triggers.
@@ -86,12 +91,16 @@ func (p *Persona) AgentTypeFlag() string {
 		return "cod"
 	case agentpkg.AgentTypeGemini:
 		return "gmi"
+	case agentpkg.AgentTypeAntigravity:
+		return "agy"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:
 		return "windsurf"
 	case agentpkg.AgentTypeAider:
 		return "aider"
+	case agentpkg.AgentTypeOpencode:
+		return "oc"
 	case agentpkg.AgentTypeOllama:
 		return "ollama"
 	default:
@@ -115,7 +124,8 @@ func (p *Persona) Validate() error {
 		// Validate agent type aliases against the shared canonical resolver.
 		switch agentpkg.AgentType(p.AgentType).Canonical() {
 		case agentpkg.AgentTypeClaudeCode, agentpkg.AgentTypeCodex, agentpkg.AgentTypeGemini,
-			agentpkg.AgentTypeCursor, agentpkg.AgentTypeWindsurf, agentpkg.AgentTypeAider, agentpkg.AgentTypeOllama:
+			agentpkg.AgentTypeAntigravity, agentpkg.AgentTypeCursor, agentpkg.AgentTypeWindsurf,
+			agentpkg.AgentTypeAider, agentpkg.AgentTypeOpencode, agentpkg.AgentTypeOllama:
 			// valid
 		default:
 			return fmt.Errorf("persona %q: invalid agent_type %q", p.Name, p.AgentType)
@@ -246,6 +256,7 @@ func mergePersonas(parent, child *Persona) *Persona {
 		Description:        child.Description,
 		AgentType:          child.AgentType,
 		Model:              child.Model,
+		ReasoningEffort:    child.ReasoningEffort,
 		SystemPrompt:       child.SystemPrompt,
 		Temperature:        child.Temperature,
 		Extends:            child.Extends,
@@ -275,6 +286,9 @@ func mergePersonas(parent, child *Persona) *Persona {
 	}
 	if merged.Model == "" {
 		merged.Model = parent.Model
+	}
+	if merged.ReasoningEffort == "" {
+		merged.ReasoningEffort = parent.ReasoningEffort
 	}
 	if merged.Temperature == nil && parent.Temperature != nil {
 		temp := *parent.Temperature

@@ -103,12 +103,12 @@ Burst patterns           → Typical of AI token streaming
 **2. Pattern Library**
 Agent-specific regex patterns that identify states:
 
-| Pattern Type | Claude Examples | Codex Examples | Gemini Examples |
-|--------------|-----------------|----------------|-----------------|
-| Idle Prompt | `claude>`, `Claude Code>` | `$`, `codex>` | `gemini>`, `>>>` |
-| Error | `rate limit`, `error:` | `Error:`, `429` | `Error`, `quota` |
-| Thinking | `...`, `Thinking` | `...` | `Thinking...` |
-| Completion | `Done`, `✓` | `Complete` | `Finished` |
+| Pattern Type | Claude Examples | Codex Examples | Antigravity Examples | Gemini Examples (legacy) |
+|--------------|-----------------|----------------|----------------------|--------------------------|
+| Idle Prompt | `claude>`, `Claude Code>` | `$`, `codex>` | `agy>`, `>>>` | `gemini>`, `>>>` |
+| Error | `rate limit`, `error:` | `Error:`, `429` | `Error`, `quota` | `Error`, `quota` |
+| Thinking | `...`, `Thinking` | `...` | `Thinking...` | `Thinking...` |
+| Completion | `Done`, `✓` | `Complete` | `Finished` | `Finished` |
 
 **3. State Classification**
 Combine velocity + patterns into confidence-weighted states:
@@ -316,7 +316,7 @@ ON agent_health == unhealthy:
 
         SEND Ctrl+C to pane
         WAIT for shell prompt
-        SEND agent launch command (cc, cod, gmi)
+        SEND agent launch command (cc, cod, agy, gmi)
 
         restarts_this_hour++
         UPDATE health state
@@ -782,7 +782,7 @@ steps:
   - id: test
     name: "Testing"
     when: ${vars.run_tests}    # Only run if run_tests is true
-    agent: gemini
+    agent: antigravity
     depends_on: [parallel_impl]
     prompt: |
       Test these implementations:
@@ -810,7 +810,7 @@ Run multiple steps concurrently on different agents:
       agent: codex
       prompt: Research technical options
     - id: competitor_analysis
-      agent: gemini
+      agent: antigravity
       prompt: Analyze competitors
   # All three run simultaneously, next step waits for all
 
@@ -914,6 +914,10 @@ Extract structured data from step outputs:
 | `${steps.X.pane}` | `${steps.design.pane}` | Pane used for step |
 | `${env.X}` | `${env.HOME}` | Environment variable |
 | `${session}` | `myproject` | Session name |
+
+Environment variables expose the runner's process environment to the workflow.
+Missing values fail substitution unless the expression includes a default such as
+`${env.OPTIONAL_TOKEN | ""}`.
 
 ### Error Handling
 

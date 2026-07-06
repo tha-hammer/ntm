@@ -461,7 +461,7 @@ func NormalizeProvider(provider string) string {
 		return "anthropic"
 	case agent.AgentTypeCodex:
 		return "openai"
-	case agent.AgentTypeGemini:
+	case agent.AgentTypeGemini, agent.AgentTypeAntigravity:
 		return "google"
 	case agent.AgentTypeOllama:
 		return "ollama"
@@ -823,7 +823,7 @@ func (ct *CodexThrottle) advanceStateLocked() {
 				ct.phase = ThrottleNormal
 				ct.affectedPanes = nil // Clear affected panes on full recovery
 			}
-			ct.lastRecoveryStep = now
+			ct.lastRecoveryStep = ct.lastRecoveryStep.Add(time.Duration(steps) * RecoveryCheckInterval)
 		}
 	}
 }

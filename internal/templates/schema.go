@@ -102,6 +102,10 @@ type AgentsSpec struct {
 	// Gemini defines Google Gemini agent configuration.
 	Gemini *AgentTypeSpec `yaml:"gemini,omitempty"`
 
+	// Antigravity defines Google Antigravity (agy) agent configuration —
+	// the successor to the Gemini CLI.
+	Antigravity *AgentTypeSpec `yaml:"antigravity,omitempty"`
+
 	// Cursor defines Cursor agent configuration.
 	Cursor *AgentTypeSpec `yaml:"cursor,omitempty"`
 
@@ -431,6 +435,9 @@ func (t *SessionTemplate) GetAgentCount() int {
 	if t.Spec.Agents.Gemini != nil {
 		count += t.Spec.Agents.Gemini.Count
 	}
+	if t.Spec.Agents.Antigravity != nil {
+		count += t.Spec.Agents.Antigravity.Count
+	}
 	if t.Spec.Agents.Cursor != nil {
 		count += t.Spec.Agents.Cursor.Count
 	}
@@ -464,6 +471,9 @@ func (t *SessionTemplate) MergeFrom(parent *SessionTemplate) {
 	}
 	if parent.Spec.Agents.Gemini != nil && t.Spec.Agents.Gemini == nil {
 		t.Spec.Agents.Gemini = parent.Spec.Agents.Gemini
+	}
+	if parent.Spec.Agents.Antigravity != nil && t.Spec.Agents.Antigravity == nil {
+		t.Spec.Agents.Antigravity = parent.Spec.Agents.Antigravity
 	}
 	if parent.Spec.Agents.Cursor != nil && t.Spec.Agents.Cursor == nil {
 		t.Spec.Agents.Cursor = parent.Spec.Agents.Cursor
@@ -580,6 +590,13 @@ func (a *AgentsSpec) Validate() error {
 			return err
 		}
 		total += a.Gemini.TotalCount()
+	}
+
+	if a.Antigravity != nil {
+		if err := a.Antigravity.Validate("antigravity"); err != nil {
+			return err
+		}
+		total += a.Antigravity.TotalCount()
 	}
 
 	if a.Cursor != nil {

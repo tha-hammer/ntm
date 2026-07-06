@@ -415,7 +415,22 @@ func (enc *toonEncoder) getFieldValue(v reflect.Value, field string) (reflect.Va
 
 	switch v.Kind() {
 	case reflect.Map:
-		return v.MapIndex(reflect.ValueOf(field)), nil
+		// The map key type may be a named string type (e.g. robot.EventCategory,
+		// `type EventCategory string`), not plain `string`. reflect.Value.MapIndex
+		// panics if the key value's type isn't assignable to the map's key type,
+		// so convert the string field name into the map's actual key type first.
+		keyType := v.Type().Key()
+		keyVal := reflect.ValueOf(field)
+		if !keyVal.Type().AssignableTo(keyType) {
+			if keyType.Kind() == reflect.String && keyVal.Type().ConvertibleTo(keyType) {
+				keyVal = keyVal.Convert(keyType)
+			} else {
+				// Non-string-keyed map: there is no string field to look up here.
+				// Return a zero Value (treated as absent) rather than panicking.
+				return reflect.Value{}, nil
+			}
+		}
+		return v.MapIndex(keyVal), nil
 	case reflect.Struct:
 		// First try JSON tag
 		t := v.Type()
