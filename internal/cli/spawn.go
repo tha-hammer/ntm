@@ -1821,6 +1821,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		paneID        string
 		paneIndex     int
 		paneTitle     string // e.g., "myproject__cc_1"
+		agentName     string // Agent Mail identity resolved before launch (pane title + AGENT_NAME env)
 		agentType     string
 		model         string // alias
 		resolvedModel string // full name
@@ -1834,6 +1835,22 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		promptDelay         time.Duration // Stagger delay before prompt delivery
 	}
 	var launchedAgents []launchedAgent
+
+	// Lazily-loaded Agent Mail session registry. Used to resolve each pane's
+	// Agent Mail identity *before* launch so the name can be threaded into the
+	// pane title and the AGENT_NAME env var. Loaded once, reused across panes.
+	registryLoaded := false
+	var spawnRegistry *agentmail.SessionAgentRegistry
+	loadSpawnRegistry := func() *agentmail.SessionAgentRegistry {
+		if registryLoaded {
+			return spawnRegistry
+		}
+		registryLoaded = true
+		if registry, err := agentmail.LoadBestSessionAgentRegistry(opts.Session, dir); err == nil {
+			spawnRegistry = registry
+		}
+		return spawnRegistry
+	}
 
 	// Track agent index for stagger calculation (0-based, regardless of user pane)
 	staggerAgentIdx := 0
@@ -2133,6 +2150,40 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			}
 		}
 
+		// Resolve the Agent Mail identity for this pane *before* launch so the
+		// name can be shown in the pane title and threaded into the startup
+		// command via AGENT_NAME. Reuse an existing identity when present,
+		// otherwise pre-register just this pane to mint one. The post-launch
+		// registration below reuses whatever we persist here (registry is saved
+		// on each call), so no second identity is minted.
+		agentMailName := ""
+		if registry := loadSpawnRegistry(); registry != nil {
+			if existingName, ok := registry.GetAgent(title, pane.ID); ok {
+				agentMailName = strings.TrimSpace(existingName)
+			}
+		}
+		if agentMailName == "" {
+			preRegisterStatus := registerSpawnedAgents(dir, opts.Session, []spawnedAgentInfo{
+				{
+					paneIndex:     pane.Index,
+					paneID:        pane.ID,
+					paneTitle:     title,
+					agentType:     string(agent.Type),
+					model:         agent.Model,
+					resolvedModel: resolvedModel,
+				},
+			})
+			if preRegisterStatus != nil {
+				agentMailName = strings.TrimSpace(preRegisterStatus.AgentMap[fmt.Sprintf("%d", pane.Index)])
+			}
+		}
+		if agentMailName != "" {
+			title = fmt.Sprintf("AGENT NAME = %s", agentMailName)
+			if err := tmux.SetPaneTitle(pane.ID, title); err != nil && !IsJSONOutput() {
+				fmt.Printf("⚠ Warning: could not set Agent Mail pane title for pane %d: %v\n", pane.Index, err)
+			}
+		}
+
 		// Generate command using template
 		agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, config.AgentTemplateVars{
 			Model:            resolvedModel,
@@ -2171,6 +2222,11 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		// Apply spawn context environment variables
 		// These allow agents to programmatically access their spawn position
 		agentCmd = agentSpawnCtx.EnvVarPrefix() + agentCmd
+		// Thread the resolved Agent Mail name into the startup command so the
+		// agent process sees its assigned identity in $AGENT_NAME.
+		if agentMailName != "" {
+			agentCmd = fmt.Sprintf("AGENT_NAME=%s %s", tmux.ShellQuote(agentMailName), agentCmd)
+		}
 
 		safeAgentCmd, err := tmux.SanitizePaneCommand(agentCmd)
 		if err != nil {
@@ -2226,8 +2282,9 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		pID := pane.ID
 		pTitle := title
 		idx := agent.Index
+		pAgentMailName := agentMailName
 
-		go func(paneID, paneTitle string, idx int, agentType AgentType, agent FlatAgent, panePrompt string, hasPrompt bool) {
+		go func(paneID, paneTitle string, idx int, agentType AgentType, agent FlatAgent, panePrompt string, hasPrompt bool, agentMailName string) {
 			defer setupWg.Done()
 
 			// Gemini post-spawn setup: auto-select Pro model
@@ -2251,6 +2308,16 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 					if !IsJSONOutput() && cfg.GeminiSetup.Verbose {
 						fmt.Printf("✓ Gemini %d configured for Pro model\n", idx)
 					}
+				}
+			}
+
+			// Bootstrap the agent's own Agent Mail registration with its assigned
+			// name, so it self-registers under the same identity ntm reserved.
+			if agentMailName != "" {
+				firstPrompt := fmt.Sprintf("register with agent mail. use %s for your name", agentMailName)
+				time.Sleep(150 * time.Millisecond)
+				if err := sendPromptWithDoubleEnterForAgent(paneID, firstPrompt, tmux.AgentType(agentType)); err != nil && !IsJSONOutput() {
+					fmt.Printf("⚠ Warning: failed to send Agent Mail bootstrap prompt for agent %d: %v\n", idx, err)
 				}
 			}
 
@@ -2331,7 +2398,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 					}
 				}
 			}
-		}(pID, pTitle, idx, agent.Type, agent, panePrompt, hasPrompt)
+		}(pID, pTitle, idx, agent.Type, agent, panePrompt, hasPrompt, pAgentMailName)
 
 		// Schedule staggered prompt delivery in spawn state (Main Thread)
 		if isStaggered && hasPrompt {
@@ -2356,6 +2423,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			paneID:              pane.ID,
 			paneIndex:           pane.Index,
 			paneTitle:           title,
+			agentName:           agentMailName,
 			agentType:           string(agent.Type),
 			model:               agent.Model,
 			resolvedModel:       resolvedModel,
