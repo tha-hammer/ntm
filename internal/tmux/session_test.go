@@ -1490,6 +1490,96 @@ func TestFormatPaneName(t *testing.T) {
 	}
 }
 
+// TestWithPaneTagKeepsTitleParseable guards the Agent Mail pane-naming fix: a
+// pane that gets an Agent Mail name must keep its session__type_index identity
+// so pane addressing by Type/NTMIndex (grep/output/scale) still resolves it.
+// The prior implementation overwrote the whole title with "AGENT NAME = <name>",
+// which made renamed panes parse as user shells (regression).
+func TestWithPaneTagKeepsTitleParseable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		title       string
+		tag         string
+		want        string
+		wantType    AgentType
+		wantIndex   int
+		wantVariant string
+		wantTags    []string
+	}{
+		{
+			name:      "no variant",
+			title:     "sequences__cc_1",
+			tag:       "brightlynx",
+			want:      "sequences__cc_1[brightlynx]",
+			wantType:  AgentClaude,
+			wantIndex: 1,
+			wantTags:  []string{"brightlynx"},
+		},
+		{
+			name:        "with model variant",
+			title:       "sequences__cc_1_opus",
+			tag:         "brightlynx",
+			want:        "sequences__cc_1_opus[brightlynx]",
+			wantType:    AgentClaude,
+			wantIndex:   1,
+			wantVariant: "opus",
+			wantTags:    []string{"brightlynx"},
+		},
+		{
+			name:      "merges into existing tags",
+			title:     "sequences__cod_2[frontend]",
+			tag:       "brownspring",
+			want:      "sequences__cod_2[frontend,brownspring]",
+			wantType:  AgentCodex,
+			wantIndex: 2,
+			wantTags:  []string{"frontend", "brownspring"},
+		},
+		{
+			name:      "sanitizes brackets and commas in name",
+			title:     "sequences__cc_3",
+			tag:       "weird[name],x",
+			want:      "sequences__cc_3[weirdnamex]",
+			wantType:  AgentClaude,
+			wantIndex: 3,
+			wantTags:  []string{"weirdnamex"},
+		},
+		{
+			name:      "empty tag is a no-op",
+			title:     "sequences__cc_4",
+			tag:       "   ",
+			want:      "sequences__cc_4",
+			wantType:  AgentClaude,
+			wantIndex: 4,
+			wantTags:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := WithPaneTag(tt.title, tt.tag)
+			if got != tt.want {
+				t.Fatalf("WithPaneTag(%q, %q) = %q, want %q", tt.title, tt.tag, got, tt.want)
+			}
+			// The whole point: the resulting title must still parse as an agent.
+			gotType, gotIndex, gotVariant, gotTags := parseAgentFromTitle(got)
+			if gotType != tt.wantType || gotIndex != tt.wantIndex || gotVariant != tt.wantVariant {
+				t.Errorf("parseAgentFromTitle(%q) = (%q, %d, %q); want (%q, %d, %q)",
+					got, gotType, gotIndex, gotVariant, tt.wantType, tt.wantIndex, tt.wantVariant)
+			}
+			if len(gotTags) != len(tt.wantTags) {
+				t.Fatalf("parseAgentFromTitle(%q) tags = %v; want %v", got, gotTags, tt.wantTags)
+			}
+			for i := range gotTags {
+				if gotTags[i] != tt.wantTags[i] {
+					t.Errorf("parseAgentFromTitle(%q) tags[%d] = %q; want %q", got, i, gotTags[i], tt.wantTags[i])
+				}
+			}
+		})
+	}
+}
+
 func TestNeedsBufferSend(t *testing.T) {
 	t.Parallel()
 

@@ -924,6 +924,27 @@ func FormatPaneName(session string, agentType string, index int, variant string)
 	return base
 }
 
+// WithPaneTag adds a tag to an ntm pane title's [tag] slot without breaking the
+// session__type_index grammar that parseAgentFromTitle (and thus pane
+// addressing by Type/NTMIndex) depends on. Used to surface an agent's Agent
+// Mail name in the pane title while keeping the title machine-parseable. If the
+// title already carries a [tags] block the new tag is merged into it. The tag is
+// sanitized (brackets and commas stripped) so it can't corrupt the title.
+func WithPaneTag(title, tag string) string {
+	tag = strings.NewReplacer("[", "", "]", "", ",", "").Replace(strings.TrimSpace(tag))
+	if tag == "" {
+		return title
+	}
+	if i := strings.LastIndex(title, "["); i >= 0 && strings.HasSuffix(title, "]") {
+		inner := strings.TrimSpace(title[i+1 : len(title)-1])
+		if inner == "" {
+			return title[:i] + "[" + tag + "]"
+		}
+		return title[:len(title)-1] + "," + tag + "]"
+	}
+	return title + "[" + tag + "]"
+}
+
 // SendKeys sends keys to a pane (default client)
 func SendKeys(target, keys string, enter bool) error {
 	return DefaultClient.SendKeys(target, keys, enter)
