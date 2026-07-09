@@ -3184,15 +3184,16 @@ func (s *Server) handleListPanesV1(w http.ResponseWriter, r *http.Request) {
 	paneList := make([]map[string]interface{}, len(panes))
 	for i, p := range panes {
 		paneList[i] = map[string]interface{}{
-			"index":   p.Index,
-			"id":      p.ID,
-			"title":   p.Title,
-			"type":    string(p.Type),
-			"variant": p.Variant,
-			"active":  p.Active,
-			"width":   p.Width,
-			"height":  p.Height,
-			"command": p.Command,
+			"index":        p.Index,
+			"window_index": p.WindowIndex,
+			"id":           p.ID,
+			"title":        p.Title,
+			"type":         string(p.Type),
+			"variant":      p.Variant,
+			"active":       p.Active,
+			"width":        p.Width,
+			"height":       p.Height,
+			"command":      p.Command,
 		}
 	}
 
@@ -3213,8 +3214,7 @@ func (s *Server) handleGetPaneV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	paneIdx := validatePaneIdx(w, paneIdxStr, reqID)
-	if paneIdx < 0 {
+	if validatePaneIdx(w, paneIdxStr, reqID) < 0 {
 		return
 	}
 
@@ -3224,27 +3224,34 @@ func (s *Server) handleGetPaneV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find the pane by index
-	for _, p := range panes {
-		if p.Index == paneIdx {
-			writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-				"pane": map[string]interface{}{
-					"index":   p.Index,
-					"id":      p.ID,
-					"title":   p.Title,
-					"type":    string(p.Type),
-					"variant": p.Variant,
-					"active":  p.Active,
-					"width":   p.Width,
-					"height":  p.Height,
-					"command": p.Command,
-				},
-			}, reqID)
+	// Resolve the pane window-aware (bare index or window.pane), failing loud
+	// on a bare index that is ambiguous across windows.
+	p, err := matchPaneByRef(panes, paneIdxStr)
+	if err != nil {
+		var amb *ambiguousPaneError
+		if errors.As(err, &amb) {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+				fmt.Sprintf("ambiguous pane reference: %v", err), nil, reqID)
 			return
 		}
+		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, "pane not found", nil, reqID)
+		return
 	}
 
-	writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, "pane not found", nil, reqID)
+	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+		"pane": map[string]interface{}{
+			"index":        p.Index,
+			"window_index": p.WindowIndex,
+			"id":           p.ID,
+			"title":        p.Title,
+			"type":         string(p.Type),
+			"variant":      p.Variant,
+			"active":       p.Active,
+			"width":        p.Width,
+			"height":       p.Height,
+			"command":      p.Command,
+		},
+	}, reqID)
 }
 
 // PaneInputRequest is the request body for POST /sessions/{id}/panes/{paneIdx}/input.
@@ -3297,7 +3304,7 @@ func (s *Server) handlePaneInputV1(w http.ResponseWriter, r *http.Request) {
 	// the target is base-index-independent — `<session>:<paneIdx>` looks
 	// like a pane index but tmux interprets it as a window index, which
 	// breaks on hosts with `base-index = 1` (see #141).
-	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdxStr, reqID)
 	if !ok {
 		return
 	}
@@ -3332,7 +3339,7 @@ func (s *Server) handlePaneInterruptV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdxStr, reqID)
 	if !ok {
 		return
 	}
@@ -3377,7 +3384,7 @@ func (s *Server) handlePaneOutputV1(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdxStr, reqID)
 	if !ok {
 		return
 	}
@@ -3425,7 +3432,7 @@ func (s *Server) handleGetPaneTitleV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdxStr, reqID)
 	if !ok {
 		return
 	}
@@ -3468,7 +3475,7 @@ func (s *Server) handleSetPaneTitleV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdxStr, reqID)
 	if !ok {
 		return
 	}
@@ -3503,7 +3510,7 @@ func (s *Server) handleStartPaneStreamV1(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	target, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	target, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdxStr, reqID)
 	if !ok {
 		return
 	}
@@ -3536,7 +3543,7 @@ func (s *Server) handleStopPaneStreamV1(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	target, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	target, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdxStr, reqID)
 	if !ok {
 		return
 	}
@@ -5931,22 +5938,109 @@ func matchesAttentionFilters(event robot.AttentionEvent, categoryFilter []string
 // window/pane ambiguity. The context is honored so the HTTP layer can
 // cancel a slow tmux ListPanes call, matching the rest of the handlers
 // (`handleGetPaneV1` etc.).
-func resolvePaneTargetByIndex(ctx context.Context, session string, paneIdx int) (string, error) {
+// ambiguousPaneError signals that a bare pane index matched panes in more than
+// one window, so the caller must use window.pane syntax to disambiguate.
+type ambiguousPaneError struct{ msg string }
+
+func (e *ambiguousPaneError) Error() string { return e.msg }
+
+// parsePaneRef parses a {paneIdx} path parameter. It accepts either a bare
+// window-local pane index ("2") or explicit "window.pane" syntax ("1.2"). The
+// bare form returns window == -1. Pane addressing in tmux is two-dimensional
+// (window, index); GetPanes lists a session's panes window-wide, so a bare
+// index can collide across windows (see matchPaneByRef).
+func parsePaneRef(raw string) (window int, pane int, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, 0, fmt.Errorf("empty pane reference")
+	}
+	if dot := strings.IndexByte(raw, '.'); dot >= 0 {
+		wnd, err1 := strconv.Atoi(raw[:dot])
+		pn, err2 := strconv.Atoi(raw[dot+1:])
+		if err1 != nil || err2 != nil || wnd < 0 || pn < 0 {
+			return 0, 0, fmt.Errorf("invalid window.pane reference %q", raw)
+		}
+		return wnd, pn, nil
+	}
+	pn, convErr := strconv.Atoi(raw)
+	if convErr != nil || pn < 0 {
+		return 0, 0, fmt.Errorf("invalid pane index %q", raw)
+	}
+	return -1, pn, nil
+}
+
+// matchPaneByRef resolves a pane reference against a pane list, window-aware.
+// Panes are matched after a deterministic sort by (WindowIndex, Index) so the
+// result never depends on the order tmux happened to list panes. A bare index
+// that collides across multiple windows is rejected as ambiguous rather than
+// silently resolving to the first match — mirroring the CLI's paneSpec/#170
+// behavior. Callers must then use window.pane syntax.
+func matchPaneByRef(panes []tmux.Pane, paneIdxStr string) (tmux.Pane, error) {
+	window, paneIdx, err := parsePaneRef(paneIdxStr)
+	if err != nil {
+		return tmux.Pane{}, err
+	}
+	sorted := append([]tmux.Pane(nil), panes...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].WindowIndex != sorted[j].WindowIndex {
+			return sorted[i].WindowIndex < sorted[j].WindowIndex
+		}
+		return sorted[i].Index < sorted[j].Index
+	})
+	if window >= 0 {
+		for _, p := range sorted {
+			if p.WindowIndex == window && p.Index == paneIdx {
+				return p, nil
+			}
+		}
+		return tmux.Pane{}, fmt.Errorf("no pane %d.%d", window, paneIdx)
+	}
+	var matches []tmux.Pane
+	for _, p := range sorted {
+		if p.Index == paneIdx {
+			matches = append(matches, p)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return tmux.Pane{}, fmt.Errorf("no pane with index %d", paneIdx)
+	case 1:
+		return matches[0], nil
+	default:
+		refs := make([]string, 0, len(matches))
+		for _, p := range matches {
+			refs = append(refs, fmt.Sprintf("%d.%d", p.WindowIndex, p.Index))
+		}
+		return tmux.Pane{}, &ambiguousPaneError{
+			msg: fmt.Sprintf("pane index %d is ambiguous across %d windows; use window.pane syntax (%s)",
+				paneIdx, len(matches), strings.Join(refs, ", ")),
+		}
+	}
+}
+
+// resolvePaneTargetByRef lists a session's panes and resolves a pane reference
+// (bare index or window.pane) to a stable tmux pane-id (%N), window-aware.
+func resolvePaneTargetByRef(ctx context.Context, session, paneIdxStr string) (string, error) {
 	panes, err := tmux.GetPanesContext(ctx, session)
 	if err != nil {
 		return "", fmt.Errorf("list panes: %w", err)
 	}
-	for _, p := range panes {
-		if p.Index == paneIdx {
-			return p.ID, nil
-		}
+	p, err := matchPaneByRef(panes, paneIdxStr)
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("no pane with index %d in session %q", paneIdx, session)
+	return p.ID, nil
 }
 
-func (s *Server) resolvePaneTargetForRequest(w http.ResponseWriter, r *http.Request, session string, paneIdx int, reqID string) (string, bool) {
-	target, err := resolvePaneTargetByIndex(r.Context(), session, paneIdx)
+func (s *Server) resolvePaneTargetForRequest(w http.ResponseWriter, r *http.Request, session, paneIdxStr, reqID string) (string, bool) {
+	target, err := resolvePaneTargetByRef(r.Context(), session, paneIdxStr)
 	if err != nil {
+		var amb *ambiguousPaneError
+		if errors.As(err, &amb) {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+				fmt.Sprintf("ambiguous pane reference: %v", err), nil, reqID)
+			return "", false
+		}
 		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
 			fmt.Sprintf("pane not found: %v", err), nil, reqID)
 		return "", false
