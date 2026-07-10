@@ -3282,7 +3282,7 @@ func init() {
 	rootCmd.Flags().StringVar(&robotAttentionTimeout, "attention-timeout", "5m", "Maximum wait time. Optional with --robot-attention. Example: --attention-timeout=10m")
 	rootCmd.Flags().StringVar(&robotAttentionPoll, "attention-poll", "1s", "Polling interval. Optional with --robot-attention. Example: --attention-poll=500ms")
 	rootCmd.Flags().StringVar(&robotAttentionCondition, "attention-condition", "attention", "Which condition to wait for. Optional with --robot-attention. Values: attention, action_required, mail_pending")
-	rootCmd.Flags().StringVar(&robotTail, "robot-tail", "", "Capture recent pane output. Required: SESSION. Example: ntm --robot-tail=myproject --lines=50")
+	rootCmd.Flags().StringVar(&robotTail, "robot-tail", "", "Capture recent pane output. Required: SESSION. Optional: --lines, --panes, --clean (LLM-facing text: wrapped lines joined, TUI chrome stripped). Example: ntm --robot-tail=myproject --lines=50 --clean")
 	rootCmd.Flags().BoolVar(&robotTailClean, "clean", false, "With --robot-tail: return LLM-facing text (wrapped lines joined, TUI chrome stripped). Default output is unchanged. Example: ntm --robot-tail=myproject --clean")
 	rootCmd.Flags().StringVar(&robotWatchBead, "robot-watch-bead", "", "Capture bead mentions across panes plus current bead status (JSON snapshot). Required: SESSION")
 	rootCmd.Flags().StringVar(&robotWatchBeadID, "bead", "", "Bead ID for --robot-watch-bead. Example: --bead=bd-abc123")
