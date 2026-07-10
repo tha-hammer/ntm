@@ -1825,3 +1825,49 @@ func truncateForLog(s string) string {
 	}
 	return s
 }
+
+// TestApplyPaneIdentityVars is the core of the name-title fix: when ntm's
+// @ntm_* pane options are set, a pane whose TITLE is just the friendly Agent
+// Mail name (which parseAgentFromTitle reads as user/0) still resolves to the
+// right agent type and index. Empty vars leave the title-based parse alone.
+func TestApplyPaneIdentityVars(t *testing.T) {
+	// Title "RainyFinch" parses as a user pane; vars must override it.
+	p := &Pane{Title: "RainyFinch", Type: AgentUser, NTMIndex: 0, Variant: ""}
+	applyPaneIdentityVars(p, "cc", "1", "opus")
+	if p.Type != AgentClaude {
+		t.Errorf("Type = %q, want cc (from @ntm_type)", p.Type)
+	}
+	if p.NTMIndex != 1 {
+		t.Errorf("NTMIndex = %d, want 1 (from @ntm_index)", p.NTMIndex)
+	}
+	if p.Variant != "opus" {
+		t.Errorf("Variant = %q, want opus (from @ntm_variant)", p.Variant)
+	}
+
+	// Empty vars (adopted/legacy/user pane): title-based identity is preserved.
+	q := &Pane{Title: "proj__cod_2", Type: AgentCodex, NTMIndex: 2}
+	applyPaneIdentityVars(q, "", "", "")
+	if q.Type != AgentCodex || q.NTMIndex != 2 {
+		t.Errorf("empty vars changed identity: got (%q,%d), want (cod,2)", q.Type, q.NTMIndex)
+	}
+}
+
+// TestParsePaneLineWithIdentityVars proves the full list-panes line (friendly
+// title + trailing @ntm_* vars) resolves to the ntm identity, and that a line
+// with empty trailing vars falls back to the title.
+func TestParsePaneLineWithIdentityVars(t *testing.T) {
+	sep := FieldSeparator
+	// id,index,title,cmd,w,h,active,pid,win, @type,@index,@variant
+	fields := []string{"%3", "0", "BrightLynx", "claude", "80", "24", "1", "1234", "0", "cc", "3", "opus"}
+	line := strings.Join(fields, sep)
+	p, err := parsePaneLine(line, sep)
+	if err != nil {
+		t.Fatalf("parsePaneLine error: %v", err)
+	}
+	if p.Title != "BrightLynx" {
+		t.Errorf("Title = %q, want BrightLynx (friendly name)", p.Title)
+	}
+	if p.Type != AgentClaude || p.NTMIndex != 3 {
+		t.Errorf("identity = (%q,%d), want (cc,3) from @ntm vars", p.Type, p.NTMIndex)
+	}
+}

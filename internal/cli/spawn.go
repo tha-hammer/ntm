@@ -2177,14 +2177,18 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 				agentMailName = strings.TrimSpace(preRegisterStatus.AgentMap[fmt.Sprintf("%d", pane.Index)])
 			}
 		}
+		// Record ntm's canonical identity (type/index/variant) in tmux pane
+		// options so pane addressing (grep/output/scale/is-working) resolves by
+		// type/index independently of the pane title. This lets the pane title
+		// BE the Agent Mail name — what shows in the tmux border — without
+		// breaking parseAgentFromTitle-based addressing.
+		identityVariant := agent.Model
+		if personaName != "" {
+			identityVariant = personaName
+		}
+		tmux.SetPaneIdentity(pane.ID, string(agent.Type), agent.Index, identityVariant)
 		if agentMailName != "" {
-			// Surface the Agent Mail name in the pane title's [tag] slot rather
-			// than overwriting the title. This keeps the name visible while the
-			// title still matches ntm's session__type_index grammar, so
-			// parseAgentFromTitle (and pane addressing by Type/NTMIndex) keeps
-			// working. Overwriting the whole title makes renamed panes parse as
-			// user shells and breaks CLI pane addressing (grep/output/scale).
-			title = tmux.WithPaneTag(title, agentMailName)
+			title = agentMailName
 			if err := tmux.SetPaneTitle(pane.ID, title); err != nil && !IsJSONOutput() {
 				fmt.Printf("⚠ Warning: could not set Agent Mail pane title for pane %d: %v\n", pane.Index, err)
 			}

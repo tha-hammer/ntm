@@ -468,7 +468,10 @@ func (c *Client) GetPanes(session string) ([]Pane, error) {
 // GetPanesContext returns all panes in a session with cancellation support.
 func (c *Client) GetPanesContext(ctx context.Context, session string) ([]Pane, error) {
 	sep := FieldSeparator
-	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}", sep)
+	// Trailing @ntm_* user options carry ntm's canonical identity so type/index
+	// survive a friendly (Agent Mail name) pane title. Appended last so existing
+	// field indices are unchanged.
+	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_type}%[1]s#{@ntm_index}%[1]s#{@ntm_variant}", sep)
 	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", session, "-F", format)
 	if err != nil {
 		return nil, err
@@ -504,7 +507,7 @@ func GetPanesContext(ctx context.Context, session string) ([]Pane, error) {
 func (c *Client) GetAllPanesContext(ctx context.Context) (map[string][]Pane, error) {
 	sep := FieldSeparator
 	// Add session_name at the beginning
-	format := fmt.Sprintf("#{session_name}%[1]s#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}", sep)
+	format := fmt.Sprintf("#{session_name}%[1]s#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_type}%[1]s#{@ntm_index}%[1]s#{@ntm_variant}", sep)
 	output, err := c.RunContext(ctx, "list-panes", "-a", "-F", format)
 	if err != nil {
 		// No server/no sessions is not an error; treat as empty result.
@@ -537,6 +540,10 @@ func (c *Client) GetAllPanesContext(ctx context.Context) (map[string][]Pane, err
 		p, err := parsePaneFromParts(parts[1:8], parts[8:])
 		if err != nil {
 			continue
+		}
+		// Trailing @ntm_* identity vars (indices 10,11,12) override title parse.
+		if len(parts) >= 13 {
+			applyPaneIdentityVars(p, parts[10], parts[11], parts[12])
 		}
 
 		panesBySession[sessionName] = append(panesBySession[sessionName], *p)
@@ -652,6 +659,48 @@ func (c *Client) SetPaneTitle(paneID, title string) error {
 // SetPaneTitle sets the title of a pane (default client)
 func SetPaneTitle(paneID, title string) error {
 	return DefaultClient.SetPaneTitle(paneID, title)
+}
+
+// SetPaneIdentity records ntm's canonical pane identity (agent type, ntm index,
+// variant) in tmux per-pane user options. GetPanes reads these back, so a pane's
+// type/index survive independently of the pane title — this lets the title be
+// set to the friendly Agent Mail name while ntm addressing (grep/output/scale/
+// is-working) keeps resolving by type/index. Errors are non-fatal; readers fall
+// back to parsing the title.
+func (c *Client) SetPaneIdentity(paneID, agentType string, ntmIndex int, variant string) {
+	_ = c.RunSilent("set-option", "-p", "-t", paneID, "@ntm_type", agentType)
+	_ = c.RunSilent("set-option", "-p", "-t", paneID, "@ntm_index", strconv.Itoa(ntmIndex))
+	if strings.TrimSpace(variant) != "" {
+		_ = c.RunSilent("set-option", "-p", "-t", paneID, "@ntm_variant", variant)
+	}
+}
+
+// SetPaneIdentity records ntm pane identity in tmux pane options (default client).
+func SetPaneIdentity(paneID, agentType string, ntmIndex int, variant string) {
+	DefaultClient.SetPaneIdentity(paneID, agentType, ntmIndex, variant)
+}
+
+// applyPaneIdentityVars overrides a pane's title-derived identity with values
+// from ntm's per-pane user options (@ntm_type/@ntm_index/@ntm_variant) when set.
+// This lets the pane title carry the friendly Agent Mail name while type/index
+// addressing still resolves. Empty vars (adopted/legacy/user panes) leave the
+// title-based parse untouched, so nothing regresses.
+func applyPaneIdentityVars(pane *Pane, ntmType, ntmIndex, ntmVariant string) {
+	ntmType = strings.TrimSpace(ntmType)
+	if ntmType == "" {
+		return
+	}
+	if canonical := AgentType(ntmType).Canonical(); canonical.IsValid() {
+		pane.Type = canonical
+	} else {
+		pane.Type = AgentType(ntmType)
+	}
+	if idx, err := strconv.Atoi(strings.TrimSpace(ntmIndex)); err == nil {
+		pane.NTMIndex = idx
+	}
+	if v := strings.TrimSpace(ntmVariant); v != "" {
+		pane.Variant = v
+	}
 }
 
 // GetPaneTitle returns the title of a pane
@@ -1547,7 +1596,7 @@ type PaneActivity struct {
 // GetPanesWithActivityContext returns all panes in a session with their activity times with cancellation support.
 func (c *Client) GetPanesWithActivityContext(ctx context.Context, session string) ([]PaneActivity, error) {
 	sep := FieldSeparator
-	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_last_activity}%[1]s#{pane_pid}%[1]s#{window_index}", sep)
+	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_last_activity}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_type}%[1]s#{@ntm_index}%[1]s#{@ntm_variant}", sep)
 	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", session, "-F", format)
 	if err != nil {
 		return nil, err
@@ -1570,6 +1619,10 @@ func (c *Client) GetPanesWithActivityContext(ctx context.Context, session string
 		p, err := parsePaneFromParts(parts[:7], parts[8:])
 		if err != nil {
 			continue
+		}
+		// Trailing @ntm_* identity vars (indices 10,11,12) override title parse.
+		if len(parts) >= 13 {
+			applyPaneIdentityVars(p, parts[10], parts[11], parts[12])
 		}
 
 		rawTimestamp := strings.TrimSpace(parts[7])
@@ -1596,7 +1649,15 @@ func parsePaneLine(line, sep string) (*Pane, error) {
 		return nil, fmt.Errorf("insufficient parts: %d", len(parts))
 	}
 	// For standard GetPanes: id, index, title, command, width, height, active, pid, window_index
-	return parsePaneFromParts(parts[:7], parts[7:])
+	p, err := parsePaneFromParts(parts[:7], parts[7:])
+	if err != nil {
+		return nil, err
+	}
+	// Trailing @ntm_* identity vars (indices 9,10,11) override title parse when set.
+	if len(parts) >= 12 {
+		applyPaneIdentityVars(p, parts[9], parts[10], parts[11])
+	}
+	return p, nil
 }
 
 // parsePaneFromParts constructs a Pane from pre-split parts.
