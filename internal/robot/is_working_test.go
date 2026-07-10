@@ -386,6 +386,40 @@ extracting archive ⠋
 	}
 }
 
+// TestApplyUserPaneNonGatingGuard locks in the base-parser fix: a user/shell
+// pane the legacy parser flagged as working (e.g. a starship prompt read as
+// velocity) must be forced to a stable non-gating verdict, while real agent
+// panes are left untouched. Observed live: a starship zsh pane reported
+// working=true, conf=0.8 → false DO_NOT_INTERRUPT on the human's shell.
+func TestApplyUserPaneNonGatingGuard(t *testing.T) {
+	falselyWorking := PaneWorkStatus{
+		AgentType:            string(agent.AgentTypeUser),
+		IsWorking:            true,
+		IsIdle:               false,
+		Confidence:           0.8,
+		Recommendation:       string(agent.RecommendDoNotInterrupt),
+		RecommendationReason: "Agent is actively producing output",
+	}
+	got := applyUserPaneNonGatingGuard(falselyWorking, agent.AgentTypeUser)
+	if got.IsWorking {
+		t.Errorf("user pane IsWorking = true, want false (must never gate)")
+	}
+	if got.Recommendation == string(agent.RecommendDoNotInterrupt) ||
+		got.Recommendation == string(agent.RecommendSafeToRestart) {
+		t.Errorf("user pane recommendation = %q, want a non-actionable verdict (UNKNOWN) so restart tooling never targets the shell", got.Recommendation)
+	}
+
+	// A real agent's working verdict must be preserved verbatim.
+	agentWorking := PaneWorkStatus{
+		AgentType:      string(agent.AgentTypeClaudeCode),
+		IsWorking:      true,
+		Recommendation: string(agent.RecommendDoNotInterrupt),
+	}
+	if out := applyUserPaneNonGatingGuard(agentWorking, agent.AgentTypeClaudeCode); !out.IsWorking {
+		t.Errorf("agent pane IsWorking flipped to false; the guard must only touch user/shell panes")
+	}
+}
+
 // =============================================================================
 // Window-aware pane selection (#170)
 // =============================================================================

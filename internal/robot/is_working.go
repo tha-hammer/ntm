@@ -334,6 +334,9 @@ func GetIsWorking(opts IsWorkingOptions) (*IsWorkingOutput, error) {
 			status.Indicators.Work = append(work, "live_window_thinking")
 		}
 
+		// User/shell panes are not AI agents and must never gate as "working".
+		status = applyUserPaneNonGatingGuard(status, state.Type)
+
 		// Ensure indicators are never nil
 		if status.Indicators.Work == nil {
 			status.Indicators.Work = []string{}
@@ -393,6 +396,26 @@ func GetIsWorking(opts IsWorkingOptions) (*IsWorkingOutput, error) {
 // selectedPane bundles a chosen pane with the metadata GetIsWorking needs:
 // its tmux target (window.pane address), the agent-type hint from tmux, and a
 // found flag (false when the caller requested a pane index that doesn't exist).
+// applyUserPaneNonGatingGuard forces a stable non-gating verdict on user/shell
+// panes. They are not AI agents, but the legacy parser can still set IsWorking
+// from raw velocity — a shell prompt redraw, cursor blink, or an async starship
+// prompt segment reads as "actively producing output" — producing a false
+// DO_NOT_INTERRUPT on the human's shell (observed live: a starship zsh pane
+// reporting working=true, conf=0.8). The IsLiveBusy override already skips these
+// panes; this also corrects the *base* parser verdict. Recommendation is forced
+// to UNKNOWN (not SAFE_TO_RESTART) so restart tooling never targets the shell.
+func applyUserPaneNonGatingGuard(status PaneWorkStatus, agentType agent.AgentType) PaneWorkStatus {
+	if agentType != agent.AgentTypeUser {
+		return status
+	}
+	status.IsWorking = false
+	status.IsIdle = false
+	status.Confidence = 1.0
+	status.Recommendation = string(agent.RecommendUnknown)
+	status.RecommendationReason = "Not an AI agent pane (user/shell); excluded from work gating"
+	return status
+}
+
 type selectedPane struct {
 	WindowIndex int
 	Index       int
