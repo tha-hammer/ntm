@@ -1405,6 +1405,32 @@ func (c *Client) CapturePaneOutputANSIContext(ctx context.Context, target string
 	return c.capturePane(ctx, target, lines, true)
 }
 
+// capturePaneJoinedArgs builds the capture-pane argv for clean, LLM-facing
+// text: -J joins wrapped lines so content isn't split mid-word by the terminal
+// width, and ANSI is always stripped (no -e).
+func capturePaneJoinedArgs(target string, lines int) []string {
+	if lines < 0 {
+		lines = -lines
+	}
+	return []string{"capture-pane", "-t", target, "-p", "-J", "-S", fmt.Sprintf("-%d", lines)}
+}
+
+// CapturePaneCleanContext captures a pane joined (-J) and ANSI-stripped, then
+// runs CleanPaneText to drop TUI chrome — the LLM-facing read path. Distinct
+// from the classifier's capture so state-detection signatures are unaffected.
+func (c *Client) CapturePaneCleanContext(ctx context.Context, target string, lines int) (string, error) {
+	out, err := c.RunContext(ctx, capturePaneJoinedArgs(target, lines)...)
+	if err != nil {
+		return "", err
+	}
+	return CleanPaneText(out), nil
+}
+
+// CapturePaneCleanContext captures clean LLM-facing pane text (default client).
+func CapturePaneCleanContext(ctx context.Context, target string, lines int) (string, error) {
+	return DefaultClient.CapturePaneCleanContext(ctx, target, lines)
+}
+
 // CapturePaneOutput captures the output of a pane (default client)
 func CapturePaneOutput(target string, lines int) (string, error) {
 	return DefaultClient.CapturePaneOutput(target, lines)

@@ -1094,7 +1094,7 @@ Shell Integration:
 			if robotPanes != "" {
 				paneFilter = strings.Split(robotPanes, ",")
 			}
-			if err := robot.PrintTail(session, robotLines, paneFilter); err != nil {
+			if err := robot.PrintTail(session, robotLines, paneFilter, robotTailClean); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -2761,6 +2761,7 @@ var (
 	robotAttentionPoll         string // poll interval for --robot-attention
 	robotAttentionCondition    string // attention condition to wait for
 	robotTail                  string // session name for tail
+	robotTailClean             bool   // --clean: LLM-facing tail output (chrome stripped, wrap-joined)
 	robotWatchBead             string // session name for bead mention watch
 	robotWatchBeadID           string // bead ID for watch command
 	robotErrors                string // session name for errors
@@ -3282,6 +3283,7 @@ func init() {
 	rootCmd.Flags().StringVar(&robotAttentionPoll, "attention-poll", "1s", "Polling interval. Optional with --robot-attention. Example: --attention-poll=500ms")
 	rootCmd.Flags().StringVar(&robotAttentionCondition, "attention-condition", "attention", "Which condition to wait for. Optional with --robot-attention. Values: attention, action_required, mail_pending")
 	rootCmd.Flags().StringVar(&robotTail, "robot-tail", "", "Capture recent pane output. Required: SESSION. Example: ntm --robot-tail=myproject --lines=50")
+	rootCmd.Flags().BoolVar(&robotTailClean, "clean", false, "With --robot-tail: return LLM-facing text (wrapped lines joined, TUI chrome stripped). Default output is unchanged. Example: ntm --robot-tail=myproject --clean")
 	rootCmd.Flags().StringVar(&robotWatchBead, "robot-watch-bead", "", "Capture bead mentions across panes plus current bead status (JSON snapshot). Required: SESSION")
 	rootCmd.Flags().StringVar(&robotWatchBeadID, "bead", "", "Bead ID for --robot-watch-bead. Example: --bead=bd-abc123")
 	rootCmd.Flags().StringVar(&robotErrors, "robot-errors", "", "Filter pane output to show only errors. Required: SESSION. Example: ntm --robot-errors=myproject --lines=100")

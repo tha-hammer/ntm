@@ -3905,6 +3905,10 @@ type TailOptions struct {
 	Session    string
 	Lines      int
 	PaneFilter []string
+	// Clean returns LLM-facing text (joined wrapped lines, TUI chrome stripped)
+	// for the Lines field. State detection still uses the raw capture, so the
+	// clean view never changes classification. Opt-in; default output unchanged.
+	Clean bool
 }
 
 // GetTail returns recent pane output for AI consumption.
@@ -4009,8 +4013,20 @@ func GetTail(opts TailOptions) (*TailOutput, error) {
 			continue
 		}
 
-		// Strip ANSI codes and split into lines
-		cleanOutput := status.StripANSI(captured)
+		// Strip ANSI codes and split into lines. With --clean, use the
+		// chrome-stripped, wrap-joined capture for the Lines field (LLM-facing);
+		// state detection below still uses the raw capture so classification is
+		// unaffected.
+		var cleanOutput string
+		if opts.Clean {
+			if ct, cerr := tmux.CapturePaneCleanContext(context.Background(), pane.ID, opts.Lines); cerr == nil {
+				cleanOutput = ct
+			} else {
+				cleanOutput = tmux.CleanPaneText(status.StripANSI(captured))
+			}
+		} else {
+			cleanOutput = status.StripANSI(captured)
+		}
 		outputLines := splitLines(cleanOutput)
 
 		// Detect state from output
@@ -4039,11 +4055,12 @@ func GetTail(opts TailOptions) (*TailOutput, error) {
 
 // PrintTail outputs recent pane output for AI consumption.
 // This is a thin wrapper around GetTail() for CLI output.
-func PrintTail(session string, lines int, paneFilter []string) error {
+func PrintTail(session string, lines int, paneFilter []string, clean bool) error {
 	output, err := GetTail(TailOptions{
 		Session:    session,
 		Lines:      lines,
 		PaneFilter: paneFilter,
+		Clean:      clean,
 	})
 	if err != nil {
 		return err

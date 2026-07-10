@@ -3394,15 +3394,21 @@ func (s *Server) handlePaneOutputV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ?ansi=1 preserves ANSI escapes for xterm.js first-paint; default stays stripped.
+	// Output mode: ?clean=1 gives LLM-facing text (joined lines, TUI chrome
+	// stripped); ?ansi=1 preserves ANSI escapes for xterm.js first-paint;
+	// default stays ANSI-stripped raw. clean wins if both are set.
+	clean := r.URL.Query().Get("clean") == "1"
 	ansi := r.URL.Query().Get("ansi") == "1"
 	var (
 		output string
 		err    error
 	)
-	if ansi {
+	switch {
+	case clean:
+		output, err = tmux.CapturePaneCleanContext(r.Context(), paneTarget, lines)
+	case ansi:
 		output, err = tmux.CapturePaneOutputANSIContext(r.Context(), paneTarget, lines)
-	} else {
+	default:
 		output, err = tmux.CapturePaneOutputContext(r.Context(), paneTarget, lines)
 	}
 	if err != nil {
@@ -3414,6 +3420,7 @@ func (s *Server) handlePaneOutputV1(w http.ResponseWriter, r *http.Request) {
 		"pane":   paneTarget,
 		"output": output,
 		"lines":  lines,
+		"clean":  clean,
 	}, reqID)
 }
 

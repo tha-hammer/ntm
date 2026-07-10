@@ -1149,7 +1149,7 @@ func TestPrintTailNonexistentSession(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 
 	output, err := captureStdout(t, func() error {
-		return PrintTail("nonexistent_session_12345", 20, nil)
+		return PrintTail("nonexistent_session_12345", 20, nil, false)
 	})
 	if err != nil {
 		t.Fatalf("PrintTail should not return error, got: %v", err)
@@ -1419,7 +1419,7 @@ func TestPrintTailWithSession(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	output, err := captureStdout(t, func() error {
-		return PrintTail(sessionName, 20, nil)
+		return PrintTail(sessionName, 20, nil, false)
 	})
 
 	if err != nil {
@@ -1458,7 +1458,7 @@ func TestPrintTailWithPaneFilter(t *testing.T) {
 	targetPane := fmt.Sprintf("%d", panes[0].Index)
 
 	output, err := captureStdout(t, func() error {
-		return PrintTail(sessionName, 10, []string{targetPane})
+		return PrintTail(sessionName, 10, []string{targetPane}, false)
 	})
 
 	if err != nil {
