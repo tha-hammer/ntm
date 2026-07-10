@@ -2,6 +2,7 @@ package cli
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -148,5 +149,49 @@ func TestWaitConditionConstants(t *testing.T) {
 	}
 	if string(ConditionHealthy) != "healthy" {
 		t.Errorf("ConditionHealthy = %q, want %q", ConditionHealthy, "healthy")
+	}
+}
+
+// TestWaitDispatchSettleLatch covers the #1 fix: a terminal wait fired right
+// after `ntm send` must not accept the pre-repaint idle screen as "done". It
+// waits until an agent is seen working, or the settle window elapses.
+func TestWaitConditionIsTerminal(t *testing.T) {
+	cases := map[WaitCondition]bool{
+		ConditionIdle:       true,
+		ConditionComplete:   true,
+		ConditionGenerating: false,
+		ConditionHealthy:    false,
+		"idle,healthy":      true, // any terminal part makes it terminal
+		"generating,idle":   true, // ...even composed with a non-terminal
+	}
+	for cond, want := range cases {
+		if got := waitConditionIsTerminal(cond); got != want {
+			t.Errorf("waitConditionIsTerminal(%q) = %v, want %v", cond, got, want)
+		}
+	}
+}
+
+func TestWaitLatchSatisfied(t *testing.T) {
+	const settle = 2 * time.Second
+	tests := []struct {
+		name        string
+		terminal    bool
+		seenWorking bool
+		elapsed     time.Duration
+		want        bool
+	}{
+		{"non-terminal accepts immediately", false, false, 0, true},
+		{"terminal, not yet seen working, within settle -> hold", true, false, 500 * time.Millisecond, false},
+		{"terminal, seen working -> accept (real work->idle)", true, true, 500 * time.Millisecond, true},
+		{"terminal, no work, settle elapsed -> accept (instant no-op)", true, false, settle, true},
+		{"terminal, no work, past settle -> accept", true, false, 5 * time.Second, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := waitLatchSatisfied(tt.terminal, tt.seenWorking, tt.elapsed, settle); got != tt.want {
+				t.Errorf("waitLatchSatisfied(%v,%v,%v,%v) = %v, want %v",
+					tt.terminal, tt.seenWorking, tt.elapsed, settle, got, tt.want)
+			}
+		})
 	}
 }

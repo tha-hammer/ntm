@@ -42,7 +42,19 @@ type WaitOptions struct {
 	WaitForAny   bool // If true, wait for ANY agent; otherwise wait for ALL
 	ExitOnError  bool // If true, exit immediately on ERROR state
 	CountN       int  // With --any, wait for at least N agents (default 1)
+	// SettleWindow bounds the #1 dispatch-settle latch: for terminal conditions
+	// (idle/complete), a "met" result is not accepted until an agent has been
+	// observed working since wait started OR this window elapses. Guards against
+	// a gate fired right after `ntm send` reading the pre-repaint idle screen and
+	// returning a false "done". Zero uses defaultPostDispatchSettle.
+	SettleWindow time.Duration
 }
+
+// defaultPostDispatchSettle is the fallback settle window for the dispatch-latch
+// (#1). Long enough for an agent TUI (Claude/Codex) to paint its working spinner
+// after a prompt is delivered, short enough not to noticeably delay a genuine
+// already-idle pane.
+const defaultPostDispatchSettle = 2 * time.Second
 
 // WaitResult is the JSON output for robot mode.
 type WaitResult struct {
@@ -192,6 +204,15 @@ func runWait(w io.Writer, opts WaitOptions) error {
 	startTime := time.Now()
 	deadline := startTime.Add(opts.Timeout)
 
+	// Dispatch-settle latch (#1): for terminal conditions, don't accept "done"
+	// until an agent has been seen working, or the settle window elapses.
+	settleWindow := opts.SettleWindow
+	if settleWindow <= 0 {
+		settleWindow = defaultPostDispatchSettle
+	}
+	terminalWait := waitConditionIsTerminal(opts.Condition)
+	seenWorking := false
+
 	// Create activity monitor
 	monitor := robot.NewActivityMonitor(nil)
 
@@ -233,6 +254,14 @@ func runWait(w io.Writer, opts WaitOptions) error {
 			activities = append(activities, activity)
 		}
 
+		// Latch: remember if any pane is actively working this poll (#1).
+		for _, a := range activities {
+			if a.State == robot.StateGenerating || a.State == robot.StateThinking {
+				seenWorking = true
+				break
+			}
+		}
+
 		// Check for error state (if --exit-on-error)
 		if opts.ExitOnError {
 			for _, a := range activities {
@@ -246,7 +275,7 @@ func runWait(w io.Writer, opts WaitOptions) error {
 
 		// Check if condition is met
 		met, details := checkConditionMet(activities, opts)
-		if met {
+		if met && waitLatchSatisfied(terminalWait, seenWorking, time.Since(startTime), settleWindow) {
 			elapsed := time.Since(startTime)
 			fmt.Fprintf(w, "%s✓%s Condition '%s' met after %v\n",
 				colorize(t.Success), colorize(t.Text), opts.Condition, elapsed.Round(time.Millisecond))
@@ -259,6 +288,32 @@ func runWait(w io.Writer, opts WaitOptions) error {
 		// Sleep and poll again
 		time.Sleep(opts.PollInterval)
 	}
+}
+
+// waitConditionIsTerminal reports whether the wait is for work to finish
+// (idle/complete) rather than to start/stay (generating/healthy). Only terminal
+// waits are subject to the dispatch-settle latch (#1).
+func waitConditionIsTerminal(c WaitCondition) bool {
+	for _, part := range strings.Split(string(c), ",") {
+		switch WaitCondition(strings.TrimSpace(part)) {
+		case ConditionIdle, ConditionComplete:
+			return true
+		}
+	}
+	return false
+}
+
+// waitLatchSatisfied implements the #1 dispatch-settle latch. A "met" terminal
+// condition is only accepted once the agent has been observed working since wait
+// started, or the settle window has elapsed. This stops a gate fired immediately
+// after `ntm send` from reading the pre-repaint idle screen and returning a
+// false "done", while the settle fallback ensures a genuine instant no-op or
+// already-idle pane never hangs.
+func waitLatchSatisfied(terminal, seenWorking bool, elapsed, settleWindow time.Duration) bool {
+	if !terminal || seenWorking {
+		return true
+	}
+	return elapsed >= settleWindow
 }
 
 // isValidCondition checks if the condition string is valid.
