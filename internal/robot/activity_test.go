@@ -2949,3 +2949,21 @@ func TestFilterRecoveredErrors(t *testing.T) {
 		}
 	})
 }
+
+// TestFilterStaleClaudeThinking_Scoping guards bd-3k63y: filterStaleClaudeThinking
+// must only arbitrate Claude's own spinner patterns via ClaudeActivelyWorking —
+// generic thinking signals stay, and non-claude panes are untouched. (Regression:
+// an over-broad filter dropped "Thinking..." and broke THINKING detection.)
+func TestFilterStaleClaudeThinking_Scoping(t *testing.T) {
+	scClaude := NewStateClassifier("t", &ClassifierConfig{AgentType: "claude", HysteresisDuration: 0})
+	generic := []PatternMatch{{Pattern: "thinking_text", Category: CategoryThinking}}
+	if got := scClaude.filterStaleClaudeThinking(generic, "no live claude spinner here\n❯ "); len(got) != 1 {
+		t.Errorf("generic thinking_text dropped on a claude pane (len=%d); want kept", len(got))
+	}
+
+	scCodex := NewStateClassifier("t", &ClassifierConfig{AgentType: "codex", HysteresisDuration: 0})
+	spinner := []PatternMatch{{Pattern: "claude_spinner_timing", Category: CategoryThinking}}
+	if got := scCodex.filterStaleClaudeThinking(spinner, "anything"); len(got) != 1 {
+		t.Errorf("non-claude pane was filtered (len=%d); want untouched", len(got))
+	}
+}

@@ -768,6 +768,7 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	effectiveMatches := filterThinkingToLive(matches, liveMatches)
 	effectiveMatches = filterErrorToLiveWhenIdle(effectiveMatches, liveMatches)
 	effectiveMatches = sc.filterRecoveredErrors(effectiveMatches, liveContent)
+	effectiveMatches = sc.filterStaleClaudeThinking(effectiveMatches, content)
 
 	// Calculate proposed state and confidence
 	proposedState, confidence, trigger := sc.classifyState(velocity, effectiveMatches)
@@ -1059,6 +1060,46 @@ func (sc *StateClassifier) filterRecoveredErrors(matches []PatternMatch, liveCon
 	out := make([]PatternMatch, 0, len(matches))
 	for _, m := range matches {
 		if m.Category == CategoryError {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// filterStaleClaudeThinking drops CategoryThinking matches for Claude panes when
+// the ordering-aware liveness check says the spinner is stale — a completed
+// turn's "Word… (Xs)" spinner still sitting above the completion line within the
+// live window. Claude pins its input box at the bottom and leaves these stale
+// spinners around, so a position-blind CategoryThinking match reports THINKING
+// for an idle pane. agent.ClaudeActivelyWorking (the single source of truth used
+// by IsLiveBusy / the dispatcher) compares the most-recent spinner vs. the
+// most-recent turn-ended marker; routing --robot-activity through it keeps the
+// classifier in agreement with the rest of the Claude detection layer. Genuinely
+// working panes keep THINKING. (bd-3k63y)
+func (sc *StateClassifier) filterStaleClaudeThinking(matches []PatternMatch, content string) []PatternMatch {
+	if normalizeAgentType(sc.agentType) != "claude" {
+		return matches
+	}
+	// Only Claude's own timing/spinner patterns are arbitrated by
+	// ClaudeActivelyWorking. Generic thinking signals (thinking_text, braille
+	// spinner) are their own evidence and must not be dropped by it.
+	isClaudeSpinner := func(m PatternMatch) bool {
+		return m.Category == CategoryThinking && strings.HasPrefix(m.Pattern, "claude_spinner")
+	}
+	hasClaudeSpinner := false
+	for _, m := range matches {
+		if isClaudeSpinner(m) {
+			hasClaudeSpinner = true
+			break
+		}
+	}
+	if !hasClaudeSpinner || agent.ClaudeActivelyWorking(content) {
+		return matches
+	}
+	out := make([]PatternMatch, 0, len(matches))
+	for _, m := range matches {
+		if isClaudeSpinner(m) {
 			continue
 		}
 		out = append(out, m)

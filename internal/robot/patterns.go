@@ -88,6 +88,13 @@ func defaultPatterns() []Pattern {
 		{Name: "claude_welcome", RegexStr: `(?i)welcome\s+back`, Agent: "claude", State: StateWaiting, Category: CategoryIdle, Priority: 102, Description: "Claude Code welcome message"},
 		{Name: "claude_try_prompt", RegexStr: `❯\s*Try\s+"`, Agent: "claude", State: StateWaiting, Category: CategoryIdle, Priority: 102, Description: "Claude Code try prompt"},
 		{Name: "claude_unicode_prompt", RegexStr: `(?m)❯[\s\x{00a0}]*$`, Agent: "claude", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Claude Code unicode angle prompt (multiline, NBSP-aware)"},
+		// Blocked on an interactive selection menu — the agent is waiting for a
+		// human choice, not working. Only yields WAITING under low velocity, so a
+		// working pane is unaffected. (bd-3k63y)
+		{Name: "claude_select_menu", RegexStr: `(?i)Enter to select\b.*\b(Tab|Arrow)\b`, Agent: "claude", State: StateWaiting, Category: CategoryIdle, Priority: 103, Description: "Claude Code selection menu (blocked awaiting input)"},
+		// Idle new-task hint shown when a turn has completed and the agent is
+		// ready for the next prompt. (bd-3k63y)
+		{Name: "claude_new_task_hint", RegexStr: `(?i)new task\?\s*/clear`, Agent: "claude", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Claude Code idle new-task hint"},
 
 		// Claude Code spinner detection (active work indicators)
 		{Name: "claude_spinner_timing", RegexStr: `\S+…\s+\(`, Agent: "claude", State: StateThinking, Category: CategoryThinking, Priority: 110, Description: "Claude Code timing spinner (e.g. Bunning… (3s))"},
