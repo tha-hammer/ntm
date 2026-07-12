@@ -1871,3 +1871,39 @@ func TestParsePaneLineWithIdentityVars(t *testing.T) {
 		t.Errorf("identity = (%q,%d), want (cc,3) from @ntm vars", p.Type, p.NTMIndex)
 	}
 }
+
+// TestCollapseInteriorBlankLines guards bd-v5sgh: a blank line inside a
+// multi-line prompt would deliver a premature Enter to auto-submit TUIs
+// (Claude/Codex/Gemini), splitting the prompt into a submit + queued remainder.
+func TestCollapseInteriorBlankLines(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"single blank line", "line one\n\nline two", "line one\nline two"},
+		{"multiple blank lines", "a\n\n\n\nb", "a\nb"},
+		{"whitespace-only blank line", "a\n   \nb", "a\nb"},
+		{"crlf blank line", "a\r\n\r\nb", "a\nb"},
+		{"no blank lines untouched", "a\nb\nc", "a\nb\nc"},
+		{"single line untouched", "just one line", "just one line"},
+		{"tabs in blank line", "a\n\t\nb", "a\nb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := collapseInteriorBlankLines(tt.in); got != tt.want {
+				t.Errorf("collapseInteriorBlankLines(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+
+	// Only auto-submit agent TUIs get the collapse; plugins/user keep verbatim.
+	for _, at := range []AgentType{AgentClaude, AgentCodex, AgentGemini, AgentAntigravity} {
+		if !agentAutoSubmitsOnBlankLine(at) {
+			t.Errorf("agentAutoSubmitsOnBlankLine(%s) = false, want true", at)
+		}
+	}
+	if agentAutoSubmitsOnBlankLine(AgentUser) {
+		t.Error("agentAutoSubmitsOnBlankLine(user) = true, want false")
+	}
+}

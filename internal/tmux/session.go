@@ -1134,12 +1134,46 @@ func (c *Client) SendKeysForAgent(target, keys string, enter bool, agentType Age
 
 // SendKeysForAgentWithDelay sends keys using the appropriate method with a configurable delay.
 func (c *Client) SendKeysForAgentWithDelay(target, keys string, enter bool, enterDelay time.Duration, agentType AgentType) error {
+	// Collapse interior blank lines for auto-submit agent TUIs. A blank line in
+	// a pasted multi-line prompt delivers a bare Enter that Claude/Codex/Gemini
+	// treat as "submit now", splitting the prompt into a premature submit plus a
+	// queued remainder ("queued messages"). Collapsing runs of blank lines to a
+	// single newline preserves the prompt text while removing the extra submit.
+	// (bd-v5sgh)
+	if agentAutoSubmitsOnBlankLine(agentType) {
+		keys = collapseInteriorBlankLines(keys)
+	}
 	// Use buffer-based paste when the agent/content combination needs it.
 	// This avoids newline interpretation issues and large-paste truncation quirks.
 	if needsBufferSend(agentType, keys) {
 		return c.SendBufferWithDelay(target, keys, enter, enterDelay)
 	}
 	return c.SendKeysWithDelay(target, keys, enter, enterDelay)
+}
+
+// interiorBlankLinesRe matches a newline followed by one or more blank
+// (whitespace-only) lines — the sequence that delivers a premature submit to
+// auto-submit agent TUIs.
+var interiorBlankLinesRe = regexp.MustCompile(`\n([ \t]*\n)+`)
+
+// collapseInteriorBlankLines collapses runs of blank lines to a single newline,
+// normalizing CRLF first. Preserves the prompt's line structure minus the empty
+// lines that would submit early.
+func collapseInteriorBlankLines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return interiorBlankLinesRe.ReplaceAllString(s, "\n")
+}
+
+// agentAutoSubmitsOnBlankLine reports whether an agent TUI submits when it
+// receives a blank line mid-prompt (so interior blank lines must be collapsed
+// before a multi-line send). Plugins/unknown types keep their content verbatim.
+func agentAutoSubmitsOnBlankLine(agentType AgentType) bool {
+	switch canonicalAgentType(agentType) {
+	case AgentClaude, AgentCodex, AgentGemini, AgentAntigravity:
+		return true
+	default:
+		return false
+	}
 }
 
 // canonicalAgentType folds user-facing aliases into the canonical short codes used
