@@ -767,6 +767,7 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	liveMatches := sc.patternLibrary.Match(liveContent, sc.agentType)
 	effectiveMatches := filterThinkingToLive(matches, liveMatches)
 	effectiveMatches = filterErrorToLiveWhenIdle(effectiveMatches, liveMatches)
+	effectiveMatches = sc.filterRecoveredErrors(effectiveMatches, liveContent)
 
 	// Calculate proposed state and confidence
 	proposedState, confidence, trigger := sc.classifyState(velocity, effectiveMatches)
@@ -1009,6 +1010,56 @@ func filterErrorToLiveWhenIdle(full, live []PatternMatch) []PatternMatch {
 			if _, ok := liveError[m.Pattern]; !ok {
 				continue
 			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// filterRecoveredErrors drops CategoryError matches when the agent has recovered
+// past them: if a healthy idle-prompt line appears at or after the last
+// error-bearing line in the live window, the agent is sitting at a prompt and
+// the earlier error is not its current state. This fixes the common
+// false-positive where a Codex/Claude startup buffer carries a NON-AGENT error —
+// e.g. an MCP subserver failing OAuth ("error: Auth error: OAuth authorization
+// required, when send initialize request" / "MCP startup incomplete (failed:
+// honeycomb)") — followed by the agent's own ready prompt. Errors with no prompt
+// after them are kept, so a genuine unrecovered failure still classifies as
+// ERROR. (bd-i6gpn)
+func (sc *StateClassifier) filterRecoveredErrors(matches []PatternMatch, liveContent string) []PatternMatch {
+	hasError := false
+	for _, m := range matches {
+		if m.Category == CategoryError {
+			hasError = true
+			break
+		}
+	}
+	if !hasError {
+		return matches
+	}
+	lines := strings.Split(liveContent, "\n")
+	lastErrorLine, lastPromptLine := -1, -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		for _, m := range sc.patternLibrary.Match(line, sc.agentType) {
+			switch m.Category {
+			case CategoryError:
+				lastErrorLine = i
+			case CategoryIdle:
+				lastPromptLine = i
+			}
+		}
+	}
+	// A prompt at/after the last error means the agent moved past the error.
+	if lastPromptLine < 0 || lastPromptLine < lastErrorLine {
+		return matches
+	}
+	out := make([]PatternMatch, 0, len(matches))
+	for _, m := range matches {
+		if m.Category == CategoryError {
+			continue
 		}
 		out = append(out, m)
 	}

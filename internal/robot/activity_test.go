@@ -2901,3 +2901,51 @@ func TestVelocityTracker_FirstSampleBaseline_ZeroCharsAdded(t *testing.T) {
 		t.Errorf("first sample (no prior baseline): expected Velocity=0, got %f", sample.Velocity)
 	}
 }
+
+// TestFilterRecoveredErrors covers bd-i6gpn: a Codex startup buffer with a
+// NON-AGENT MCP OAuth error followed by the agent's ready prompt must NOT
+// classify as ERROR (the agent recovered), while a genuine unrecovered crash
+// with no following prompt must still be kept.
+func TestFilterRecoveredErrors(t *testing.T) {
+	hasError := func(ms []PatternMatch) bool {
+		for _, m := range ms {
+			if m.Category == CategoryError {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("MCP startup error recovered to prompt is dropped", func(t *testing.T) {
+		sc := NewStateClassifier("t", nil)
+		sc.SetAgentType("codex")
+		// Real carousel-impl pane 3 frame.
+		live := strings.Join([]string{
+			"] error: Auth error: OAuth authorization required, when send initialize request",
+			"⚠ MCP startup incomplete (failed: honeycomb)",
+			"› Run /review on my current changes",
+			"gpt-5.5 xhigh · ~/ntm_Dev/carousel-impl · Context 100% left · Context 0% used",
+		}, "\n")
+		matches := sc.patternLibrary.Match(live, sc.agentType)
+		if !hasError(matches) {
+			t.Fatalf("expected an error match in the raw frame (patterns changed?)")
+		}
+		if hasError(sc.filterRecoveredErrors(matches, live)) {
+			t.Errorf("MCP startup error not filtered despite recovery to prompt — pane would misclassify as ERROR")
+		}
+	})
+
+	t.Run("unrecovered crash with no following prompt is kept", func(t *testing.T) {
+		sc := NewStateClassifier("t", nil)
+		sc.SetAgentType("codex")
+		live := strings.Join([]string{
+			"› earlier prompt",
+			"panic: runtime error: invalid memory address",
+			"goroutine 1 [running]:",
+		}, "\n")
+		matches := sc.patternLibrary.Match(live, sc.agentType)
+		if !hasError(sc.filterRecoveredErrors(matches, live)) {
+			t.Errorf("genuine unrecovered error (no prompt after) was dropped — real crashes would be missed")
+		}
+	})
+}
