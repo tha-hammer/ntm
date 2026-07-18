@@ -47,9 +47,17 @@ func TestIsCodexFamilyModel(t *testing.T) {
 		{"  gpt-5-codex  ", true}, // whitespace tolerated
 		{"gpt-5.4-codex", true},   // future variants
 
+		// GPT-5.6 flagship: OpenAI restricts gpt-5.6-sol to API-key auth
+		// (openai/codex#31905), so it must be flagged; its siblings are fine.
+		{"gpt-5.6-sol", true},
+		{"GPT-5.6-SOL", true}, // case-insensitive
+		{"gpt-5.6-terra", false},
+		{"gpt-5.6-luna", false},
+
 		// Non-codex gpt models — must NOT be flagged.
 		{"gpt-5", false},
 		{"gpt-5.5", false}, // the #147 reporter's configured default
+		{"gpt-5.6", false}, // bare generation id, safe
 		{"gpt-5.3", false},
 		{"gpt-4", false},
 		{"gpt-4o", false},

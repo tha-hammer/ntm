@@ -1819,7 +1819,7 @@ type ModelsConfig struct {
 func DefaultModels() ModelsConfig {
 	return ModelsConfig{
 		DefaultClaude: "claude-opus-4-8",
-		DefaultCodex:  "gpt-5.5",
+		DefaultCodex:  "gpt-5.6-sol",
 		DefaultGemini: "gemini-3-pro-preview",
 		DefaultOllama: "llama3",
 		Claude: map[string]string{
@@ -1831,11 +1831,15 @@ func DefaultModels() ModelsConfig {
 		},
 		Codex: map[string]string{
 			"gpt4":  "gpt-4",
-			"gpt5":  "gpt-5.5",
+			"gpt5":  "gpt-5.6-sol",
 			"o1":    "o1",
 			"o3":    "o3",
 			"turbo": "gpt-4-turbo",
-			"codex": "gpt-5.5",
+			"codex": "gpt-5.6-sol",
+			// GPT-5.6 capability tiers (Sol=flagship, Terra=balanced, Luna=fast).
+			"sol":   "gpt-5.6-sol",
+			"terra": "gpt-5.6-terra",
+			"luna":  "gpt-5.6-luna",
 		},
 		Gemini: map[string]string{
 			"pro":    "gemini-3-pro-preview",

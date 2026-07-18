@@ -4413,13 +4413,13 @@ func preflightCodexAccountSupport(agents []FlatAgent) error {
 	switch decideCodexPreflight(hasUnsafeCodex && isChatGPT, strict) {
 	case codexBlock:
 		return fmt.Errorf(
-			"refusing to spawn %d `gpt-*-codex` Codex agent(s) on a ChatGPT-billed account (NTM_CODEX_PREFLIGHT_STRICT is set). Some ChatGPT plans reject `gpt-*-codex` with HTTP 400; if yours supports it, unset NTM_CODEX_PREFLIGHT_STRICT, or use `--cod=%d:gpt-5.5` / a Codex API key (see ntm#155, ntm#142)",
+			"refusing to spawn %d ChatGPT-restricted Codex model agent(s) (gpt-*-codex or gpt-5.6-sol) on a ChatGPT-billed account (NTM_CODEX_PREFLIGHT_STRICT is set). OpenAI rejects these with HTTP 400 on ChatGPT auth; if yours supports it, unset NTM_CODEX_PREFLIGHT_STRICT, or use `--cod=%d:gpt-5.6-terra` / a Codex API key (see ntm#155, ntm#142, openai/codex#31905)",
 			n, n,
 		)
 	case codexWarn:
 		if !IsJSONOutput() {
 			output.PrintWarningf(
-				"%d Codex agent(s) request a `gpt-*-codex` model on a ChatGPT-billed login. Most ChatGPT plans run it fine, but some accounts get HTTP 400 — if a pane stays alive yet rejects the first prompt, switch to `--cod=N:gpt-5.5` or use a Codex API key (see ntm#155). Set NTM_CODEX_PREFLIGHT_STRICT=1 to fail fast instead.",
+				"%d Codex agent(s) request a ChatGPT-restricted model (gpt-*-codex or gpt-5.6-sol) on a ChatGPT-billed login. OpenAI rejects gpt-5.6-sol with HTTP 400 on ChatGPT auth (openai/codex#31905); gpt-*-codex is fine on most plans but 400s on some. If a pane stays alive yet rejects the first prompt, switch to `--cod=N:gpt-5.6-terra` or use a Codex API key (see ntm#155). Set NTM_CODEX_PREFLIGHT_STRICT=1 to fail fast instead.",
 				n,
 			)
 		}
@@ -4452,14 +4452,16 @@ func effectiveCodexModel(cliModel string) string {
 	return config.DefaultModels().DefaultCodex
 }
 
-// isCodexFamilyModel reports whether a model id is a `gpt-*-codex`
-// family id that OpenAI rejects with HTTP 400 on ChatGPT-billed
-// accounts. The check is suffix-based ("-codex") so it matches
-// gpt-5-codex, gpt-5.2-codex, gpt-5.3-codex, and any future
-// gpt-5.X-codex without an explicit allow-list update. Plain
-// `gpt-5`, `gpt-5.5`, etc. do not match and are considered safe.
+// isCodexFamilyModel reports whether a model id is one OpenAI rejects with
+// HTTP 400 on ChatGPT-billed accounts (usable only with a Codex API key).
+// This covers the `gpt-*-codex` family (suffix match, so gpt-5-codex,
+// gpt-5.3-codex, and any future gpt-5.X-codex are caught without an allow-list
+// update) AND the GPT-5.6 flagship `gpt-5.6-sol`, which OpenAI restricts to
+// API-key auth (openai/codex#31905). Its siblings gpt-5.6-terra / gpt-5.6-luna
+// and plain gpt-5, gpt-5.5, etc. run fine on ChatGPT accounts and are safe.
 func isCodexFamilyModel(model string) bool {
-	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(model)), "-codex")
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasSuffix(m, "-codex") || m == "gpt-5.6-sol"
 }
 
 // worktreeAgentName builds the directory-name component for an agent's

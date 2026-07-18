@@ -40,20 +40,23 @@ var ContextLimits = map[string]int{
 	"claude-3-5-haiku":  200000,
 
 	// OpenAI models
-	"gpt-4":       128000,
-	"gpt-4-turbo": 128000,
-	"gpt-4o":      128000,
-	"gpt-4o-mini": 128000,
-	"gpt-5":       256000,
-	"gpt-5-codex": 256000,
-	"gpt-5.1":     256000,
-	"gpt-5.3":     256000,
-	"o1":          128000,
-	"o1-mini":     128000,
-	"o1-preview":  128000,
-	"o3":          200000,
-	"o3-mini":     200000,
-	"o4-mini":     128000,
+	"gpt-4":         128000,
+	"gpt-4-turbo":   128000,
+	"gpt-4o":        128000,
+	"gpt-4o-mini":   128000,
+	"gpt-5":         256000,
+	"gpt-5-codex":   256000,
+	"gpt-5.1":       256000,
+	"gpt-5.3":       256000,
+	"gpt-5.6-sol":   256000,
+	"gpt-5.6-terra": 256000,
+	"gpt-5.6-luna":  256000,
+	"o1":            128000,
+	"o1-mini":       128000,
+	"o1-preview":    128000,
+	"o3":            200000,
+	"o3-mini":       200000,
+	"o4-mini":       128000,
 
 	// Google Gemini models
 	"gemini-2.0-flash":      1000000,
@@ -215,7 +218,7 @@ var agentTypeBudgetPct = map[string]float64{
 // agentTypeDefaultModels maps agent types to their default model for budget calculation.
 var agentTypeDefaultModels = map[string]string{
 	"cc":       "claude-opus-4",
-	"cod":      "gpt-5-codex",
+	"cod":      "gpt-5.6-sol",
 	"gmi":      "gemini-2.0-flash",
 	"agy":      "gemini-3-pro-preview", // Antigravity pins Gemini 3 Pro
 	"cursor":   "claude-3.5-sonnet",
