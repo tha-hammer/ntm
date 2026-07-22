@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -464,6 +465,99 @@ func TestTemplateFunctions(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCargoBuildJobs_ReturnsValidPositiveInteger checks the shape of
+// cargoBuildJobs' output rather than its exact value, since the value is
+// derived from the host's real memory (via memLimitMBValue/systemMemoryMB),
+// which is not mocked here — consistent with how memLimitMB itself has no
+// exact-value test.
+func TestCargoBuildJobs_ReturnsValidPositiveInteger(t *testing.T) {
+	got := cargoBuildJobs()
+	n, err := strconv.Atoi(got)
+	if err != nil {
+		t.Fatalf("cargoBuildJobs() = %q, not a valid integer: %v", got, err)
+	}
+	if n < 1 {
+		t.Errorf("cargoBuildJobs() = %d, want >= 1", n)
+	}
+}
+
+// TestMemLimitPrefix_MemoryHighBelowMemoryMax checks the relationship
+// between MemoryHigh and MemoryMax when memLimitPrefix is non-empty (i.e.
+// this environment has a systemd user session, as hasSystemdUserSession
+// gates). On environments without one (Docker/WSL1/darwin/CI without a user
+// session bus), memLimitPrefix returns "" and the test has nothing to check
+// — mirroring how TestDefaultAgentTemplates already treats this as
+// environment-gated rather than asserting exact prefix content.
+func TestMemLimitPrefix_MemoryHighBelowMemoryMax(t *testing.T) {
+	prefix := memLimitPrefix()
+	if prefix == "" {
+		t.Skip("memLimitPrefix() is empty in this environment (no systemd user session); nothing to check")
+	}
+	if !strings.Contains(prefix, "MemoryMax=") {
+		t.Fatalf("memLimitPrefix() = %q, missing MemoryMax=", prefix)
+	}
+	if !strings.Contains(prefix, "MemoryHigh=") {
+		t.Fatalf("memLimitPrefix() = %q, missing MemoryHigh=", prefix)
+	}
+
+	maxMB := mustExtractPropertyMB(t, prefix, "MemoryMax=")
+	highMB := mustExtractPropertyMB(t, prefix, "MemoryHigh=")
+	if highMB >= maxMB {
+		t.Errorf("MemoryHigh=%dM should be strictly below MemoryMax=%dM", highMB, maxMB)
+	}
+	wantHigh := int(float64(maxMB) * memHighFraction)
+	if highMB != wantHigh {
+		t.Errorf("MemoryHigh=%dM, want %dM (%.0f%% of MemoryMax)", highMB, wantHigh, memHighFraction*100)
+	}
+}
+
+// mustExtractPropertyMB parses the "<value>M" that follows a "-p
+// <property>=" style token (e.g. "MemoryMax=") out of a memLimitPrefix()
+// string like "systemd-run --user --scope -q -p MemoryMax=16384M -p
+// MemoryHigh=13107M".
+func mustExtractPropertyMB(t *testing.T, prefix, property string) int {
+	t.Helper()
+	idx := strings.Index(prefix, property)
+	if idx == -1 {
+		t.Fatalf("property %q not found in %q", property, prefix)
+	}
+	rest := prefix[idx+len(property):]
+	end := strings.IndexAny(rest, " \t")
+	if end != -1 {
+		rest = rest[:end]
+	}
+	rest = strings.TrimSuffix(rest, "M")
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		t.Fatalf("could not parse %q value from %q: %v", property, rest, err)
+	}
+	return n
+}
+
+// TestDefaultAgentTemplates_CargoBuildJobs checks that Claude, Codex, and
+// Gemini all render a CARGO_BUILD_JOBS= assignment (unconditional, unlike
+// memLimitPrefix, so this does not need environment gating).
+func TestDefaultAgentTemplates_CargoBuildJobs(t *testing.T) {
+	templates := DefaultAgentTemplates()
+	vars := AgentTemplateVars{AgentType: "cc"}
+
+	for name, tmpl := range map[string]string{
+		"Claude": templates.Claude,
+		"Codex":  templates.Codex,
+		"Gemini": templates.Gemini,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := GenerateAgentCommand(tmpl, vars)
+			if err != nil {
+				t.Fatalf("%s template failed: %v", name, err)
+			}
+			if !strings.Contains(got, "CARGO_BUILD_JOBS=") {
+				t.Errorf("%s rendered command %q missing CARGO_BUILD_JOBS=", name, got)
 			}
 		})
 	}

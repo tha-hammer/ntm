@@ -82,12 +82,12 @@ func nodeHeapMB() string {
 	return memLimitMB()
 }
 
-// memLimitMB computes a per-agent memory limit based on system RAM.
-// Uses 25% of total RAM, clamped between 2048 MB and 16384 MB.
-func memLimitMB() string {
+// memLimitMBValue computes a per-agent memory limit in MB based on system
+// RAM. Uses 25% of total RAM, clamped between 2048 MB and 16384 MB.
+func memLimitMBValue() uint64 {
 	totalMB := systemMemoryMB()
 	if totalMB == 0 {
-		return "8192" // safe default for unknown systems
+		return 8192 // safe default for unknown systems
 	}
 	limitMB := totalMB / 4
 	if limitMB < 2048 {
@@ -96,7 +96,45 @@ func memLimitMB() string {
 	if limitMB > 16384 {
 		limitMB = 16384
 	}
-	return fmt.Sprintf("%d", limitMB)
+	return limitMB
+}
+
+// memLimitMB computes a per-agent memory limit based on system RAM.
+// Uses 25% of total RAM, clamped between 2048 MB and 16384 MB.
+func memLimitMB() string {
+	return fmt.Sprintf("%d", memLimitMBValue())
+}
+
+// memHighFraction is the MemoryHigh soft-throttle threshold as a fraction of
+// the MemoryMax hard cap applied by memLimitPrefix. Cgroup v2 reclaims and
+// throttles a scope as its usage approaches MemoryHigh instead of jumping
+// straight to an OOM kill at MemoryMax, giving a transient spike (e.g. an
+// in-pane `cargo build`) a chance to finish rather than being killed outright.
+const memHighFraction = 0.8
+
+// cargoBuildJobsPerJobMB is the assumed peak memory footprint of a single
+// rustc codegen worker, used to size cargoBuildJobs. Based on observed
+// OOM-killer log data for rustc processes killed inside an agent pane's
+// cgroup (anon-rss ~1.3-1.4GB, total-vm ~2.1-2.4GB); rounded up for headroom.
+const cargoBuildJobsPerJobMB = 2048
+
+// cargoBuildJobsReserveFraction is the fraction of a pane's memory budget
+// reserved for the agent process itself, left unavailable to cargo/rustc
+// when sizing cargoBuildJobs.
+const cargoBuildJobsReserveFraction = 0.25
+
+// cargoBuildJobs computes a default CARGO_BUILD_JOBS value sized to fit
+// within the pane's memory budget (memLimitMBValue) rather than scaling with
+// CPU count — this bounds the actual memory driver of an in-pane `cargo
+// build` (parallel rustc workers), which is what pushes a pane's cgroup over
+// its MemoryMax cap, rather than just capping concurrency by core count.
+func cargoBuildJobs() string {
+	budgetMB := float64(memLimitMBValue()) * (1 - cargoBuildJobsReserveFraction)
+	jobs := int(budgetMB / cargoBuildJobsPerJobMB)
+	if jobs < 1 {
+		jobs = 1
+	}
+	return fmt.Sprintf("%d", jobs)
 }
 
 // hasSystemdUserSession checks whether a systemd user session is available.
@@ -111,11 +149,15 @@ var hasSystemdUserSession = sync.OnceValue(func() bool {
 
 // memLimitPrefix returns a command prefix that enforces a real memory limit.
 // On Linux with a systemd user session, uses systemd-run --user --scope -p
-// MemoryMax= (cgroup v2). On other platforms or when systemd is unavailable
-// (e.g., Docker containers, WSL1), returns an empty string.
+// MemoryMax=/-p MemoryHigh= (cgroup v2): MemoryHigh throttles via reclaim as
+// usage approaches the soft threshold, MemoryMax is the hard OOM-kill
+// backstop. On other platforms or when systemd is unavailable (e.g., Docker
+// containers, WSL1), returns an empty string.
 func memLimitPrefix() string {
 	if runtime.GOOS == "linux" && hasSystemdUserSession() {
-		return fmt.Sprintf("systemd-run --user --scope -q -p MemoryMax=%sM", memLimitMB())
+		maxMB := memLimitMBValue()
+		highMB := uint64(float64(maxMB) * memHighFraction)
+		return fmt.Sprintf("systemd-run --user --scope -q -p MemoryMax=%dM -p MemoryHigh=%dM", maxMB, highMB)
 	}
 	return ""
 }
@@ -168,6 +210,10 @@ var templateFuncs = template.FuncMap{
 	// memLimitPrefix returns an OS-appropriate command prefix that enforces
 	// a real memory limit (systemd-run on Linux, empty on other platforms)
 	"memLimitPrefix": memLimitPrefix,
+	// cargoBuildJobs returns a default CARGO_BUILD_JOBS value sized to the
+	// per-agent memory budget, so an in-pane `cargo build` can't blow past
+	// the pane's own memory cap by scaling parallelism with core count
+	"cargoBuildJobs": cargoBuildJobs,
 }
 
 func templateReferencesModel(tmpl string) bool {
@@ -228,10 +274,17 @@ func IsTemplateCommand(cmd string) bool {
 // These templates show the recommended format for model-aware agent commands.
 // System prompt injection is supported via SystemPromptFile for persona agents.
 func DefaultAgentTemplates() AgentConfig {
+	// Claude, Codex, and Gemini all carry {{cargoBuildJobs}}/{{memLimitPrefix}}
+	// so an in-pane `cargo build` inherits a bounded CARGO_BUILD_JOBS and the
+	// same per-pane cgroup cap regardless of which agent's pane it runs in —
+	// these render inline into the command string (rather than being
+	// injected the way AGENT_NAME is, in internal/cli/spawn.go) so they take
+	// effect on both the `ntm spawn` and `--robot-spawn` paths, which share
+	// GenerateAgentCommand but not the CLI path's post-render env-prepending.
 	return AgentConfig{
-		Claude: `{{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .ReasoningEffort}} --effort {{shellQuote .ReasoningEffort}}{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,
-		Codex:  `{{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT="$(cat {{shellQuote .SystemPromptFile}})" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "gpt-5.6-sol")}} -c model_reasoning_effort={{shellQuote (.ReasoningEffort | default "xhigh")}} -c model_reasoning_summary_format=experimental --search`,
-		Gemini: `gemini{{if .Model}} --model {{shellQuote .Model}}{{end}} --yolo`,
+		Claude: `CARGO_BUILD_JOBS={{cargoBuildJobs}} {{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .ReasoningEffort}} --effort {{shellQuote .ReasoningEffort}}{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,
+		Codex:  `CARGO_BUILD_JOBS={{cargoBuildJobs}} {{memLimitPrefix}} {{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT="$(cat {{shellQuote .SystemPromptFile}})" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "gpt-5.6-sol")}} -c model_reasoning_effort={{shellQuote (.ReasoningEffort | default "xhigh")}} -c model_reasoning_summary_format=experimental --search`,
+		Gemini: `CARGO_BUILD_JOBS={{cargoBuildJobs}} {{memLimitPrefix}} gemini{{if .Model}} --model {{shellQuote .Model}}{{end}} --yolo`,
 		// Antigravity (agy): the model is hard-pinned to "Gemini 3.1 Pro (High)"
 		// by ResolveModel, so --model is always injected. --dangerously-skip-permissions
 		// is agy's autonomous (auto-approve) flag — the equivalent of gemini's --yolo —
