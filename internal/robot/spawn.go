@@ -2,12 +2,14 @@ package robot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -112,11 +114,16 @@ func collectSpawnAdmissionInput(opts SpawnOptions, cfg *config.Config, totalAgen
 	}
 
 	if cfg == nil || cfg.SpawnPacing.Enabled {
+		// LargeSpawnThreshold gates admission on pressure only once a spawn
+		// requests "a lot" of agents at once. cfg.SpawnPacing.MaxConcurrentSpawns
+		// is a rate-pacing knob (how many spawn *operations* run concurrently,
+		// default 4) — reusing it here made routine 4-agent spawns get
+		// pressure-gated as "large", which combined with the proc_count metric
+		// bug above meant any spawn >=4 was refused regardless of real
+		// headroom. Use the pressure package's own pipeline-fanout budget
+		// instead, which is what "large spawn" is meant to track.
 		input.LargeSpawnThreshold = pressure.DefaultBudget().MaxPipelineFanout
 		if cfg != nil {
-			if cfg.SpawnPacing.MaxConcurrentSpawns > 0 {
-				input.LargeSpawnThreshold = cfg.SpawnPacing.MaxConcurrentSpawns
-			}
 			input.MaxAgents = spawnAdmissionAgentLimit(cfg)
 		}
 		input.Pressure = collectSystemPressureSnapshot()
@@ -485,9 +492,16 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	agentNum := startIdx
 	agentCommands := getAgentCommands(cfg)
 
+	// Resolve/mint Agent Mail identities the same way `ntm spawn` (CLI) does,
+	// so --robot-spawn panes get a pre-selected Agent Mail name as their pane
+	// title + $AGENT_NAME instead of a generic <session>__type_N placeholder
+	// (bd-3frkf). Degrades gracefully to nil (no names) when Agent Mail is
+	// disabled/unavailable.
+	amState := setupAgentMailState(cfg, dir, opts.Session)
+
 	// Launch Claude agents
 	for i := 0; i < opts.CCCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "claude", i+1, dir, agentCommands["claude"])
+		agent := launchAgent(panes[agentNum], opts.Session, "claude", i+1, dir, agentCommands["claude"], amState)
 		agent.Name = nameMap.AssignNew("claude", agent.Pane)
 		output.Agents = append(output.Agents, agent)
 		agentNum++
@@ -495,7 +509,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 
 	// Launch Codex agents
 	for i := 0; i < opts.CodCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "codex", i+1, dir, agentCommands["codex"])
+		agent := launchAgent(panes[agentNum], opts.Session, "codex", i+1, dir, agentCommands["codex"], amState)
 		agent.Name = nameMap.AssignNew("codex", agent.Pane)
 		output.Agents = append(output.Agents, agent)
 		agentNum++
@@ -503,7 +517,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 
 	// Launch Gemini agents
 	for i := 0; i < opts.GmiCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "gemini", i+1, dir, agentCommands["gemini"])
+		agent := launchAgent(panes[agentNum], opts.Session, "gemini", i+1, dir, agentCommands["gemini"], amState)
 		agent.Name = nameMap.AssignNew("gemini", agent.Pane)
 		output.Agents = append(output.Agents, agent)
 		agentNum++
@@ -511,11 +525,13 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 
 	// Launch Antigravity agents
 	for i := 0; i < opts.AgyCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "antigravity", i+1, dir, agentCommands["antigravity"])
+		agent := launchAgent(panes[agentNum], opts.Session, "antigravity", i+1, dir, agentCommands["antigravity"], amState)
 		agent.Name = nameMap.AssignNew("antigravity", agent.Pane)
 		output.Agents = append(output.Agents, agent)
 		agentNum++
 	}
+
+	amState.persist()
 
 	// Wait for agents to be ready if requested
 	if opts.WaitReady {
@@ -555,10 +571,22 @@ func PrintSpawn(opts SpawnOptions, cfg *config.Config) error {
 }
 
 // launchAgent launches a single agent and returns its info.
-func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, command string) SpawnedAgent {
+func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, command string, am *agentMailState) SpawnedAgent {
 	startTime := time.Now()
 
-	title := fmt.Sprintf("%s__%s_%d", session, agentTypeShort(agentType), num)
+	shortType := agentTypeShort(agentType)
+	fallbackTitle := fmt.Sprintf("%s__%s_%d", session, shortType, num)
+	title := fallbackTitle
+
+	// Resolve (reuse or mint) the Agent Mail identity for this pane before
+	// launch, so the name can be shown in the pane title and threaded into
+	// the startup command via AGENT_NAME — mirrors internal/cli/spawn.go's
+	// `ntm spawn` path (bd-3frkf).
+	agentMailName := resolveAgentMailIdentity(am, dir, fallbackTitle, pane.ID, shortType, "")
+	if agentMailName != "" {
+		title = agentMailName
+	}
+
 	agent := SpawnedAgent{
 		Pane:  fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
 		Type:  agentType,
@@ -573,8 +601,23 @@ func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, comman
 		return agent
 	}
 
+	// Record ntm's canonical identity (type/index) in tmux pane options so
+	// pane addressing (grep/output/scale/is-working) resolves by type/index
+	// independently of the pane title. This lets the title BE the Agent Mail
+	// name without breaking parseAgentFromTitle-based addressing.
+	if agentMailName != "" {
+		tmux.SetPaneIdentity(pane.ID, string(tmux.AgentType(agentType).Canonical()), num, "")
+	}
+
+	// Thread the resolved Agent Mail name into the startup command so the
+	// agent process sees its assigned identity in $AGENT_NAME.
+	fullCommand := command
+	if agentMailName != "" {
+		fullCommand = fmt.Sprintf("AGENT_NAME=%s %s", tmux.ShellQuote(agentMailName), fullCommand)
+	}
+
 	// Launch agent command
-	safeCommand, err := tmux.SanitizePaneCommand(command)
+	safeCommand, err := tmux.SanitizePaneCommand(fullCommand)
 	if err != nil {
 		agent.Error = fmt.Sprintf("invalid command: %v", err)
 		agent.StartupMs = time.Since(startTime).Milliseconds()
@@ -597,6 +640,149 @@ func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, comman
 
 	agent.StartupMs = time.Since(startTime).Milliseconds()
 	return agent
+}
+
+// agentMailState holds the per-spawn Agent Mail session used to resolve
+// (reuse or mint) identities for --robot-spawn panes. A nil *agentMailState
+// means Agent Mail is disabled/unavailable; callers must treat that as
+// graceful degradation (fall back to the generic <session>__type_N title),
+// never as a spawn failure (bd-3frkf).
+type agentMailState struct {
+	client        *agentmail.Client
+	registry      *agentmail.SessionAgentRegistry
+	reconciledIDs map[int]bool
+}
+
+// setupAgentMailState prepares the Agent Mail session for a --robot-spawn
+// call, mirroring internal/cli/spawn.go's registerSpawnedAgents setup.
+// Returns nil whenever Agent Mail is disabled, unreachable, or the project
+// can't be registered — every caller must degrade gracefully on nil.
+func setupAgentMailState(cfg *config.Config, workingDir, sessionName string) *agentMailState {
+	if cfg != nil && !cfg.AgentMail.Enabled {
+		return nil
+	}
+
+	var opts []agentmail.Option
+	if cfg != nil {
+		if cfg.AgentMail.URL != "" {
+			opts = append(opts, agentmail.WithBaseURL(cfg.AgentMail.URL))
+		}
+		if cfg.AgentMail.Token != "" {
+			opts = append(opts, agentmail.WithToken(cfg.AgentMail.Token))
+		}
+	}
+	client := agentmail.NewClient(opts...)
+	if !client.IsAvailable() {
+		return nil
+	}
+
+	registry, _ := agentmail.LoadSessionAgentRegistry(sessionName, workingDir)
+	if registry == nil {
+		registry = agentmail.NewSessionAgentRegistry(sessionName, workingDir)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.EnsureProject(ctx, workingDir); err != nil {
+		return nil
+	}
+
+	return &agentMailState{client: client, registry: registry, reconciledIDs: make(map[int]bool)}
+}
+
+// resolveAgentMailIdentity resolves the Agent Mail name for one pane: reuse
+// an existing registration (by pane title, then pane ID) when present,
+// otherwise mint a new identity. Returns "" whenever am is nil or resolution
+// fails — callers fall back to the generic pane title in that case.
+func resolveAgentMailIdentity(am *agentMailState, workingDir, paneTitle, paneID, shortAgentType, model string) string {
+	if am == nil {
+		return ""
+	}
+
+	if existingName, ok := am.registry.GetAgent(paneTitle, paneID); ok && existingName != "" {
+		_, _ = agentmail.WriteIdentity(workingDir, paneID, existingName)
+		_ = agentmail.WriteLegacyCompatIdentity(workingDir, paneID, existingName)
+		am.registry.AddAgent(paneTitle, paneID, existingName)
+		return existingName
+	}
+
+	program := agentMailProgram(shortAgentType)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	registered, err := am.client.CreateAgentIdentity(ctx, agentmail.RegisterAgentOptions{
+		ProjectKey: workingDir,
+		Program:    program,
+		Model:      model,
+	})
+	if err != nil {
+		if !errors.Is(err, agentmail.ErrTransientBusy) {
+			return ""
+		}
+		// On transient busy errors, the agent may have been created server-side
+		// despite the error. Reconcile by listing agents and checking, same as
+		// internal/cli/spawn.go's registerSpawnedAgents (bd-1oenb-adjacent).
+		reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer reconcileCancel()
+		allAgents, listErr := am.client.ListAgents(reconcileCtx, workingDir)
+		if listErr != nil {
+			return ""
+		}
+		var found *agentmail.Agent
+		for i := range allAgents {
+			if allAgents[i].Program == program && allAgents[i].Model == model && !am.reconciledIDs[allAgents[i].ID] {
+				if found == nil || allAgents[i].ID > found.ID {
+					found = &allAgents[i]
+				}
+			}
+		}
+		if found == nil {
+			return ""
+		}
+		am.reconciledIDs[found.ID] = true
+		registered = found
+	}
+
+	_, _ = agentmail.WriteIdentity(workingDir, paneID, registered.Name)
+	_ = agentmail.WriteLegacyCompatIdentity(workingDir, paneID, registered.Name)
+	am.registry.AddAgent(paneTitle, paneID, registered.Name)
+	if registered.RegistrationToken != "" {
+		am.registry.SetRegistrationToken(registered.Name, registered.RegistrationToken)
+	}
+	return registered.Name
+}
+
+// persist saves the Agent Mail registry accumulated during this spawn so a
+// later respawn/restart of the same session reuses these identities. No-op
+// when am is nil or nothing was registered.
+func (am *agentMailState) persist() {
+	if am == nil || am.registry == nil || am.registry.Count() == 0 {
+		return
+	}
+	_ = agentmail.SaveSessionAgentRegistry(am.registry)
+}
+
+// agentMailProgram maps an ntm short agent-type code to the program name
+// Agent Mail expects. Mirrors internal/cli/spawn.go's agentTypeToProgram so
+// both spawn paths register agents under the same program names.
+func agentMailProgram(shortAgentType string) string {
+	switch shortAgentType {
+	case "cc":
+		return "claude-code"
+	case "cod":
+		return "codex-cli"
+	case "gmi":
+		return "gemini-cli"
+	case "cursor":
+		return "cursor"
+	case "windsurf":
+		return "windsurf"
+	case "aider":
+		return "aider"
+	case "oc":
+		return "opencode"
+	default:
+		return shortAgentType
+	}
 }
 
 // waitForAgentsReady polls agents for ready state.

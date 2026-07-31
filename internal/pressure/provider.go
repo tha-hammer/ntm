@@ -1,8 +1,10 @@
 package pressure
 
 import (
+	"bufio"
 	"context"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -124,16 +126,62 @@ func readLoadRatio() (float64, bool) {
 	return load1 / float64(cpus), true
 }
 
+// readProcessCountRatio reports the current user's process count against the
+// per-CPU budget. It intentionally counts only processes owned by the
+// current user (matching internal/scheduler/headroom.go's getProcessCount),
+// not /proc/loadavg's system-wide total: that total includes every process
+// on the host (browsers, docker, systemd units, other users' sessions), so
+// on any moderately busy Linux machine it sits at or above the budget
+// permanently — pinning Overall pressure at "critical" regardless of actual
+// swarm/spawn headroom (bd-3frkf-adjacent headroom investigation).
 func readProcessCountRatio() (float64, bool) {
-	raw, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return 0, false
-	}
-	total, ok := parseProcessTotalFromLoadavg(string(raw))
+	total, ok := currentUserProcessCount()
 	if !ok {
 		return 0, false
 	}
 	return processCountRatio(total, defaultProcessCountLimit())
+}
+
+// currentUserProcessCount counts processes in /proc owned by the current
+// user's UID.
+func currentUserProcessCount() (int, bool) {
+	uid := os.Getuid()
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, false
+	}
+
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			continue
+		}
+
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "Uid:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if procUID, err := strconv.Atoi(fields[1]); err == nil && procUID == uid {
+						count++
+					}
+				}
+				break
+			}
+		}
+	}
+
+	return count, true
 }
 
 func parseProcessTotalFromLoadavg(raw string) (int, bool) {
