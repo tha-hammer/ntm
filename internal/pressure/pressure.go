@@ -195,8 +195,8 @@ func EvaluateSpawnAdmission(in SpawnAdmissionInput) SpawnAdmission {
 	}
 	projectedPanes := currentPanes + additionalPanes
 	largeSpawn := largeThreshold > 0 && requestedAgents >= largeThreshold
-	pressureLevel := in.Pressure.Overall
-	limiting := limitingStrings(in.Pressure.Limiting)
+	pressureLevel, pressureLimiting := effectiveSpawnPressure(in.Pressure)
+	limiting := limitingStrings(pressureLimiting)
 
 	out := SpawnAdmission{
 		Decision:            SpawnAdmissionAdmit,
@@ -246,13 +246,49 @@ func EvaluateSpawnAdmission(in SpawnAdmissionInput) SpawnAdmission {
 	case largeSpawn && pressureLevel >= LevelCritical:
 		out.Decision = SpawnAdmissionRefuse
 		out.Reason = "pressure_critical"
-		out.Hint = recommendation(ActionSwarmSpawn, in.Pressure.Limiting)
+		out.Hint = recommendation(ActionSwarmSpawn, pressureLimiting)
 	case largeSpawn && pressureLevel >= LevelHigh:
 		out.Decision = SpawnAdmissionDefer
 		out.Reason = "pressure_high"
-		out.Hint = recommendation(ActionSwarmSpawn, in.Pressure.Limiting)
+		out.Hint = recommendation(ActionSwarmSpawn, pressureLimiting)
 	}
 	return out
+}
+
+// effectiveSpawnPressure returns the pressure signals that are authoritative
+// for spawn admission. Process count remains in SpawnAdmission.Sources as a
+// diagnostic, but it is not evidence of host overload by itself: the budget is
+// a host-scaled heuristic rather than a kernel capacity limit, and the ratio is
+// deliberately clamped at 1. CPU, memory, load, and any future pressure sources
+// continue to retain their normal admission weight.
+func effectiveSpawnPressure(snap Snapshot) (Level, []Source) {
+	if len(snap.Levels) == 0 {
+		limiting := make([]Source, 0, len(snap.Limiting))
+		for _, source := range snap.Limiting {
+			if source != SourceProcCount {
+				limiting = append(limiting, source)
+			}
+		}
+		if len(snap.Limiting) > 0 && len(limiting) == 0 {
+			return LevelLow, nil
+		}
+		return snap.Overall, limiting
+	}
+
+	overall := LevelLow
+	for source, level := range snap.Levels {
+		if source != SourceProcCount && level > overall {
+			overall = level
+		}
+	}
+	limiting := make([]Source, 0, len(snap.Levels))
+	for source, level := range snap.Levels {
+		if source != SourceProcCount && level == overall {
+			limiting = append(limiting, source)
+		}
+	}
+	sort.Slice(limiting, func(i, j int) bool { return limiting[i] < limiting[j] })
+	return overall, limiting
 }
 
 func spawnAdmissionSources(snap Snapshot) []SpawnAdmissionSource {

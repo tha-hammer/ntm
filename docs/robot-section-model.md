@@ -292,6 +292,11 @@ Operators should treat `overall=high|critical` as a reason to defer
 non-urgent large spawns or assignment bursts. `proc_count` is normalized
 against a host-scaled process budget (`max(CPU*256, 4096)` by default)
 so small laptops and 64+ core swarm hosts can use the same level tokens.
+For spawn admission, `proc_count` is advisory: it remains visible in the
+per-source diagnostics but cannot independently defer or refuse a spawn.
+The admission decision and its `pressure_level`/`limiting` fields use the
+strongest non-process signal, so a hard refusal requires another source such
+as CPU, memory, or load to be genuinely critical.
 
 **Used by:** snapshot, spawn admission, future assignment/backpressure gates
 

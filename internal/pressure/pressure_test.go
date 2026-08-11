@@ -184,6 +184,75 @@ func TestEvaluateSpawnAdmission_RefusesCriticalPressure(t *testing.T) {
 	}
 }
 
+func TestEvaluateSpawnAdmission_AdmitsWhenOnlyProcessCountIsCritical(t *testing.T) {
+	t.Parallel()
+	admission := EvaluateSpawnAdmission(SpawnAdmissionInput{
+		Session:             "proj",
+		RequestedAgents:     5,
+		RequestedPanes:      6,
+		MaxAgents:           8,
+		LargeSpawnThreshold: 4,
+		Pressure: buildSnapshot(fixedClock()(), []Reading{
+			{Source: SourceCPU, Value: 0.20, Unit: "ratio"},
+			{Source: SourceLoad, Value: 0.55, Unit: "ratio"},
+			{Source: SourceMemory, Value: 0.62, Unit: "ratio"},
+			{Source: SourceProcCount, Value: 1.0, Unit: "ratio"},
+		}, DefaultThresholds()),
+	})
+	if admission.Decision != SpawnAdmissionAdmit {
+		t.Fatalf("Decision = %s, want admit when proc_count is the only critical source", admission.Decision)
+	}
+	if admission.Reason != "headroom_available" {
+		t.Errorf("Reason = %q, want headroom_available", admission.Reason)
+	}
+	if admission.PressureLevel != "normal" {
+		t.Errorf("PressureLevel = %q, want normal", admission.PressureLevel)
+	}
+	foundProcCount := false
+	for _, source := range admission.Sources {
+		if source.Source == string(SourceProcCount) {
+			foundProcCount = true
+			if source.Level != "critical" {
+				t.Errorf("proc_count source level = %q, want critical diagnostic", source.Level)
+			}
+		}
+	}
+	if !foundProcCount {
+		t.Error("proc_count source missing from admission diagnostics")
+	}
+}
+
+func TestEvaluateSpawnAdmission_DefersAtRealHostPressureDespiteCriticalProcessCount(t *testing.T) {
+	t.Parallel()
+	admission := EvaluateSpawnAdmission(SpawnAdmissionInput{
+		Session:             "proj",
+		RequestedAgents:     5,
+		RequestedPanes:      6,
+		MaxAgents:           8,
+		LargeSpawnThreshold: 4,
+		Pressure: buildSnapshot(fixedClock()(), []Reading{
+			{Source: SourceCPU, Value: 0.85, Unit: "ratio"},
+			{Source: SourceMemory, Value: 0.30, Unit: "ratio"},
+			{Source: SourceProcCount, Value: 1.0, Unit: "ratio"},
+		}, DefaultThresholds()),
+	})
+	if admission.Decision != SpawnAdmissionDefer {
+		t.Fatalf("Decision = %s, want defer for high CPU", admission.Decision)
+	}
+	if admission.Reason != "pressure_high" {
+		t.Errorf("Reason = %q, want pressure_high", admission.Reason)
+	}
+	if admission.PressureLevel != "high" {
+		t.Errorf("PressureLevel = %q, want high", admission.PressureLevel)
+	}
+	if len(admission.Limiting) != 1 || admission.Limiting[0] != string(SourceCPU) {
+		t.Errorf("Limiting = %v, want [cpu]", admission.Limiting)
+	}
+	if !strings.Contains(admission.Hint, "cpu") || strings.Contains(admission.Hint, "proc_count") {
+		t.Errorf("Hint = %q, want cpu without proc_count", admission.Hint)
+	}
+}
+
 func TestEvaluateSpawnAdmission_RefusesAgentLimit(t *testing.T) {
 	t.Parallel()
 	admission := EvaluateSpawnAdmission(SpawnAdmissionInput{
