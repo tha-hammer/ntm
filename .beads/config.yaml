@@ -1,1 +1,3 @@
 sync-branch: beads-sync
+
+sync.remote: "git+https://github.com/tha-hammer/ntm"
