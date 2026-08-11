@@ -141,6 +141,14 @@ type SpawnAdmissionInput struct {
 	MaxAgents           int
 	LargeSpawnThreshold int
 	Pressure            Snapshot
+	// RequestedMemoryMB is the aggregate memory (MB) this spawn could demand
+	// at worst case — typically RequestedAgents * config.PerAgentMemLimitMB().
+	// Zero means "not configured" (check skipped), matching the other count
+	// limits above.
+	RequestedMemoryMB int
+	// AvailableMemoryMB is a live /proc/meminfo MemAvailable reading (MB),
+	// e.g. from pressure.AvailableMemoryMB(). Zero means "not configured".
+	AvailableMemoryMB int
 }
 
 // SpawnAdmission is the robot-stable explanation for a pre-spawn
@@ -162,6 +170,8 @@ type SpawnAdmission struct {
 	AgentHeadroom       int                    `json:"agent_headroom,omitempty"`
 	LargeSpawn          bool                   `json:"large_spawn"`
 	LargeSpawnThreshold int                    `json:"large_spawn_threshold,omitempty"`
+	RequestedMemoryMB   int                    `json:"requested_memory_mb,omitempty"`
+	AvailableMemoryMB   int                    `json:"available_memory_mb,omitempty"`
 	PressureLevel       string                 `json:"pressure_level"`
 	Limiting            []string               `json:"limiting,omitempty"`
 	Sources             []SpawnAdmissionSource `json:"sources,omitempty"`
@@ -175,6 +185,13 @@ type SpawnAdmissionSource struct {
 	Unit   string  `json:"unit,omitempty"`
 	Level  string  `json:"level"`
 }
+
+// memoryReserveMB is held back from AvailableMemoryMB before comparing
+// against RequestedMemoryMB, so the check refuses slightly before the
+// literal breaking point rather than exactly at it — headroom for the OS,
+// desktop apps, and the brief burst an agent can take above its nominal
+// usage on the way to its hard MemoryMax cap.
+const memoryReserveMB = 2048
 
 // EvaluateSpawnAdmission converts pressure, pane, and agent-count
 // signals into an admit/defer/refuse decision. It is deliberately pure
@@ -198,6 +215,9 @@ func EvaluateSpawnAdmission(in SpawnAdmissionInput) SpawnAdmission {
 	pressureLevel, pressureLimiting := effectiveSpawnPressure(in.Pressure)
 	limiting := limitingStrings(pressureLimiting)
 
+	requestedMemoryMB := maxInt(in.RequestedMemoryMB, 0)
+	availableMemoryMB := maxInt(in.AvailableMemoryMB, 0)
+
 	out := SpawnAdmission{
 		Decision:            SpawnAdmissionAdmit,
 		Reason:              "headroom_available",
@@ -213,6 +233,8 @@ func EvaluateSpawnAdmission(in SpawnAdmissionInput) SpawnAdmission {
 		MaxAgents:           maxAgents,
 		LargeSpawn:          largeSpawn,
 		LargeSpawnThreshold: largeThreshold,
+		RequestedMemoryMB:   requestedMemoryMB,
+		AvailableMemoryMB:   availableMemoryMB,
 		PressureLevel:       pressureLevel.String(),
 		Limiting:            limiting,
 		Sources:             spawnAdmissionSources(in.Pressure),
@@ -243,6 +265,19 @@ func EvaluateSpawnAdmission(in SpawnAdmissionInput) SpawnAdmission {
 			" + requested " + strconv.Itoa(requestedAgents) +
 			" exceeds cap " + strconv.Itoa(maxAgents) +
 			"; reduce requested agents or raise spawn_pacing agent caps"
+	case availableMemoryMB > 0 && requestedMemoryMB > availableMemoryMB-memoryReserveMB:
+		// Per-pane memory caps (memLimitPrefix) bound one agent; nothing else
+		// bounds the sum of several agents spawned at once. requestedMemoryMB
+		// is that worst-case sum; availableMemoryMB is a live MemAvailable
+		// read, so this catches "collectively too much" regardless of spawn
+		// size — unlike the pressure_critical/high cases below, which only
+		// fire once a spawn is classified "large".
+		out.Decision = SpawnAdmissionRefuse
+		out.Reason = "insufficient_memory"
+		out.Hint = strconv.Itoa(requestedAgents) +
+			" agent(s) could demand up to " + strconv.Itoa(requestedMemoryMB) +
+			"MB but only " + strconv.Itoa(availableMemoryMB) + "MB is available" +
+			"; reduce requested agents or free memory"
 	case largeSpawn && pressureLevel >= LevelCritical:
 		out.Decision = SpawnAdmissionRefuse
 		out.Reason = "pressure_critical"

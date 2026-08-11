@@ -36,6 +36,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/recipe"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
@@ -1664,6 +1665,32 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	totalPanes := totalAgents
 	if opts.UserPane {
 		totalPanes++
+	}
+
+	// Aggregate-memory admission check: each pane's memLimitPrefix caps one
+	// agent's memory individually, but nothing previously bounded the sum of
+	// several agents spawned at once against what's actually free — a burst
+	// of individually-capped agents could still collectively exceed system
+	// RAM (unlike --robot-spawn, this CLI path had no memory/pressure check
+	// of any kind before this). Sizes worst-case demand from the same
+	// per-agent cap panes actually get and compares to a live reading, so it
+	// self-corrects regardless of what else (VS Code, browser, ...) is
+	// already running. Gated behind Headroom.Enabled so tests/operators can
+	// opt out of a live system read, matching --robot-spawn's gate.
+	if cfg == nil || cfg.SpawnPacing.Headroom.Enabled {
+		if avail, ok := pressure.AvailableMemoryMB(); ok {
+			requestedMB := totalAgents * int(config.PerAgentMemLimitMB())
+			admission := pressure.EvaluateSpawnAdmission(pressure.SpawnAdmissionInput{
+				Session:           opts.Session,
+				RequestedAgents:   totalAgents,
+				RequestedPanes:    totalPanes,
+				RequestedMemoryMB: requestedMB,
+				AvailableMemoryMB: avail,
+			})
+			if admission.Decision == pressure.SpawnAdmissionRefuse {
+				return outputError(fmt.Errorf("spawn admission refused: %s (%s)", admission.Reason, admission.Hint))
+			}
+		}
 	}
 
 	// Create or use existing session

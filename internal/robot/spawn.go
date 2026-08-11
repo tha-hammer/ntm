@@ -127,6 +127,23 @@ func collectSpawnAdmissionInput(opts SpawnOptions, cfg *config.Config, totalAgen
 			input.MaxAgents = spawnAdmissionAgentLimit(cfg)
 		}
 		input.Pressure = collectSystemPressureSnapshot()
+
+		// Aggregate-memory check: per-pane memLimitPrefix caps one agent, but
+		// nothing previously bounded the sum of several agents spawned at
+		// once against what's actually free — a burst of individually-capped
+		// agents could still collectively exceed system RAM. Size the
+		// worst-case demand from the same per-agent cap those panes actually
+		// get, and compare to a live reading, so this self-corrects
+		// regardless of what else (VS Code, browser, ...) is already running.
+		// Gated behind Headroom.Enabled (like the rest of this block behind
+		// SpawnPacing.Enabled) so tests/operators can opt out of a live
+		// system read the same way they already hoist AgentCaps.
+		if cfg == nil || cfg.SpawnPacing.Headroom.Enabled {
+			if avail, ok := pressure.AvailableMemoryMB(); ok {
+				input.AvailableMemoryMB = avail
+				input.RequestedMemoryMB = totalAgents * int(config.PerAgentMemLimitMB())
+			}
+		}
 	}
 
 	panesBySession, err := tmux.GetAllPanes()
@@ -494,7 +511,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 
 	// Resolve/mint Agent Mail identities the same way `ntm spawn` (CLI) does,
 	// so --robot-spawn panes get a pre-selected Agent Mail name as their pane
-	// title + $AGENT_NAME instead of a generic <session>__type_N placeholder
+	// title + $AGENT_NAME instead of the generic <session>__type_N string
 	// (bd-3frkf). Degrades gracefully to nil (no names) when Agent Mail is
 	// disabled/unavailable.
 	amState := setupAgentMailState(cfg, dir, opts.Session)

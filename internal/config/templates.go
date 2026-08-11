@@ -99,6 +99,15 @@ func memLimitMBValue() uint64 {
 	return limitMB
 }
 
+// PerAgentMemLimitMB is the exported form of memLimitMBValue: the per-agent
+// memory cap (in MB) that memLimitPrefix enforces via systemd-run's
+// MemoryMax. Exported so spawn admission checks can size a predictive
+// aggregate-memory budget (requested agents * this value) using the exact
+// same number agents are actually capped at, rather than re-deriving it.
+func PerAgentMemLimitMB() uint64 {
+	return memLimitMBValue()
+}
+
 // memLimitMB computes a per-agent memory limit based on system RAM.
 // Uses 25% of total RAM, clamped between 2048 MB and 16384 MB.
 func memLimitMB() string {

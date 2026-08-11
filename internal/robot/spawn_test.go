@@ -307,6 +307,11 @@ func TestSpawnOptions_DryRunIncludesAdmission(t *testing.T) {
 	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
 	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
 	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
+	// Disable the live-memory admission check for the same reason the caps
+	// above are hoisted: on a memory-constrained CI/dev runner, 2 agents *
+	// PerAgentMemLimitMB can legitimately exceed live MemAvailable, which
+	// isn't what this test is exercising (bd-oom-headroom).
+	cfg.SpawnPacing.Headroom.Enabled = false
 
 	resp, err := GetSpawn(opts, cfg)
 	if err != nil {
@@ -449,6 +454,10 @@ func TestSpawnOptions_MultipleAgentTypes(t *testing.T) {
 	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
 	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
 	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
+	// Disable the live-memory admission check for the same reason: a busy
+	// runner's live MemAvailable is outside this test's control
+	// (bd-oom-headroom).
+	cfg.SpawnPacing.Headroom.Enabled = false
 	// Use fast echo commands
 	cfg.Agents.Claude = "echo claude_test"
 	cfg.Agents.Codex = "echo codex_test"

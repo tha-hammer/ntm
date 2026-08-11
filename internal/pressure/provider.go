@@ -231,6 +231,37 @@ func readMemoryRatio() (float64, bool) {
 	return parseMemoryRatio(string(raw))
 }
 
+// AvailableMemoryMB reads /proc/meminfo's MemAvailable in megabytes, or
+// (0, false) if the host doesn't expose it. Deliberately excludes swap:
+// admitting more agents into swap headroom is the degrade-into-thrashing
+// path that precedes an OOM-kill cluster, not real spawn headroom.
+func AvailableMemoryMB() (int, bool) {
+	raw, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, false
+	}
+	return parseAvailableMemoryMB(string(raw))
+}
+
+// parseAvailableMemoryMB is the pure parser behind AvailableMemoryMB.
+func parseAvailableMemoryMB(raw string) (int, bool) {
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if strings.TrimSuffix(fields[0], ":") != "MemAvailable" {
+			continue
+		}
+		kb, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			return 0, false
+		}
+		return int(kb / 1024), true
+	}
+	return 0, false
+}
+
 // parseMemoryRatio is the pure /proc/meminfo parser separated from the
 // file-reading wrapper so unit tests can exercise the missing-field
 // shapes that show up on stripped /proc mounts (containers, sandboxes,

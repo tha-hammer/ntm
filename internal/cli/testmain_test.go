@@ -27,6 +27,11 @@ func newTmuxIntegrationTestConfig(projectsBase string) *config.Config {
 	testCfg.SessionRecovery.IncludeBeadsContext = false
 	testCfg.SessionRecovery.IncludeCMMemories = false
 	testCfg.GeminiSetup.AutoSelectProModel = false
+	// The live aggregate-memory admission check (bd-oom-headroom) reads real
+	// /proc/meminfo state, which these tests don't control and shouldn't be
+	// gated by — a busy/memory-constrained runner can legitimately have less
+	// MemAvailable than a few agents' worst-case memory caps.
+	testCfg.SpawnPacing.Headroom.Enabled = false
 
 	return testCfg
 }
