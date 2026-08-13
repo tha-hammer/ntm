@@ -1,6 +1,8 @@
 package process
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"runtime"
@@ -158,6 +160,179 @@ func TestHasChildAlive_NonExistentProcess(t *testing.T) {
 	if HasChildAlive(999999999) {
 		t.Error("HasChildAlive(999999999) = true, want false")
 	}
+}
+
+func TestCaptureProcessIdentity_CurrentProcessStable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pid := os.Getpid()
+
+	first, err := CaptureProcessIdentity(ctx, pid)
+	if err != nil {
+		t.Fatalf("CaptureProcessIdentity(%d) first call error = %v", pid, err)
+	}
+	if first.PID != pid {
+		t.Errorf("first.PID = %d, want %d", first.PID, pid)
+	}
+	if first.CreateTimeMillis == 0 {
+		t.Error("first.CreateTimeMillis = 0, want nonzero")
+	}
+
+	second, err := CaptureProcessIdentity(ctx, pid)
+	if err != nil {
+		t.Fatalf("CaptureProcessIdentity(%d) second call error = %v", pid, err)
+	}
+	if second != first {
+		t.Errorf("second capture = %+v, want identical to first %+v", second, first)
+	}
+}
+
+func TestCaptureProcessIdentity_ExitedProcess(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestLivenessHelperProcess")
+	cmd.Env = append(os.Environ(), "NTM_PROCESS_HELPER=exit-immediately")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("wait helper: %v", err)
+	}
+
+	if _, err := CaptureProcessIdentity(ctx, pid); !errors.Is(err, ErrProcessNotRunning) {
+		t.Errorf("CaptureProcessIdentity(%d) after exit+wait error = %v, want ErrProcessNotRunning", pid, err)
+	}
+}
+
+func TestCaptureProcessIdentity_InvalidPID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	for _, pid := range []int{0, -1} {
+		if _, err := CaptureProcessIdentity(ctx, pid); !errors.Is(err, ErrProcessNotRunning) {
+			t.Errorf("CaptureProcessIdentity(%d) error = %v, want ErrProcessNotRunning", pid, err)
+		}
+	}
+}
+
+func TestCaptureProcessIdentity_CancelledContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := CaptureProcessIdentity(ctx, os.Getpid()); !errors.Is(err, context.Canceled) {
+		t.Errorf("CaptureProcessIdentity with cancelled context error = %v, want context.Canceled", err)
+	}
+}
+
+func TestProcessIdentity_RejectsDifferentCreateTime(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pid := os.Getpid()
+
+	real, err := CaptureProcessIdentity(ctx, pid)
+	if err != nil {
+		t.Fatalf("CaptureProcessIdentity(%d) error = %v", pid, err)
+	}
+
+	mismatched := ProcessIdentity{PID: real.PID, CreateTimeMillis: real.CreateTimeMillis + 1}
+	if real == mismatched {
+		t.Errorf("identity %+v unexpectedly equals mismatched-create-time identity %+v", real, mismatched)
+	}
+
+	// A stale stored identity for a since-exited PID must not validate
+	// against a fresh capture of whatever now holds that PID slot.
+	exitedCmd := exec.Command(os.Args[0], "-test.run=TestLivenessHelperProcess")
+	exitedCmd.Env = append(os.Environ(), "NTM_PROCESS_HELPER=exit-immediately")
+	if err := exitedCmd.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	exitedPID := exitedCmd.Process.Pid
+	if err := exitedCmd.Wait(); err != nil {
+		t.Fatalf("wait helper: %v", err)
+	}
+	staleStored := ProcessIdentity{PID: exitedPID, CreateTimeMillis: 1}
+	fresh, err := CaptureProcessIdentity(ctx, exitedPID)
+	if !errors.Is(err, ErrProcessNotRunning) {
+		t.Fatalf("CaptureProcessIdentity(%d) after exit error = %v, want ErrProcessNotRunning", exitedPID, err)
+	}
+	if fresh == staleStored {
+		t.Errorf("fresh capture of exited pid unexpectedly produced a valid identity matching the stale stored one")
+	}
+}
+
+func TestGetChildPIDsContext_ReturnsErrorAndHonorsLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("invalid parent", func(t *testing.T) {
+		t.Parallel()
+		for _, pid := range []int{0, -1} {
+			if children, err := GetChildPIDsContext(ctx, pid, 8); err == nil {
+				t.Errorf("GetChildPIDsContext(%d) error = nil, want error; children = %v", pid, children)
+			}
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		t.Parallel()
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := GetChildPIDsContext(cancelledCtx, os.Getpid(), 8); !errors.Is(err, context.Canceled) {
+			t.Errorf("GetChildPIDsContext with cancelled context error = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("current process no error", func(t *testing.T) {
+		t.Parallel()
+		// The current test process may or may not have children, but
+		// enumeration itself must not fail.
+		if _, err := GetChildPIDsContext(ctx, os.Getpid(), 8); err != nil {
+			t.Errorf("GetChildPIDsContext(%d) error = %v, want nil", os.Getpid(), err)
+		}
+	})
+
+	t.Run("honors limit", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("relies on /proc task-children enumeration")
+		}
+		// Fork children through a real shell (single main thread), not
+		// exec.Command from the Go test binary directly: Go's runtime can
+		// run ForkExec on a non-main OS thread, which would make the
+		// spawned PID invisible under the parent's own
+		// /proc/<pid>/task/<pid>/children file and flake this assertion.
+		// A shell's own children always show up there, matching how this
+		// enumeration is actually used against real pane shell PIDs.
+		shellCmd := exec.Command("sh", "-c", "sleep 5 & sleep 5 & sleep 5 & sleep 5 & sleep 5 & wait")
+		if err := shellCmd.Start(); err != nil {
+			t.Fatalf("start shell: %v", err)
+		}
+		defer func() {
+			_ = shellCmd.Process.Kill()
+			_ = shellCmd.Wait()
+		}()
+		shellPID := shellCmd.Process.Pid
+
+		const limit = 2
+		deadline := time.Now().Add(2 * time.Second)
+		var children []int
+		var err error
+		for time.Now().Before(deadline) {
+			children, err = GetChildPIDsContext(ctx, shellPID, limit)
+			if err != nil {
+				t.Fatalf("GetChildPIDsContext error = %v", err)
+			}
+			if len(children) >= limit {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if len(children) != limit {
+			t.Errorf("len(children) = %d, want exactly limit %d", len(children), limit)
+		}
+	})
 }
 
 func TestProcessStateNames(t *testing.T) {

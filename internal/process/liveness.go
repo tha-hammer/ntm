@@ -2,12 +2,16 @@
 package process
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
+
+	gopsutilprocess "github.com/shirou/gopsutil/v4/process"
 )
 
 // IsAlive checks whether a process with the given PID is still running.
@@ -66,6 +70,55 @@ func IsAlive(pid int) bool {
 		}
 	}
 	return true
+}
+
+// ErrProcessNotRunning is returned by CaptureProcessIdentity when pid does
+// not correspond to a currently running process. Callers building a live
+// snapshot treat this as "the process is gone" rather than an unexpected
+// lookup failure.
+var ErrProcessNotRunning = errors.New("process: not running")
+
+// ProcessIdentity is the immutable identity of a process: its PID paired
+// with its creation time. The OS reuses PIDs, but a given PID+CreateTime
+// pair is not reused, so a stored ProcessIdentity can be revalidated
+// against a fresh capture immediately before signaling it, ruling out a
+// signal landing on an unrelated process that inherited the same PID.
+type ProcessIdentity struct {
+	PID              int
+	CreateTimeMillis int64
+}
+
+// CaptureProcessIdentity captures the current identity of the process with
+// the given PID. It always constructs a fresh gopsutil process handle — a
+// retained handle caches its creation time, which would defeat the purpose
+// of revalidating identity on every call — so every capture reflects the
+// process table at call time.
+//
+// It returns ErrProcessNotRunning if pid is invalid or does not correspond
+// to a running process (using the same zombie-aware liveness semantics as
+// IsAlive), and a wrapped error for any other lookup failure, including
+// context cancellation.
+func CaptureProcessIdentity(ctx context.Context, pid int) (ProcessIdentity, error) {
+	if pid <= 0 {
+		return ProcessIdentity{}, fmt.Errorf("%w: pid %d", ErrProcessNotRunning, pid)
+	}
+	if err := ctx.Err(); err != nil {
+		return ProcessIdentity{}, err
+	}
+	if !IsAlive(pid) {
+		return ProcessIdentity{}, fmt.Errorf("%w: pid %d", ErrProcessNotRunning, pid)
+	}
+
+	proc, err := gopsutilprocess.NewProcessWithContext(ctx, int32(pid))
+	if err != nil {
+		return ProcessIdentity{}, fmt.Errorf("%w: pid %d: %v", ErrProcessNotRunning, pid, err)
+	}
+	createMs, err := proc.CreateTimeWithContext(ctx)
+	if err != nil {
+		return ProcessIdentity{}, fmt.Errorf("process: create time for pid %d: %w", pid, err)
+	}
+
+	return ProcessIdentity{PID: pid, CreateTimeMillis: createMs}, nil
 }
 
 // HasChildAlive returns true if the given shell PID has at least one
@@ -242,6 +295,61 @@ func GetChildPIDs(parentPID int, limit int) []int {
 		return collect(strings.Fields(string(out)))
 	}
 	return nil
+}
+
+// GetChildPIDsContext returns up to limit direct children of parentPID,
+// same as GetChildPIDs, but reports enumeration failures instead of
+// silently returning nil. This lets a live-snapshot caller distinguish "the
+// parent legitimately has zero children right now" from "enumeration
+// couldn't be completed" (e.g. a real filesystem error or a cancelled
+// context), so it can decide whether a refresh is safe to commit.
+func GetChildPIDsContext(ctx context.Context, parentPID int, limit int) ([]int, error) {
+	if parentPID <= 0 {
+		return nil, fmt.Errorf("process: invalid parent pid %d", parentPID)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 8
+	}
+
+	collect := func(parts []string) []int {
+		var out []int
+		for _, p := range parts {
+			pid, err := strconv.Atoi(p)
+			if err != nil || pid <= 0 {
+				continue
+			}
+			out = append(out, pid)
+			if len(out) >= limit {
+				return out
+			}
+		}
+		return out
+	}
+
+	taskPath := fmt.Sprintf("/proc/%d/task/%d/children", parentPID, parentPID)
+	data, err := os.ReadFile(taskPath)
+	if err == nil {
+		return collect(strings.Fields(string(data))), nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("process: read %s: %w", taskPath, err)
+	}
+
+	cmd := exec.CommandContext(ctx, "pgrep", "-P", strconv.Itoa(parentPID))
+	out, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			// pgrep exits non-zero with no output when nothing matches —
+			// a legitimate zero-children result, not an enumeration failure.
+			return nil, nil
+		}
+		return nil, fmt.Errorf("process: pgrep -P %d: %w", parentPID, err)
+	}
+	return collect(strings.Fields(string(out))), nil
 }
 
 // processStateNames maps single-character /proc state codes to human names.
