@@ -131,17 +131,18 @@ func collectSpawnAdmissionInput(opts SpawnOptions, cfg *config.Config, totalAgen
 		// Aggregate-memory check: per-pane memLimitPrefix caps one agent, but
 		// nothing previously bounded the sum of several agents spawned at
 		// once against what's actually free — a burst of individually-capped
-		// agents could still collectively exceed system RAM. Size the
-		// worst-case demand from the same per-agent cap those panes actually
-		// get, and compare to a live reading, so this self-corrects
-		// regardless of what else (VS Code, browser, ...) is already running.
-		// Gated behind Headroom.Enabled (like the rest of this block behind
+		// agents could still collectively exceed system RAM. Size demand from
+		// PerAgentExpectedMemMB — a typical-usage estimate, not the
+		// memLimitPrefix ceiling those panes are merely capped at — and
+		// compare to a live reading, so this self-corrects regardless of what
+		// else (VS Code, browser, ...) is already running. Gated behind
+		// Headroom.Enabled (like the rest of this block behind
 		// SpawnPacing.Enabled) so tests/operators can opt out of a live
 		// system read the same way they already hoist AgentCaps.
 		if cfg == nil || cfg.SpawnPacing.Headroom.Enabled {
 			if avail, ok := pressure.AvailableMemoryMB(); ok {
 				input.AvailableMemoryMB = avail
-				input.RequestedMemoryMB = totalAgents * int(config.PerAgentMemLimitMB())
+				input.RequestedMemoryMB = totalAgents * int(config.PerAgentExpectedMemMB(cfg))
 			}
 		}
 	}

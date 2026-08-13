@@ -1689,14 +1689,15 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	// several agents spawned at once against what's actually free — a burst
 	// of individually-capped agents could still collectively exceed system
 	// RAM (unlike --robot-spawn, this CLI path had no memory/pressure check
-	// of any kind before this). Sizes worst-case demand from the same
-	// per-agent cap panes actually get and compares to a live reading, so it
-	// self-corrects regardless of what else (VS Code, browser, ...) is
-	// already running. Gated behind Headroom.Enabled so tests/operators can
-	// opt out of a live system read, matching --robot-spawn's gate.
+	// of any kind before this). Sizes demand from PerAgentExpectedMemMB — a
+	// typical-usage estimate, not the memLimitPrefix ceiling those panes are
+	// merely capped at — and compares to a live reading, so it self-corrects
+	// regardless of what else (VS Code, browser, ...) is already running.
+	// Gated behind Headroom.Enabled so tests/operators can opt out of a live
+	// system read, matching --robot-spawn's gate.
 	if cfg == nil || cfg.SpawnPacing.Headroom.Enabled {
 		if avail, ok := pressure.AvailableMemoryMB(); ok {
-			requestedMB := totalAgents * int(config.PerAgentMemLimitMB())
+			requestedMB := totalAgents * int(config.PerAgentExpectedMemMB(cfg))
 			admission := pressure.EvaluateSpawnAdmission(pressure.SpawnAdmissionInput{
 				Session:           opts.Session,
 				RequestedAgents:   totalAgents,

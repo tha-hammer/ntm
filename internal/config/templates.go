@@ -100,12 +100,40 @@ func memLimitMBValue() uint64 {
 }
 
 // PerAgentMemLimitMB is the exported form of memLimitMBValue: the per-agent
-// memory cap (in MB) that memLimitPrefix enforces via systemd-run's
-// MemoryMax. Exported so spawn admission checks can size a predictive
-// aggregate-memory budget (requested agents * this value) using the exact
-// same number agents are actually capped at, rather than re-deriving it.
+// memory ceiling (in MB) that memLimitPrefix enforces via systemd-run's
+// MemoryMax. This is an enforcement backstop against one misbehaving agent,
+// not an estimate of normal usage — spawn admission math must use
+// PerAgentExpectedMemMB instead (see bd-oom-headroom's follow-up: using this
+// ceiling to size aggregate demand meant N agents were refused unless N *
+// ceiling fit in available memory, and the ceiling clamps to 16GB/agent on
+// any host >=64GB RAM, so 5 agents required 80GB free regardless of host
+// size).
 func PerAgentMemLimitMB() uint64 {
 	return memLimitMBValue()
+}
+
+// defaultPerAgentExpectedMemMB is the assumed typical memory footprint (in
+// MB) of one freshly spawned agent CLI process, used only to size spawn
+// admission math. It is deliberately far below PerAgentMemLimitMB: agents
+// normally run in the low hundreds of MB to a couple GB, not anywhere near
+// their systemd MemoryMax ceiling, which exists to catch a runaway process
+// (e.g. a stuck subprocess an agent shells out to), not to describe typical
+// demand. This is a static placeholder pending an adaptive, observed-usage
+// estimator (tracked follow-up); operators can override it in the meantime
+// via spawn_pacing.headroom.per_agent_expected_mem_mb.
+const defaultPerAgentExpectedMemMB = 2048
+
+// PerAgentExpectedMemMB returns the per-agent memory estimate (in MB) used
+// to size aggregate-memory spawn admission (requested agents * this value,
+// vs live MemAvailable) — distinct from PerAgentMemLimitMB, the enforcement
+// ceiling. cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB overrides the
+// built-in default when positive; a nil cfg or a zero/unset override both
+// fall back to defaultPerAgentExpectedMemMB.
+func PerAgentExpectedMemMB(cfg *Config) uint64 {
+	if cfg != nil && cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB > 0 {
+		return uint64(cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB)
+	}
+	return defaultPerAgentExpectedMemMB
 }
 
 // memLimitMB computes a per-agent memory limit based on system RAM.

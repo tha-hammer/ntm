@@ -3892,6 +3892,7 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "max_load_average = %.2f\n", cfg.SpawnPacing.Headroom.MaxLoadAverage)
 	fmt.Fprintf(w, "max_open_files = %d\n", cfg.SpawnPacing.Headroom.MaxOpenFiles)
 	fmt.Fprintf(w, "check_interval_ms = %d\n", cfg.SpawnPacing.Headroom.CheckIntervalMs)
+	fmt.Fprintf(w, "per_agent_expected_mem_mb = %d\n", cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[spawn_pacing.backoff]")
@@ -4926,6 +4927,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 				return cfg.SpawnPacing.Headroom.MaxOpenFiles, nil
 			case "check_interval_ms":
 				return cfg.SpawnPacing.Headroom.CheckIntervalMs, nil
+			case "per_agent_expected_mem_mb":
+				return cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB, nil
 			}
 		case "backoff":
 			if len(parts) < 3 {

@@ -539,6 +539,49 @@ func mustExtractPropertyMB(t *testing.T, prefix, property string) int {
 	return n
 }
 
+// TestPerAgentExpectedMemMB_DefaultsAndOverride checks that admission sizing
+// falls back to defaultPerAgentExpectedMemMB when unconfigured, and honors an
+// explicit operator override — distinct from and unaffected by
+// PerAgentMemLimitMB, which is host-memory-derived.
+func TestPerAgentExpectedMemMB_DefaultsAndOverride(t *testing.T) {
+	if got := PerAgentExpectedMemMB(nil); got != defaultPerAgentExpectedMemMB {
+		t.Errorf("PerAgentExpectedMemMB(nil) = %d, want %d", got, defaultPerAgentExpectedMemMB)
+	}
+
+	cfg := Default()
+	if got := PerAgentExpectedMemMB(cfg); got != defaultPerAgentExpectedMemMB {
+		t.Errorf("PerAgentExpectedMemMB(default cfg) = %d, want %d", got, defaultPerAgentExpectedMemMB)
+	}
+
+	cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB = 4096
+	if got := PerAgentExpectedMemMB(cfg); got != 4096 {
+		t.Errorf("PerAgentExpectedMemMB(overridden cfg) = %d, want 4096", got)
+	}
+
+	// Explicitly re-zeroing the override falls back to the default rather
+	// than admitting a zero-sized (i.e. unbounded) per-agent estimate.
+	cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB = 0
+	if got := PerAgentExpectedMemMB(cfg); got != defaultPerAgentExpectedMemMB {
+		t.Errorf("PerAgentExpectedMemMB(re-zeroed cfg) = %d, want %d", got, defaultPerAgentExpectedMemMB)
+	}
+}
+
+// TestPerAgentExpectedMemMB_FarBelowLimit guards the actual bug this
+// function exists to fix (bd-oom-headroom): admission math must never again
+// use the enforcement ceiling (PerAgentMemLimitMB, clamped up to 16384MB) as
+// the expected per-agent demand, which made N agents unspawnable unless N *
+// 16384MB fit in available memory regardless of host size.
+func TestPerAgentExpectedMemMB_FarBelowLimit(t *testing.T) {
+	expected := PerAgentExpectedMemMB(nil)
+	limit := PerAgentMemLimitMB()
+	// Not a strict "<": PerAgentMemLimitMB floors at 2048MB on hosts with
+	// <8GB total RAM, which can coincide with defaultPerAgentExpectedMemMB.
+	// What must never happen is the estimate exceeding the ceiling.
+	if expected > limit {
+		t.Errorf("PerAgentExpectedMemMB() = %d must not exceed PerAgentMemLimitMB() = %d", expected, limit)
+	}
+}
+
 // TestDefaultAgentTemplates_CargoBuildJobs checks that Claude, Codex, and
 // Gemini all render a CARGO_BUILD_JOBS= assignment (unconditional, unlike
 // memLimitPrefix, so this does not need environment gating).

@@ -88,6 +88,16 @@ type HeadroomPacingConfig struct {
 
 	// CheckIntervalMs is the interval between resource checks in milliseconds.
 	CheckIntervalMs int `toml:"check_interval_ms"`
+
+	// PerAgentExpectedMemMB is the assumed typical (not worst-case) memory
+	// footprint of one freshly spawned agent, in megabytes, used to size the
+	// aggregate-memory spawn admission check (requested agents * this value,
+	// vs live MemAvailable). Deliberately independent from and far below
+	// PerAgentMemLimitMB (the systemd MemoryMax hard cap): the cap exists to
+	// bound a single misbehaving agent, not to describe what agents normally
+	// use. Zero means "use the built-in default" (see
+	// config.PerAgentExpectedMemMB).
+	PerAgentExpectedMemMB int `toml:"per_agent_expected_mem_mb"`
 }
 
 // BackoffPacingConfig configures exponential backoff for resource errors.
@@ -265,6 +275,9 @@ func validateHeadroomPacingConfig(cfg *HeadroomPacingConfig) error {
 	}
 	if cfg.MaxOpenFiles < 0 {
 		return fmt.Errorf("max_open_files must be non-negative, got %d", cfg.MaxOpenFiles)
+	}
+	if cfg.PerAgentExpectedMemMB < 0 {
+		return fmt.Errorf("per_agent_expected_mem_mb must be non-negative, got %d", cfg.PerAgentExpectedMemMB)
 	}
 	if cfg.CheckIntervalMs < 100 {
 		return fmt.Errorf("check_interval_ms must be at least 100, got %d", cfg.CheckIntervalMs)

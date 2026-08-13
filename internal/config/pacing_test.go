@@ -486,6 +486,9 @@ func TestValidateHeadroomPacingConfig_AllBranches(t *testing.T) {
 		{"CheckIntervalMs below 100", func(c *HeadroomPacingConfig) { c.CheckIntervalMs = 99 }, true},
 		{"CheckIntervalMs exactly 100", func(c *HeadroomPacingConfig) { c.CheckIntervalMs = 100 }, false},
 		{"CheckIntervalMs zero", func(c *HeadroomPacingConfig) { c.CheckIntervalMs = 0 }, true},
+		{"PerAgentExpectedMemMB negative", func(c *HeadroomPacingConfig) { c.PerAgentExpectedMemMB = -1 }, true},
+		{"PerAgentExpectedMemMB zero (unset, use default)", func(c *HeadroomPacingConfig) { c.PerAgentExpectedMemMB = 0 }, false},
+		{"PerAgentExpectedMemMB positive override", func(c *HeadroomPacingConfig) { c.PerAgentExpectedMemMB = 4096 }, false},
 	}
 
 	for _, tc := range tests {
