@@ -372,6 +372,231 @@ func captureOrphanProcessSnapshot(ctx context.Context, manifest *resilience.Spaw
 	}, nil
 }
 
+// Production defaults for the session-monitor loop's cadence.
+const (
+	monitorDefaultPollInterval           = 5 * time.Second
+	monitorDefaultOutputSnapshotInterval = 30 * time.Second
+	monitorDefaultMaxMisses              = 5 // ~25s at the default poll interval before confirmed death
+)
+
+// monitorLoopOptions bounds the session-observation loop's timing. Every
+// production caller uses the monitorDefault* constants; tests use short
+// named values instead of scattering duration literals.
+type monitorLoopOptions struct {
+	PollInterval           time.Duration
+	OutputSnapshotInterval time.Duration
+	MaxMisses              int
+	ReapGrace              time.Duration
+}
+
+// validate reports whether options are safe to build tickers and invoke
+// dependencies from. It is checked before any ticker or callback exists.
+func (o monitorLoopOptions) validate() error {
+	if o.PollInterval <= 0 {
+		return fmt.Errorf("monitor loop: poll interval must be positive, got %v", o.PollInterval)
+	}
+	if o.OutputSnapshotInterval <= 0 {
+		return fmt.Errorf("monitor loop: output snapshot interval must be positive, got %v", o.OutputSnapshotInterval)
+	}
+	if o.MaxMisses < 1 {
+		return fmt.Errorf("monitor loop: max misses must be at least 1, got %d", o.MaxMisses)
+	}
+	return nil
+}
+
+// monitorLoopDependencies carries every external operation
+// runSessionMonitorLoop needs: live observation, output capture, the
+// process-snapshot capture dependencies, the one-shot readiness callback,
+// and the confirmed-death callback. Production wiring lives in runMonitor;
+// tests supply deterministic fakes so the loop can be driven without a real
+// tmux session or OS process table.
+type monitorLoopDependencies struct {
+	// Observe fetches live panes for the session, or an error to classify
+	// via tmux.ClassifyCommandError.
+	Observe func(ctx context.Context, session string) ([]tmux.Pane, error)
+
+	// CaptureOutput captures per-pane output on the separate
+	// output-snapshot cadence — independent of process-snapshot refresh
+	// even though both share the loop's select statement. Production
+	// supplies a closure over its own retained output map.
+	CaptureOutput func(session string)
+
+	// SnapshotDeps supplies the process-table operations
+	// captureOrphanProcessSnapshot needs to refresh the process snapshot on
+	// every successful, usable live poll.
+	SnapshotDeps orphanSnapshotDeps
+
+	// Ready is invoked exactly once, after the first usable live capture,
+	// with a defensive copy of the current snapshot. Production supplies a
+	// no-op; tests wait on it instead of sleeping.
+	Ready func(snap orphanProcessSnapshot)
+
+	// OnConfirmedDeath is invoked exactly once, with the retained snapshot,
+	// when the miss streak reaches options.MaxMisses. The loop returns
+	// immediately afterward without further mutation.
+	OnConfirmedDeath func(ctx context.Context, snap orphanProcessSnapshot)
+
+	// PollTicks and OutputTicks let tests drive ticks through an explicit
+	// channel instead of waiting on real timers. When nil (the production
+	// default), runSessionMonitorLoop builds real time.Tickers from
+	// options — only after validation, never unconditionally.
+	PollTicks   <-chan time.Time
+	OutputTicks <-chan time.Time
+}
+
+// monitorLoopState is the session-observation loop's retained state across
+// ticks: the last-good process snapshot, the consecutive definite-missing
+// streak, and whether readiness has already fired.
+type monitorLoopState struct {
+	snapshot   orphanProcessSnapshot
+	missCount  int
+	readyFired bool
+}
+
+// copyOrphanProcessSnapshot returns a defensive copy of snap: the Roots
+// slice and Candidates map are independent backing storage, so a Ready
+// recipient can never mutate the loop's own retained state.
+func copyOrphanProcessSnapshot(snap orphanProcessSnapshot) orphanProcessSnapshot {
+	cp := snap
+	if snap.Roots != nil {
+		cp.Roots = append([]int(nil), snap.Roots...)
+	}
+	if snap.Candidates != nil {
+		cp.Candidates = make(map[process.ProcessIdentity]struct{}, len(snap.Candidates))
+		for id := range snap.Candidates {
+			cp.Candidates[id] = struct{}{}
+		}
+	}
+	return cp
+}
+
+// applyMonitorObservation advances state given one poll's outcome, per the
+// locked transition table:
+//
+//   - A definite-missing tmux error (session not found / no server)
+//     advances the miss streak and retains the snapshot.
+//   - Any other tmux error is ambiguous: it resets/breaks the miss streak —
+//     an ambiguous failure must never accumulate toward destructive
+//     confirmation — and retains the snapshot.
+//   - A successful poll always resets the miss streak. If the pane list is
+//     unusable (empty, or the manifest has agents but none resolve to an
+//     owned pane), the snapshot is retained. A zero-agent manifest is
+//     always usable, even with zero panes.
+//   - A usable poll captures a fresh snapshot. A capture failure (any
+//     enumeration or identity-lookup error beyond an expected vanished
+//     child) retains the previous generation instead of committing a
+//     partial replacement.
+//   - A usable capture replaces the snapshot and advances its generation,
+//     whether or not it produced any candidates. A live pane respawn under
+//     the same PaneID falls under this same replacement, since it is
+//     captured fresh from whatever PID currently backs that PaneID.
+//
+// It returns the (possibly unchanged) state and whether this observation
+// produced a usable live capture, which the caller uses to decide whether
+// to fire readiness.
+func applyMonitorObservation(ctx context.Context, manifest *resilience.SpawnManifest, panes []tmux.Pane, obsErr error, state monitorLoopState, deps monitorLoopDependencies) (monitorLoopState, bool) {
+	if obsErr != nil {
+		class := tmux.ClassifyCommandError(obsErr)
+		switch class.Kind {
+		case tmux.CommandErrorSessionNotFound, tmux.CommandErrorNoServer:
+			state.missCount++
+		default:
+			state.missCount = 0
+		}
+		return state, false
+	}
+
+	state.missCount = 0
+
+	roots := manifestOwnedPaneRoots(manifest, panes)
+	usable := len(manifest.Agents) == 0 || len(roots) > 0
+	if !usable {
+		return state, false
+	}
+
+	snap, err := captureOrphanProcessSnapshot(ctx, manifest, panes, deps.SnapshotDeps)
+	if err != nil {
+		return state, false
+	}
+	snap.Generation = state.snapshot.Generation + 1
+	state.snapshot = snap
+	return state, true
+}
+
+// pollMonitorLoopOnce performs one live observation and advances state
+// through applyMonitorObservation. It is the loop's single seam for "what
+// happens on one tick" — used for both the pre-readiness synchronous
+// observation and every subsequent poll tick.
+func pollMonitorLoopOnce(ctx context.Context, manifest *resilience.SpawnManifest, state monitorLoopState, deps monitorLoopDependencies) (monitorLoopState, bool) {
+	panes, err := deps.Observe(ctx, manifest.Session)
+	return applyMonitorObservation(ctx, manifest, panes, err, state, deps)
+}
+
+// runSessionMonitorLoop owns session observation, process-snapshot state
+// transitions, readiness, and confirmed-death dispatch for one spawned
+// session. runMonitor remains the production assembler for signals,
+// supervisor daemons, plugins, webhook bridge, resilience monitoring,
+// archiving, and summary state; this loop owns only what the locked
+// transition table describes.
+//
+// It performs one synchronous observation before signaling readiness
+// (rather than waiting out the first tick), then polls on
+// options.PollInterval and refreshes the process snapshot on every
+// successful, usable live poll. Output is captured separately on
+// options.OutputSnapshotInterval. Context cancellation returns promptly
+// without running confirmed-death effects.
+func runSessionMonitorLoop(ctx context.Context, manifest *resilience.SpawnManifest, options monitorLoopOptions, deps monitorLoopDependencies) error {
+	if err := options.validate(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+
+	advance := func(state monitorLoopState) monitorLoopState {
+		newState, usable := pollMonitorLoopOnce(ctx, manifest, state, deps)
+		if usable && !newState.readyFired {
+			deps.Ready(copyOrphanProcessSnapshot(newState.snapshot))
+			newState.readyFired = true
+		}
+		return newState
+	}
+
+	state := advance(monitorLoopState{})
+	if state.missCount >= options.MaxMisses {
+		deps.OnConfirmedDeath(ctx, state.snapshot)
+		return nil
+	}
+
+	pollTicks := deps.PollTicks
+	if pollTicks == nil {
+		pollTicker := time.NewTicker(options.PollInterval)
+		defer pollTicker.Stop()
+		pollTicks = pollTicker.C
+	}
+	outputTicks := deps.OutputTicks
+	if outputTicks == nil {
+		outputTicker := time.NewTicker(options.OutputSnapshotInterval)
+		defer outputTicker.Stop()
+		outputTicks = outputTicker.C
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-pollTicks:
+			state = advance(state)
+			if state.missCount >= options.MaxMisses {
+				deps.OnConfirmedDeath(ctx, state.snapshot)
+				return nil
+			}
+		case <-outputTicks:
+			deps.CaptureOutput(manifest.Session)
+		}
+	}
+}
+
 func shouldSuperviseAgentMailDaemon() bool {
 	if cfg == nil || !cfg.AgentMail.Enabled {
 		return false
