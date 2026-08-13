@@ -2,14 +2,260 @@ package robot
 
 import (
 	"encoding/json"
+	"errors"
+	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/pressure"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
+
+// TestSpawnMemoryEstimateCounts covers Behavior 7 of the live-polled
+// per-agent memory estimation TDD plan: robot's per-type count grouping for
+// memory-admission estimation.
+func TestSpawnMemoryEstimateCounts(t *testing.T) {
+	t.Parallel()
+
+	opts := SpawnOptions{CCCount: 3, CodCount: 2, GmiCount: 0, AgyCount: 1}
+	got := spawnMemoryEstimateCounts(opts)
+
+	want := map[agent.AgentType]int{
+		agent.AgentTypeClaudeCode:  3,
+		agent.AgentTypeCodex:       2,
+		agent.AgentTypeAntigravity: 1,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for t2, n := range want {
+		if got[t2] != n {
+			t.Errorf("got[%q] = %d, want %d", t2, got[t2], n)
+		}
+	}
+	if _, ok := got[agent.AgentTypeGemini]; ok {
+		t.Errorf("zero-count GmiCount must be excluded, got %+v", got)
+	}
+}
+
+// TestShouldStartRobotSessionMonitor covers Behavior 8's gating logic: the
+// resilience-monitor opt-in only ever fires when it's not a dry-run, the
+// operator explicitly enabled it, and the environment is safe to launch a
+// real process in (resilience.ShouldStartInternalMonitor — always false
+// under go test, proving the same fork-bomb guard CLI `ntm spawn` relies
+// on applies to the robot path too).
+func TestShouldStartRobotSessionMonitor(t *testing.T) {
+	t.Parallel()
+
+	enabledCfg := config.Default()
+	enabledCfg.SpawnPacing.Headroom.RobotMonitorEnabled = true
+	disabledCfg := config.Default() // RobotMonitorEnabled defaults to false
+
+	cases := []struct {
+		name   string
+		dryRun bool
+		cfg    *config.Config
+		want   bool
+	}{
+		{"default false: not enabled, not dry-run", false, disabledCfg, false},
+		{"dry-run never launches, even when enabled", true, enabledCfg, false},
+		{"enabled + not dry-run is still blocked by the go-test environment guard", false, enabledCfg, false},
+		{"nil cfg is safe and false", false, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shouldStartRobotSessionMonitor(tc.dryRun, tc.cfg); got != tc.want {
+				t.Errorf("shouldStartRobotSessionMonitor(%v, cfg) = %v, want %v", tc.dryRun, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStartRobotSessionMonitorWithDeps covers Behavior 8's launch sequence
+// via dependency injection — proving it makes exactly the same shape of
+// calls CLI `ntm spawn`'s own monitor-launch does (build the manifest from
+// the frozen config policy, save it, build the internal-monitor command for
+// this session, detach it, start it) — without ever touching the real
+// filesystem or starting a real process.
+func TestStartRobotSessionMonitorWithDeps(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success: manifest fields, session, and call order are exact", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := config.Default()
+		cfg.Resilience.AutoRestart = true
+		cfg.Resilience.ReapOrphansOnExit = true
+		agents := []resilience.AgentConfig{{PaneID: "%1", PaneIndex: 1, Type: "claude", Command: "claude"}}
+
+		var order []string
+		var gotManifest *resilience.SpawnManifest
+		var gotSession string
+		fakeCmd := &exec.Cmd{}
+		var detachedCalled, startCalled bool
+
+		deps := robotMonitorLaunchDeps{
+			saveManifest: func(m *resilience.SpawnManifest) error {
+				order = append(order, "save")
+				gotManifest = m
+				return nil
+			},
+			newMonitorCommand: func(session string) (*exec.Cmd, error) {
+				order = append(order, "new_command")
+				gotSession = session
+				return fakeCmd, nil
+			},
+			setDetached: func(cmd *exec.Cmd) {
+				order = append(order, "detach")
+				if cmd != fakeCmd {
+					t.Errorf("setDetached called with a different *exec.Cmd than newMonitorCommand returned")
+				}
+				detachedCalled = true
+			},
+			startCommand: func(cmd *exec.Cmd) error {
+				order = append(order, "start")
+				if cmd != fakeCmd {
+					t.Errorf("startCommand called with a different *exec.Cmd than newMonitorCommand returned")
+				}
+				startCalled = true
+				return nil
+			},
+		}
+
+		startRobotSessionMonitorWithDeps("robot-session", "/proj", cfg, agents, deps)
+
+		wantOrder := []string{"save", "new_command", "detach", "start"}
+		if !reflect.DeepEqual(order, wantOrder) {
+			t.Errorf("call order = %v, want %v", order, wantOrder)
+		}
+		if !detachedCalled || !startCalled {
+			t.Errorf("detachedCalled=%v startCalled=%v, want both true", detachedCalled, startCalled)
+		}
+		if gotSession != "robot-session" {
+			t.Errorf("newMonitorCommand session = %q, want %q", gotSession, "robot-session")
+		}
+		if gotManifest == nil {
+			t.Fatal("saveManifest was not called")
+		}
+		if gotManifest.Session != "robot-session" || gotManifest.ProjectDir != "/proj" {
+			t.Errorf("manifest = %+v, want Session=robot-session ProjectDir=/proj", gotManifest)
+		}
+		if !gotManifest.AutoRestart || !gotManifest.ReapOrphansOnExit {
+			t.Errorf("manifest AutoRestart/ReapOrphansOnExit = %v/%v, want true/true (frozen from cfg.Resilience)", gotManifest.AutoRestart, gotManifest.ReapOrphansOnExit)
+		}
+		if len(gotManifest.Agents) != 1 || gotManifest.Agents[0].PaneID != "%1" {
+			t.Errorf("manifest.Agents = %+v, want the one passed-in agent", gotManifest.Agents)
+		}
+	})
+
+	t.Run("saveManifest error stops before building the monitor command", func(t *testing.T) {
+		t.Parallel()
+		cfg := config.Default()
+		deps := robotMonitorLaunchDeps{
+			saveManifest: func(*resilience.SpawnManifest) error { return errors.New("disk full") },
+			newMonitorCommand: func(string) (*exec.Cmd, error) {
+				t.Fatal("newMonitorCommand must not be called after a saveManifest error")
+				return nil, nil
+			},
+			setDetached: func(*exec.Cmd) { t.Fatal("setDetached must not be called after a saveManifest error") },
+			startCommand: func(*exec.Cmd) error {
+				t.Fatal("startCommand must not be called after a saveManifest error")
+				return nil
+			},
+		}
+		startRobotSessionMonitorWithDeps("s", "/proj", cfg, nil, deps) // must not panic
+	})
+
+	t.Run("newMonitorCommand error stops before starting", func(t *testing.T) {
+		t.Parallel()
+		cfg := config.Default()
+		deps := robotMonitorLaunchDeps{
+			saveManifest:      func(*resilience.SpawnManifest) error { return nil },
+			newMonitorCommand: func(string) (*exec.Cmd, error) { return nil, errors.New("invalid session") },
+			setDetached:       func(*exec.Cmd) { t.Fatal("setDetached must not be called after a newMonitorCommand error") },
+			startCommand: func(*exec.Cmd) error {
+				t.Fatal("startCommand must not be called after a newMonitorCommand error")
+				return nil
+			},
+		}
+		startRobotSessionMonitorWithDeps("s", "/proj", cfg, nil, deps) // must not panic
+	})
+
+	t.Run("startCommand error is logged and swallowed, not propagated", func(t *testing.T) {
+		t.Parallel()
+		cfg := config.Default()
+		deps := robotMonitorLaunchDeps{
+			saveManifest:      func(*resilience.SpawnManifest) error { return nil },
+			newMonitorCommand: func(string) (*exec.Cmd, error) { return &exec.Cmd{}, nil },
+			setDetached:       func(*exec.Cmd) {},
+			startCommand:      func(*exec.Cmd) error { return errors.New("exec failed") },
+		}
+		startRobotSessionMonitorWithDeps("s", "/proj", cfg, nil, deps) // must not panic
+	})
+}
+
+// TestGetSpawn_RobotMonitorDefaultFalseLeavesNoManifest covers Behavior 8's
+// "false (default) leaves no manifest/monitor (today's behavior,
+// unchanged)" requirement end-to-end through a real (non-dry-run) spawn.
+func TestGetSpawn_RobotMonitorDefaultFalseLeavesNoManifest(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	sessionName := "test_robot_monitor_default_false"
+	cfg := config.Default() // RobotMonitorEnabled defaults to false
+	cfg.Agents.Claude = "echo test"
+	cfg.SpawnPacing.Headroom.Enabled = false // avoid a live-memory read flaking this test
+	// Hoist the agent cap above any plausible runner state, matching
+	// TestSpawnOptions_DryRunIncludesAdmission's precedent: on a busy
+	// CI/agent-swarm host, real running_agents can otherwise trip the
+	// default cap before this test's single requested agent is considered.
+	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
+
+	opts := SpawnOptions{Session: sessionName, CCCount: 1, NoUserPane: true}
+	resp, err := GetSpawn(opts, cfg)
+	if err != nil {
+		t.Fatalf("GetSpawn returned error: %v", err)
+	}
+	defer tmux.KillSession(sessionName)
+	if !resp.Success {
+		t.Fatalf("GetSpawn was not successful: %+v", resp)
+	}
+
+	if _, err := resilience.LoadManifest(sessionName); err == nil {
+		t.Error("expected no manifest to be saved when RobotMonitorEnabled is false (the default)")
+		_ = resilience.DeleteManifest(sessionName)
+	}
+}
+
+// TestGetSpawn_RobotMonitorEnabledDryRunNeverLaunches covers Behavior 8's
+// "dry-run never launches either way" requirement, even with the opt-in on.
+func TestGetSpawn_RobotMonitorEnabledDryRunNeverLaunches(t *testing.T) {
+	sessionName := "test_robot_monitor_dryrun_enabled"
+	cfg := config.Default()
+	cfg.SpawnPacing.Headroom.RobotMonitorEnabled = true
+	cfg.SpawnPacing.Headroom.Enabled = false
+
+	opts := SpawnOptions{Session: sessionName, CCCount: 1, NoUserPane: true, DryRun: true}
+	resp, err := GetSpawn(opts, cfg)
+	if err != nil {
+		t.Fatalf("GetSpawn returned error: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("dry-run GetSpawn was not successful: %+v", resp)
+	}
+
+	if _, err := resilience.LoadManifest(sessionName); err == nil {
+		t.Error("expected no manifest to be saved during a dry-run, even with RobotMonitorEnabled=true")
+		_ = resilience.DeleteManifest(sessionName)
+	}
+}
 
 func TestGetSpawnRejectsProjectNameWithLabelSeparator(t *testing.T) {
 

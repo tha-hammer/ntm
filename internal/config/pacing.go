@@ -98,6 +98,19 @@ type HeadroomPacingConfig struct {
 	// use. Zero means "use the built-in default" (see
 	// config.PerAgentExpectedMemMB).
 	PerAgentExpectedMemMB int `toml:"per_agent_expected_mem_mb"`
+
+	// RobotMonitorEnabled opts --robot-spawn into the same background
+	// resilience-monitor process CLI `ntm spawn` always starts (manifest +
+	// internal-monitor), which is also what produces live per-agent memory
+	// evidence for the adaptive estimator behind PerAgentExpectedMemMB.
+	// Default false: today --robot-spawn leaves no background process
+	// running at all, and flipping that default silently would be a real,
+	// surprising behavior change for existing robot automation (CI,
+	// scripts) that may run in ephemeral/constrained environments.
+	// Robot-spawned agents still benefit from evidence gathered via CLI
+	// spawns on the same host even with this off — they just don't
+	// contribute samples themselves unless opted in.
+	RobotMonitorEnabled bool `toml:"robot_monitor_enabled"`
 }
 
 // BackoffPacingConfig configures exponential backoff for resource errors.

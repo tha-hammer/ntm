@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/cm"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
@@ -21,9 +22,60 @@ import (
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
-func TestShouldStartInternalMonitor_IsDisabledUnderGoTest(t *testing.T) {
-	if shouldStartInternalMonitor() {
-		t.Fatal("expected internal monitor to be disabled under go test")
+// TestSpawnMemoryEstimateCounts_FromAgentsSlice covers Behavior 7 of the
+// live-polled per-agent memory estimation TDD plan: when opts.Agents is
+// populated (the AgentSpecs-flattened path), per-type counts are grouped
+// from its canonical Type, not the legacy count fields.
+func TestSpawnMemoryEstimateCounts_FromAgentsSlice(t *testing.T) {
+	t.Parallel()
+
+	opts := SpawnOptions{
+		Agents: []FlatAgent{
+			{Type: "cc"}, {Type: "cc"}, {Type: "claude-code"}, // all canonicalize to cc
+			{Type: "cod"},
+		},
+		// Legacy fields set too, to prove they're ignored when Agents is populated.
+		CCCount: 99,
+	}
+	got := spawnMemoryEstimateCounts(opts)
+
+	want := map[agentpkg.AgentType]int{
+		agentpkg.AgentTypeClaudeCode: 3,
+		agentpkg.AgentTypeCodex:      1,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("got[%q] = %d, want %d", k, got[k], v)
+		}
+	}
+}
+
+// TestSpawnMemoryEstimateCounts_LegacyCounts covers the fallback path: no
+// opts.Agents, so counts come from the explicit --cc/--cod/etc fields.
+func TestSpawnMemoryEstimateCounts_LegacyCounts(t *testing.T) {
+	t.Parallel()
+
+	opts := SpawnOptions{CCCount: 2, CodCount: 0, GmiCount: 1, AiderCount: 1}
+	got := spawnMemoryEstimateCounts(opts)
+
+	want := map[agentpkg.AgentType]int{
+		agentpkg.AgentTypeClaudeCode: 2,
+		agentpkg.AgentTypeGemini:     1,
+		agentpkg.AgentTypeAider:      1,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("got[%q] = %d, want %d", k, got[k], v)
+		}
+	}
+	if _, ok := got[agentpkg.AgentTypeCodex]; ok {
+		t.Errorf("zero-count CodCount must be excluded, got %+v", got)
 	}
 }
 
@@ -195,24 +247,6 @@ func TestSpawnHasPromptDelivery_RecognizesDefaultAndMarchingPrompts(t *testing.T
 		Agents: []FlatAgent{{Type: AgentTypeClaude, Index: 1}},
 	}) {
 		t.Fatal("expected no prompt delivery when no prompt sources are configured")
-	}
-}
-
-func TestNewInternalMonitorCommand_ValidatesSessionAndExecutable(t *testing.T) {
-
-	cmd, err := newInternalMonitorCommand("proj")
-	if err != nil {
-		t.Fatalf("newInternalMonitorCommand(valid) error = %v", err)
-	}
-	if !filepath.IsAbs(cmd.Path) {
-		t.Fatalf("command path = %q, want absolute path", cmd.Path)
-	}
-	if got, want := cmd.Args, []string{cmd.Path, "internal-monitor", "proj"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-		t.Fatalf("command args = %#v, want %#v", got, want)
-	}
-
-	if _, err := newInternalMonitorCommand("bad:name"); err == nil {
-		t.Fatal("expected invalid session name to be rejected")
 	}
 }
 

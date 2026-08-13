@@ -149,6 +149,12 @@ type SpawnAdmissionInput struct {
 	// AvailableMemoryMB is a live /proc/meminfo MemAvailable reading (MB),
 	// e.g. from pressure.AvailableMemoryMB(). Zero means "not configured".
 	AvailableMemoryMB int
+	// MemoryEstimates is the per-canonical-agent-type breakdown behind
+	// RequestedMemoryMB, from ResolveSpawnMemoryEstimate. Passed through
+	// unchanged to SpawnAdmission.MemoryEstimates so --robot-spawn --dry-run
+	// stays inspectable. Nil when the memory check itself is skipped
+	// (Headroom disabled, or AvailableMemoryMB unreadable).
+	MemoryEstimates []AgentMemoryEstimate
 }
 
 // SpawnAdmission is the robot-stable explanation for a pre-spawn
@@ -175,6 +181,7 @@ type SpawnAdmission struct {
 	PressureLevel       string                 `json:"pressure_level"`
 	Limiting            []string               `json:"limiting,omitempty"`
 	Sources             []SpawnAdmissionSource `json:"sources,omitempty"`
+	MemoryEstimates     []AgentMemoryEstimate  `json:"memory_estimates,omitempty"`
 }
 
 // SpawnAdmissionSource records the source-level pressure inputs used by
@@ -238,6 +245,7 @@ func EvaluateSpawnAdmission(in SpawnAdmissionInput) SpawnAdmission {
 		PressureLevel:       pressureLevel.String(),
 		Limiting:            limiting,
 		Sources:             spawnAdmissionSources(in.Pressure),
+		MemoryEstimates:     in.MemoryEstimates,
 	}
 	// postSpawnAgents is what the host would be running AFTER this
 	// admission. The cap exists to bound concurrent agents — running +

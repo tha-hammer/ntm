@@ -15,10 +15,12 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/archive"
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/summary"
@@ -185,8 +187,9 @@ func runMonitor(session string) error {
 		CaptureOutput: func(session string) {
 			captureSessionOutputs(session, lastOutputs)
 		},
-		SnapshotDeps: productionOrphanSnapshotDeps(),
-		Ready:        func(orphanProcessSnapshot) {},
+		SnapshotDeps:           productionOrphanSnapshotDeps(),
+		Ready:                  func(orphanProcessSnapshot) {},
+		OnAgentGenerationEnded: productionOnAgentGenerationEnded(pressure.NewFileMemorySampleStore()),
 		OnConfirmedDeath: func(dctx context.Context, snap orphanProcessSnapshot) {
 			// The gate reads only the manifest's frozen, spawn-time policy —
 			// never the detached monitor's own global config — so a custom
@@ -247,22 +250,52 @@ type orphanProcessSnapshot struct {
 	CapturedAt time.Time
 	Roots      []int
 	Candidates map[process.ProcessIdentity]struct{}
+
+	// ScopePeaks holds, for every manifest-owned pane whose depth-1
+	// descendant is running in a cgroup distinct from its own pane shell's
+	// (i.e., a memLimitPrefix-scoped agent), the largest memory.peak
+	// reading observed for that descendant's current generation. Keyed by
+	// PaneID. A pane running an unscoped/custom template, or one where any
+	// cgroup read failed, simply has no entry here — the same best-effort
+	// omission as any other capture failure.
+	ScopePeaks map[string]agentScopePeak
+}
+
+// agentScopePeak is one pane's best-effort live memory evidence: the
+// largest memory.peak observed so far for a specific agent process
+// generation, identified by PaneID + ProcessIdentity.
+type agentScopePeak struct {
+	PaneID     string
+	AgentType  agent.AgentType
+	Identity   process.ProcessIdentity
+	PeakBytes  uint64
+	ObservedAt time.Time
 }
 
 // orphanSnapshotDeps carries the process-table operations
 // captureOrphanProcessSnapshot needs, so tests can supply deterministic
 // fakes instead of depending on the real OS process table.
+//
+// cgroupPathForPID and readCgroupMemoryPeakBytes are optional (nil is a
+// valid, silent "no scope-peak evidence" configuration) so every existing
+// test fixture that only cares about the orphan-candidate walk keeps
+// working unmodified.
 type orphanSnapshotDeps struct {
 	childPIDs       func(ctx context.Context, parentPID, limit int) ([]int, error)
 	captureIdentity func(ctx context.Context, pid int) (process.ProcessIdentity, error)
+
+	cgroupPathForPID          func(pid int) (path string, ok bool)
+	readCgroupMemoryPeakBytes func(path string) (bytes uint64, ok bool)
 }
 
 // productionOrphanSnapshotDeps wires orphanSnapshotDeps to the real
 // internal/process package.
 func productionOrphanSnapshotDeps() orphanSnapshotDeps {
 	return orphanSnapshotDeps{
-		childPIDs:       process.GetChildPIDsContext,
-		captureIdentity: process.CaptureProcessIdentity,
+		childPIDs:                 process.GetChildPIDsContext,
+		captureIdentity:           process.CaptureProcessIdentity,
+		cgroupPathForPID:          process.CgroupPathForPID,
+		readCgroupMemoryPeakBytes: process.ReadCgroupMemoryPeakBytes,
 	}
 }
 
@@ -294,6 +327,33 @@ func manifestOwnedPaneRoots(manifest *resilience.SpawnManifest, panes []tmux.Pan
 	return roots
 }
 
+// manifestOwnedPaneRootIDs returns the manifest-owned PaneID that each
+// manifest-owned root PID resolved from, applying the exact same
+// ownership/dedup rule as manifestOwnedPaneRoots so the two stay in
+// lockstep. Used by captureOrphanProcessSnapshot to attribute per-pane
+// scope-peak evidence back to a PaneID.
+func manifestOwnedPaneRootIDs(manifest *resilience.SpawnManifest, panes []tmux.Pane) map[int]string {
+	owned := make(map[string]struct{}, len(manifest.Agents))
+	for _, agent := range manifest.Agents {
+		owned[agent.PaneID] = struct{}{}
+	}
+
+	byPID := make(map[int]string)
+	for _, p := range panes {
+		if p.PID <= 0 {
+			continue
+		}
+		if _, ok := owned[p.ID]; !ok {
+			continue
+		}
+		if _, ok := byPID[p.PID]; ok {
+			continue
+		}
+		byPID[p.PID] = p.ID
+	}
+	return byPID
+}
+
 // captureOrphanProcessSnapshot builds a fresh orphan-candidate snapshot from
 // the manifest-owned pane-shell roots present in panes. It walks each
 // root's descendant subtree — bounded by orphanReapMaxDepth/orphanReapFanout,
@@ -310,9 +370,24 @@ func manifestOwnedPaneRoots(manifest *resilience.SpawnManifest, panes []tmux.Pan
 // snapshot.
 func captureOrphanProcessSnapshot(ctx context.Context, manifest *resilience.SpawnManifest, panes []tmux.Pane, deps orphanSnapshotDeps) (orphanProcessSnapshot, error) {
 	roots := manifestOwnedPaneRoots(manifest, panes)
+	paneIDByRoot := manifestOwnedPaneRootIDs(manifest, panes)
+	agentTypeByPane := make(map[string]agent.AgentType, len(manifest.Agents))
+	for _, a := range manifest.Agents {
+		agentTypeByPane[a.PaneID] = agent.AgentType(a.Type).Canonical()
+	}
+
+	rootCgroupPath := make(map[int]string, len(roots))
+	if deps.cgroupPathForPID != nil {
+		for _, root := range roots {
+			if p, ok := deps.cgroupPathForPID(root); ok {
+				rootCgroupPath[root] = p
+			}
+		}
+	}
 
 	seenPID := make(map[int]struct{})
 	candidates := make(map[process.ProcessIdentity]struct{})
+	scopePeaks := make(map[string]agentScopePeak)
 
 	var walk func(pid, depth int) error
 	walk = func(pid, depth int) error {
@@ -340,6 +415,9 @@ func captureOrphanProcessSnapshot(ctx context.Context, manifest *resilience.Spaw
 				return fmt.Errorf("capture identity of pid %d: %w", child, err)
 			default:
 				candidates[identity] = struct{}{}
+				if depth == 1 {
+					captureScopePeak(ctx, deps, pid, child, identity, paneIDByRoot, agentTypeByPane, rootCgroupPath, scopePeaks)
+				}
 			}
 
 			if err := walk(child, depth+1); err != nil {
@@ -360,7 +438,59 @@ func captureOrphanProcessSnapshot(ctx context.Context, manifest *resilience.Spaw
 		CapturedAt: time.Now(),
 		Roots:      roots,
 		Candidates: candidates,
+		ScopePeaks: scopePeaks,
 	}, nil
+}
+
+// captureScopePeak best-effort reads rootPID's depth-1 descendant childPID's
+// cgroup memory.peak and records it into scopePeaks, keyed by the owning
+// pane's PaneID — but only when childPID is running in a cgroup distinct
+// from rootPID's own, the signature of a memLimitPrefix-scoped (systemd
+// transient scope) agent process. A pane whose depth-1 child shares its
+// shell's cgroup (an unscoped/custom template, or a systemd-unavailable
+// host) is left with no entry, indistinguishable from any other read
+// failure here — this is expected, not an error.
+//
+// identity must already be a fresh capture of childPID (the walk's own
+// "before" read). This function re-captures it once more immediately after
+// the cgroup memory read; a mismatch means childPID was reaped and its PID
+// reused mid-read, so that single reading is discarded without touching
+// scopePeaks.
+func captureScopePeak(ctx context.Context, deps orphanSnapshotDeps, rootPID, childPID int, identity process.ProcessIdentity, paneIDByRoot map[int]string, agentTypeByPane map[string]agent.AgentType, rootCgroupPath map[int]string, scopePeaks map[string]agentScopePeak) {
+	if deps.cgroupPathForPID == nil || deps.readCgroupMemoryPeakBytes == nil {
+		return
+	}
+	rootPath, ok := rootCgroupPath[rootPID]
+	if !ok {
+		return
+	}
+	paneID, ok := paneIDByRoot[rootPID]
+	if !ok {
+		return
+	}
+	childPath, ok := deps.cgroupPathForPID(childPID)
+	if !ok || childPath == rootPath {
+		return
+	}
+	peakBytes, ok := deps.readCgroupMemoryPeakBytes(childPath)
+	if !ok {
+		return
+	}
+	fresh, err := deps.captureIdentity(ctx, childPID)
+	if err != nil || fresh != identity {
+		return
+	}
+
+	if existing, exists := scopePeaks[paneID]; exists && existing.Identity == identity && existing.PeakBytes >= peakBytes {
+		return
+	}
+	scopePeaks[paneID] = agentScopePeak{
+		PaneID:     paneID,
+		AgentType:  agentTypeByPane[paneID],
+		Identity:   identity,
+		PeakBytes:  peakBytes,
+		ObservedAt: time.Now(),
+	}
 }
 
 // Production defaults for the session-monitor loop's cadence.
@@ -427,6 +557,14 @@ type monitorLoopDependencies struct {
 	// immediately afterward without further mutation.
 	OnConfirmedDeath func(ctx context.Context, snap orphanProcessSnapshot)
 
+	// OnAgentGenerationEnded fires once per pane whose ScopePeaks entry was
+	// present in the previous snapshot but is absent from a freshly
+	// captured one, while the session itself stayed usable this tick — see
+	// applyMonitorObservation's transition table. Optional: nil is a valid
+	// no-op configuration (used by every test that doesn't care about this
+	// signal).
+	OnAgentGenerationEnded func(ctx context.Context, peak agentScopePeak)
+
 	// PollTicks and OutputTicks let tests drive ticks through an explicit
 	// channel instead of waiting on real timers. When nil (the production
 	// default), runSessionMonitorLoop builds real time.Tickers from
@@ -458,6 +596,12 @@ func copyOrphanProcessSnapshot(snap orphanProcessSnapshot) orphanProcessSnapshot
 			cp.Candidates[id] = struct{}{}
 		}
 	}
+	if snap.ScopePeaks != nil {
+		cp.ScopePeaks = make(map[string]agentScopePeak, len(snap.ScopePeaks))
+		for k, v := range snap.ScopePeaks {
+			cp.ScopePeaks[k] = v
+		}
+	}
 	return cp
 }
 
@@ -481,6 +625,13 @@ func copyOrphanProcessSnapshot(snap orphanProcessSnapshot) orphanProcessSnapshot
 //     whether or not it produced any candidates. A live pane respawn under
 //     the same PaneID falls under this same replacement, since it is
 //     captured fresh from whatever PID currently backs that PaneID.
+//   - Immediately before that replacement, any PaneID whose ScopePeaks
+//     entry was present in the outgoing snapshot but is absent from the
+//     fresh one fires deps.OnAgentGenerationEnded once with its last
+//     reading — that specific agent's generation ended (normal exit,
+//     crash, or restart) while the session itself stayed usable this
+//     tick. This never fires on an unusable/errored tick (session death
+//     is Behavior 4's confirmed-death path, not this one).
 //
 // It returns the (possibly unchanged) state and whether this observation
 // produced a usable live capture, which the caller uses to decide whether
@@ -509,6 +660,15 @@ func applyMonitorObservation(ctx context.Context, manifest *resilience.SpawnMani
 	if err != nil {
 		return state, false
 	}
+
+	if deps.OnAgentGenerationEnded != nil {
+		for paneID, endedPeak := range state.snapshot.ScopePeaks {
+			if _, stillPresent := snap.ScopePeaks[paneID]; !stillPresent {
+				deps.OnAgentGenerationEnded(ctx, endedPeak)
+			}
+		}
+	}
+
 	snap.Generation = state.snapshot.Generation + 1
 	state.snapshot = snap
 	return state, true
@@ -598,22 +758,50 @@ type confirmedDeathDeps struct {
 	StopResilience func()
 	Reap           func(ctx context.Context, candidates []process.ProcessIdentity) orphanReapResult
 	LogReapResult  func(enabled bool, snap orphanProcessSnapshot, result orphanReapResult)
+
+	// FinalizeMemorySamples persists every still-present ScopePeaks entry
+	// from the final retained snapshot. It runs unconditionally —
+	// independent of the enabled reap gate — since memory evidence capture
+	// is not a destructive action and must not share that gate. A pane
+	// already finalized via monitorLoopDependencies.OnAgentGenerationEnded
+	// is structurally absent from snap.ScopePeaks by the time confirmed
+	// death runs (the diff that fired that callback replaced the retained
+	// snapshot with one that no longer has that entry), so no
+	// double-finalization bookkeeping is needed here. Any store error is
+	// logged and swallowed by the production implementation itself (the
+	// signature returns nothing, matching Reap/Summary's own best-effort
+	// shape); a panic here is recovered and logged, exactly like Summary
+	// below. Optional: nil is a valid no-op configuration.
+	FinalizeMemorySamples func(ctx context.Context, peaks map[string]agentScopePeak)
+
 	Summary        func()
 	DeleteManifest func() error
 }
 
 // handleConfirmedSessionDeath sequences the confirmed-death effects in the
 // locked, flat order: emit the ended event, synchronously stop/join
-// resilience monitoring, then — only when enabled — identity-safely reap
-// the retained snapshot's candidates and log the exact result. An enabled
-// policy with a valid empty snapshot still reaps and logs a zero-count
-// record, so disabled is observably distinct from "reaper received an
-// empty list." It then attempts the session summary behind a panic-safe
-// boundary and deletes the manifest regardless of what the summary did —
-// deletion is never skipped or hidden by a caller's fallback cleanup.
+// resilience monitoring, best-effort finalize any still-present memory
+// evidence, then — only when enabled — identity-safely reap the retained
+// snapshot's candidates and log the exact result. An enabled policy with a
+// valid empty snapshot still reaps and logs a zero-count record, so
+// disabled is observably distinct from "reaper received an empty list." It
+// then attempts the session summary behind a panic-safe boundary and
+// deletes the manifest regardless of what the summary did — deletion is
+// never skipped or hidden by a caller's fallback cleanup.
 func handleConfirmedSessionDeath(ctx context.Context, enabled bool, snap orphanProcessSnapshot, deps confirmedDeathDeps) error {
 	deps.EmitEnded(ctx)
 	deps.StopResilience()
+
+	if deps.FinalizeMemorySamples != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "Panic in memory-sample finalization: %v\n", r)
+				}
+			}()
+			deps.FinalizeMemorySamples(ctx, snap.ScopePeaks)
+		}()
+	}
 
 	if enabled {
 		candidates := make([]process.ProcessIdentity, 0, len(snap.Candidates))
@@ -634,6 +822,44 @@ func handleConfirmedSessionDeath(ctx context.Context, enabled bool, snap orphanP
 	}()
 
 	return deps.DeleteManifest()
+}
+
+// agentScopePeakToMemorySample converts one best-effort live memory
+// reading into the store's persisted shape. Generation is the process
+// identity's create time, matching pressure.MemorySample's documented
+// dedup key.
+func agentScopePeakToMemorySample(peak agentScopePeak) pressure.MemorySample {
+	return pressure.MemorySample{
+		PaneID:     peak.PaneID,
+		AgentType:  peak.AgentType,
+		PeakBytes:  peak.PeakBytes,
+		ObservedAt: peak.ObservedAt,
+		Generation: peak.Identity.CreateTimeMillis,
+	}
+}
+
+// productionOnAgentGenerationEnded persists one per-tick generation-ended
+// reading to store. Best-effort: any store error is logged and swallowed,
+// never surfaced to the monitor loop.
+func productionOnAgentGenerationEnded(store pressure.MemorySampleStore) func(ctx context.Context, peak agentScopePeak) {
+	return func(ctx context.Context, peak agentScopePeak) {
+		if err := store.Append(ctx, agentScopePeakToMemorySample(peak)); err != nil {
+			slog.Default().Warn("memory sample: failed to persist generation-ended reading", "pane_id", peak.PaneID, "error", err)
+		}
+	}
+}
+
+// productionFinalizeMemorySamples persists every still-present ScopePeaks
+// entry at confirmed death. Best-effort, same posture as
+// productionOnAgentGenerationEnded.
+func productionFinalizeMemorySamples(store pressure.MemorySampleStore) func(ctx context.Context, peaks map[string]agentScopePeak) {
+	return func(ctx context.Context, peaks map[string]agentScopePeak) {
+		for _, peak := range peaks {
+			if err := store.Append(ctx, agentScopePeakToMemorySample(peak)); err != nil {
+				slog.Default().Warn("memory sample: failed to persist confirmed-death reading", "pane_id", peak.PaneID, "error", err)
+			}
+		}
+	}
 }
 
 // productionConfirmedDeathDeps wires confirmedDeathDeps to runMonitor's
@@ -657,7 +883,8 @@ func productionConfirmedDeathDeps(session string, manifest *resilience.SpawnMani
 				},
 			))
 		},
-		StopResilience: monitor.Stop,
+		StopResilience:        monitor.Stop,
+		FinalizeMemorySamples: productionFinalizeMemorySamples(pressure.NewFileMemorySampleStore()),
 		Reap: func(ctx context.Context, candidates []process.ProcessIdentity) orphanReapResult {
 			return reapIdentifiedOrphanProcesses(ctx, candidates, reapGrace, productionOrphanReapDeps())
 		},

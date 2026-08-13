@@ -526,6 +526,38 @@ func legacySpawnTotalAgentCount(opts SpawnOptions) int {
 	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OllamaCount
 }
 
+// spawnMemoryEstimateCounts groups the requested agents by canonical type
+// for memory-admission estimation (pressure.ResolveSpawnMemoryEstimate). It
+// prefers opts.Agents' per-agent Type field, which is already available
+// whenever an AgentSpecs list was flattened, and falls back to the legacy
+// explicit-count fields otherwise — the same duality
+// legacySpawnTotalAgentCount already handles for totalAgents.
+func spawnMemoryEstimateCounts(opts SpawnOptions) map[agentpkg.AgentType]int {
+	counts := make(map[agentpkg.AgentType]int)
+	if len(opts.Agents) > 0 {
+		for _, a := range opts.Agents {
+			counts[agentpkg.AgentType(a.Type).Canonical()]++
+		}
+		return counts
+	}
+
+	add := func(t agentpkg.AgentType, n int) {
+		if n > 0 {
+			counts[t] += n
+		}
+	}
+	add(agentpkg.AgentTypeClaudeCode, opts.CCCount)
+	add(agentpkg.AgentTypeCodex, opts.CodCount)
+	add(agentpkg.AgentTypeGemini, opts.GmiCount)
+	add(agentpkg.AgentTypeAntigravity, opts.AgyCount)
+	add(agentpkg.AgentTypeCursor, opts.CursorCount)
+	add(agentpkg.AgentTypeWindsurf, opts.WindsurfCount)
+	add(agentpkg.AgentTypeAider, opts.AiderCount)
+	add(agentpkg.AgentTypeOpencode, opts.OpencodeCount)
+	add(agentpkg.AgentTypeOllama, opts.OllamaCount)
+	return counts
+}
+
 func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
 	return map[string]string{
 		"NTM_AGENT_COUNT_CC":       fmt.Sprintf("%d", opts.CCCount),
@@ -682,19 +714,6 @@ func codexCooldownRemaining(tracker *ratelimit.RateLimitTracker, alreadyWaited b
 		return 0, alreadyWaited
 	}
 	return tracker.CooldownRemaining("openai"), true
-}
-
-func shouldStartInternalMonitor() bool {
-	// When spawnSessionLogic is invoked from package tests, os.Executable() points at a
-	// `*.test` binary. Spawning "internal-monitor" via that binary re-runs the entire
-	// test suite recursively (detached), which can quickly fork-bomb the machine.
-	if flag.Lookup("test.v") != nil {
-		return false
-	}
-	if os.Getenv("NTM_DISABLE_INTERNAL_MONITOR") != "" {
-		return false
-	}
-	return true
 }
 
 // SpawnOptions configures session creation and agent spawning
@@ -1496,7 +1515,7 @@ func registerPluginAgentFlags(cmd *cobra.Command, p plugins.AgentPlugin, specs *
 // the spawn path and tests can prove the effective global config values —
 // including an explicit false — are snapshotted at spawn time rather than
 // re-read by the detached internal-monitor process, which receives no
-// --config flag (see newInternalMonitorCommand).
+// --config flag (see resilience.NewInternalMonitorCommand).
 func buildSpawnManifest(opts SpawnOptions, cfg *config.Config, projectDir string, agents []resilience.AgentConfig) *resilience.SpawnManifest {
 	return &resilience.SpawnManifest{
 		Session:           opts.Session,
@@ -1697,13 +1716,25 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	// system read, matching --robot-spawn's gate.
 	if cfg == nil || cfg.SpawnPacing.Headroom.Enabled {
 		if avail, ok := pressure.AvailableMemoryMB(); ok {
-			requestedMB := totalAgents * int(config.PerAgentExpectedMemMB(cfg))
+			var overrideMB uint64
+			if cfg != nil && cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB > 0 {
+				overrideMB = uint64(cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB)
+			}
+			requestedMB, memoryEstimates := pressure.ResolveSpawnMemoryEstimate(
+				context.Background(),
+				spawnMemoryEstimateCounts(opts),
+				overrideMB,
+				config.PerAgentExpectedMemMB(cfg),
+				config.PerAgentMemLimitMB(),
+				pressure.NewFileMemorySampleStore(),
+			)
 			admission := pressure.EvaluateSpawnAdmission(pressure.SpawnAdmissionInput{
 				Session:           opts.Session,
 				RequestedAgents:   totalAgents,
 				RequestedPanes:    totalPanes,
 				RequestedMemoryMB: requestedMB,
 				AvailableMemoryMB: avail,
+				MemoryEstimates:   memoryEstimates,
 			})
 			if admission.Decision == pressure.SpawnAdmissionRefuse {
 				return outputError(fmt.Errorf("spawn admission refused: %s (%s)", admission.Reason, admission.Hint))
@@ -2509,7 +2540,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	// Always started regardless of auto-restart config
 	// Note: Started BEFORE waiting for staggered prompts so that resilience is active
 	// even if the user interrupts the wait.
-	if shouldStartInternalMonitor() {
+	if resilience.ShouldStartInternalMonitor() {
 		// Save manifest for the monitor process
 		agentConfigs := make([]resilience.AgentConfig, 0, len(launchedAgents))
 		for _, agent := range launchedAgents {
@@ -2536,7 +2567,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 				}
 			}
 
-			cmd, err := newInternalMonitorCommand(opts.Session)
+			cmd, err := resilience.NewInternalMonitorCommand(opts.Session)
 			if err != nil {
 				if !IsJSONOutput() {
 					output.PrintWarningf("Failed to prepare session monitor: %v", err)
@@ -2555,7 +2586,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 				}
 
 				// Detach from terminal so it survives when ntm spawn exits
-				setDetachedProcess(cmd)
+				resilience.SetDetachedProcess(cmd)
 				if err := cmd.Start(); err != nil {
 					if !IsJSONOutput() {
 						output.PrintWarningf("Failed to start session monitor: %v", err)
@@ -2952,36 +2983,6 @@ func spawnHasPromptDelivery(opts SpawnOptions) bool {
 		}
 	}
 	return false
-}
-
-func currentExecutablePath() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("resolve current executable: %w", err)
-	}
-	exe = filepath.Clean(exe)
-	if !filepath.IsAbs(exe) {
-		return "", fmt.Errorf("current executable path must be absolute: %q", exe)
-	}
-	info, err := os.Stat(exe)
-	if err != nil {
-		return "", fmt.Errorf("stat current executable: %w", err)
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("current executable path is a directory: %q", exe)
-	}
-	return exe, nil
-}
-
-func newInternalMonitorCommand(session string) (*exec.Cmd, error) {
-	if err := tmux.ValidateSessionName(session); err != nil {
-		return nil, fmt.Errorf("invalid session name: %w", err)
-	}
-	exe, err := currentExecutablePath()
-	if err != nil {
-		return nil, err
-	}
-	return exec.Command(exe, "internal-monitor", session), nil
 }
 
 func killExistingMonitorProcess(session string) error {

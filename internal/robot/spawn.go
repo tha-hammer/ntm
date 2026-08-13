@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
@@ -16,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
 	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/recovery"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -142,7 +146,18 @@ func collectSpawnAdmissionInput(opts SpawnOptions, cfg *config.Config, totalAgen
 		if cfg == nil || cfg.SpawnPacing.Headroom.Enabled {
 			if avail, ok := pressure.AvailableMemoryMB(); ok {
 				input.AvailableMemoryMB = avail
-				input.RequestedMemoryMB = totalAgents * int(config.PerAgentExpectedMemMB(cfg))
+				var overrideMB uint64
+				if cfg != nil && cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB > 0 {
+					overrideMB = uint64(cfg.SpawnPacing.Headroom.PerAgentExpectedMemMB)
+				}
+				input.RequestedMemoryMB, input.MemoryEstimates = pressure.ResolveSpawnMemoryEstimate(
+					context.Background(),
+					spawnMemoryEstimateCounts(opts),
+					overrideMB,
+					config.PerAgentExpectedMemMB(cfg),
+					config.PerAgentMemLimitMB(),
+					pressure.NewFileMemorySampleStore(),
+				)
 			}
 		}
 	}
@@ -164,6 +179,24 @@ func collectSpawnAdmissionInput(opts SpawnOptions, cfg *config.Config, totalAgen
 		}
 	}
 	return input
+}
+
+// spawnMemoryEstimateCounts groups the requested agents by canonical type
+// for memory-admission estimation (pressure.ResolveSpawnMemoryEstimate).
+// Robot spawns only ever come from explicit per-type counts (no
+// AgentSpecs/FlatAgent list, unlike the CLI's own spawn path).
+func spawnMemoryEstimateCounts(opts SpawnOptions) map[agent.AgentType]int {
+	counts := make(map[agent.AgentType]int)
+	add := func(t agent.AgentType, n int) {
+		if n > 0 {
+			counts[t] += n
+		}
+	}
+	add(agent.AgentTypeClaudeCode, opts.CCCount)
+	add(agent.AgentTypeCodex, opts.CodCount)
+	add(agent.AgentTypeGemini, opts.GmiCount)
+	add(agent.AgentTypeAntigravity, opts.AgyCount)
+	return counts
 }
 
 func spawnAdmissionAgentLimit(cfg *config.Config) int {
@@ -193,6 +226,75 @@ func collectSystemPressureSnapshot() pressure.Snapshot {
 func isSpawnAdmissionAgentPane(pane tmux.Pane) bool {
 	agentType := pane.Type.Canonical()
 	return agentType != "" && agentType != tmux.AgentUser
+}
+
+// robotMonitorLaunchDeps carries the operations startRobotSessionMonitor
+// needs, so tests can supply recording fakes instead of actually saving a
+// manifest or starting a detached process — starting a real one under
+// `go test` would resolve to the test binary and recursively re-run the
+// whole suite (the exact hazard resilience.ShouldStartInternalMonitor
+// exists to prevent).
+type robotMonitorLaunchDeps struct {
+	saveManifest      func(*resilience.SpawnManifest) error
+	newMonitorCommand func(session string) (*exec.Cmd, error)
+	setDetached       func(*exec.Cmd)
+	startCommand      func(*exec.Cmd) error
+}
+
+// productionRobotMonitorLaunchDeps wires robotMonitorLaunchDeps to the real
+// internal/resilience package — the exact same three calls
+// internal/cli/spawn.go's own `ntm spawn` path makes, reused here rather
+// than duplicated.
+func productionRobotMonitorLaunchDeps() robotMonitorLaunchDeps {
+	return robotMonitorLaunchDeps{
+		saveManifest:      resilience.SaveManifest,
+		newMonitorCommand: resilience.NewInternalMonitorCommand,
+		setDetached:       resilience.SetDetachedProcess,
+		startCommand:      func(cmd *exec.Cmd) error { return cmd.Start() },
+	}
+}
+
+// shouldStartRobotSessionMonitor reports whether the resilience-monitor
+// opt-in (Behavior 8) should run for this spawn: not a dry-run, the
+// operator opted in via HeadroomPacingConfig.RobotMonitorEnabled, and it's
+// safe to launch a real process right now (resilience.ShouldStartInternalMonitor
+// — the same environment guard CLI `ntm spawn` relies on, preventing a
+// `go test` binary from re-exec'ing itself recursively as "internal-monitor").
+func shouldStartRobotSessionMonitor(dryRun bool, cfg *config.Config) bool {
+	return !dryRun && cfg != nil && cfg.SpawnPacing.Headroom.RobotMonitorEnabled && resilience.ShouldStartInternalMonitor()
+}
+
+// startRobotSessionMonitor saves a resilience manifest and launches the
+// detached internal-monitor process for session. Called only when
+// HeadroomPacingConfig.RobotMonitorEnabled opts in. Every failure is
+// logged and swallowed — this is best-effort evidence infrastructure, not
+// part of spawn's success/failure contract.
+func startRobotSessionMonitor(session, projectDir string, cfg *config.Config, agents []resilience.AgentConfig) {
+	startRobotSessionMonitorWithDeps(session, projectDir, cfg, agents, productionRobotMonitorLaunchDeps())
+}
+
+func startRobotSessionMonitorWithDeps(session, projectDir string, cfg *config.Config, agents []resilience.AgentConfig, deps robotMonitorLaunchDeps) {
+	manifest := &resilience.SpawnManifest{
+		Session:           session,
+		ProjectDir:        projectDir,
+		Agents:            agents,
+		AutoRestart:       cfg.Resilience.AutoRestart,
+		ReapOrphansOnExit: cfg.Resilience.ReapOrphansOnExit,
+	}
+	if err := deps.saveManifest(manifest); err != nil {
+		slog.Default().Warn("robot spawn: failed to save resilience manifest", "session", session, "error", err)
+		return
+	}
+
+	cmd, err := deps.newMonitorCommand(session)
+	if err != nil {
+		slog.Default().Warn("robot spawn: failed to prepare session monitor", "session", session, "error", err)
+		return
+	}
+	deps.setDetached(cmd)
+	if err := deps.startCommand(cmd); err != nil {
+		slog.Default().Warn("robot spawn: failed to start session monitor", "session", session, "error", err)
+	}
 }
 
 // GetSpawn creates a session with agents and returns structured output.
@@ -517,39 +619,58 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	// disabled/unavailable.
 	amState := setupAgentMailState(cfg, dir, opts.Session)
 
+	var manifestAgents []resilience.AgentConfig
+
 	// Launch Claude agents
 	for i := 0; i < opts.CCCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "claude", i+1, dir, agentCommands["claude"], amState)
+		pane := panes[agentNum]
+		agent := launchAgent(pane, opts.Session, "claude", i+1, dir, agentCommands["claude"], amState)
 		agent.Name = nameMap.AssignNew("claude", agent.Pane)
 		output.Agents = append(output.Agents, agent)
+		manifestAgents = append(manifestAgents, resilience.AgentConfig{PaneID: pane.ID, PaneIndex: pane.Index, Type: "claude", Command: agentCommands["claude"]})
 		agentNum++
 	}
 
 	// Launch Codex agents
 	for i := 0; i < opts.CodCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "codex", i+1, dir, agentCommands["codex"], amState)
+		pane := panes[agentNum]
+		agent := launchAgent(pane, opts.Session, "codex", i+1, dir, agentCommands["codex"], amState)
 		agent.Name = nameMap.AssignNew("codex", agent.Pane)
 		output.Agents = append(output.Agents, agent)
+		manifestAgents = append(manifestAgents, resilience.AgentConfig{PaneID: pane.ID, PaneIndex: pane.Index, Type: "codex", Command: agentCommands["codex"]})
 		agentNum++
 	}
 
 	// Launch Gemini agents
 	for i := 0; i < opts.GmiCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "gemini", i+1, dir, agentCommands["gemini"], amState)
+		pane := panes[agentNum]
+		agent := launchAgent(pane, opts.Session, "gemini", i+1, dir, agentCommands["gemini"], amState)
 		agent.Name = nameMap.AssignNew("gemini", agent.Pane)
 		output.Agents = append(output.Agents, agent)
+		manifestAgents = append(manifestAgents, resilience.AgentConfig{PaneID: pane.ID, PaneIndex: pane.Index, Type: "gemini", Command: agentCommands["gemini"]})
 		agentNum++
 	}
 
 	// Launch Antigravity agents
 	for i := 0; i < opts.AgyCount && agentNum < len(panes); i++ {
-		agent := launchAgent(panes[agentNum], opts.Session, "antigravity", i+1, dir, agentCommands["antigravity"], amState)
+		pane := panes[agentNum]
+		agent := launchAgent(pane, opts.Session, "antigravity", i+1, dir, agentCommands["antigravity"], amState)
 		agent.Name = nameMap.AssignNew("antigravity", agent.Pane)
 		output.Agents = append(output.Agents, agent)
+		manifestAgents = append(manifestAgents, resilience.AgentConfig{PaneID: pane.ID, PaneIndex: pane.Index, Type: "antigravity", Command: agentCommands["antigravity"]})
 		agentNum++
 	}
 
 	amState.persist()
+
+	// Best-effort resilience-monitor opt-in (bd-n1iva Behavior 8): today
+	// --robot-spawn leaves no background process running at all — CLI
+	// `ntm spawn`'s own manifest+monitor launch is what produces the live
+	// per-agent memory evidence the adaptive estimator (Behaviors 1-7)
+	// learns from. Off by default; see HeadroomPacingConfig.RobotMonitorEnabled.
+	if shouldStartRobotSessionMonitor(opts.DryRun, cfg) {
+		startRobotSessionMonitor(opts.Session, dir, cfg, manifestAgents)
+	}
 
 	// Wait for agents to be ready if requested
 	if opts.WaitReady {
