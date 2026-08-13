@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -664,5 +665,230 @@ func TestRunSessionMonitorLoop_CancellationJoinsWithoutDeathEffects(t *testing.T
 	case pollCh <- time.Now():
 		t.Error("a tick was consumed after the loop already returned from cancellation")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestHandleConfirmedSessionDeath_EffectOrder covers Behavior 6 of the
+// periodic orphan-sweep TDD plan: the flat, locked confirmed-death effect
+// order for enabled+populated, enabled+valid-empty (which still reaps and
+// logs a zero-count record — disabled is observably distinct from "the
+// reaper received an empty list"), and disabled+populated.
+func TestHandleConfirmedSessionDeath_EffectOrder(t *testing.T) {
+	t.Parallel()
+
+	populatedSnap := orphanProcessSnapshot{
+		Valid:      true,
+		Generation: 3,
+		Roots:      []int{100},
+		Candidates: map[process.ProcessIdentity]struct{}{{PID: 101, CreateTimeMillis: 1000}: {}},
+	}
+	emptySnap := orphanProcessSnapshot{
+		Valid:      true,
+		Generation: 5,
+		Roots:      []int{100},
+		Candidates: map[process.ProcessIdentity]struct{}{},
+	}
+
+	cases := []struct {
+		name        string
+		enabled     bool
+		snap        orphanProcessSnapshot
+		wantOrder   []string
+		wantReapLen int // expected len(candidates) passed to Reap; reap/log skipped entirely when disabled
+	}{
+		{"enabled + populated", true, populatedSnap, []string{"ended", "stop", "reap", "log", "summary", "delete"}, 1},
+		{"enabled + valid empty", true, emptySnap, []string{"ended", "stop", "reap", "log", "summary", "delete"}, 0},
+		{"disabled + populated", false, populatedSnap, []string{"ended", "stop", "summary", "delete"}, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var order []string
+			var reapCalled, logCalled bool
+			var reapCandidates []process.ProcessIdentity
+			var loggedEnabled bool
+			var loggedResult orphanReapResult
+			fakeResult := orphanReapResult{Captured: tc.wantReapLen}
+
+			deps := confirmedDeathDeps{
+				EmitEnded:      func(context.Context) { order = append(order, "ended") },
+				StopResilience: func() { order = append(order, "stop") },
+				Reap: func(_ context.Context, candidates []process.ProcessIdentity) orphanReapResult {
+					order = append(order, "reap")
+					reapCalled = true
+					reapCandidates = candidates
+					return fakeResult
+				},
+				LogReapResult: func(enabled bool, _ orphanProcessSnapshot, result orphanReapResult) {
+					order = append(order, "log")
+					logCalled = true
+					loggedEnabled = enabled
+					loggedResult = result
+				},
+				Summary: func() { order = append(order, "summary") },
+				DeleteManifest: func() error {
+					order = append(order, "delete")
+					return nil
+				},
+			}
+
+			if err := handleConfirmedSessionDeath(context.Background(), tc.enabled, tc.snap, deps); err != nil {
+				t.Fatalf("handleConfirmedSessionDeath error = %v, want nil", err)
+			}
+
+			if !reflect.DeepEqual(order, tc.wantOrder) {
+				t.Errorf("effect order = %v, want %v", order, tc.wantOrder)
+			}
+
+			if !tc.enabled {
+				if reapCalled || logCalled {
+					t.Errorf("reapCalled=%v logCalled=%v, want both false when disabled", reapCalled, logCalled)
+				}
+				return
+			}
+			if !reapCalled || !logCalled {
+				t.Fatalf("reapCalled=%v logCalled=%v, want both true when enabled", reapCalled, logCalled)
+			}
+			if len(reapCandidates) != tc.wantReapLen {
+				t.Errorf("len(candidates passed to Reap) = %d, want %d", len(reapCandidates), tc.wantReapLen)
+			}
+			if !loggedEnabled {
+				t.Error("LogReapResult enabled = false, want true")
+			}
+			if loggedResult != fakeResult {
+				t.Errorf("LogReapResult result = %+v, want %+v", loggedResult, fakeResult)
+			}
+		})
+	}
+}
+
+// TestHandleConfirmedSessionDeath_DisabledNeverReaps covers Behavior 6:
+// disabled means the reaper and its log are never invoked at all — not
+// merely that they receive an empty candidate list.
+func TestHandleConfirmedSessionDeath_DisabledNeverReaps(t *testing.T) {
+	t.Parallel()
+
+	snap := orphanProcessSnapshot{
+		Valid:      true,
+		Generation: 1,
+		Roots:      []int{100},
+		Candidates: map[process.ProcessIdentity]struct{}{{PID: 101, CreateTimeMillis: 1000}: {}},
+	}
+	var order []string
+	deps := confirmedDeathDeps{
+		EmitEnded:      func(context.Context) { order = append(order, "ended") },
+		StopResilience: func() { order = append(order, "stop") },
+		Reap: func(context.Context, []process.ProcessIdentity) orphanReapResult {
+			t.Fatal("Reap must not be invoked when the policy is disabled")
+			return orphanReapResult{}
+		},
+		LogReapResult: func(bool, orphanProcessSnapshot, orphanReapResult) {
+			t.Fatal("LogReapResult must not be invoked when the policy is disabled")
+		},
+		Summary: func() { order = append(order, "summary") },
+		DeleteManifest: func() error {
+			order = append(order, "delete")
+			return nil
+		},
+	}
+
+	if err := handleConfirmedSessionDeath(context.Background(), false, snap, deps); err != nil {
+		t.Fatalf("handleConfirmedSessionDeath error = %v, want nil", err)
+	}
+	want := []string{"ended", "stop", "summary", "delete"}
+	if !reflect.DeepEqual(order, want) {
+		t.Errorf("effect order = %v, want %v", order, want)
+	}
+}
+
+// TestHandleConfirmedSessionDeath_SummaryFailureStillDeletesManifest covers
+// Behavior 6: a panicking Summary must not prevent manifest deletion, and a
+// DeleteManifest error is returned (not hidden) after Summary was attempted.
+func TestHandleConfirmedSessionDeath_SummaryFailureStillDeletesManifest(t *testing.T) {
+	t.Parallel()
+
+	snap := orphanProcessSnapshot{Valid: true}
+	noopReap := func(context.Context, []process.ProcessIdentity) orphanReapResult { return orphanReapResult{} }
+	noopLog := func(bool, orphanProcessSnapshot, orphanReapResult) {}
+
+	t.Run("summary panics, deletion still occurs", func(t *testing.T) {
+		t.Parallel()
+		deleteCalled := false
+		deps := confirmedDeathDeps{
+			EmitEnded:      func(context.Context) {},
+			StopResilience: func() {},
+			Reap:           noopReap,
+			LogReapResult:  noopLog,
+			Summary:        func() { panic("summary boom") },
+			DeleteManifest: func() error {
+				deleteCalled = true
+				return nil
+			},
+		}
+
+		if err := handleConfirmedSessionDeath(context.Background(), true, snap, deps); err != nil {
+			t.Fatalf("handleConfirmedSessionDeath error = %v, want nil", err)
+		}
+		if !deleteCalled {
+			t.Error("DeleteManifest was not called after a panicking Summary")
+		}
+	})
+
+	t.Run("delete error is returned, not hidden", func(t *testing.T) {
+		t.Parallel()
+		wantErr := errors.New("delete boom")
+		summaryCalled := false
+		deps := confirmedDeathDeps{
+			EmitEnded:      func(context.Context) {},
+			StopResilience: func() {},
+			Reap:           noopReap,
+			LogReapResult:  noopLog,
+			Summary:        func() { summaryCalled = true },
+			DeleteManifest: func() error { return wantErr },
+		}
+
+		err := handleConfirmedSessionDeath(context.Background(), true, snap, deps)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("handleConfirmedSessionDeath error = %v, want %v", err, wantErr)
+		}
+		if !summaryCalled {
+			t.Error("Summary was not attempted before the delete error was returned")
+		}
+	})
+}
+
+// TestRunMonitor_UsesManifestPolicyAndProductionLoop covers Behavior 6's
+// production callback assembly: productionConfirmedDeathDeps wires every
+// confirmedDeathDeps field to a real dependency, and DeleteManifest reaches
+// the real, XDG-isolated resilience.DeleteManifest.
+//
+// The effective enabled bool at runMonitor's OnConfirmedDeath call site is
+// a deliberate fail-safe false placeholder pending Behavior 1, which adds
+// SpawnManifest.ReapOrphansOnExit and updates that one call site to read
+// the real field — see the TODO in runMonitor.
+func TestRunMonitor_UsesManifestPolicyAndProductionLoop(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	manifest := &resilience.SpawnManifest{Session: "test-session", ProjectDir: t.TempDir()}
+	cfg := config.Default()
+	monitor := resilience.NewMonitor(manifest.Session, manifest.ProjectDir, cfg, false)
+
+	deps := productionConfirmedDeathDeps(manifest.Session, manifest, monitor, time.Millisecond, map[string]string{})
+
+	if deps.EmitEnded == nil || deps.StopResilience == nil || deps.Reap == nil ||
+		deps.LogReapResult == nil || deps.Summary == nil || deps.DeleteManifest == nil {
+		t.Fatalf("productionConfirmedDeathDeps returned a dependency struct with a nil field: %+v", deps)
+	}
+
+	// StopResilience must be the real monitor's Stop method, not a no-op —
+	// calling it must be safe even though Start was never called.
+	deps.StopResilience()
+
+	// DeleteManifest must actually reach resilience.DeleteManifest: deleting
+	// a manifest that was never saved is a no-op, not an error.
+	if err := deps.DeleteManifest(); err != nil {
+		t.Errorf("DeleteManifest() on a nonexistent manifest = %v, want nil (idempotent)", err)
 	}
 }

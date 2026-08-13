@@ -166,77 +166,68 @@ func runMonitor(session string) error {
 		defer archiver.Close()
 	}
 
-	// Poll for session existence periodically to exit if session is killed.
-	// Use consecutive-miss counting to tolerate transient tmux failures.
-	const maxMisses = 5 // ~25 seconds at 5s interval before giving up
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	// Snapshot output periodically to generate summary on exit
-	snapshotTicker := time.NewTicker(30 * time.Second)
-	defer snapshotTicker.Stop()
+	// Poll for session existence and refresh the orphan-candidate process
+	// snapshot via the extracted, independently-testable session-monitor
+	// loop. runMonitor stays the production assembler: it owns signals,
+	// supervisor daemons, plugins, webhook bridge, resilience monitoring,
+	// and archiving, and wires the loop's confirmed-death effects below.
+	// The signal path is deliberately kept outside the loop and never
+	// reaps or deletes a potentially still-live session manifest.
 	lastOutputs := make(map[string]string)
+	loopOptions := monitorLoopOptions{
+		PollInterval:           monitorDefaultPollInterval,
+		OutputSnapshotInterval: monitorDefaultOutputSnapshotInterval,
+		MaxMisses:              monitorDefaultMaxMisses,
+		ReapGrace:              orphanReapGrace,
+	}
+	loopDeps := monitorLoopDependencies{
+		Observe: tmux.GetPanesContext,
+		CaptureOutput: func(session string) {
+			captureSessionOutputs(session, lastOutputs)
+		},
+		SnapshotDeps: productionOrphanSnapshotDeps(),
+		Ready:        func(orphanProcessSnapshot) {},
+		OnConfirmedDeath: func(dctx context.Context, snap orphanProcessSnapshot) {
+			deathDeps := productionConfirmedDeathDeps(session, manifest, monitor, loopOptions.ReapGrace, lastOutputs)
+			// TODO(bd-vc07s / Behavior 1): read manifest.ReapOrphansOnExit
+			// once Behavior 1 lands the config+manifest policy surface.
+			// Hardcoded false is the fail-safe default until then — never
+			// reap by default before the policy toggle actually exists.
+			if err := handleConfirmedSessionDeath(dctx, false, snap, deathDeps); err != nil {
+				fmt.Fprintf(os.Stderr, "confirmed-death handler error: %v\n", err)
+			}
+		},
+	}
 
 	fmt.Printf("Monitoring session '%s' for resilience...\n", session)
 
-	missCount := 0
-	for {
-		select {
-		case <-sigChan:
-			fmt.Println("Monitor stopping...")
-			monitor.Stop()
-			// Try to generate summary on signal too (recover from panics
-			// to ensure graceful exit)
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						fmt.Fprintf(os.Stderr, "Panic in session summary generation: %v\n", r)
-					}
-				}()
-				generateEndSessionSummary(session, lastOutputs, manifest)
-			}()
-			return nil
-		case <-ticker.C:
-			if !tmux.SessionExists(session) {
-				missCount++
-				cause := detectSessionTerminationCause(session)
-				if missCount < maxMisses {
-					fmt.Fprintf(os.Stderr, "Session '%s' not found (%d/%d consecutive misses, cause: %s)\n",
-						session, missCount, maxMisses, cause)
-					continue
+	loopDone := make(chan error, 1)
+	go func() {
+		loopDone <- runSessionMonitorLoop(ctx, manifest, loopOptions, loopDeps)
+	}()
+
+	select {
+	case <-sigChan:
+		fmt.Println("Monitor stopping...")
+		cancel()
+		<-loopDone
+		monitor.Stop()
+		// Try to generate summary on signal too (recover from panics
+		// to ensure graceful exit)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "Panic in session summary generation: %v\n", r)
 				}
-				// Confirmed permanently gone after maxMisses consecutive failures
-				fmt.Printf("Session ended (%d consecutive misses), stopping monitor (%s)\n", missCount, cause)
-				events.DefaultEmitter().Emit(events.NewWebhookEvent(
-					events.WebhookSessionEnded,
-					session,
-					"",
-					"",
-					fmt.Sprintf("Session %s ended", session),
-					map[string]string{
-						"project_dir": manifest.ProjectDir,
-					},
-				))
-				monitor.Stop()
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							fmt.Fprintf(os.Stderr, "Panic in session summary generation: %v\n", r)
-						}
-					}()
-					generateEndSessionSummary(session, lastOutputs, manifest)
-				}()
-				_ = resilience.DeleteManifest(session)
-				return nil
-			}
-			// Session found — reset miss counter
-			if missCount > 0 {
-				fmt.Printf("Session '%s' recovered after %d miss(es)\n", session, missCount)
-				missCount = 0
-			}
-		case <-snapshotTicker.C:
-			captureSessionOutputs(session, lastOutputs)
+			}()
+			generateEndSessionSummary(session, lastOutputs, manifest)
+		}()
+		return nil
+	case err := <-loopDone:
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Monitor loop error: %v\n", err)
 		}
+		return nil
 	}
 }
 
@@ -594,6 +585,106 @@ func runSessionMonitorLoop(ctx context.Context, manifest *resilience.SpawnManife
 		case <-outputTicks:
 			deps.CaptureOutput(manifest.Session)
 		}
+	}
+}
+
+// confirmedDeathDeps carries the effects handleConfirmedSessionDeath
+// sequences: emitting the ended event, stopping/joining resilience
+// monitoring, the identity-safe reap and its structured log, attempting
+// the session summary, and deleting the manifest. Production wiring is
+// productionConfirmedDeathDeps; tests supply recording/failing fakes.
+type confirmedDeathDeps struct {
+	EmitEnded      func(ctx context.Context)
+	StopResilience func()
+	Reap           func(ctx context.Context, candidates []process.ProcessIdentity) orphanReapResult
+	LogReapResult  func(enabled bool, snap orphanProcessSnapshot, result orphanReapResult)
+	Summary        func()
+	DeleteManifest func() error
+}
+
+// handleConfirmedSessionDeath sequences the confirmed-death effects in the
+// locked, flat order: emit the ended event, synchronously stop/join
+// resilience monitoring, then — only when enabled — identity-safely reap
+// the retained snapshot's candidates and log the exact result. An enabled
+// policy with a valid empty snapshot still reaps and logs a zero-count
+// record, so disabled is observably distinct from "reaper received an
+// empty list." It then attempts the session summary behind a panic-safe
+// boundary and deletes the manifest regardless of what the summary did —
+// deletion is never skipped or hidden by a caller's fallback cleanup.
+func handleConfirmedSessionDeath(ctx context.Context, enabled bool, snap orphanProcessSnapshot, deps confirmedDeathDeps) error {
+	deps.EmitEnded(ctx)
+	deps.StopResilience()
+
+	if enabled {
+		candidates := make([]process.ProcessIdentity, 0, len(snap.Candidates))
+		for id := range snap.Candidates {
+			candidates = append(candidates, id)
+		}
+		result := deps.Reap(ctx, candidates)
+		deps.LogReapResult(enabled, snap, result)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "Panic in session summary generation: %v\n", r)
+			}
+		}()
+		deps.Summary()
+	}()
+
+	return deps.DeleteManifest()
+}
+
+// productionConfirmedDeathDeps wires confirmedDeathDeps to runMonitor's
+// real session state: the existing ended-event/webhook emission, the
+// resilience monitor's Stop, the identity-safe reaper from send.go, a
+// structured slog record (no raw PID lists), the existing summary
+// generator, and manifest deletion.
+func productionConfirmedDeathDeps(session string, manifest *resilience.SpawnManifest, monitor *resilience.Monitor, reapGrace time.Duration, lastOutputs map[string]string) confirmedDeathDeps {
+	return confirmedDeathDeps{
+		EmitEnded: func(context.Context) {
+			cause := detectSessionTerminationCause(session)
+			fmt.Printf("Session ended, stopping monitor (%s)\n", cause)
+			events.DefaultEmitter().Emit(events.NewWebhookEvent(
+				events.WebhookSessionEnded,
+				session,
+				"",
+				"",
+				fmt.Sprintf("Session %s ended", session),
+				map[string]string{
+					"project_dir": manifest.ProjectDir,
+				},
+			))
+		},
+		StopResilience: monitor.Stop,
+		Reap: func(ctx context.Context, candidates []process.ProcessIdentity) orphanReapResult {
+			return reapIdentifiedOrphanProcesses(ctx, candidates, reapGrace, productionOrphanReapDeps())
+		},
+		LogReapResult: func(enabled bool, snap orphanProcessSnapshot, result orphanReapResult) {
+			slog.Default().Info("orphan reap",
+				"session", session,
+				"enabled", enabled,
+				"generation", snap.Generation,
+				"age", time.Since(snap.CapturedAt).String(),
+				"captured", result.Captured,
+				"matched_before_term", result.MatchedBeforeTERM,
+				"term_signaled", result.TERMSignaled,
+				"matched_before_kill", result.MatchedBeforeKILL,
+				"kill_signaled", result.KILLSignaled,
+				"skipped_stale", result.SkippedStale,
+				"skipped_exited", result.SkippedExited,
+				"skipped_excluded", result.SkippedExcluded,
+				"lookup_errors", result.LookupErrors,
+				"signal_errors", result.SignalErrors,
+			)
+		},
+		Summary: func() {
+			generateEndSessionSummary(session, lastOutputs, manifest)
+		},
+		DeleteManifest: func() error {
+			return resilience.DeleteManifest(session)
+		},
 	}
 }
 
