@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -907,6 +908,58 @@ func TestGetPanesWithBadSession(t *testing.T) {
 	_, err := GetPanes("nonexistent_session_xyz")
 	if err == nil {
 		t.Error("GetPanes should fail for non-existent session")
+	}
+}
+
+// TestGetPanesContext_ExactSessionTarget_PrefixSiblingSurvives guards the
+// exactSessionTarget fix: tmux's default target parsing does prefix/glob
+// matching on session names, so a bare "-t foo" query issued after "foo" is
+// killed can silently resolve to a still-live sibling session named
+// "foobar" instead of failing — returning that sibling's real pane data
+// under the dead session's name, rather than any error at all. A caller
+// like the periodic orphan-process sweep would treat that as proof the
+// dead session is still alive, permanently masking its death. This proves
+// GetPanesContext and GetPanesWithActivityContext both fail explicitly,
+// classified as CommandErrorSessionNotFound, and that the live sibling
+// remains reachable and unaffected.
+func TestGetPanesContext_ExactSessionTarget_PrefixSiblingSurvives(t *testing.T) {
+	skipIfNoTmux(t)
+	acquireGlobalTmuxTestLock(t)
+
+	base := fmt.Sprintf("ntm_test_exact_%d", time.Now().UnixNano())
+	sibling := base + "bar"
+	t.Cleanup(func() {
+		_ = KillSession(base)
+		_ = KillSession(sibling)
+	})
+
+	if err := CreateSession(base, os.TempDir()); err != nil {
+		t.Skipf("failed to create base test session: %v", err)
+	}
+	if err := CreateSession(sibling, os.TempDir()); err != nil {
+		t.Skipf("failed to create prefix-sibling test session: %v", err)
+	}
+
+	if err := KillSession(base); err != nil {
+		t.Fatalf("KillSession(base): %v", err)
+	}
+
+	ctx := context.Background()
+
+	if panes, err := GetPanesContext(ctx, base); err == nil {
+		t.Errorf("GetPanesContext(base) succeeded after kill (got %v) — must fail, not silently resolve to the live prefix-sibling session", panes)
+	} else if class := ClassifyCommandError(err); class.Kind != CommandErrorSessionNotFound {
+		t.Errorf("GetPanesContext(base) error classified as %v, want CommandErrorSessionNotFound; err=%v", class.Kind, err)
+	}
+
+	if panes, err := GetPanesWithActivityContext(ctx, base); err == nil {
+		t.Errorf("GetPanesWithActivityContext(base) succeeded after kill (got %v) — must fail, not silently resolve to the live prefix-sibling session", panes)
+	} else if class := ClassifyCommandError(err); class.Kind != CommandErrorSessionNotFound {
+		t.Errorf("GetPanesWithActivityContext(base) error classified as %v, want CommandErrorSessionNotFound; err=%v", class.Kind, err)
+	}
+
+	if panes, err := GetPanes(sibling); err != nil || len(panes) == 0 {
+		t.Errorf("GetPanes(sibling) = %v, %v; want the live prefix-sibling session to remain reachable and unaffected", panes, err)
 	}
 }
 

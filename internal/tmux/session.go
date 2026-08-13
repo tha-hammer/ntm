@@ -465,6 +465,22 @@ func (c *Client) GetPanes(session string) ([]Pane, error) {
 	return c.GetPanesContext(context.Background(), session)
 }
 
+// exactSessionTarget builds an unambiguous whole-session tmux target: "="
+// disables tmux's default prefix/glob session-name matching (so a query for
+// "foo" can never silently resolve to a live sibling session "foobar"), and
+// the trailing ":" forces session-target parsing instead of tmux's window
+// lookup. Without both, a bare session name that no longer exists reports
+// "can't find window: <name>" on tmux 3.5a rather than "can't find
+// session: <name>", which ClassifyCommandError never recognizes as
+// CommandErrorSessionNotFound — silently breaking definite-absence
+// detection for any caller (e.g. the periodic orphan-process sweep) that
+// depends on it. session is never empty or attacker-controlled here:
+// callers always pass an already-validated ntm session name (see
+// sessionNameRegex), which cannot itself contain ':' or '='.
+func exactSessionTarget(session string) string {
+	return "=" + session + ":"
+}
+
 // GetPanesContext returns all panes in a session with cancellation support.
 func (c *Client) GetPanesContext(ctx context.Context, session string) ([]Pane, error) {
 	sep := FieldSeparator
@@ -472,7 +488,7 @@ func (c *Client) GetPanesContext(ctx context.Context, session string) ([]Pane, e
 	// survive a friendly (Agent Mail name) pane title. Appended last so existing
 	// field indices are unchanged.
 	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_type}%[1]s#{@ntm_index}%[1]s#{@ntm_variant}", sep)
-	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", session, "-F", format)
+	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", exactSessionTarget(session), "-F", format)
 	if err != nil {
 		return nil, err
 	}
@@ -1631,7 +1647,7 @@ type PaneActivity struct {
 func (c *Client) GetPanesWithActivityContext(ctx context.Context, session string) ([]PaneActivity, error) {
 	sep := FieldSeparator
 	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_last_activity}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_type}%[1]s#{@ntm_index}%[1]s#{@ntm_variant}", sep)
-	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", session, "-F", format)
+	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", exactSessionTarget(session), "-F", format)
 	if err != nil {
 		return nil, err
 	}
