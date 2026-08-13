@@ -3,9 +3,15 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -13,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 // TestCaptureOrphanProcessSnapshot_FiltersManifestPanesAndDeduplicates covers
@@ -890,5 +897,266 @@ func TestRunMonitor_UsesManifestPolicyAndProductionLoop(t *testing.T) {
 	// a manifest that was never saved is a no-op, not an error.
 	if err := deps.DeleteManifest(); err != nil {
 		t.Errorf("DeleteManifest() on a nonexistent manifest = %v, want nil (idempotent)", err)
+	}
+}
+
+// waitForPidfile polls path until it contains a positive PID or the named
+// deadline elapses, so callers never guess a fixed startup duration for a
+// process that writes its own PID after launch.
+func waitForPidfile(t *testing.T, path string, deadline time.Duration) int {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if pid, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("pidfile %s did not contain a valid PID within %s", path, deadline)
+	return 0
+}
+
+// TestRunSessionMonitorLoop_OrganicDeathHUPSurvivor covers Behavior 7 of the
+// periodic orphan-sweep TDD plan: the real-tmux Closure Test. A
+// deliberately HUP-surviving process is launched inside a real tmux pane
+// through tmux.SendKeys; runSessionMonitorLoop is driven with production
+// observation/snapshot/reap dependencies and a real ticker (no PollTicks
+// override); the exact target-plus-descendant identity set must appear in
+// the one-shot ready snapshot; and after tmux.KillSession, the confirmed
+// death path must remove every ready-snapshot identity when the policy is
+// enabled while leaving them alive when it is disabled — both cases
+// completing the same ended->stop->summary->delete workflow with exactly
+// one summary callback and manifest absence before this test's own
+// fallback cleanup.
+func TestRunSessionMonitorLoop_OrganicDeathHUPSurvivor(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	const (
+		behavior7PollInterval    = 100 * time.Millisecond
+		behavior7OutputInterval  = time.Hour
+		behavior7MaxMisses       = 3
+		behavior7ReapGrace       = 200 * time.Millisecond
+		behavior7ReadyDeadline   = 10 * time.Second
+		behavior7JoinDeadline    = 10 * time.Second
+		behavior7PidfileDeadline = 5 * time.Second
+		behavior7AbsenceDeadline = 3 * time.Second
+	)
+
+	cases := []struct {
+		name    string
+		enabled bool
+	}{
+		{"enabled", true},
+		{"disabled", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			projectDir := t.TempDir()
+			pidFile := filepath.Join(t.TempDir(), "behavior7-target.pid")
+			sessionName := fmt.Sprintf("ntm-test-b7-%s-%d", tc.name, time.Now().UnixNano())
+			t.Cleanup(func() { _ = tmux.KillSession(sessionName) })
+
+			// A sentinel session, deliberately not a prefix of sessionName in
+			// either direction, kept alive for the whole subtest so killing
+			// sessionName below can never be the tmux server's last session.
+			// Without this, that kill could tear the server down entirely,
+			// producing CommandErrorNoServer — which also advances the miss
+			// streak (see applyMonitorObservation) and would let this test
+			// go green without ever exercising the session-specific
+			// definite-absence path (CommandErrorSessionNotFound) that the
+			// exactSessionTarget fix in internal/tmux/session.go exists for.
+			sentinelSession := fmt.Sprintf("ntm-test-b7-sentinel-%s-%d", tc.name, time.Now().UnixNano())
+			t.Cleanup(func() { _ = tmux.KillSession(sentinelSession) })
+			if err := tmux.CreateSession(sentinelSession, projectDir); err != nil {
+				t.Fatalf("CreateSession(sentinel): %v", err)
+			}
+
+			if err := tmux.CreateSession(sessionName, projectDir); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+
+			panes, err := tmux.GetPanes(sessionName)
+			if err != nil || len(panes) == 0 {
+				t.Fatalf("GetPanes after create: panes=%v err=%v", panes, err)
+			}
+			pane := panes[0]
+			if pane.PID <= 0 {
+				t.Fatalf("pane has no resolved PID: %+v", pane)
+			}
+
+			manifest := &resilience.SpawnManifest{
+				Session:           sessionName,
+				ProjectDir:        projectDir,
+				Agents:            []resilience.AgentConfig{{PaneID: pane.ID}},
+				ReapOrphansOnExit: tc.enabled,
+			}
+			if err := resilience.SaveManifest(manifest); err != nil {
+				t.Fatalf("SaveManifest: %v", err)
+			}
+
+			// The child is forked before the pidfile is written, so by the
+			// time this test observes the pidfile, both the target and its
+			// descendant already exist — runSessionMonitorLoop's Ready
+			// callback fires only once, on the first usable live capture,
+			// so both identities must already be present before the loop
+			// starts, not merely by the time it eventually polls again.
+			launchCmd := fmt.Sprintf(
+				`nohup sh -c 'trap "" HUP; sleep 300 & echo $$ > %s; wait' >/dev/null 2>&1 & disown`,
+				pidFile,
+			)
+			if err := tmux.SendKeys(pane.ID, launchCmd, true); err != nil {
+				t.Fatalf("SendKeys launch: %v", err)
+			}
+
+			targetPID := waitForPidfile(t, pidFile, behavior7PidfileDeadline)
+			targetIdentity, err := process.CaptureProcessIdentity(context.Background(), targetPID)
+			if err != nil {
+				t.Fatalf("CaptureProcessIdentity(target=%d): %v", targetPID, err)
+			}
+			if !process.IsAlive(targetIdentity.PID) {
+				t.Fatalf("target pid %d must be alive right after capture", targetIdentity.PID)
+			}
+
+			cfg := config.Default()
+			monitor := resilience.NewMonitor(manifest.Session, manifest.ProjectDir, cfg, false)
+
+			var summaryCalls atomic.Int32
+			var deathMu sync.Mutex
+			var deathHandlerErr error
+			deathDone := make(chan struct{})
+
+			readyCh := make(chan orphanProcessSnapshot, 1)
+			deps := monitorLoopDependencies{
+				Observe:       tmux.GetPanesContext,
+				CaptureOutput: func(string) {},
+				SnapshotDeps:  productionOrphanSnapshotDeps(),
+				Ready: func(snap orphanProcessSnapshot) {
+					readyCh <- snap
+				},
+				OnConfirmedDeath: func(dctx context.Context, snap orphanProcessSnapshot) {
+					defer close(deathDone)
+					deathDeps := productionConfirmedDeathDeps(sessionName, manifest, monitor, behavior7ReapGrace, map[string]string{})
+					deathDeps.Summary = func() {
+						summaryCalls.Add(1)
+					}
+					if herr := handleConfirmedSessionDeath(dctx, tc.enabled, snap, deathDeps); herr != nil {
+						deathMu.Lock()
+						deathHandlerErr = herr
+						deathMu.Unlock()
+					}
+				},
+			}
+			options := monitorLoopOptions{
+				PollInterval:           behavior7PollInterval,
+				OutputSnapshotInterval: behavior7OutputInterval,
+				MaxMisses:              behavior7MaxMisses,
+				ReapGrace:              behavior7ReapGrace,
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			loopErrCh := make(chan error, 1)
+			go func() {
+				loopErrCh <- runSessionMonitorLoop(ctx, manifest, options, deps)
+			}()
+
+			var readySnap orphanProcessSnapshot
+			select {
+			case readySnap = <-readyCh:
+			case <-time.After(behavior7ReadyDeadline):
+				cancel()
+				t.Fatal("runSessionMonitorLoop never signaled readiness")
+			}
+
+			// Hermetic cleanup contract: cancel and join first, then
+			// identity-safely clean every captured process, registered
+			// before this test does anything that could fail a t.Fatalf.
+			t.Cleanup(func() {
+				cancel()
+				_ = tmux.KillSession(sessionName)
+				select {
+				case <-loopErrCh:
+				case <-time.After(behavior7JoinDeadline):
+				}
+				for id := range readySnap.Candidates {
+					if process.IsAlive(id.PID) {
+						_ = syscall.Kill(id.PID, syscall.SIGKILL)
+					}
+				}
+			})
+
+			if _, ok := readySnap.Candidates[targetIdentity]; !ok {
+				t.Fatalf("ready snapshot candidates %v do not contain target identity %+v", readySnap.Candidates, targetIdentity)
+			}
+			if len(readySnap.Candidates) < 2 {
+				t.Fatalf("ready snapshot has %d candidate(s), want at least 2 (target + its descendant): %v", len(readySnap.Candidates), readySnap.Candidates)
+			}
+
+			if err := tmux.KillSession(sessionName); err != nil {
+				t.Fatalf("KillSession: %v", err)
+			}
+
+			select {
+			case err := <-loopErrCh:
+				if err != nil {
+					t.Fatalf("runSessionMonitorLoop returned error %v, want nil", err)
+				}
+			case <-time.After(behavior7JoinDeadline):
+				t.Fatal("runSessionMonitorLoop did not join after tmux.KillSession")
+			}
+
+			select {
+			case <-deathDone:
+			case <-time.After(behavior7JoinDeadline):
+				t.Fatal("OnConfirmedDeath handler did not complete")
+			}
+			deathMu.Lock()
+			gotErr := deathHandlerErr
+			deathMu.Unlock()
+			if gotErr != nil {
+				t.Fatalf("handleConfirmedSessionDeath returned error: %v", gotErr)
+			}
+
+			if got := summaryCalls.Load(); got != 1 {
+				t.Errorf("summary callback invoked %d times, want exactly 1", got)
+			}
+
+			if _, err := resilience.LoadManifest(sessionName); err == nil {
+				t.Error("manifest still present after confirmed death, want deleted before this test's own fallback cleanup")
+			}
+
+			if tc.enabled {
+				deadline := time.Now().Add(behavior7AbsenceDeadline)
+				for {
+					stillAlive := false
+					for id := range readySnap.Candidates {
+						if process.IsAlive(id.PID) {
+							stillAlive = true
+							break
+						}
+					}
+					if !stillAlive {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("candidate identities still alive after enabled reap: %v", readySnap.Candidates)
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+				return
+			}
+
+			if !process.IsAlive(targetIdentity.PID) {
+				t.Error("target must still be alive after the loop joins when reaping is disabled")
+			}
+			fresh, err := process.CaptureProcessIdentity(context.Background(), targetIdentity.PID)
+			if err != nil || fresh != targetIdentity {
+				t.Errorf("disabled: fresh identity capture = %+v, err=%v; want exact match with %+v", fresh, err, targetIdentity)
+			}
+		})
 	}
 }
