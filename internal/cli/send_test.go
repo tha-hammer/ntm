@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1717,4 +1718,172 @@ func TestCollectPaneDescendants_RecursiveAndExclusion(t *testing.T) {
 			t.Errorf("collectPaneDescendants returned excluded PID %d", pid)
 		}
 	}
+}
+
+// TestReapIdentifiedOrphanProcesses_RevalidatesBeforeTERMAndKILL covers
+// Behavior 5 of the periodic orphan-sweep TDD plan: identity is revalidated
+// immediately before both TERM and KILL, and every result counter is exact.
+func TestReapIdentifiedOrphanProcesses_RevalidatesBeforeTERMAndKILL(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty input yields a zero-valued result", func(t *testing.T) {
+		t.Parallel()
+		deps := orphanReapDeps{
+			isAlive: func(int) bool {
+				t.Fatal("isAlive should not be called for empty input")
+				return false
+			},
+			captureIdentity: func(context.Context, int) (process.ProcessIdentity, error) {
+				t.Fatal("captureIdentity should not be called for empty input")
+				return process.ProcessIdentity{}, nil
+			},
+			signal: func(int, syscall.Signal) error {
+				t.Fatal("signal should not be called for empty input")
+				return nil
+			},
+			wait: func(context.Context, time.Duration) {
+				t.Fatal("wait should not be called for empty input")
+			},
+		}
+		got := reapIdentifiedOrphanProcesses(context.Background(), nil, time.Millisecond, deps)
+		want := orphanReapResult{}
+		if got != want {
+			t.Errorf("result = %+v, want zero-value %+v", got, want)
+		}
+	})
+
+	t.Run("mixed batch: full accounting across every locked case", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			pidSameBoth   = 100 // same identity through both phases: TERM'd then KILL'd
+			pidStaleTerm  = 101 // PID reused (different create time) before TERM
+			pidLookupErr  = 102 // identity lookup errors before TERM
+			pidExitsGrace = 103 // TERM'd, exits on its own during the grace wait
+			pidStaleKill  = 104 // TERM'd, PID reused before KILL
+			pidTermErr    = 105 // TERM signal itself errors; KILL is still attempted
+		)
+		excludedID := process.ProcessIdentity{PID: os.Getpid(), CreateTimeMillis: 42}
+
+		identities := map[int]process.ProcessIdentity{
+			pidSameBoth:   {PID: pidSameBoth, CreateTimeMillis: 1000},
+			pidStaleTerm:  {PID: pidStaleTerm, CreateTimeMillis: 1000},
+			pidLookupErr:  {PID: pidLookupErr, CreateTimeMillis: 1000},
+			pidExitsGrace: {PID: pidExitsGrace, CreateTimeMillis: 1000},
+			pidStaleKill:  {PID: pidStaleKill, CreateTimeMillis: 1000},
+			pidTermErr:    {PID: pidTermErr, CreateTimeMillis: 1000},
+		}
+		candidates := []process.ProcessIdentity{
+			identities[pidSameBoth],
+			identities[pidStaleTerm],
+			identities[pidLookupErr],
+			identities[pidExitsGrace],
+			identities[pidStaleKill],
+			identities[pidTermErr],
+			excludedID,
+		}
+
+		aliveCalls := map[int]int{}
+		identityCalls := map[int]int{}
+		lookupErrSentinel := errors.New("lookup boom")
+
+		deps := orphanReapDeps{
+			isAlive: func(pid int) bool {
+				aliveCalls[pid]++
+				if pid == pidExitsGrace {
+					// Alive for the pre-TERM check, gone by the pre-KILL check.
+					return aliveCalls[pid] == 1
+				}
+				return true
+			},
+			captureIdentity: func(_ context.Context, pid int) (process.ProcessIdentity, error) {
+				identityCalls[pid]++
+				switch pid {
+				case pidStaleTerm:
+					return process.ProcessIdentity{PID: pid, CreateTimeMillis: 9999}, nil
+				case pidLookupErr:
+					return process.ProcessIdentity{}, lookupErrSentinel
+				case pidStaleKill:
+					if identityCalls[pid] == 1 {
+						return identities[pid], nil
+					}
+					return process.ProcessIdentity{PID: pid, CreateTimeMillis: 2000}, nil
+				default:
+					return identities[pid], nil
+				}
+			},
+			signal: func(pid int, sig syscall.Signal) error {
+				if pid == pidTermErr && sig == syscall.SIGTERM {
+					return errors.New("term boom")
+				}
+				return nil
+			},
+			wait: func(context.Context, time.Duration) {},
+		}
+
+		got := reapIdentifiedOrphanProcesses(context.Background(), candidates, time.Millisecond, deps)
+
+		want := orphanReapResult{
+			Captured:          7,
+			MatchedBeforeTERM: 4, // pidSameBoth, pidExitsGrace, pidStaleKill, pidTermErr
+			TERMSignaled:      3, // all of the above except pidTermErr, whose TERM call errored
+			MatchedBeforeKILL: 2, // pidSameBoth, pidTermErr (still valid after grace)
+			KILLSignaled:      2,
+			SkippedStale:      2, // pidStaleTerm (pre-TERM) + pidStaleKill (pre-KILL)
+			SkippedExited:     1, // pidExitsGrace (pre-KILL)
+			SkippedExcluded:   1, // excludedID
+			LookupErrors:      1, // pidLookupErr
+			SignalErrors:      1, // pidTermErr's TERM call
+		}
+		if got != want {
+			t.Errorf("result = %+v, want %+v", got, want)
+		}
+
+		if aliveCalls[excludedID.PID] != 0 || identityCalls[excludedID.PID] != 0 {
+			t.Errorf("excluded pid %d must never reach isAlive/captureIdentity, got aliveCalls=%d identityCalls=%d",
+				excludedID.PID, aliveCalls[excludedID.PID], identityCalls[excludedID.PID])
+		}
+	})
+}
+
+// TestReapIdentifiedOrphanProcesses_RealProcessSmokeTest exercises the
+// identity-safe reaper against a real OS process with production
+// dependencies, after the deterministic branch coverage above. It cleans
+// the whole subtree and waits the started process so no zombie leaks.
+func TestReapIdentifiedOrphanProcesses_RealProcessSmokeTest(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not available")
+	}
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start real process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	reaped := false
+	t.Cleanup(func() {
+		if !reaped {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
+
+	ctx := context.Background()
+	id, err := process.CaptureProcessIdentity(ctx, pid)
+	if err != nil {
+		t.Fatalf("CaptureProcessIdentity(%d) error = %v", pid, err)
+	}
+
+	result := reapIdentifiedOrphanProcesses(ctx, []process.ProcessIdentity{id}, 200*time.Millisecond, productionOrphanReapDeps())
+
+	if result.Captured != 1 || result.MatchedBeforeTERM != 1 || result.TERMSignaled != 1 {
+		t.Errorf("unexpected phase-1 accounting: %+v", result)
+	}
+	if process.IsAlive(pid) {
+		t.Errorf("pid %d still alive after reap, want terminated", pid)
+	}
+
+	// Reap the exited child now so it doesn't linger as a zombie.
+	_, _ = cmd.Process.Wait()
+	reaped = true
 }

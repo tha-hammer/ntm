@@ -2378,6 +2378,167 @@ func reapOrphanProcesses(pids []int) {
 	}
 }
 
+// orphanCandidateSkipReason classifies why a candidate identity failed
+// pre-signal revalidation in reapIdentifiedOrphanProcesses. The zero value
+// means the identity is still current and safe to signal.
+type orphanCandidateSkipReason int
+
+const (
+	orphanCandidateOK orphanCandidateSkipReason = iota
+	orphanCandidateExcluded
+	orphanCandidateExited
+	orphanCandidateStale
+	orphanCandidateLookupError
+)
+
+// orphanReapDeps carries the liveness/identity/signal/grace operations
+// reapIdentifiedOrphanProcesses needs, so tests can supply deterministic
+// fakes instead of depending on the real OS process table and sending real
+// signals.
+type orphanReapDeps struct {
+	isAlive         func(pid int) bool
+	captureIdentity func(ctx context.Context, pid int) (process.ProcessIdentity, error)
+	signal          func(pid int, sig syscall.Signal) error
+	wait            func(ctx context.Context, d time.Duration)
+}
+
+// productionOrphanReapDeps wires orphanReapDeps to the real OS process
+// table and real signals.
+func productionOrphanReapDeps() orphanReapDeps {
+	return orphanReapDeps{
+		isAlive:         process.IsAlive,
+		captureIdentity: process.CaptureProcessIdentity,
+		signal:          syscall.Kill,
+		wait: func(ctx context.Context, d time.Duration) {
+			timer := time.NewTimer(d)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+		},
+	}
+}
+
+// validateOrphanCandidate revalidates id immediately before a signal is
+// sent: it rejects excluded PIDs, checks liveness, captures a fresh
+// identity, and requires exact equality with id. An exit, mismatch, or
+// lookup error fails closed (orphanCandidateOK is the only reason it is
+// safe to signal), which is exactly what rules out a signal landing on an
+// unrelated process that has reused id.PID since it was captured.
+func validateOrphanCandidate(ctx context.Context, id process.ProcessIdentity, deps orphanReapDeps) orphanCandidateSkipReason {
+	if orphanReapExcluded(id.PID) {
+		return orphanCandidateExcluded
+	}
+	if !deps.isAlive(id.PID) {
+		return orphanCandidateExited
+	}
+	fresh, err := deps.captureIdentity(ctx, id.PID)
+	if errors.Is(err, process.ErrProcessNotRunning) {
+		return orphanCandidateExited
+	}
+	if err != nil {
+		return orphanCandidateLookupError
+	}
+	if fresh != id {
+		return orphanCandidateStale
+	}
+	return orphanCandidateOK
+}
+
+// orphanReapResult carries exact accounting for one identity-safe delayed
+// reap pass, so the confirmed-death handler can log observable evidence
+// without ever logging raw PID lists.
+type orphanReapResult struct {
+	Captured          int
+	MatchedBeforeTERM int
+	TERMSignaled      int
+	MatchedBeforeKILL int
+	KILLSignaled      int
+	SkippedStale      int
+	SkippedExited     int
+	SkippedExcluded   int
+	LookupErrors      int
+	SignalErrors      int
+}
+
+// recordOrphanCandidateSkip tallies a non-OK validation outcome into the
+// matching result counter.
+func (r *orphanReapResult) recordSkip(reason orphanCandidateSkipReason) {
+	switch reason {
+	case orphanCandidateExcluded:
+		r.SkippedExcluded++
+	case orphanCandidateExited:
+		r.SkippedExited++
+	case orphanCandidateStale:
+		r.SkippedStale++
+	case orphanCandidateLookupError:
+		r.LookupErrors++
+	}
+}
+
+// reapIdentifiedOrphanProcesses sends SIGTERM, waits a grace period, then
+// SIGKILLs any survivor — but only for candidates whose identity is
+// revalidated immediately before each signal. This is the periodic-sweep
+// counterpart to reapOrphanProcesses: because the periodic path holds
+// candidates across a much longer window (tens of seconds of confirmed-miss
+// polling, rather than the instant right before tmux.KillSession), a bare
+// PID could have been reused by an unrelated process by the time the
+// delayed signal fires. Revalidating {PID, CreateTimeMillis} immediately
+// adjacent to each signal closes that window.
+//
+// An exit, identity mismatch, or lookup error fails closed for that
+// signal: the candidate is skipped, never signaled. A TERM syscall error
+// does not disqualify a candidate from the KILL phase — the process may
+// still be alive despite the error, and phase two's own revalidation will
+// determine the correct outcome either way.
+func reapIdentifiedOrphanProcesses(ctx context.Context, candidates []process.ProcessIdentity, grace time.Duration, deps orphanReapDeps) orphanReapResult {
+	result := orphanReapResult{Captured: len(candidates)}
+	if len(candidates) == 0 {
+		return result
+	}
+
+	var survivors []process.ProcessIdentity
+	for _, id := range candidates {
+		reason := validateOrphanCandidate(ctx, id, deps)
+		if reason != orphanCandidateOK {
+			result.recordSkip(reason)
+			continue
+		}
+
+		result.MatchedBeforeTERM++
+		if err := deps.signal(id.PID, syscall.SIGTERM); err != nil {
+			result.SignalErrors++
+		} else {
+			result.TERMSignaled++
+		}
+		survivors = append(survivors, id)
+	}
+
+	if len(survivors) == 0 {
+		return result
+	}
+
+	deps.wait(ctx, grace)
+
+	for _, id := range survivors {
+		reason := validateOrphanCandidate(ctx, id, deps)
+		if reason != orphanCandidateOK {
+			result.recordSkip(reason)
+			continue
+		}
+
+		result.MatchedBeforeKILL++
+		if err := deps.signal(id.PID, syscall.SIGKILL); err != nil {
+			result.SignalErrors++
+		} else {
+			result.KILLSignaled++
+		}
+	}
+
+	return result
+}
+
 // runKillProject kills all sessions matching a base project name (bd-3cu02.14).
 func runKillProject(w io.Writer, project string, force bool, tags []string, noHooks bool, summarize bool) error {
 	if err := tmux.EnsureInstalled(); err != nil {
