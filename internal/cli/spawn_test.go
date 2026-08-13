@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/cm"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -77,6 +78,56 @@ func TestResolveSpawnProjectDirRejectsRelativeOverride(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must be absolute") {
 		t.Fatalf("expected absolute-path error, got %v", err)
+	}
+}
+
+// TestBuildSpawnManifestSnapshotsEffectiveResiliencePolicy covers Behavior
+// 1 of the periodic orphan-sweep TDD plan: buildSpawnManifest freezes the
+// effective spawn-time policy — including an explicit false — into the
+// manifest, exactly mirroring the existing AutoRestart-override contract.
+func TestBuildSpawnManifestSnapshotsEffectiveResiliencePolicy(t *testing.T) {
+	agents := []resilience.AgentConfig{
+		{PaneID: "%0", PaneIndex: 0, Type: "cc", Model: "opus-4", Command: "claude"},
+	}
+
+	cases := []struct {
+		name            string
+		optsAutoRestart bool
+		cfgAutoRestart  bool
+		cfgReapOnExit   bool
+		wantAutoRestart bool
+	}{
+		{"both false", false, false, false, false},
+		{"opts overrides autorestart", true, false, false, true},
+		{"cfg overrides autorestart", false, true, false, true},
+		{"reap explicit true, autorestart false", false, false, true, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := SpawnOptions{Session: "test-session", AutoRestart: tc.optsAutoRestart}
+			effectiveCfg := config.Default()
+			effectiveCfg.Resilience.AutoRestart = tc.cfgAutoRestart
+			effectiveCfg.Resilience.ReapOrphansOnExit = tc.cfgReapOnExit
+
+			manifest := buildSpawnManifest(opts, effectiveCfg, "/tmp/project", agents)
+
+			if manifest.Session != "test-session" {
+				t.Errorf("Session = %q, want test-session", manifest.Session)
+			}
+			if manifest.ProjectDir != "/tmp/project" {
+				t.Errorf("ProjectDir = %q, want /tmp/project", manifest.ProjectDir)
+			}
+			if len(manifest.Agents) != 1 || manifest.Agents[0].PaneID != "%0" {
+				t.Errorf("Agents = %+v, want the supplied agent slice", manifest.Agents)
+			}
+			if manifest.AutoRestart != tc.wantAutoRestart {
+				t.Errorf("AutoRestart = %v, want %v", manifest.AutoRestart, tc.wantAutoRestart)
+			}
+			if manifest.ReapOrphansOnExit != tc.cfgReapOnExit {
+				t.Errorf("ReapOrphansOnExit = %v, want %v (explicit value snapshotted, not defaulted)", manifest.ReapOrphansOnExit, tc.cfgReapOnExit)
+			}
+		})
 	}
 }
 

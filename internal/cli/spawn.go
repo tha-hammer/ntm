@@ -1490,6 +1490,23 @@ func registerPluginAgentFlags(cmd *cobra.Command, p plugins.AgentPlugin, specs *
 	}
 }
 
+// buildSpawnManifest assembles the resilience.SpawnManifest for a freshly
+// spawned session from the effective spawn-time policy. It exists as a
+// standalone, real production helper (not a test-only extraction) so both
+// the spawn path and tests can prove the effective global config values —
+// including an explicit false — are snapshotted at spawn time rather than
+// re-read by the detached internal-monitor process, which receives no
+// --config flag (see newInternalMonitorCommand).
+func buildSpawnManifest(opts SpawnOptions, cfg *config.Config, projectDir string, agents []resilience.AgentConfig) *resilience.SpawnManifest {
+	return &resilience.SpawnManifest{
+		Session:           opts.Session,
+		ProjectDir:        projectDir,
+		Agents:            agents,
+		AutoRestart:       opts.AutoRestart || cfg.Resilience.AutoRestart,
+		ReapOrphansOnExit: cfg.Resilience.ReapOrphansOnExit,
+	}
+}
+
 // spawnSessionLogic handles the creation of the session and spawning of agents
 func spawnSessionLogic(opts SpawnOptions) (err error) {
 	// Helper for JSON error output
@@ -2493,13 +2510,9 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	// even if the user interrupts the wait.
 	if shouldStartInternalMonitor() {
 		// Save manifest for the monitor process
-		manifest := &resilience.SpawnManifest{
-			Session:     opts.Session,
-			ProjectDir:  dir,
-			AutoRestart: opts.AutoRestart || cfg.Resilience.AutoRestart,
-		}
+		agentConfigs := make([]resilience.AgentConfig, 0, len(launchedAgents))
 		for _, agent := range launchedAgents {
-			manifest.Agents = append(manifest.Agents, resilience.AgentConfig{
+			agentConfigs = append(agentConfigs, resilience.AgentConfig{
 				PaneID:    agent.paneID,
 				PaneIndex: agent.paneIndex,
 				Type:      agent.agentType,
@@ -2507,6 +2520,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 				Command:   agent.command,
 			})
 		}
+		manifest := buildSpawnManifest(opts, cfg, dir, agentConfigs)
 		if err := resilience.SaveManifest(manifest); err != nil {
 			if !IsJSONOutput() {
 				output.PrintWarningf("Failed to save resilience manifest: %v", err)

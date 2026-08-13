@@ -188,12 +188,12 @@ func runMonitor(session string) error {
 		SnapshotDeps: productionOrphanSnapshotDeps(),
 		Ready:        func(orphanProcessSnapshot) {},
 		OnConfirmedDeath: func(dctx context.Context, snap orphanProcessSnapshot) {
+			// The gate reads only the manifest's frozen, spawn-time policy —
+			// never the detached monitor's own global config — so a custom
+			// --config at spawn time is honored (see buildSpawnManifest) and
+			// global config changes only affect future spawns.
 			deathDeps := productionConfirmedDeathDeps(session, manifest, monitor, loopOptions.ReapGrace, lastOutputs)
-			// TODO(bd-vc07s / Behavior 1): read manifest.ReapOrphansOnExit
-			// once Behavior 1 lands the config+manifest policy surface.
-			// Hardcoded false is the fail-safe default until then — never
-			// reap by default before the policy toggle actually exists.
-			if err := handleConfirmedSessionDeath(dctx, false, snap, deathDeps); err != nil {
+			if err := handleConfirmedSessionDeath(dctx, manifest.ReapOrphansOnExit, snap, deathDeps); err != nil {
 				fmt.Fprintf(os.Stderr, "confirmed-death handler error: %v\n", err)
 			}
 		},

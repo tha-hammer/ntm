@@ -193,6 +193,34 @@ func TestDiff_ResilienceSettings(t *testing.T) {
 	}
 }
 
+// TestDiff_ResilienceReapOrphansOnExit covers Behavior 1 of the periodic
+// orphan-sweep TDD plan: Diff must report the exact default (true) and
+// current (false) values, not just the path's presence.
+func TestDiff_ResilienceReapOrphansOnExit(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.Resilience.ReapOrphansOnExit = false
+
+	diffs := Diff(cfg)
+
+	found := false
+	for _, d := range diffs {
+		if d.Path == "resilience.reap_orphans_on_exit" {
+			found = true
+			if d.Default != true {
+				t.Errorf("Default = %v, want true", d.Default)
+			}
+			if d.Current != false {
+				t.Errorf("Current = %v, want false", d.Current)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected diff for resilience.reap_orphans_on_exit")
+	}
+}
+
 func TestDiff_ContextRotationSettings(t *testing.T) {
 	t.Parallel()
 

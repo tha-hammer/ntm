@@ -2784,6 +2784,95 @@ func TestConfigShowJSONIncludesSafetyProfile(t *testing.T) {
 	}
 }
 
+// TestConfigShowJSONIncludesResilienceReapOrphansOnExit covers Behavior 1
+// of the periodic orphan-sweep TDD plan: the curated JSON `config show`
+// projection exposes this destructive setting and retains explicit false.
+//
+// PersistentPreRunE reloads the package-level cfg via startup.GetConfig()
+// for any command that needs config, discarding a directly-assigned cfg —
+// so, like TestConfigGetResilienceReapOrphansOnExit_ExplicitFalse below, an
+// explicit-false value must come from a real --config file, not assignment.
+func TestConfigShowJSONIncludesResilienceReapOrphansOnExit(t *testing.T) {
+	resetFlags()
+	oldCfg, oldCfgFile := cfg, cfgFile
+	t.Cleanup(func() {
+		cfg = oldCfg
+		cfgFile = oldCfgFile
+		startup.ResetConfig()
+	})
+	cfg = nil
+	cfgFile = ""
+	startup.ResetConfig()
+
+	tmpDir := t.TempDir()
+	customPath := filepath.Join(tmpDir, "ntm.toml")
+	if err := os.WriteFile(customPath, []byte("[resilience]\nreap_orphans_on_exit = false\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(global config) failed: %v", err)
+	}
+
+	output, err := captureStdout(t, func() error {
+		rootCmd.SetArgs([]string{"--config", customPath, "--json", "config", "show"})
+		return rootCmd.Execute()
+	})
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("Failed to parse JSON output: %v\nOutput: %s", err, output)
+	}
+
+	resilienceAny, ok := parsed["resilience"]
+	if !ok {
+		t.Fatalf("expected resilience key in output")
+	}
+	resilience, ok := resilienceAny.(map[string]any)
+	if !ok {
+		t.Fatalf("expected resilience to be object, got %T", resilienceAny)
+	}
+	reap, ok := resilience["reap_orphans_on_exit"].(bool)
+	if !ok {
+		t.Fatalf("expected resilience.reap_orphans_on_exit to be bool, got %T", resilience["reap_orphans_on_exit"])
+	}
+	if reap {
+		t.Error("resilience.reap_orphans_on_exit = true, want false (explicit-false config retained)")
+	}
+}
+
+// TestConfigGetResilienceReapOrphansOnExit_ExplicitFalse covers Behavior 1:
+// `ntm config get resilience.reap_orphans_on_exit` must return the exact
+// explicit-false value loaded from a custom --config file.
+func TestConfigGetResilienceReapOrphansOnExit_ExplicitFalse(t *testing.T) {
+	resetFlags()
+	oldCfg, oldCfgFile := cfg, cfgFile
+	t.Cleanup(func() {
+		cfg = oldCfg
+		cfgFile = oldCfgFile
+		startup.ResetConfig()
+	})
+	cfg = nil
+	cfgFile = ""
+	startup.ResetConfig()
+
+	tmpDir := t.TempDir()
+	customPath := filepath.Join(tmpDir, "ntm.toml")
+	if err := os.WriteFile(customPath, []byte("[resilience]\nreap_orphans_on_exit = false\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(global config) failed: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		rootCmd.SetArgs([]string{"--config", customPath, "config", "get", "resilience.reap_orphans_on_exit"})
+		return rootCmd.Execute()
+	})
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+	if got := strings.TrimSpace(out); got != "false" {
+		t.Fatalf("config get output = %q, want false", got)
+	}
+}
+
 // TestDepsCmdExecutes tests the deps command runs
 func TestDepsCmdExecutes(t *testing.T) {
 	fakeToolsDir := filepath.Join(repoRoot(t), "testdata", "faketools")

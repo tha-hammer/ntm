@@ -862,10 +862,66 @@ func TestCreateDefaultSuccess(t *testing.T) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Errorf("Config file not created at %s", path)
 	}
-	_, err = Load(path)
+	reloaded, err := Load(path)
 	if err != nil {
 		t.Errorf("Created config is not valid: %v", err)
 	}
+	if reloaded != nil && !reloaded.Resilience.ReapOrphansOnExit {
+		t.Error("generated default config reloaded resilience.reap_orphans_on_exit = false, want true")
+	}
+}
+
+// TestResilienceReapOrphansOnExit_DefaultAbsentAndExplicitFalse covers
+// Behavior 1 of the periodic orphan-sweep TDD plan: default/absent are
+// true and explicit false is preserved, across Default(), Print(), and
+// Load().
+func TestResilienceReapOrphansOnExit_DefaultAbsentAndExplicitFalse(t *testing.T) {
+	t.Parallel()
+
+	if !Default().Resilience.ReapOrphansOnExit {
+		t.Error("Default().Resilience.ReapOrphansOnExit = false, want true")
+	}
+
+	var buf bytes.Buffer
+	if err := Print(Default(), &buf); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	if !strings.Contains(buf.String(), "reap_orphans_on_exit = true") {
+		t.Errorf("Print output missing 'reap_orphans_on_exit = true':\n%s", buf.String())
+	}
+
+	tmpDir := t.TempDir()
+
+	t.Run("absent key decodes true", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(tmpDir, "absent.toml")
+		if err := os.WriteFile(path, []byte("theme = \"dark\"\n"), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.Resilience.ReapOrphansOnExit {
+			t.Error("absent reap_orphans_on_exit decoded false, want true (default)")
+		}
+	})
+
+	t.Run("explicit false is preserved", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(tmpDir, "explicit-false.toml")
+		body := "[resilience]\nreap_orphans_on_exit = false\n"
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Resilience.ReapOrphansOnExit {
+			t.Error("explicit reap_orphans_on_exit = false decoded true, want false preserved")
+		}
+	})
 }
 
 func TestFindPaletteMarkdownCwd(t *testing.T) {

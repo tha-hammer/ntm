@@ -322,6 +322,41 @@ legacy = true
 	}
 }
 
+// TestLoadProjectConfig_RejectsResilienceSection covers Behavior 1 of the
+// periodic orphan-sweep TDD plan: the reap_orphans_on_exit toggle is
+// global-only. ProjectConfig has no Resilience field, so a project-level
+// [resilience] section is rejected as an unknown field, the same as any
+// other unrecognized project-config section.
+func TestLoadProjectConfig_RejectsResilienceSection(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "resilience.toml")
+
+	content := []byte(`
+[project]
+name = "test"
+created = "2026-01-01T00:00:00Z"
+
+[resilience]
+reap_orphans_on_exit = false
+`)
+	if err := os.WriteFile(configPath, content, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadProjectConfig(configPath)
+	if err == nil {
+		t.Fatal("expected error for project-level [resilience] section")
+	}
+	if !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("LoadProjectConfig() error = %v, want unknown field", err)
+	}
+	if !strings.Contains(err.Error(), "resilience") {
+		t.Fatalf("LoadProjectConfig() error = %v, want resilience field name", err)
+	}
+}
+
 // TestLoadProjectConfig_NotFound verifies error for missing file
 func TestLoadProjectConfig_NotFound(t *testing.T) {
 	t.Parallel()

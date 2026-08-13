@@ -33,6 +33,14 @@ type SpawnManifest struct {
 	ProjectDir  string        `json:"project_dir"`
 	Agents      []AgentConfig `json:"agents"`
 	AutoRestart bool          `json:"auto_restart"`
+	// ReapOrphansOnExit is the effective global config value frozen at
+	// spawn time (mirroring AutoRestart above), so a custom --config at
+	// spawn time is honored even though the detached internal-monitor
+	// process's argv carries no --config flag. No omitempty: a legacy
+	// manifest saved before this field existed decodes false, a
+	// deliberate fail-safe default for a destructive policy rather than a
+	// compatibility shim.
+	ReapOrphansOnExit bool `json:"reap_orphans_on_exit"`
 }
 
 // AgentConfig represents the configuration for a single agent

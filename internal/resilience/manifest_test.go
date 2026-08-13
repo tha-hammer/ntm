@@ -130,6 +130,80 @@ func TestDeleteManifest_NotFound(t *testing.T) {
 	}
 }
 
+// TestSaveLoadManifest_ReapOrphansOnExit covers Behavior 1 of the periodic
+// orphan-sweep TDD plan: true and false both round-trip exactly, and the
+// raw JSON always contains the key (no omitempty) so a legacy manifest
+// without it is distinguishable from an explicit false.
+func TestSaveLoadManifest_ReapOrphansOnExit(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", tmpDir)
+
+	cases := []struct {
+		name    string
+		session string
+		want    bool
+	}{
+		{"true", "reap-true", true},
+		{"false", "reap-false", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := &SpawnManifest{
+				Session:           tc.session,
+				ProjectDir:        "/tmp/test",
+				ReapOrphansOnExit: tc.want,
+			}
+			if err := SaveManifest(manifest); err != nil {
+				t.Fatalf("SaveManifest: %v", err)
+			}
+
+			path := filepath.Join(tmpDir, "ntm", "manifests", tc.session+".json")
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read raw manifest: %v", err)
+			}
+			if !strings.Contains(string(raw), `"reap_orphans_on_exit"`) {
+				t.Errorf("raw manifest JSON missing reap_orphans_on_exit key:\n%s", raw)
+			}
+
+			loaded, err := LoadManifest(tc.session)
+			if err != nil {
+				t.Fatalf("LoadManifest: %v", err)
+			}
+			if loaded.ReapOrphansOnExit != tc.want {
+				t.Errorf("ReapOrphansOnExit = %v, want %v", loaded.ReapOrphansOnExit, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadManifest_LegacyMissingReapOrphansOnExitDecodesFalse covers
+// Behavior 1: a manifest saved before this field existed has no key at
+// all, and must decode to the fail-safe false rather than the current
+// default true — silently upgrading a legacy manifest to the destructive
+// default would be unsafe.
+func TestLoadManifest_LegacyMissingReapOrphansOnExitDecodesFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", tmpDir)
+
+	dir := filepath.Join(tmpDir, "ntm", "manifests")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	legacy := `{"session":"legacy","project_dir":"/tmp/test","agents":[],"auto_restart":true}`
+	if err := os.WriteFile(filepath.Join(dir, "legacy.json"), []byte(legacy), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	loaded, err := LoadManifest("legacy")
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if loaded.ReapOrphansOnExit {
+		t.Error("legacy manifest missing reap_orphans_on_exit decoded true, want false (fail-safe default)")
+	}
+}
+
 func TestSaveManifest_EmptyAgents(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", tmpDir)

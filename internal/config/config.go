@@ -494,6 +494,12 @@ type ResilienceConfig struct {
 	NotifyOnCrash       bool            `toml:"notify_on_crash"`        // Send notification when agent crashes
 	NotifyOnMaxRestarts bool            `toml:"notify_on_max_restarts"` // Notify when max restarts exceeded
 	RateLimit           RateLimitConfig `toml:"rate_limit"`             // Rate limit detection configuration
+	// ReapOrphansOnExit gates the internal-monitor's periodic sweep for
+	// agent processes that survive their tmux session dying by something
+	// other than `ntm kill` (crash, OOM-kill, manual `tmux kill-session`).
+	// The effective value is frozen into SpawnManifest at spawn time, not
+	// read fresh by the detached monitor — see SpawnManifest.ReapOrphansOnExit.
+	ReapOrphansOnExit bool `toml:"reap_orphans_on_exit"`
 }
 
 // RateLimitConfig holds configuration for rate limit detection
@@ -523,6 +529,7 @@ func DefaultResilienceConfig() ResilienceConfig {
 		CrashThreshold:      3,     // 3 consecutive text-based failures before restart
 		NotifyOnCrash:       true,  // Notify on crash by default
 		NotifyOnMaxRestarts: true,  // Notify when max restarts exceeded
+		ReapOrphansOnExit:   true,  // Reap orphaned agent processes after organic session death
 		RateLimit: RateLimitConfig{
 			Detect:   true, // Detect rate limits by default
 			Notify:   true, // Notify on rate limit by default
@@ -3593,6 +3600,7 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "crash_threshold = %d        # Consecutive failures before restart\n", cfg.Resilience.CrashThreshold)
 	fmt.Fprintf(w, "notify_on_crash = %t       # Send notification when agent crashes\n", cfg.Resilience.NotifyOnCrash)
 	fmt.Fprintf(w, "notify_on_max_restarts = %t # Notify when max restarts exceeded\n", cfg.Resilience.NotifyOnMaxRestarts)
+	fmt.Fprintf(w, "reap_orphans_on_exit = %t  # Reap orphaned agent processes after organic session death\n", cfg.Resilience.ReapOrphansOnExit)
 	fmt.Fprintln(w)
 
 	// Write rate limit sub-configuration
@@ -4613,6 +4621,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Resilience.NotifyOnCrash, nil
 		case "notify_on_max_restarts":
 			return cfg.Resilience.NotifyOnMaxRestarts, nil
+		case "reap_orphans_on_exit":
+			return cfg.Resilience.ReapOrphansOnExit, nil
 		case "rate_limit":
 			if len(parts) < 3 {
 				return cfg.Resilience.RateLimit, nil
@@ -5505,6 +5515,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("resilience.crash_threshold", defaults.Resilience.CrashThreshold, cfg.Resilience.CrashThreshold)
 	addDiff("resilience.notify_on_crash", defaults.Resilience.NotifyOnCrash, cfg.Resilience.NotifyOnCrash)
 	addDiff("resilience.notify_on_max_restarts", defaults.Resilience.NotifyOnMaxRestarts, cfg.Resilience.NotifyOnMaxRestarts)
+	addDiff("resilience.reap_orphans_on_exit", defaults.Resilience.ReapOrphansOnExit, cfg.Resilience.ReapOrphansOnExit)
 	addDiff("resilience.rate_limit.detect", defaults.Resilience.RateLimit.Detect, cfg.Resilience.RateLimit.Detect)
 	addDiff("resilience.rate_limit.notify", defaults.Resilience.RateLimit.Notify, cfg.Resilience.RateLimit.Notify)
 	addDiff("resilience.rate_limit.patterns", defaults.Resilience.RateLimit.Patterns, cfg.Resilience.RateLimit.Patterns)

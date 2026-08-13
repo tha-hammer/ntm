@@ -4730,6 +4730,9 @@ Examples:
 						"check_interval": effectiveCfg.Health.CheckInterval,
 						"auto_restart":   effectiveCfg.Health.AutoRestart,
 					},
+					"resilience": map[string]interface{}{
+						"reap_orphans_on_exit": effectiveCfg.Resilience.ReapOrphansOnExit,
+					},
 					"scanner": map[string]interface{}{
 						"ubs_path": effectiveCfg.Scanner.UBSPath,
 					},

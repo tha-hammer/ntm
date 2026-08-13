@@ -398,6 +398,24 @@ func TestGetValue_Resilience(t *testing.T) {
 	}
 }
 
+// TestGetValue_ResilienceReapOrphansOnExit_ExactFalse covers Behavior 1 of
+// the periodic orphan-sweep TDD plan: GetValue must return the exact
+// explicit-false value, not merely succeed without error.
+func TestGetValue_ResilienceReapOrphansOnExit_ExactFalse(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.Resilience.ReapOrphansOnExit = false
+
+	got, err := GetValue(cfg, "resilience.reap_orphans_on_exit")
+	if err != nil {
+		t.Fatalf("GetValue error = %v", err)
+	}
+	if got != false {
+		t.Errorf("GetValue(resilience.reap_orphans_on_exit) = %v, want false", got)
+	}
+}
+
 func TestGetValue_ContextRotation(t *testing.T) {
 	t.Parallel()
 	cfg := Default()
