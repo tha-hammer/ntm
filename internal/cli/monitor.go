@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/summary"
 	"github.com/Dicklesworthstone/ntm/internal/supervisor"
@@ -236,6 +238,138 @@ func runMonitor(session string) error {
 			captureSessionOutputs(session, lastOutputs)
 		}
 	}
+}
+
+// orphanProcessSnapshot is the CLI session-observation loop's own record of
+// manifest-owned pane-shell descendant identities, captured while tmux is
+// still live. It is the only safe source of orphan-reap candidates: by the
+// time a session is confirmed dead, survivors have already reparented and
+// there is nothing left to walk from the (now-gone) pane shell PID.
+//
+// Generation is intentionally not set by captureOrphanProcessSnapshot — it
+// is assigned only when a caller commits a successful replacement over the
+// loop's retained state, so a capture helper can be tested in isolation
+// from the loop's generation bookkeeping.
+type orphanProcessSnapshot struct {
+	Valid      bool
+	Generation int
+	CapturedAt time.Time
+	Roots      []int
+	Candidates map[process.ProcessIdentity]struct{}
+}
+
+// orphanSnapshotDeps carries the process-table operations
+// captureOrphanProcessSnapshot needs, so tests can supply deterministic
+// fakes instead of depending on the real OS process table.
+type orphanSnapshotDeps struct {
+	childPIDs       func(ctx context.Context, parentPID, limit int) ([]int, error)
+	captureIdentity func(ctx context.Context, pid int) (process.ProcessIdentity, error)
+}
+
+// productionOrphanSnapshotDeps wires orphanSnapshotDeps to the real
+// internal/process package.
+func productionOrphanSnapshotDeps() orphanSnapshotDeps {
+	return orphanSnapshotDeps{
+		childPIDs:       process.GetChildPIDsContext,
+		captureIdentity: process.CaptureProcessIdentity,
+	}
+}
+
+// manifestOwnedPaneRoots returns the deduplicated, nonzero pane-shell PIDs
+// of every pane whose ID matches a manifest-owned agent pane. User panes,
+// foreign panes, supervisors, the archiver, the monitor itself, and any
+// pane with an unresolved (zero) PID are never traversal roots.
+func manifestOwnedPaneRoots(manifest *resilience.SpawnManifest, panes []tmux.Pane) []int {
+	owned := make(map[string]struct{}, len(manifest.Agents))
+	for _, agent := range manifest.Agents {
+		owned[agent.PaneID] = struct{}{}
+	}
+
+	seen := make(map[int]struct{})
+	var roots []int
+	for _, p := range panes {
+		if p.PID <= 0 {
+			continue
+		}
+		if _, ok := owned[p.ID]; !ok {
+			continue
+		}
+		if _, ok := seen[p.PID]; ok {
+			continue
+		}
+		seen[p.PID] = struct{}{}
+		roots = append(roots, p.PID)
+	}
+	return roots
+}
+
+// captureOrphanProcessSnapshot builds a fresh orphan-candidate snapshot from
+// the manifest-owned pane-shell roots present in panes. It walks each
+// root's descendant subtree — bounded by orphanReapMaxDepth/orphanReapFanout,
+// the same bounds the existing direct-kill reap path uses — and captures the
+// identity of every descendant found. Pane-shell roots are excluded from the
+// candidate set (tmux reaps them directly), as is any orphanReapExcluded
+// PID.
+//
+// A descendant that has already exited by the time its identity is captured
+// is simply omitted — an expected race, not a failure. Any other
+// enumeration or identity-lookup error aborts the whole capture: the
+// snapshot is assembled entirely locally and only returned on full success,
+// so a caller never commits a partial replacement over a good prior
+// snapshot.
+func captureOrphanProcessSnapshot(ctx context.Context, manifest *resilience.SpawnManifest, panes []tmux.Pane, deps orphanSnapshotDeps) (orphanProcessSnapshot, error) {
+	roots := manifestOwnedPaneRoots(manifest, panes)
+
+	seenPID := make(map[int]struct{})
+	candidates := make(map[process.ProcessIdentity]struct{})
+
+	var walk func(pid, depth int) error
+	walk = func(pid, depth int) error {
+		if depth > orphanReapMaxDepth {
+			return nil
+		}
+		children, err := deps.childPIDs(ctx, pid, orphanReapFanout)
+		if err != nil {
+			return fmt.Errorf("enumerate children of pid %d: %w", pid, err)
+		}
+		for _, child := range children {
+			if orphanReapExcluded(child) {
+				continue
+			}
+			if _, ok := seenPID[child]; ok {
+				continue
+			}
+			seenPID[child] = struct{}{}
+
+			identity, err := deps.captureIdentity(ctx, child)
+			switch {
+			case errors.Is(err, process.ErrProcessNotRunning):
+				// Vanished between enumeration and identity capture.
+			case err != nil:
+				return fmt.Errorf("capture identity of pid %d: %w", child, err)
+			default:
+				candidates[identity] = struct{}{}
+			}
+
+			if err := walk(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, root := range roots {
+		if err := walk(root, 1); err != nil {
+			return orphanProcessSnapshot{}, err
+		}
+	}
+
+	return orphanProcessSnapshot{
+		Valid:      true,
+		CapturedAt: time.Now(),
+		Roots:      roots,
+		Candidates: candidates,
+	}, nil
 }
 
 func shouldSuperviseAgentMailDaemon() bool {
