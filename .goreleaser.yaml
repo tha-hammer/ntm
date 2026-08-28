@@ -157,32 +157,6 @@ release:
 
     **Container Image**: `ghcr.io/dicklesworthstone/ntm:{{ .Tag }}`
 
-homebrew_casks:
-  - name: ntm
-    ids:
-      - default  # Use only the tarball archives, not the binary archives
-    repository:
-      owner: Dicklesworthstone
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    directory: Casks
-    homepage: "https://github.com/Dicklesworthstone/ntm"
-    description: "Named Tmux Manager - Orchestrate AI coding agents in tmux sessions"
-    binaries:
-      - ntm
-    dependencies:
-      - formula: tmux
-    caveats: |
-      To complete installation, add the following to your shell config:
-
-        # For zsh (add to ~/.zshrc):
-        eval "$(ntm shell zsh)"
-
-        # For bash (add to ~/.bashrc):
-        eval "$(ntm shell bash)"
-
-      Run 'ntm tutorial' to get started!
-
 nfpms:
   - id: packages
     package_name: ntm
@@ -215,18 +189,6 @@ nfpms:
           mode: 0644
     scripts:
       postinstall: scripts/postinstall.sh
-
-# Scoop manifest for Windows users (via WSL)
-scoops:
-  - name: ntm
-    repository:
-      owner: Dicklesworthstone
-      name: scoop-bucket
-      token: "{{ .Env.SCOOP_GITHUB_TOKEN }}"
-    homepage: "https://github.com/Dicklesworthstone/ntm"
-    description: "Named Tmux Manager - Orchestrate AI coding agents in tmux sessions"
-    license: MIT
-    skip_upload: auto
 
 # Docker/Container images - disabled for now due to build context issues
 # TODO: Re-enable after fixing Dockerfile to work with GoReleaser's build context
