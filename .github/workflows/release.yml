@@ -271,9 +271,6 @@ jobs:
           - os: macos-15-intel
             goos: darwin
             goarch: amd64
-          - os: windows-latest
-            goos: windows
-            goarch: amd64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout

@@ -19,7 +19,6 @@ builds:
     goos:
       - linux
       - darwin
-      - windows
       - freebsd
     goarch:
       - amd64
@@ -28,11 +27,6 @@ builds:
     goarm:
       - "7"
     ignore:
-      # Windows ARM64 not commonly used
-      - goos: windows
-        goarch: arm64
-      - goos: windows
-        goarch: arm
       # FreeBSD ARM not commonly used
       - goos: freebsd
         goarch: arm
@@ -74,10 +68,6 @@ archives:
       - README.md
       - LICENSE*
       - CHANGELOG*
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
 
   # Also create raw binaries for curl-based install
   - id: binary
