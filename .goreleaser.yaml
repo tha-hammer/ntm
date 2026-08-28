@@ -119,7 +119,7 @@ release:
   github:
     owner: tha-hammer
     name: ntm
-  prerelease: auto
+  prerelease: false
   mode: replace
   draft: false
   header: |
