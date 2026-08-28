@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # NTM Install Script
-# https://github.com/Dicklesworthstone/ntm
+# https://github.com/tha-hammer/ntm
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/tha-hammer/ntm/main/install.sh | bash
 #
 # Options:
 #   --version=TAG   Install specific version (default: latest)
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-REPO_OWNER="Dicklesworthstone"
+REPO_OWNER="tha-hammer"
 REPO_NAME="ntm"
 BIN_NAME="ntm"
 
@@ -71,7 +71,7 @@ for arg in "$@"; do
             cat << 'EOF'
 NTM Install Script
 
-Usage: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash
+Usage: curl -fsSL https://raw.githubusercontent.com/tha-hammer/ntm/main/install.sh | bash
 
 Options:
   --version=TAG   Install specific version (default: latest)
@@ -82,13 +82,13 @@ Options:
 
 Examples:
   # Install latest version
-  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/tha-hammer/ntm/main/install.sh | bash
 
   # Install specific version
-  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --version=v1.0.0
+  curl -fsSL https://raw.githubusercontent.com/tha-hammer/ntm/main/install.sh | bash -s -- --version=v1.0.0
 
   # Install to custom directory
-  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --dir=/opt/bin
+  curl -fsSL https://raw.githubusercontent.com/tha-hammer/ntm/main/install.sh | bash -s -- --dir=/opt/bin
 EOF
             exit 0
             ;;
@@ -630,9 +630,6 @@ install_ntm() {
     echo "  ntm attach myproject                  # Attach to session"
     echo "  ntm palette                           # Open command palette"
     echo "  ntm tutorial                          # Interactive tutorial"
-    echo ""
-    echo "Tip: You can also install via Homebrew:"
-    echo "  brew install dicklesworthstone/tap/ntm"
     echo ""
     echo "Run 'ntm --help' for full documentation."
 }
