@@ -117,7 +117,7 @@ changelog:
 
 release:
   github:
-    owner: Dicklesworthstone
+    owner: tha-hammer
     name: ntm
   prerelease: auto
   mode: replace
@@ -131,13 +131,10 @@ release:
 
     ```bash
     # One-liner install (Linux/macOS)
-    curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --version={{ .Tag }}
-
-    # Homebrew (macOS/Linux)
-    brew install dicklesworthstone/tap/ntm
+    curl -fsSL https://raw.githubusercontent.com/tha-hammer/ntm/main/install.sh | bash -s -- --version={{ .Tag }}
 
     # Source build
-    git clone --branch {{ .Tag }} --depth 1 https://github.com/Dicklesworthstone/ntm.git
+    git clone --branch {{ .Tag }} --depth 1 https://github.com/tha-hammer/ntm.git
     cd ntm && go install ./cmd/ntm
     ```
 
@@ -153,9 +150,9 @@ release:
   footer: |
     ---
 
-    **Full Changelog**: https://github.com/Dicklesworthstone/ntm/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full Changelog**: https://github.com/tha-hammer/ntm/compare/{{ .PreviousTag }}...{{ .Tag }}
 
-    **Container Image**: `ghcr.io/dicklesworthstone/ntm:{{ .Tag }}`
+    **Container Image**: `ghcr.io/tha-hammer/ntm:{{ .Tag }}`
 
 nfpms:
   - id: packages
