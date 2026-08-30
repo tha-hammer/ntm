@@ -54,6 +54,7 @@ storage.sqlite3-*
 .beads/.migration-hint-ts
 .beads/embeddeddolt/
 .beads/backup/
+.beads/.auto-import-issues.jsonl
 
 # Temporary/backup files
 *.bak
