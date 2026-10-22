@@ -41,6 +41,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/recipe"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/webhook"
@@ -520,6 +521,24 @@ func sortPanesForAssignment(panes []tmux.Pane) {
 		}
 		return panes[i].Index < panes[j].Index
 	})
+}
+
+// paneRecordWriteHook persists the per-pane provider session id record (see
+// internal/session pane-records). It is a var so tests can observe the
+// invocation and inject failures without a live tmux server.
+var paneRecordWriteHook = func(sessionName string, panes []tmux.Pane) error {
+	return session.WritePaneRecord(sessionName, panes)
+}
+
+// recordSpawnPanes writes the spawn roster for a live session. Best-effort:
+// a hook failure warns on stderr only (never output.PrintWarning, which
+// writes to stdout and would break --json parseability) and never fails the
+// command.
+func recordSpawnPanes(sessionName string, panes []tmux.Pane) error {
+	if err := paneRecordWriteHook(sessionName, panes); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: failed to write pane session-id record:", err)
+	}
+	return nil
 }
 
 func legacySpawnTotalAgentCount(opts SpawnOptions) int {
@@ -2645,6 +2664,11 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	// persona→pane mapping) is reproducible across runs rather than dependent
 	// on tmux list-panes ordering (ntm#149).
 	sortPanesForAssignment(finalPanes)
+
+	// Best-effort pane record write, placed before the JSON fork so JSON
+	// mode records too. Hook failures warn on stderr only (never
+	// output.PrintWarning, which writes to stdout) and never fail spawn.
+	recordSpawnPanes(opts.Session, finalPanes)
 
 	// Enable project webhooks (if configured) for this session and emit
 	// webhook-compatible lifecycle events (always, regardless of JSON mode).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -58,8 +59,11 @@ func Capture(sessionName string) (state *SessionState, err error) {
 	// Detect working directory from active pane, first pane, or process
 	cwd := detectWorkDir(sessionName, panes)
 
-	// Map pane states (enriches each agent pane with its resumable session id)
-	paneStates := mapPaneStates(panes, cwd)
+	// Map pane states (enriches each agent pane with its resumable session id).
+	// Recorded ids win; new panes are lazily discovered and deduped. The
+	// refreshed record is stashed for Save to persist after a successful
+	// write (keyed by the live session name).
+	paneStates, refreshed := reconcilePaneIDs(panes, resolvePaneCwds(panes, cwd), loadPaneRecord(StorageDir(), sessionName), agentsession.Discover)
 
 	// Get git info if in a repo
 	gitBranch, gitRemote, gitCommit := getGitInfo(cwd)
@@ -100,6 +104,7 @@ func Capture(sessionName string) (state *SessionState, err error) {
 		CreatedAt: createdAt,
 		Version:   StateVersion,
 	}
+	state.refreshedPaneRecords = refreshed
 
 	return state, nil
 }
@@ -184,7 +189,152 @@ func countAgents(panes []tmux.Pane) AgentConfig {
 // mapPaneStates converts tmux panes to PaneState. sessionCwd is the session's
 // detected working directory, used as a fallback when a pane's own current path
 // cannot be read, for discovering each agent pane's resumable session id.
+// With no record it behaves as before (discover per pane) plus dedupe, so
+// same-cwd same-provider panes never save the same id twice.
 func mapPaneStates(panes []tmux.Pane, sessionCwd string) []PaneState {
+	states, _ := reconcilePaneIDs(panes, resolvePaneCwds(panes, sessionCwd), nil, agentsession.Discover)
+	return states
+}
+
+// resolvePaneCwds reads each pane's current working directory via tmux,
+// falling back to the session cwd when it cannot be read.
+func resolvePaneCwds(panes []tmux.Pane, sessionCwd string) []string {
+	cwds := make([]string, len(panes))
+	for i, p := range panes {
+		cwd := paneCurrentPath(p.ID)
+		if cwd == "" {
+			cwd = sessionCwd
+		}
+		cwds[i] = cwd
+	}
+	return cwds
+}
+
+// reconcilePaneIDs is the pure core behind save-time pane enrichment. It
+// matches live panes against the record by stable identity, fills matched
+// panes from the record (no Discover call), lazily discovers ids for panes
+// with no recorded id, and dedupes so the same id is never assigned twice
+// within a provider. It returns the saved states in live input order plus
+// the refreshed record (live matched panes only, in sorted order; a
+// refreshed filled id is never regressed to empty).
+func reconcilePaneIDs(panes []tmux.Pane, paneCwds []string, record []PaneRecordEntry, discover func(agentType, cwd string) *agentsession.Info) ([]PaneState, []PaneRecordEntry) {
+	stored := make(map[paneRecordKey]PaneRecordEntry, len(record))
+	for _, e := range record {
+		k := paneRecordKeyOfEntry(e)
+		if _, dup := stored[k]; !dup {
+			stored[k] = e
+		}
+	}
+
+	// Process a copy sorted by (WindowIndex, Index) — mirroring restore —
+	// so first-in-order wins deterministically regardless of list-panes
+	// ordering. Output still follows live input order.
+	order := make([]int, len(panes))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		pa, pb := panes[order[a]], panes[order[b]]
+		if pa.WindowIndex != pb.WindowIndex {
+			return pa.WindowIndex < pb.WindowIndex
+		}
+		return pa.Index < pb.Index
+	})
+
+	cwdOf := func(i int) string {
+		if i >= 0 && i < len(paneCwds) {
+			return paneCwds[i]
+		}
+		return ""
+	}
+
+	type providerID struct {
+		provider string
+		id       string
+	}
+	// Recorded ids seed the used-set before lazy fill runs, so lazy fill
+	// can never steal an id already recorded for another pane.
+	used := map[providerID]bool{}
+	for _, idx := range order {
+		p := panes[idx]
+		provider := agentsession.ResumeProvider(string(p.Type))
+		if provider == "" {
+			continue
+		}
+		if e, ok := stored[paneRecordKeyOfPane(p)]; ok && e.SessionID != "" {
+			used[providerID{provider, e.SessionID}] = true
+		}
+	}
+
+	type assignment struct {
+		id       string
+		provider string
+		file     string
+	}
+	assigned := make([]assignment, len(panes))
+	claimed := map[providerID]bool{}
+
+	// Recorded panes keep their recorded ids (first in sorted order wins a
+	// recorded duplicate); no Discover call for any recorded pane.
+	for _, idx := range order {
+		p := panes[idx]
+		provider := agentsession.ResumeProvider(string(p.Type))
+		if provider == "" {
+			continue
+		}
+		e, ok := stored[paneRecordKeyOfPane(p)]
+		if !ok || e.SessionID == "" {
+			continue
+		}
+		key := providerID{provider, e.SessionID}
+		if claimed[key] {
+			continue // recorded duplicate: saved state gets empty, record keeps old id
+		}
+		claimed[key] = true
+		assigned[idx] = assignment{id: e.SessionID, provider: e.SessionProvider, file: e.SessionFile}
+	}
+
+	// Lazy fill: panes with no recorded id share one memoized discovery
+	// result per (provider, cwd); an already-used id assigns empty (fresh
+	// launch on resume beats a harmful duplicate resume).
+	type memoKey struct {
+		provider string
+		cwd      string
+	}
+	memo := map[memoKey]*agentsession.Info{}
+	discovered := map[memoKey]bool{}
+	for _, idx := range order {
+		p := panes[idx]
+		if assigned[idx].id != "" {
+			continue
+		}
+		provider := agentsession.ResumeProvider(string(p.Type))
+		if provider == "" {
+			continue
+		}
+		if e, ok := stored[paneRecordKeyOfPane(p)]; ok && e.SessionID != "" {
+			continue // recorded-duplicate loser: stays empty, keeps old id in refresh
+		}
+		cwd := cwdOf(idx)
+		mk := memoKey{provider, cwd}
+		if !discovered[mk] {
+			discovered[mk] = true
+			if discover != nil {
+				memo[mk] = discover(string(p.Type), cwd)
+			}
+		}
+		info := memo[mk]
+		if info == nil || info.SessionID == "" {
+			continue
+		}
+		key := providerID{provider, info.SessionID}
+		if used[key] || claimed[key] {
+			continue
+		}
+		claimed[key] = true
+		assigned[idx] = assignment{id: info.SessionID, provider: info.Provider, file: info.SourcePath}
+	}
+
 	states := make([]PaneState, len(panes))
 	for i, p := range panes {
 		states[i] = PaneState{
@@ -198,23 +348,34 @@ func mapPaneStates(panes []tmux.Pane, sessionCwd string) []PaneState {
 			Height:      p.Height,
 			PaneID:      p.ID,
 		}
+		if a := assigned[i]; a.id != "" {
+			states[i].SessionID = a.id
+			states[i].SessionProvider = a.provider
+			states[i].SessionFile = a.file
+		}
+	}
 
-		// Best-effort: link each agent pane to its provider session id so it
-		// can be resumed later. User/editor panes return no provider.
+	refreshed := make([]PaneRecordEntry, 0, len(order))
+	for _, idx := range order {
+		p := panes[idx]
 		if agentsession.ResumeProvider(string(p.Type)) == "" {
 			continue
 		}
-		paneCwd := paneCurrentPath(p.ID)
-		if paneCwd == "" {
-			paneCwd = sessionCwd
+		e := PaneRecordEntry{
+			WindowIndex: p.WindowIndex,
+			AgentType:   string(p.Type),
+			NTMIndex:    p.NTMIndex,
 		}
-		if info := agentsession.Discover(string(p.Type), paneCwd); info != nil {
-			states[i].SessionID = info.SessionID
-			states[i].SessionProvider = info.Provider
-			states[i].SessionFile = info.SourcePath
+		if a := assigned[idx]; a.id != "" {
+			e.SessionID, e.SessionProvider, e.SessionFile = a.id, a.provider, a.file
+		} else if s, ok := stored[paneRecordKeyOfPane(p)]; ok && s.SessionID != "" {
+			// Never regress a filled id to empty: keep the old linkage
+			// when this cycle yielded nothing (idle agent, nil discovery).
+			e.SessionID, e.SessionProvider, e.SessionFile = s.SessionID, s.SessionProvider, s.SessionFile
 		}
+		refreshed = append(refreshed, e)
 	}
-	return states
+	return states, refreshed
 }
 
 // paneCurrentPath reads a single pane's current working directory via tmux.

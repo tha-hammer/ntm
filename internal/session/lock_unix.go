@@ -14,10 +14,15 @@ var localMu sync.Mutex
 // acquireLock acquires both process-level (flock) and thread-level (mutex) locks.
 // Returns an unlock function to release both.
 func acquireLock() (func(), error) {
+	return acquireLockAt(StorageDir())
+}
+
+// acquireLockAt is the dir-taking core behind acquireLock so tests can
+// exercise lock-serialized read-modify-write cycles in a temp dir.
+func acquireLockAt(dir string) (func(), error) {
 	localMu.Lock()
 
 	// Ensure directory exists for lock file
-	dir := StorageDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		localMu.Unlock()
 		return nil, err

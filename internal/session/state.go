@@ -43,6 +43,12 @@ type SessionState struct {
 
 	// Optional: Configuration snapshot
 	Config *ConfigSnapshot `json:"config,omitempty"`
+
+	// refreshedPaneRecords carries the reconciled pane record produced by
+	// Capture for Save to persist after a successful write. Unexported so it
+	// never appears in the saved JSON. Nil means Capture did not run (e.g. a
+	// hand-built state), in which case Save leaves the record untouched.
+	refreshedPaneRecords []PaneRecordEntry
 }
 
 // AgentConfig represents agent counts by type.

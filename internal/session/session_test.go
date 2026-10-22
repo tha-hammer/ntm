@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -1034,5 +1037,502 @@ func TestSessionState_WindowsRoundTrip(t *testing.T) {
 	}
 	if got.Panes[0].Command != "claude --model opus" {
 		t.Errorf("pane Command lost in round-trip: %q", got.Panes[0].Command)
+	}
+}
+
+// --- Pane record (per-pane provider session id) tests ---
+//
+// The pane record works around agentsession.Discover returning only the
+// single newest session per (agentType, workDir): same-cwd panes would
+// otherwise all save the same id. Spawn writes the roster with empty ids;
+// save reconciles and lazily fills them.
+
+func TestWritePaneRecordAtSpawn(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	panes := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 2, Title: "proj__cc_2", Type: tmux.AgentClaude},
+		{ID: "%0", Index: 2, WindowIndex: 0, Title: "bash", Type: tmux.AgentUser},
+	}
+
+	if err := writePaneRecord(dir, "proj", panes); err != nil {
+		t.Fatalf("writePaneRecord: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "pane-records", "proj.json"))
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	if strings.Contains(string(raw), "session_id") {
+		t.Errorf("spawn-written record must omit session fields, got:\n%s", raw)
+	}
+
+	var rec PaneRecordFile
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("parse record: %v", err)
+	}
+	if rec.Version != 1 {
+		t.Errorf("Version = %d, want 1", rec.Version)
+	}
+	if len(rec.Entries) != 2 {
+		t.Fatalf("len(entries) = %d, want 2 (user pane skipped)", len(rec.Entries))
+	}
+	wantKeys := []paneRecordKey{
+		{windowIndex: 0, agentType: "cc", ntmIndex: 1},
+		{windowIndex: 0, agentType: "cc", ntmIndex: 2},
+	}
+	for i, want := range wantKeys {
+		e := rec.Entries[i]
+		if got := (paneRecordKey{windowIndex: e.WindowIndex, agentType: e.AgentType, ntmIndex: e.NTMIndex}); got != want {
+			t.Errorf("entries[%d] key = %+v, want %+v", i, got, want)
+		}
+		if e.SessionID != "" || e.SessionProvider != "" || e.SessionFile != "" {
+			t.Errorf("entries[%d] must start empty, got %+v", i, e)
+		}
+	}
+}
+
+func TestWritePaneRecordZeroAgentPanes(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	panes := []tmux.Pane{
+		{ID: "%0", Index: 0, WindowIndex: 0, Title: "bash", Type: tmux.AgentUser},
+	}
+	if err := writePaneRecord(dir, "empty", panes); err != nil {
+		t.Fatalf("writePaneRecord: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "pane-records", "empty.json"))
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	var rec PaneRecordFile
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("parse record: %v", err)
+	}
+	if rec.Version != 1 {
+		t.Errorf("Version = %d, want 1", rec.Version)
+	}
+	if rec.Entries == nil || len(rec.Entries) != 0 {
+		t.Errorf("entries = %+v, want empty non-nil array", rec.Entries)
+	}
+}
+
+func TestAppendPaneRecordOnAdd(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	seed := []PaneRecordEntry{
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "id-1", SessionProvider: "claude", SessionFile: "/f/1"},
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 2},
+	}
+	if err := storePaneRecord(dir, "proj", seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	newPane := tmux.Pane{ID: "%3", Index: 2, WindowIndex: 0, NTMIndex: 3, Title: "proj__cc_3", Type: tmux.AgentClaude}
+	if err := appendPaneRecord(dir, "proj", newPane); err != nil {
+		t.Fatalf("appendPaneRecord: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "pane-records", "proj.json"))
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	// Exact on-wire shape (golden): envelope plus one object per entry.
+	wantJSON := `{
+  "version": 1,
+  "entries": [
+    {
+      "window_index": 0,
+      "agent_type": "cc",
+      "ntm_index": 1,
+      "session_id": "id-1",
+      "session_provider": "claude",
+      "session_file": "/f/1"
+    },
+    {
+      "window_index": 0,
+      "agent_type": "cc",
+      "ntm_index": 2
+    },
+    {
+      "window_index": 0,
+      "agent_type": "cc",
+      "ntm_index": 3
+    }
+  ]
+}`
+	if string(raw) != wantJSON {
+		t.Errorf("record JSON mismatch.\ngot:\n%s\nwant:\n%s", raw, wantJSON)
+	}
+
+	var rec PaneRecordFile
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("parse record: %v", err)
+	}
+	if len(rec.Entries) != 3 {
+		t.Fatalf("len(entries) = %d, want 3", len(rec.Entries))
+	}
+	for i, want := range seed {
+		if rec.Entries[i] != want {
+			t.Errorf("entries[%d] = %+v, want %+v (old entries must be untouched)", i, rec.Entries[i], want)
+		}
+	}
+	last := rec.Entries[2]
+	if last.WindowIndex != 0 || last.AgentType != "cc" || last.NTMIndex != 3 {
+		t.Errorf("new entry key = %+v, want (0 cc 3)", last)
+	}
+	if last.SessionID != "" || last.SessionProvider != "" || last.SessionFile != "" {
+		t.Errorf("new entry must start empty, got %+v", last)
+	}
+}
+
+func TestAppendPaneRecordEdges(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing record creates single entry", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		pane := tmux.Pane{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude}
+		if err := appendPaneRecord(dir, "proj", pane); err != nil {
+			t.Fatalf("appendPaneRecord: %v", err)
+		}
+		got := loadPaneRecord(dir, "proj")
+		if len(got) != 1 {
+			t.Fatalf("len = %d, want 1", len(got))
+		}
+		if got[0].NTMIndex != 1 || got[0].SessionID != "" {
+			t.Errorf("entry = %+v, want fresh empty cc_1", got[0])
+		}
+	})
+
+	t.Run("user pane leaves record untouched", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		user := tmux.Pane{ID: "%0", Index: 0, WindowIndex: 0, Title: "bash", Type: tmux.AgentUser}
+		if err := appendPaneRecord(dir, "proj", user); err != nil {
+			t.Fatalf("appendPaneRecord: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "pane-records", "proj.json")); !os.IsNotExist(err) {
+			t.Errorf("user-pane append must not create a record file")
+		}
+	})
+
+	t.Run("re-added pane never inherits killed pane id", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		seed := []PaneRecordEntry{
+			{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "dead-id", SessionProvider: "claude", SessionFile: "/f/dead"},
+			{WindowIndex: 0, AgentType: "cc", NTMIndex: 2, SessionID: "id-2", SessionProvider: "claude", SessionFile: "/f/2"},
+		}
+		if err := storePaneRecord(dir, "proj", seed); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		readded := tmux.Pane{ID: "%9", Index: 5, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude}
+		if err := appendPaneRecord(dir, "proj", readded); err != nil {
+			t.Fatalf("appendPaneRecord: %v", err)
+		}
+		got := loadPaneRecord(dir, "proj")
+		if len(got) != 2 {
+			t.Fatalf("len = %d, want 2 (replace, not duplicate)", len(got))
+		}
+		if got[1].NTMIndex != 1 || got[1].SessionID != "" || got[1].SessionFile != "" {
+			t.Errorf("re-added entry = %+v, want empty cc_1, not dead-id", got[1])
+		}
+		if got[0] != seed[1] {
+			t.Errorf("unrelated entry changed: %+v, want %+v", got[0], seed[1])
+		}
+	})
+}
+
+func TestAppendPaneRecordConcurrent(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := storePaneRecord(dir, "proj", []PaneRecordEntry{
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 1},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	newPanes := []tmux.Pane{
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 2, Title: "proj__cc_2", Type: tmux.AgentClaude},
+		{ID: "%3", Index: 2, WindowIndex: 0, NTMIndex: 1, Title: "proj__cod_1", Type: tmux.AgentCodex},
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, len(newPanes))
+	for i, pane := range newPanes {
+		wg.Add(1)
+		go func(i int, pane tmux.Pane) {
+			defer wg.Done()
+			unlock, err := acquireLockAt(dir)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer unlock()
+			errs[i] = appendPaneRecord(dir, "proj", pane)
+		}(i, pane)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	got := loadPaneRecord(dir, "proj")
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3 (no lost appends)", len(got))
+	}
+	seen := map[paneRecordKey]bool{}
+	for _, e := range got {
+		seen[paneRecordKeyOfEntry(e)] = true
+	}
+	for _, want := range []paneRecordKey{
+		{windowIndex: 0, agentType: "cc", ntmIndex: 1},
+		{windowIndex: 0, agentType: "cc", ntmIndex: 2},
+		{windowIndex: 0, agentType: "cod", ntmIndex: 1},
+	} {
+		if !seen[want] {
+			t.Errorf("missing entry for key %+v in %+v", want, got)
+		}
+	}
+}
+
+func TestWritePaneRecordRerunPreservesFilledIDs(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	seed := []PaneRecordEntry{
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "id-1", SessionProvider: "claude", SessionFile: "/f/1"},
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 2},
+	}
+	if err := storePaneRecord(dir, "proj", seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// A spawn re-run sees only empty-id panes; filled ids must survive.
+	rerun := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 2, Title: "proj__cc_2", Type: tmux.AgentClaude},
+	}
+	if err := writePaneRecord(dir, "proj", rerun); err != nil {
+		t.Fatalf("writePaneRecord: %v", err)
+	}
+	got := loadPaneRecord(dir, "proj")
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0] != seed[0] {
+		t.Errorf("filled entry regressed: %+v, want %+v", got[0], seed[0])
+	}
+}
+
+func TestPaneRecordLifecycle(t *testing.T) {
+	// Mutates HOME to redirect StorageDir; cannot run in parallel.
+	home := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", oldHome)
+	os.Setenv("HOME", home)
+
+	panes := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 1, Title: "proj__cod_1", Type: tmux.AgentCodex},
+	}
+	activeSidecar := filepath.Join(StorageDir(), "pane-records", "proj.json")
+	archivedSidecar := filepath.Join(ArchiveDir(), "pane-records", "proj.json")
+	saveState := func() {
+		t.Helper()
+		state := &SessionState{Name: "proj", SavedAt: time.Now().UTC(), Version: StateVersion}
+		if _, err := Save(state, SaveOptions{Overwrite: true}); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+	}
+	exists := func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+
+	if err := WritePaneRecord("proj", panes); err != nil {
+		t.Fatalf("WritePaneRecord: %v", err)
+	}
+	if !exists(activeSidecar) {
+		t.Fatalf("sidecar not written at %s", activeSidecar)
+	}
+
+	// Delete drops the sidecar.
+	saveState()
+	if err := Delete("proj"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if exists(activeSidecar) {
+		t.Errorf("Delete left the sidecar behind")
+	}
+
+	// Archive moves the sidecar alongside the archived state.
+	if err := WritePaneRecord("proj", panes); err != nil {
+		t.Fatalf("WritePaneRecord: %v", err)
+	}
+	saveState()
+	if _, err := Archive("proj"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if exists(activeSidecar) {
+		t.Errorf("Archive left the sidecar in the active store")
+	}
+	if !exists(archivedSidecar) {
+		t.Errorf("Archive did not move the sidecar to %s", archivedSidecar)
+	}
+
+	// Unarchive restores it.
+	if _, err := Unarchive("proj"); err != nil {
+		t.Fatalf("Unarchive: %v", err)
+	}
+	if !exists(activeSidecar) {
+		t.Errorf("Unarchive did not restore the sidecar")
+	}
+	if exists(archivedSidecar) {
+		t.Errorf("Unarchive left the sidecar in the archive store")
+	}
+}
+
+func TestReconcilePaneRecord(t *testing.T) {
+	t.Parallel()
+	panes := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 2, Title: "proj__cc_2", Type: tmux.AgentClaude},
+		{ID: "%3", Index: 2, WindowIndex: 0, NTMIndex: 1, Title: "proj__cod_1", Type: tmux.AgentCodex},
+		{ID: "%4", Index: 3, WindowIndex: 0, NTMIndex: 2, Title: "proj__cod_2", Type: tmux.AgentCodex},
+	}
+	cwds := []string{"/proj", "/proj", "/shared", "/shared"}
+	record := []PaneRecordEntry{
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "id-a", SessionProvider: "claude", SessionFile: "/f/a"},
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 2, SessionID: "id-b", SessionProvider: "claude", SessionFile: "/f/b"},
+	}
+	calls := map[string]int{}
+	fakeDiscover := func(agentType, cwd string) *agentsession.Info {
+		calls[agentType+"|"+cwd]++
+		return &agentsession.Info{AgentType: agentType, SessionID: "disc-x", Provider: "codex", SourcePath: "/f/disc"}
+	}
+
+	states, refreshed := reconcilePaneIDs(panes, cwds, record, fakeDiscover)
+
+	if len(calls) != 1 || calls["cod|/shared"] != 1 {
+		t.Errorf("discover calls = %v, want exactly one cod|/shared call (recorded panes need none; same provider+cwd memoizes)", calls)
+	}
+	if len(states) != 4 {
+		t.Fatalf("len(states) = %d, want 4", len(states))
+	}
+	if states[0].SessionID != "id-a" || states[0].SessionProvider != "claude" || states[0].SessionFile != "/f/a" {
+		t.Errorf("states[0] = %+v, want recorded id-a", states[0])
+	}
+	if states[1].SessionID != "id-b" {
+		t.Errorf("states[1] = %+v, want recorded id-b", states[1])
+	}
+	if states[2].SessionID != "disc-x" {
+		t.Errorf("states[2] = %+v, want lazily filled disc-x", states[2])
+	}
+	if states[3].SessionID != "" || states[3].SessionFile != "" {
+		t.Errorf("states[3] = %+v, want empty (deduped duplicate of disc-x)", states[3])
+	}
+	if len(refreshed) != 4 {
+		t.Errorf("len(refreshed) = %d, want 4", len(refreshed))
+	}
+}
+
+func TestLazyFillDedupesAcrossSameProviderPanes(t *testing.T) {
+	t.Parallel()
+	// Fed in reverse (WindowIndex, Index) order: D sorts after C.
+	panes := []tmux.Pane{
+		{ID: "%4", Index: 1, WindowIndex: 0, NTMIndex: 2, Title: "proj__cc_2", Type: tmux.AgentClaude},
+		{ID: "%3", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+	}
+	cwds := []string{"/proj", "/proj"}
+	fakeDiscover := func(agentType, cwd string) *agentsession.Info {
+		return &agentsession.Info{AgentType: agentType, SessionID: "disc-x", Provider: "claude", SourcePath: "/f/disc"}
+	}
+
+	states, refreshed := reconcilePaneIDs(panes, cwds, nil, fakeDiscover)
+
+	if len(states) != 2 {
+		t.Fatalf("len(states) = %d, want 2", len(states))
+	}
+	// Output follows input order (D first), but the id goes to the
+	// sorted-first pane (C).
+	if states[0].SessionID != "" {
+		t.Errorf("states[0] (D, sorted-second) = %q, want empty", states[0].SessionID)
+	}
+	if states[1].SessionID != "disc-x" {
+		t.Errorf("states[1] (C, sorted-first) = %q, want disc-x", states[1].SessionID)
+	}
+	if len(refreshed) != 2 || refreshed[0].SessionID != "disc-x" || refreshed[1].SessionID != "" {
+		t.Errorf("refreshed = %+v, want [disc-x \"\"] in sorted order", refreshed)
+	}
+}
+
+func TestDedupeKeysByProviderNotType(t *testing.T) {
+	t.Parallel()
+	panes := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__gmi_1", Type: tmux.AgentGemini},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 1, Title: "proj__agy_1", Type: tmux.AgentAntigravity},
+	}
+	cwds := []string{"/proj", "/proj"}
+	fakeDiscover := func(agentType, cwd string) *agentsession.Info {
+		return &agentsession.Info{AgentType: agentType, SessionID: "shared-raw", Provider: "p-" + agentType, SourcePath: "/f/" + agentType}
+	}
+
+	states, _ := reconcilePaneIDs(panes, cwds, nil, fakeDiscover)
+
+	if len(states) != 2 {
+		t.Fatalf("len(states) = %d, want 2", len(states))
+	}
+	// gmi and agy are distinct providers: the same raw id must NOT dedupe.
+	if states[0].SessionID != "shared-raw" {
+		t.Errorf("states[0] (gmi) = %q, want shared-raw", states[0].SessionID)
+	}
+	if states[1].SessionID != "shared-raw" {
+		t.Errorf("states[1] (agy) = %q, want shared-raw", states[1].SessionID)
+	}
+}
+
+func TestStaleRecordEntriesDroppedOnSave(t *testing.T) {
+	t.Parallel()
+	record := []PaneRecordEntry{
+		{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "id-a", SessionProvider: "claude", SessionFile: "/f/a"},
+		{WindowIndex: 9, AgentType: "cc", NTMIndex: 9, SessionID: "id-z", SessionProvider: "claude", SessionFile: "/f/z"},
+	}
+	panes := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+	}
+	cwds := []string{"/proj"}
+	discoverCalls := 0
+	nilDiscover := func(agentType, cwd string) *agentsession.Info {
+		discoverCalls++
+		return nil // idle agent: nothing discoverable this cycle
+	}
+
+	states, refreshed := reconcilePaneIDs(panes, cwds, record, nilDiscover)
+
+	if discoverCalls != 0 {
+		t.Errorf("recorded pane triggered %d discover calls, want 0", discoverCalls)
+	}
+	if len(states) != 1 || states[0].SessionID != "id-a" {
+		t.Errorf("states = %+v, want [id-a]", states)
+	}
+	// The killed pane Z is dropped, and A's filled id is never regressed to
+	// empty even though lazy fill yielded nothing this cycle.
+	if len(refreshed) != 1 {
+		t.Fatalf("refreshed = %+v, want only A", refreshed)
+	}
+	if refreshed[0] != record[0] {
+		t.Errorf("refreshed[0] = %+v, want %+v (old id intact)", refreshed[0], record[0])
+	}
+
+	// File level: the refresh rewrite drops Z from the stored record.
+	dir := t.TempDir()
+	if err := storePaneRecord(dir, "proj", record); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := upsertPaneRecordEntries(dir, "proj", refreshed); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	got := loadPaneRecord(dir, "proj")
+	if len(got) != 1 || got[0] != record[0] {
+		t.Errorf("stored after refresh = %+v, want [%+v]", got, record[0])
 	}
 }

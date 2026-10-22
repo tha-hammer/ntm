@@ -24,6 +24,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/webhook"
 )
@@ -37,6 +38,43 @@ type AddOptions struct {
 	CassContextQuery string
 	NoCassContext    bool
 	Prompt           string
+}
+
+// paneRecordAppendHook persists one per-pane provider session id record entry
+// (see internal/session pane-records). It is a var so tests can observe the
+// invocation and inject failures without a live tmux server.
+var paneRecordAppendHook = func(sessionName string, pane tmux.Pane) error {
+	return session.AppendPaneRecord(sessionName, pane)
+}
+
+// recordAddedPanes appends one record entry per newly added pane id. The
+// fresh pane list is read once (titles were set during the add loop, so NTM
+// indices exist) and matched by pane id. getPanes is injectable for tests;
+// production passes tmux.GetPanes. Best-effort: failures warn on stderr only
+// and never fail the command.
+func recordAddedPanes(sessionName string, paneIDs []string, getPanes func(string) ([]tmux.Pane, error)) error {
+	if len(paneIDs) == 0 {
+		return nil
+	}
+	panes, err := getPanes(sessionName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: failed to list panes for pane session-id record:", err)
+		return nil
+	}
+	byID := make(map[string]tmux.Pane, len(panes))
+	for _, p := range panes {
+		byID[p.ID] = p
+	}
+	for _, id := range paneIDs {
+		p, ok := byID[id]
+		if !ok {
+			continue
+		}
+		if err := paneRecordAppendHook(sessionName, p); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: failed to append pane session-id record:", err)
+		}
+	}
+	return nil
 }
 
 // opencodeCommandOrDefault returns the configured [agents] oc launch command,
@@ -367,6 +405,9 @@ func runAdd(opts AddOptions) error {
 
 	// Track newly added panes for JSON output
 	var newPanes []output.PaneResponse
+
+	// Track new pane ids for the pane-record append below.
+	var newPaneIDs []string
 
 	// Get existing panes to determine next indices
 	panes, err := tmux.GetPanes(session)
@@ -722,7 +763,12 @@ func runAdd(opts AddOptions) error {
 			Variant: agent.Model,
 			Command: cmd,
 		})
+		newPaneIDs = append(newPaneIDs, paneID)
 	}
+
+	// Best-effort pane record append, once per new pane, before the JSON
+	// emit so both modes record. Never fails add; warnings go to stderr.
+	recordAddedPanes(session, newPaneIDs, tmux.GetPanes)
 
 	// Run post-add hooks
 	if hookExec.HasHooksForEvent(hooks.EventPostAdd) {

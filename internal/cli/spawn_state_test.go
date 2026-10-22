@@ -1,10 +1,15 @@
 package cli
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func TestNewSpawnState(t *testing.T) {
@@ -285,5 +290,138 @@ func TestGetPromptStatuses(t *testing.T) {
 	state.MarkSent("pane-1")
 	if statuses[0].Sent {
 		t.Error("copy should not be affected by original changes")
+	}
+}
+
+// captureStderr runs fn with os.Stderr redirected to a pipe and returns what
+// was written. Write volume is tiny (one warning line), so no drain
+// goroutine is needed.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	fn()
+	_ = w.Close()
+	os.Stderr = orig
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
+
+// --- Pane record hooks (per-pane provider session id record) ---
+
+func TestSpawnWritesPaneRecord(t *testing.T) {
+	prev := paneRecordWriteHook
+	t.Cleanup(func() { paneRecordWriteHook = prev })
+	var gotName string
+	var gotPanes []tmux.Pane
+	paneRecordWriteHook = func(name string, panes []tmux.Pane) error {
+		gotName, gotPanes = name, panes
+		return errors.New("synthetic record failure")
+	}
+	panes := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "sess__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 1, Title: "sess__cod_1", Type: tmux.AgentCodex},
+	}
+
+	origStdout := os.Stdout
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = outW
+	var hookErr error
+	stderr := captureStderr(t, func() {
+		hookErr = recordSpawnPanes("sess", panes)
+	})
+	_ = outW.Close()
+	os.Stdout = origStdout
+	outBytes, _ := io.ReadAll(outR)
+
+	if hookErr != nil {
+		t.Errorf("recordSpawnPanes returned %v: a failing record write must never fail spawn", hookErr)
+	}
+	if gotName != "sess" {
+		t.Errorf("hook session = %q, want sess", gotName)
+	}
+	if len(gotPanes) != 2 {
+		t.Errorf("hook panes = %d, want 2 (finalPanes)", len(gotPanes))
+	}
+	if len(outBytes) != 0 {
+		t.Errorf("stdout got %q: hook output must stay on stderr so --json stays parseable", outBytes)
+	}
+	if !strings.Contains(stderr, "warning") {
+		t.Errorf("stderr got %q, want a warning", stderr)
+	}
+}
+
+func TestRecordAddedPanes(t *testing.T) {
+	prev := paneRecordAppendHook
+	t.Cleanup(func() { paneRecordAppendHook = prev })
+	var appended []tmux.Pane
+	appendErr := error(nil)
+	paneRecordAppendHook = func(name string, pane tmux.Pane) error {
+		if name != "sess" {
+			t.Errorf("hook session = %q, want sess", name)
+		}
+		appended = append(appended, pane)
+		return appendErr
+	}
+	live := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "sess__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 1, Title: "sess__cod_1", Type: tmux.AgentCodex},
+	}
+	getPanes := func(session string) ([]tmux.Pane, error) {
+		if session != "sess" {
+			t.Errorf("getPanes session = %q, want sess", session)
+		}
+		return live, nil
+	}
+
+	// Exactly one append per new pane id; unknown ids are skipped.
+	if err := recordAddedPanes("sess", []string{"%1", "%bogus"}, getPanes); err != nil {
+		t.Fatalf("recordAddedPanes: %v", err)
+	}
+	if len(appended) != 1 || appended[0].ID != "%1" {
+		t.Fatalf("appended = %+v, want only pane %%1", appended)
+	}
+
+	// A failing append warns on stderr but never fails add.
+	appendErr = errors.New("synthetic append failure")
+	var hookErr error
+	stderr := captureStderr(t, func() {
+		hookErr = recordAddedPanes("sess", []string{"%2"}, getPanes)
+	})
+	if hookErr != nil {
+		t.Errorf("recordAddedPanes returned %v, want nil", hookErr)
+	}
+	if !strings.Contains(stderr, "warning") {
+		t.Errorf("stderr got %q, want a warning", stderr)
+	}
+
+	// No new panes means no pane listing at all.
+	called := false
+	if err := recordAddedPanes("sess", nil, func(string) ([]tmux.Pane, error) {
+		called = true
+		return nil, nil
+	}); err != nil || called {
+		t.Errorf("empty ids: err = %v, getPanes called = %v", err, called)
+	}
+
+	// A failed listing warns on stderr but never fails add.
+	var listErr error
+	stderr = captureStderr(t, func() {
+		listErr = recordAddedPanes("sess", []string{"%1"}, func(string) ([]tmux.Pane, error) {
+			return nil, errors.New("no tmux")
+		})
+	})
+	if listErr != nil {
+		t.Errorf("listing failure returned %v, want nil", listErr)
+	}
+	if !strings.Contains(stderr, "warning") {
+		t.Errorf("stderr got %q, want a warning", stderr)
 	}
 }

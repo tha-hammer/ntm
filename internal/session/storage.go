@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
@@ -133,6 +135,11 @@ func Save(state *SessionState, opts SaveOptions) (path string, err error) {
 		return "", fmt.Errorf("writing session file: %w", err)
 	}
 
+	// Persist the reconciled pane record (if Capture produced one) keyed by
+	// the live session name, never the --name save-as alias. Best-effort:
+	// a refresh failure never fails the save.
+	refreshPaneRecordAfterSave(dir, state.Name, state.refreshedPaneRecords)
+
 	return path, nil
 }
 
@@ -233,6 +240,9 @@ func Delete(name string) (err error) {
 	err = os.Remove(path)
 	if os.IsNotExist(err) {
 		return fmt.Errorf("no saved session named '%s'", name)
+	}
+	if err == nil {
+		removePaneRecordSidecar(StorageDir(), name)
 	}
 	return err
 }
@@ -372,6 +382,7 @@ func Archive(name string) (archivedPath string, err error) {
 	if err := moveFile(src, dst); err != nil {
 		return "", fmt.Errorf("archiving session: %w", err)
 	}
+	movePaneRecordSidecar(StorageDir(), ArchiveDir(), name)
 	return dst, nil
 }
 
@@ -410,6 +421,7 @@ func Unarchive(name string) (restoredPath string, err error) {
 	if err := moveFile(src, dst); err != nil {
 		return "", fmt.Errorf("unarchiving session: %w", err)
 	}
+	movePaneRecordSidecar(ArchiveDir(), StorageDir(), name)
 	return dst, nil
 }
 
@@ -518,4 +530,243 @@ func normalizeSavedSessionName(name string) (string, error) {
 		return "", fmt.Errorf("session name cannot be '.' or '..'")
 	}
 	return sanitized, nil
+}
+
+// --- Per-pane provider session id record ---
+//
+// Rationale: agentsession.Discover returns only the single newest session per
+// (agentType, workDir), so same-cwd panes would otherwise all save the same
+// id. The record stores one entry per agent pane keyed by stable identity
+// (window index, agent type, NTM index — never the tmux %N id, which changes
+// on restore). Spawn writes the roster with empty ids; save reconciles the
+// recorded ids, lazily fills new panes, and dedupes within a provider (see
+// reconcilePaneIDs in capture.go). All record I/O is best-effort and never
+// fails spawn, add, or save.
+
+const paneRecordsDirName = "pane-records"
+
+const paneRecordVersion = 1
+
+// PaneRecordEntry is one roster row: a pane's stable identity plus its
+// provider session linkage. Readers ignore unknown fields; every session_*
+// field is omitempty, and session_file always changes in lockstep with
+// session_id wherever an id is assigned or cleared.
+type PaneRecordEntry struct {
+	WindowIndex     int    `json:"window_index"`
+	AgentType       string `json:"agent_type"`
+	NTMIndex        int    `json:"ntm_index"`
+	SessionID       string `json:"session_id,omitempty"`
+	SessionProvider string `json:"session_provider,omitempty"`
+	SessionFile     string `json:"session_file,omitempty"`
+}
+
+// PaneRecordFile is the on-disk envelope. An empty record is an envelope
+// with an empty array; the file is always kept so the add-path append always
+// has a target.
+type PaneRecordFile struct {
+	Version int               `json:"version"`
+	Entries []PaneRecordEntry `json:"entries"`
+}
+
+// paneRecordKey is the stable pane identity shared by reconcile and
+// stale-drop so both agree on what "same pane" means.
+type paneRecordKey struct {
+	windowIndex int
+	agentType   string
+	ntmIndex    int
+}
+
+func paneRecordKeyOfPane(p tmux.Pane) paneRecordKey {
+	return paneRecordKey{windowIndex: p.WindowIndex, agentType: string(p.Type), ntmIndex: p.NTMIndex}
+}
+
+func paneRecordKeyOfEntry(e PaneRecordEntry) paneRecordKey {
+	return paneRecordKey{windowIndex: e.WindowIndex, agentType: e.AgentType, ntmIndex: e.NTMIndex}
+}
+
+// isAgentPaneForRecord reports whether a pane gets a record entry. Panes
+// with no provider-session resume path (user/editor panes) are skipped.
+func isAgentPaneForRecord(p tmux.Pane) bool {
+	return agentsession.ResumeProvider(string(p.Type)) != ""
+}
+
+// paneRecordPath resolves the sidecar path for a live tmux session name,
+// always through normalizeSavedSessionName (never a --name save-as alias).
+func paneRecordPath(dir, sessionName string) (string, error) {
+	name, err := normalizeSavedSessionName(sessionName)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, paneRecordsDirName, name+fileExtension), nil
+}
+
+// loadPaneRecord reads the record. A missing or corrupt file behaves like an
+// empty record: save falls back to lazy fill for every pane.
+func loadPaneRecord(dir, sessionName string) []PaneRecordEntry {
+	path, err := paneRecordPath(dir, sessionName)
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var rec PaneRecordFile
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil
+	}
+	return rec.Entries
+}
+
+func storePaneRecord(dir, sessionName string, entries []PaneRecordEntry) error {
+	path, err := paneRecordPath(dir, sessionName)
+	if err != nil {
+		return err
+	}
+	if entries == nil {
+		entries = []PaneRecordEntry{}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("failed to create pane-records directory: %w", err)
+	}
+	data, err := json.MarshalIndent(PaneRecordFile{Version: paneRecordVersion, Entries: entries}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize pane record: %w", err)
+	}
+	if err := util.AtomicWriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("writing pane record file: %w", err)
+	}
+	return nil
+}
+
+// upsertPaneRecordEntries merges entries over the stored record. Stored
+// non-empty ids for matched keys are never overwritten with empties
+// (merge-only: a spawn/save race or re-run cannot clobber a filled id), and
+// stored keys absent from entries are dropped (stale panes are forgotten).
+func upsertPaneRecordEntries(dir, sessionName string, entries []PaneRecordEntry) error {
+	stored := loadPaneRecord(dir, sessionName)
+	byKey := make(map[paneRecordKey]PaneRecordEntry, len(stored))
+	for _, e := range stored {
+		k := paneRecordKeyOfEntry(e)
+		if _, dup := byKey[k]; !dup {
+			byKey[k] = e
+		}
+	}
+	merged := make([]PaneRecordEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.SessionID == "" {
+			if s, ok := byKey[paneRecordKeyOfEntry(e)]; ok && s.SessionID != "" {
+				e.SessionID = s.SessionID
+				e.SessionProvider = s.SessionProvider
+				e.SessionFile = s.SessionFile
+			}
+		}
+		merged = append(merged, e)
+	}
+	return storePaneRecord(dir, sessionName, merged)
+}
+
+// writePaneRecord writes one empty-id entry per agent pane (the spawn roster).
+// Merge-only: existing non-empty ids survive a re-run.
+func writePaneRecord(dir, sessionName string, panes []tmux.Pane) error {
+	entries := make([]PaneRecordEntry, 0, len(panes))
+	for _, p := range panes {
+		if !isAgentPaneForRecord(p) {
+			continue
+		}
+		entries = append(entries, PaneRecordEntry{
+			WindowIndex: p.WindowIndex,
+			AgentType:   string(p.Type),
+			NTMIndex:    p.NTMIndex,
+		})
+	}
+	return upsertPaneRecordEntries(dir, sessionName, entries)
+}
+
+// WritePaneRecord writes the spawn roster for a live session. It resolves
+// StorageDir plus the normalized record name and serializes the
+// read-modify-write under acquireLock.
+func WritePaneRecord(sessionName string, panes []tmux.Pane) error {
+	unlock, err := acquireLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return writePaneRecord(StorageDir(), sessionName, panes)
+}
+
+// appendPaneRecord adds exactly one entry for a newly added pane. A same-key
+// entry (e.g. a re-added pane reusing a killed pane's NTM index) is replaced
+// with a fresh empty entry: the new pane never inherits the dead pane's id
+// (stale-drop at save heals any key reuse).
+func appendPaneRecord(dir, sessionName string, pane tmux.Pane) error {
+	if !isAgentPaneForRecord(pane) {
+		return nil
+	}
+	stored := loadPaneRecord(dir, sessionName)
+	fresh := PaneRecordEntry{
+		WindowIndex: pane.WindowIndex,
+		AgentType:   string(pane.Type),
+		NTMIndex:    pane.NTMIndex,
+	}
+	merged := make([]PaneRecordEntry, 0, len(stored)+1)
+	for _, e := range stored {
+		if paneRecordKeyOfEntry(e) == paneRecordKeyOfPane(pane) {
+			continue
+		}
+		merged = append(merged, e)
+	}
+	return storePaneRecord(dir, sessionName, append(merged, fresh))
+}
+
+// AppendPaneRecord appends one record entry for a newly added pane, under
+// acquireLock so concurrent adds never lose entries.
+func AppendPaneRecord(sessionName string, pane tmux.Pane) error {
+	unlock, err := acquireLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return appendPaneRecord(StorageDir(), sessionName, pane)
+}
+
+// refreshPaneRecordAfterSave persists the reconciled record produced by
+// Capture. It runs only after a successful Save, inside the save path's
+// acquireLock scope; failures are swallowed (best-effort, the save stands).
+// A nil refreshed (Capture did not run) leaves the record untouched.
+func refreshPaneRecordAfterSave(dir, liveSessionName string, refreshed []PaneRecordEntry) {
+	if refreshed == nil {
+		return
+	}
+	_ = upsertPaneRecordEntries(dir, liveSessionName, refreshed)
+}
+
+// removePaneRecordSidecar drops the sidecar on Delete. Best-effort: a
+// missing sidecar is fine.
+func removePaneRecordSidecar(dir, sessionName string) {
+	path, err := paneRecordPath(dir, sessionName)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+// movePaneRecordSidecar carries the sidecar alongside the state file on
+// Archive/Unarchive. Best-effort: no sidecar, no move.
+func movePaneRecordSidecar(srcDir, dstDir, sessionName string) {
+	src, err := paneRecordPath(srcDir, sessionName)
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(src); err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Join(dstDir, paneRecordsDirName), 0700); err != nil {
+		return
+	}
+	dst, err := paneRecordPath(dstDir, sessionName)
+	if err != nil {
+		return
+	}
+	_ = moveFile(src, dst)
 }
