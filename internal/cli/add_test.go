@@ -2,11 +2,13 @@ package cli
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func TestResolveAddAgentCommandTemplate_Ollama(t *testing.T) {
@@ -161,6 +163,100 @@ func TestAddThreadsCodexReasoningEffort(t *testing.T) {
 	}
 	if strings.Contains(noEffort, "model_reasoning_effort='low'") {
 		t.Errorf("unset effort should not render low: %q", noEffort)
+	}
+}
+
+// TestSeedMaxIndicesFromPanes pins Behavior 2 of the add-pane-identity plan:
+// next-index seeding reads the resolved Type/NTMIndex fields GetPanes already
+// populated from the @ntm_* identity vars, unioned with the legacy title
+// parse, so an Agent Mail-titled pane (e.g. RubyDog) can never have its live
+// index re-issued.
+func TestSeedMaxIndicesFromPanes(t *testing.T) {
+	tests := []struct {
+		name  string
+		panes []tmux.Pane
+		want  map[string]int
+	}{
+		{
+			name:  "identity-backed Agent Mail title",
+			panes: []tmux.Pane{{Title: "RubyDog", Type: tmux.AgentClaude, NTMIndex: 1}},
+			want:  map[string]int{"cc": 1},
+		},
+		{
+			name:  "title-only legacy",
+			panes: []tmux.Pane{{Title: "proj__cc_3"}},
+			want:  map[string]int{"cc": 3},
+		},
+		{
+			name: "mixed identity and legacy title",
+			panes: []tmux.Pane{
+				{Title: "proj__cc_2", Type: tmux.AgentClaude, NTMIndex: 2},
+				{Title: "RubyDog", Type: tmux.AgentClaude, NTMIndex: 1},
+				{Title: "proj__cc_3"},
+				{Title: "user shell", Type: tmux.AgentUser},
+				{Title: "custom-title"},
+			},
+			want: map[string]int{"cc": 3},
+		},
+		{
+			name:  "user pane contributes nothing",
+			panes: []tmux.Pane{{Title: "user shell", Type: tmux.AgentUser, NTMIndex: 5}},
+			want:  map[string]int{},
+		},
+		{
+			name:  "unresolvable title contributes nothing",
+			panes: []tmux.Pane{{Title: "custom-title"}},
+			want:  map[string]int{},
+		},
+		{
+			name:  "identity index zero falls back to title",
+			panes: []tmux.Pane{{Title: "proj__cc_2", Type: tmux.AgentClaude, NTMIndex: 0}},
+			want:  map[string]int{"cc": 2},
+		},
+		{
+			name:  "identity type canonicalized",
+			panes: []tmux.Pane{{Title: "RubyDog", Type: tmux.AgentType("claude"), NTMIndex: 4}},
+			want:  map[string]int{"cc": 4},
+		},
+		{
+			name: "duplicate same-index panes keep max once",
+			panes: []tmux.Pane{
+				{Title: "RubyDog", Type: tmux.AgentClaude, NTMIndex: 2},
+				{Title: "BlueCat", Type: tmux.AgentClaude, NTMIndex: 2},
+			},
+			want: map[string]int{"cc": 2},
+		},
+		{
+			name:  "empty pane list",
+			panes: nil,
+			want:  map[string]int{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := seedMaxIndices(tc.panes)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("seedMaxIndices() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// Next index issued is seed+1: the mixed session issues 4, and a session
+	// whose only cc pane is RubyDog (cc,1) issues 2, never 1.
+	mixed := seedMaxIndices([]tmux.Pane{
+		{Title: "proj__cc_2", Type: tmux.AgentClaude, NTMIndex: 2},
+		{Title: "RubyDog", Type: tmux.AgentClaude, NTMIndex: 1},
+		{Title: "proj__cc_3"},
+	})
+	if next := mixed["cc"] + 1; next != 4 {
+		t.Errorf("next cc index for mixed session = %d, want 4", next)
+	}
+	rubyOnly := seedMaxIndices([]tmux.Pane{
+		{Title: "RubyDog", Type: tmux.AgentClaude, NTMIndex: 1},
+	})
+	if next := rubyOnly["cc"] + 1; next != 2 {
+		t.Errorf("next cc index for RubyDog-only session = %d, want 2", next)
 	}
 }
 
