@@ -709,6 +709,12 @@ func PrintSpawn(opts SpawnOptions, cfg *config.Config) error {
 	return encodeJSON(output)
 }
 
+var (
+	setPaneTitleHook     = tmux.SetPaneTitle
+	setPaneIdentityHook  = tmux.SetPaneIdentity
+	sendKeysForAgentHook = tmux.SendKeysForAgent
+)
+
 // launchAgent launches a single agent and returns its info.
 func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, command string, am *agentMailState) SpawnedAgent {
 	startTime := time.Now()
@@ -734,7 +740,7 @@ func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, comman
 	}
 
 	// Set pane title
-	if err := tmux.SetPaneTitle(pane.ID, title); err != nil {
+	if err := setPaneTitleHook(pane.ID, title); err != nil {
 		agent.Error = fmt.Sprintf("setting title: %v", err)
 		agent.StartupMs = time.Since(startTime).Milliseconds()
 		return agent
@@ -744,9 +750,7 @@ func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, comman
 	// pane addressing (grep/output/scale/is-working) resolves by type/index
 	// independently of the pane title. This lets the title BE the Agent Mail
 	// name without breaking parseAgentFromTitle-based addressing.
-	if agentMailName != "" {
-		tmux.SetPaneIdentity(pane.ID, string(tmux.AgentType(agentType).Canonical()), num, "")
-	}
+	setPaneIdentityHook(pane.ID, string(tmux.AgentType(agentType).Canonical()), num, "")
 
 	// Thread the resolved Agent Mail name into the startup command so the
 	// agent process sees its assigned identity in $AGENT_NAME.
@@ -771,7 +775,7 @@ func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, comman
 	}
 
 	// Use SendKeysForAgent to handle different submission methods (buffer vs send-keys)
-	if err := tmux.SendKeysForAgent(pane.ID, cmd, true, tmux.AgentType(agentTypeShort(agentType))); err != nil {
+	if err := sendKeysForAgentHook(pane.ID, cmd, true, tmux.AgentType(agentTypeShort(agentType))); err != nil {
 		agent.Error = fmt.Sprintf("launching: %v", err)
 		agent.StartupMs = time.Since(startTime).Milliseconds()
 		return agent
