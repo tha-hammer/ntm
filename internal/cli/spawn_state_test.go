@@ -425,3 +425,85 @@ func TestRecordAddedPanes(t *testing.T) {
 		t.Errorf("stderr got %q, want a warning", stderr)
 	}
 }
+
+// TestRecordAddedPanesNeverFails extends TestRecordAddedPanes with the
+// Behavior 6 failure-injection cases it does not already pin: a partial
+// append failure must not stop the remaining panes, and neither an append
+// failure nor a listing failure may write anything to stdout (so --json
+// output stays parseable). The identity writer is pinned too: it returns
+// nothing by construction (tmux.SetPaneIdentity swallows tmux errors), so
+// stubbing the seam and calling it for several panes must simply complete.
+func TestRecordAddedPanesNeverFails(t *testing.T) {
+	prevAppend := paneRecordAppendHook
+	t.Cleanup(func() { paneRecordAppendHook = prevAppend })
+	prevIdentity := setPaneIdentityHook
+	t.Cleanup(func() { setPaneIdentityHook = prevIdentity })
+
+	live := []tmux.Pane{
+		{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "sess__cc_1", Type: tmux.AgentClaude},
+		{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 1, Title: "sess__cod_1", Type: tmux.AgentCodex},
+	}
+	getPanes := func(string) ([]tmux.Pane, error) { return live, nil }
+
+	// Partial failure: %1's append fails, %2 must still be attempted.
+	var attempted []string
+	paneRecordAppendHook = func(_ string, pane tmux.Pane) error {
+		attempted = append(attempted, pane.ID)
+		if pane.ID == "%1" {
+			return errors.New("synthetic append failure")
+		}
+		return nil
+	}
+	var addErr error
+	var stderr string
+	stdout, _ := captureStdout(t, func() error {
+		stderr = captureStderr(t, func() {
+			addErr = recordAddedPanes("sess", []string{"%1", "%2"}, getPanes)
+		})
+		return nil
+	})
+	if addErr != nil {
+		t.Errorf("partial append failure returned %v, want nil (add must never fail)", addErr)
+	}
+	if len(attempted) != 2 || attempted[0] != "%1" || attempted[1] != "%2" {
+		t.Errorf("attempted = %v, want both panes attempted in order despite the first failing", attempted)
+	}
+	if stdout != "" {
+		t.Errorf("stdout got %q, want empty so --json output stays parseable", stdout)
+	}
+	if !strings.Contains(stderr, "warning") {
+		t.Errorf("stderr got %q, want a warning", stderr)
+	}
+
+	// Listing failure: nil error and stdout stays clean.
+	var listErr error
+	stdout, _ = captureStdout(t, func() error {
+		stderr = captureStderr(t, func() {
+			listErr = recordAddedPanes("sess", []string{"%1", "%2"}, func(string) ([]tmux.Pane, error) {
+				return nil, errors.New("no tmux")
+			})
+		})
+		return nil
+	})
+	if listErr != nil {
+		t.Errorf("listing failure returned %v, want nil", listErr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout got %q, want empty so --json output stays parseable", stdout)
+	}
+	if !strings.Contains(stderr, "warning") {
+		t.Errorf("stderr got %q, want a warning", stderr)
+	}
+
+	// Identity write: the seam mirrors tmux.SetPaneIdentity, which returns
+	// nothing and swallows tmux errors, so there is no error to propagate.
+	// Calling the writer for several panes must complete and hit the seam
+	// once per pane.
+	var identityCalls int
+	setPaneIdentityHook = func(string, string, int, string) { identityCalls++ }
+	writeAddPaneIdentity("%1", FlatAgent{Type: AgentTypeClaude, Model: "opus"}, 1)
+	writeAddPaneIdentity("%2", FlatAgent{Type: AgentTypeCodex}, 1)
+	if identityCalls != 2 {
+		t.Errorf("identity hook calls = %d, want 2 (one per added pane)", identityCalls)
+	}
+}
