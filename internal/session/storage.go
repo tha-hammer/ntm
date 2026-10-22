@@ -643,6 +643,9 @@ func storePaneRecord(dir, sessionName string, entries []PaneRecordEntry) error {
 // non-empty ids for matched keys are never overwritten with empties
 // (merge-only: a spawn/save race or re-run cannot clobber a filled id), and
 // stored keys absent from entries are dropped (stale panes are forgotten).
+// Incoming entries are first deduped by key (a filled SessionID beats an
+// empty one regardless of order; otherwise the first in list order wins)
+// so no writer can persist duplicate keys.
 func upsertPaneRecordEntries(dir, sessionName string, entries []PaneRecordEntry) error {
 	stored := loadPaneRecord(dir, sessionName)
 	byKey := make(map[paneRecordKey]PaneRecordEntry, len(stored))
@@ -652,8 +655,22 @@ func upsertPaneRecordEntries(dir, sessionName string, entries []PaneRecordEntry)
 			byKey[k] = e
 		}
 	}
-	merged := make([]PaneRecordEntry, 0, len(entries))
+	deduped := make([]PaneRecordEntry, 0, len(entries))
+	dedupPos := make(map[paneRecordKey]int, len(entries))
 	for _, e := range entries {
+		k := paneRecordKeyOfEntry(e)
+		pos, dup := dedupPos[k]
+		if !dup {
+			dedupPos[k] = len(deduped)
+			deduped = append(deduped, e)
+			continue
+		}
+		if deduped[pos].SessionID == "" && e.SessionID != "" {
+			deduped[pos] = e
+		}
+	}
+	merged := make([]PaneRecordEntry, 0, len(deduped))
+	for _, e := range deduped {
 		if e.SessionID == "" {
 			if s, ok := byKey[paneRecordKeyOfEntry(e)]; ok && s.SessionID != "" {
 				e.SessionID = s.SessionID
