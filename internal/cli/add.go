@@ -47,6 +47,27 @@ var paneRecordAppendHook = func(sessionName string, pane tmux.Pane) error {
 	return session.AppendPaneRecord(sessionName, pane)
 }
 
+// setPaneIdentityHook writes a new pane's @ntm_type/@ntm_index/@ntm_variant
+// identity vars (see tmux.SetPaneIdentity). It is a var so tests can observe
+// the invocation without a live tmux server. SetPaneIdentity returns nothing
+// and swallows tmux errors, so calling it can never fail add.
+var setPaneIdentityHook = tmux.SetPaneIdentity
+
+// paneIdentityArgs returns the identity args for one added pane: the
+// canonical agent type (the same canonicalization FormatPaneName applies to
+// the title, so title and identity can never diverge), the assigned index,
+// and the model/persona variant already carried in agent.Model.
+func paneIdentityArgs(agent FlatAgent, num int) (string, int, string) {
+	return string(tmux.AgentType(agent.Type).Canonical()), num, agent.Model
+}
+
+// writeAddPaneIdentity writes one added pane's tmux identity vars through
+// the seam, mirroring spawn's identity-before-launch order.
+func writeAddPaneIdentity(paneID string, agent FlatAgent, num int) {
+	typ, idx, variant := paneIdentityArgs(agent, num)
+	setPaneIdentityHook(paneID, typ, idx, variant)
+}
+
 // recordAddedPanes appends one record entry per newly added pane id. The
 // fresh pane list is read once (titles were set during the add loop, so NTM
 // indices exist) and matched by pane id. getPanes is injectable for tests;
@@ -520,6 +541,7 @@ func runAdd(opts AddOptions) error {
 		if err := tmux.SetPaneTitle(paneID, title); err != nil {
 			return outputError(fmt.Errorf("setting pane title: %w", err))
 		}
+		writeAddPaneIdentity(paneID, agent, num)
 
 		// Generate command
 		agentCmd, envVars, err := resolveAddAgentCommandTemplate(agent.Type, opts.PluginMap, ollamaHost)

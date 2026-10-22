@@ -260,6 +260,109 @@ func TestSeedMaxIndicesFromPanes(t *testing.T) {
 	}
 }
 
+// TestPaneIdentityArgsForAdd pins Behavior 1 of the add-pane-identity plan:
+// the identity args for an added pane are the canonical type, the assigned
+// index, and the model/persona variant already carried in agent.Model.
+func TestPaneIdentityArgsForAdd(t *testing.T) {
+	tests := []struct {
+		name        string
+		agent       FlatAgent
+		num         int
+		wantType    string
+		wantIndex   int
+		wantVariant string
+	}{
+		{
+			name:        "claude with model variant",
+			agent:       FlatAgent{Type: AgentTypeClaude, Model: "opus"},
+			num:         2,
+			wantType:    "cc",
+			wantIndex:   2,
+			wantVariant: "opus",
+		},
+		{
+			name:        "empty variant writes type and index only",
+			agent:       FlatAgent{Type: AgentTypeCodex},
+			num:         1,
+			wantType:    "cod",
+			wantIndex:   1,
+			wantVariant: "",
+		},
+		{
+			name:        "persona name is the variant",
+			agent:       FlatAgent{Type: AgentTypeClaude, Model: "reviewer"},
+			num:         3,
+			wantType:    "cc",
+			wantIndex:   3,
+			wantVariant: "reviewer",
+		},
+		{
+			name:        "alias type canonicalizes",
+			agent:       FlatAgent{Type: AgentType("claude"), Model: "opus"},
+			num:         4,
+			wantType:    "cc",
+			wantIndex:   4,
+			wantVariant: "opus",
+		},
+		{
+			name:        "custom plugin type passes through canonical form",
+			agent:       FlatAgent{Type: AgentType("myplugin"), Model: "v1"},
+			num:         1,
+			wantType:    "myplugin",
+			wantIndex:   1,
+			wantVariant: "v1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotType, gotIndex, gotVariant := paneIdentityArgs(tc.agent, tc.num)
+			if gotType != tc.wantType || gotIndex != tc.wantIndex || gotVariant != tc.wantVariant {
+				t.Errorf("paneIdentityArgs(%+v, %d) = (%q, %d, %q), want (%q, %d, %q)",
+					tc.agent, tc.num, gotType, gotIndex, gotVariant, tc.wantType, tc.wantIndex, tc.wantVariant)
+			}
+		})
+	}
+}
+
+// TestWriteAddPaneIdentityUsesHook pins that the extracted writer routes
+// through the setPaneIdentityHook seam exactly once per pane with the
+// canonical identity args, so runAdd's wiring is testable without tmux.
+func TestWriteAddPaneIdentityUsesHook(t *testing.T) {
+	prev := setPaneIdentityHook
+	t.Cleanup(func() { setPaneIdentityHook = prev })
+
+	type call struct {
+		paneID  string
+		typ     string
+		index   int
+		variant string
+	}
+	var calls []call
+	setPaneIdentityHook = func(paneID, agentType string, ntmIndex int, variant string) {
+		calls = append(calls, call{paneID: paneID, typ: agentType, index: ntmIndex, variant: variant})
+	}
+
+	writeAddPaneIdentity("%7", FlatAgent{Type: AgentTypeClaude, Model: "opus"}, 2)
+	if len(calls) != 1 {
+		t.Fatalf("hook calls = %d, want exactly 1: %+v", len(calls), calls)
+	}
+	want := call{paneID: "%7", typ: "cc", index: 2, variant: "opus"}
+	if calls[0] != want {
+		t.Errorf("hook call = %+v, want %+v", calls[0], want)
+	}
+
+	// Multiple panes in one add each get their own (type, num).
+	writeAddPaneIdentity("%8", FlatAgent{Type: AgentTypeCodex}, 1)
+	if len(calls) != 2 {
+		t.Fatalf("hook calls after second pane = %d, want 2: %+v", len(calls), calls)
+	}
+	want = call{paneID: "%8", typ: "cod", index: 1, variant: ""}
+	if calls[1] != want {
+		t.Errorf("second hook call = %+v, want %+v", calls[1], want)
+	}
+}
+
 func TestAddResponseJSONIncludesOllama(t *testing.T) {
 
 	data, err := json.Marshal(output.AddResponse{
