@@ -3871,6 +3871,8 @@ func TestTerseStateString(t *testing.T) {
 		IdleAgents:        1,
 		ErrorAgents:       0,
 		ContextPct:        45,
+		PeriodBudgetPct:   60,
+		WeeklyBudgetPct:   30,
 		ReadyBeads:        10,
 		BlockedBeads:      5,
 		InProgressBead:    2,
@@ -3881,7 +3883,7 @@ func TestTerseStateString(t *testing.T) {
 		WarningAlerts:     2,
 	}
 
-	expected := "S:myproject|A:2/3|W:1|I:1|E:0|C:45%|B:R10/I2/B5|M:3|^:2a,4i|!:1c,2w"
+	expected := "S:myproject|A:2/3|W:1|I:1|E:0|C:45%|P:60%|Wk:30%|B:R10/I2/B5|M:3|^:2a,4i|!:1c,2w"
 	got := state.String()
 	if got != expected {
 		t.Errorf("TerseState.String() = %q, want %q", got, expected)
@@ -3907,7 +3909,7 @@ func TestTerseStateStringNoSession(t *testing.T) {
 		WarningAlerts:     0,
 	}
 
-	expected := "S:-|A:0/0|W:0|I:0|E:0|C:0%|B:R15/I3/B8|M:0|^:0|!:0"
+	expected := "S:-|A:0/0|W:0|I:0|E:0|C:0%|P:0%|Wk:0%|B:R15/I3/B8|M:0|^:0|!:0"
 	got := state.String()
 	if got != expected {
 		t.Errorf("TerseState.String() = %q, want %q", got, expected)
@@ -3922,7 +3924,7 @@ func TestParseTerse(t *testing.T) {
 	}{
 		{
 			name:  "full state with alerts and attention",
-			input: "S:myproject|A:2/3|W:1|I:1|E:0|C:45%|B:R10/I2/B5|M:3|^:2a,4i|!:1c,2w",
+			input: "S:myproject|A:2/3|W:1|I:1|E:0|C:45%|P:60%|Wk:30%|B:R10/I2/B5|M:3|^:2a,4i|!:1c,2w",
 			expected: TerseState{
 				Session:           "myproject",
 				ActiveAgents:      2,
@@ -3931,6 +3933,8 @@ func TestParseTerse(t *testing.T) {
 				IdleAgents:        1,
 				ErrorAgents:       0,
 				ContextPct:        45,
+				PeriodBudgetPct:   60,
+				WeeklyBudgetPct:   30,
 				ReadyBeads:        10,
 				BlockedBeads:      5,
 				InProgressBead:    2,
@@ -3943,7 +3947,7 @@ func TestParseTerse(t *testing.T) {
 		},
 		{
 			name:  "no session zero alerts zero attention",
-			input: "S:-|A:0/0|W:0|I:0|E:0|C:0%|B:R15/I3/B8|M:0|^:0|!:0",
+			input: "S:-|A:0/0|W:0|I:0|E:0|C:0%|P:0%|Wk:0%|B:R15/I3/B8|M:0|^:0|!:0",
 			expected: TerseState{
 				Session:           "-",
 				ActiveAgents:      0,
@@ -3952,6 +3956,8 @@ func TestParseTerse(t *testing.T) {
 				IdleAgents:        0,
 				ErrorAgents:       0,
 				ContextPct:        0,
+				PeriodBudgetPct:   0,
+				WeeklyBudgetPct:   0,
 				ReadyBeads:        15,
 				BlockedBeads:      8,
 				InProgressBead:    3,
@@ -3964,7 +3970,7 @@ func TestParseTerse(t *testing.T) {
 		},
 		{
 			name:  "only critical alerts only action attention",
-			input: "S:proj|A:5/8|W:3|I:2|E:0|C:78%|B:R100/I50/B20|M:10|^:3a|!:5c",
+			input: "S:proj|A:5/8|W:3|I:2|E:0|C:78%|P:90%|Wk:12%|B:R100/I50/B20|M:10|^:3a|!:5c",
 			expected: TerseState{
 				Session:           "proj",
 				ActiveAgents:      5,
@@ -3973,6 +3979,8 @@ func TestParseTerse(t *testing.T) {
 				IdleAgents:        2,
 				ErrorAgents:       0,
 				ContextPct:        78,
+				PeriodBudgetPct:   90,
+				WeeklyBudgetPct:   12,
 				ReadyBeads:        100,
 				BlockedBeads:      20,
 				InProgressBead:    50,
@@ -3985,7 +3993,7 @@ func TestParseTerse(t *testing.T) {
 		},
 		{
 			name:  "only interesting attention",
-			input: "S:test|A:1/1|W:1|I:0|E:0|C:50%|B:R5/I1/B2|M:0|^:7i|!:0",
+			input: "S:test|A:1/1|W:1|I:0|E:0|C:50%|P:10%|Wk:5%|B:R5/I1/B2|M:0|^:7i|!:0",
 			expected: TerseState{
 				Session:           "test",
 				ActiveAgents:      1,
@@ -3994,6 +4002,31 @@ func TestParseTerse(t *testing.T) {
 				IdleAgents:        0,
 				ErrorAgents:       0,
 				ContextPct:        50,
+				PeriodBudgetPct:   10,
+				WeeklyBudgetPct:   5,
+				ReadyBeads:        5,
+				BlockedBeads:      2,
+				InProgressBead:    1,
+				UnreadMail:        0,
+				AttentionAction:   0,
+				AttentionInterest: 7,
+				CriticalAlerts:    0,
+				WarningAlerts:     0,
+			},
+		},
+		{
+			name:  "legacy line without budget segments",
+			input: "S:old|A:1/1|W:1|I:0|E:0|C:50%|B:R5/I1/B2|M:0|^:7i|!:0",
+			expected: TerseState{
+				Session:           "old",
+				ActiveAgents:      1,
+				TotalAgents:       1,
+				WorkingAgents:     1,
+				IdleAgents:        0,
+				ErrorAgents:       0,
+				ContextPct:        50,
+				PeriodBudgetPct:   0,
+				WeeklyBudgetPct:   0,
 				ReadyBeads:        5,
 				BlockedBeads:      2,
 				InProgressBead:    1,
@@ -4028,6 +4061,8 @@ func TestTerseStateRoundTrip(t *testing.T) {
 		IdleAgents:        2,
 		ErrorAgents:       0,
 		ContextPct:        78,
+		PeriodBudgetPct:   64,
+		WeeklyBudgetPct:   22,
 		ReadyBeads:        20,
 		BlockedBeads:      10,
 		InProgressBead:    5,
@@ -4177,6 +4212,93 @@ func TestTerseStateAttentionRoundTrip(t *testing.T) {
 				t.Errorf("Round trip failed: original=%+v, parsed=%+v", original, *parsed)
 			}
 		})
+	}
+}
+
+// TestTerseBudgetFromQuota verifies period budget derivation from the
+// snapshot quota section and the documented weekly gap.
+func TestTerseBudgetFromQuota(t *testing.T) {
+	pct := func(f float64) *float64 { return &f }
+
+	tests := []struct {
+		name       string
+		snapshot   *SnapshotOutput
+		wantPeriod int
+		wantWeekly int
+	}{
+		{
+			name:       "nil snapshot",
+			snapshot:   nil,
+			wantPeriod: 0,
+			wantWeekly: 0,
+		},
+		{
+			name:       "nil quota section",
+			snapshot:   &SnapshotOutput{},
+			wantPeriod: 0,
+			wantWeekly: 0,
+		},
+		{
+			name: "no accounts with known usage",
+			snapshot: &SnapshotOutput{
+				Quota: &adapters.QuotaSection{
+					Accounts:  []adapters.AccountQuota{{ID: "a", Provider: "anthropic"}},
+					Available: true,
+				},
+			},
+			wantPeriod: 0,
+			wantWeekly: 0,
+		},
+		{
+			name: "uses highest known account usage as period",
+			snapshot: &SnapshotOutput{
+				Quota: &adapters.QuotaSection{
+					Accounts: []adapters.AccountQuota{
+						{ID: "a", Provider: "anthropic", UsagePercent: pct(62.4)},
+						{ID: "b", Provider: "openai", UsagePercent: pct(11.0)},
+						{ID: "c", Provider: "google"},
+					},
+					Available: true,
+				},
+			},
+			wantPeriod: 62,
+			wantWeekly: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotPeriod, gotWeekly := terseBudgetFromQuota(tc.snapshot)
+			if gotPeriod != tc.wantPeriod {
+				t.Errorf("terseBudgetFromQuota period = %d, want %d", gotPeriod, tc.wantPeriod)
+			}
+			if gotWeekly != tc.wantWeekly {
+				t.Errorf("terseBudgetFromQuota weekly = %d, want %d", gotWeekly, tc.wantWeekly)
+			}
+		})
+	}
+}
+
+// TestTerseBudgetStringSegments verifies budget fields render in the status line.
+func TestTerseBudgetStringSegments(t *testing.T) {
+	state := TerseState{
+		Session:         "budget-test",
+		ContextPct:      40,
+		PeriodBudgetPct: 60,
+		WeeklyBudgetPct: 0,
+	}
+	got := state.String()
+	for _, want := range []string{"|C:40%", "|P:60%", "|Wk:0%"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("TerseState.String() = %q, want substring %q", got, want)
+		}
+	}
+	parsed, err := ParseTerse(got)
+	if err != nil {
+		t.Fatalf("ParseTerse failed: %v", err)
+	}
+	if *parsed != state {
+		t.Errorf("Round trip failed: original=%+v, parsed=%+v", state, *parsed)
 	}
 }
 

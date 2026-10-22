@@ -9125,7 +9125,8 @@ func PrintRecipes() error {
 }
 
 // TerseState represents the ultra-compact state for token-constrained scenarios.
-// Format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|B:Rn/In/Bn|M:mail|^:NaNi|!:
+// Format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|P:period%|Wk:week%|B:Rn/In/Bn|M:mail|^:NaNi|!:
+// (Wk avoids colliding with W:working.)
 type TerseState struct {
 	Session           string `json:"session"`
 	ActiveAgents      int    `json:"active_agents"`
@@ -9134,8 +9135,10 @@ type TerseState struct {
 	IdleAgents        int    `json:"idle_agents"`    // Agents waiting at prompt
 	ErrorAgents       int    `json:"error_agents"`   // Agents in error state
 	ContextPct        int    `json:"context_pct"`    // Average context usage %
-	ReadyBeads        int    `json:"ready_beads"`    // Beads ready to work on
-	BlockedBeads      int    `json:"blocked_beads"`  // Blocked beads
+	PeriodBudgetPct   int    `json:"period_budget_pct"`
+	WeeklyBudgetPct   int    `json:"weekly_budget_pct"`
+	ReadyBeads        int    `json:"ready_beads"`   // Beads ready to work on
+	BlockedBeads      int    `json:"blocked_beads"` // Blocked beads
 	InProgressBead    int    `json:"in_progress_beads"`
 	UnreadMail        int    `json:"unread_mail"`
 	AttentionAction   int    `json:"attention_action"`      // Action-required attention events
@@ -9145,7 +9148,7 @@ type TerseState struct {
 }
 
 // String returns the ultra-compact string representation.
-// Format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|B:Rn/In/Bn|M:mail|^:NaNi|!:
+// Format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|P:period%|Wk:week%|B:Rn/In/Bn|M:mail|^:NaNi|!:
 func (t TerseState) String() string {
 	// Build alerts string (only include if non-zero)
 	alertStr := ""
@@ -9177,11 +9180,12 @@ func (t TerseState) String() string {
 		attnStr = "0"
 	}
 
-	return fmt.Sprintf("S:%s|A:%d/%d|W:%d|I:%d|E:%d|C:%d%%|B:R%d/I%d/B%d|M:%d|^:%s|!:%s",
+	return fmt.Sprintf("S:%s|A:%d/%d|W:%d|I:%d|E:%d|C:%d%%|P:%d%%|Wk:%d%%|B:R%d/I%d/B%d|M:%d|^:%s|!:%s",
 		t.Session,
 		t.ActiveAgents, t.TotalAgents,
 		t.WorkingAgents, t.IdleAgents, t.ErrorAgents,
 		t.ContextPct,
+		t.PeriodBudgetPct, t.WeeklyBudgetPct,
 		t.ReadyBeads, t.InProgressBead, t.BlockedBeads,
 		t.UnreadMail,
 		attnStr,
@@ -9224,6 +9228,7 @@ func buildTerseOutputFromSnapshot(snapshot *SnapshotOutput) *TerseOutput {
 
 	criticalAlerts, warningAlerts := terseAlertCounts(snapshot)
 	readyBeads, inProgressBeads, blockedBeads := terseWorkCounts(snapshot)
+	periodBudgetPct, weeklyBudgetPct := terseBudgetFromQuota(snapshot)
 	mailCount := snapshot.MailUnread
 	if mailCount == 0 {
 		mailCount = snapshot.Summary.MailUnread
@@ -9249,6 +9254,8 @@ func buildTerseOutputFromSnapshot(snapshot *SnapshotOutput) *TerseOutput {
 			ReadyBeads:        readyBeads,
 			BlockedBeads:      blockedBeads,
 			InProgressBead:    inProgressBeads,
+			PeriodBudgetPct:   periodBudgetPct,
+			WeeklyBudgetPct:   weeklyBudgetPct,
 		}
 		output.States = append(output.States, state)
 		output.TerseLines = append(output.TerseLines, formatTerseLine(state, output.AttentionHint))
@@ -9266,6 +9273,9 @@ func buildTerseOutputFromSnapshot(snapshot *SnapshotOutput) *TerseOutput {
 			ReadyBeads:        readyBeads,
 			BlockedBeads:      blockedBeads,
 			InProgressBead:    inProgressBeads,
+			ContextPct:        terseSessionContextPct(sess.Name),
+			PeriodBudgetPct:   periodBudgetPct,
+			WeeklyBudgetPct:   weeklyBudgetPct,
 		}
 
 		state.TotalAgents = len(sess.Agents)
@@ -9322,6 +9332,52 @@ func terseWorkCounts(snapshot *SnapshotOutput) (ready, inProgress, blocked int) 
 	return snapshot.Summary.ReadyWork, snapshot.Summary.InProgress, 0
 }
 
+// terseContextLines bounds the scrollback captured for the status line's
+// context estimate. It matches the depth snapshot itself captures per pane,
+// so the status line stays cheap to render.
+const terseContextLines = 50
+
+// terseSessionContextPct returns the rounded average context-window usage
+// for a session using the same estimator as --robot-context. It returns 0
+// when the session has no measurable agent output.
+func terseSessionContextPct(session string) int {
+	ctxOut, err := GetContext(session, terseContextLines)
+	if err != nil || ctxOut == nil || !ctxOut.Success {
+		return 0
+	}
+	if ctxOut.Summary.TotalAgents == 0 {
+		return 0
+	}
+	return int(ctxOut.Summary.AvgUsage + 0.5)
+}
+
+// terseBudgetFromQuota derives token-budget usage for the status line from
+// the snapshot's cached quota section (no live pane interaction).
+// The period value is the highest known per-account usage percent: the
+// primary rate window tracks the current period window.
+// Gap: no weekly-split budget source exists in the snapshot path. The only
+// weekly usage data comes from live PTY quota fetches (internal/quota,
+// surfaced by `ntm quota`), which must not run inside a status line, so
+// weekly returns 0 until a cached weekly source exists.
+func terseBudgetFromQuota(snapshot *SnapshotOutput) (period, weekly int) {
+	if snapshot == nil || snapshot.Quota == nil {
+		return 0, 0
+	}
+	maxKnown := -1.0
+	for _, account := range snapshot.Quota.Accounts {
+		if account.UsagePercent == nil {
+			continue
+		}
+		if *account.UsagePercent > maxKnown {
+			maxKnown = *account.UsagePercent
+		}
+	}
+	if maxKnown < 0 {
+		return 0, 0
+	}
+	return int(maxKnown + 0.5), 0
+}
+
 // buildAttentionHint creates a compact attention summary for terse output.
 // Format: "2!action 5?interesting" or "clear" if no attention items.
 func buildAttentionHint() string {
@@ -9358,7 +9414,8 @@ func formatTerseLine(state TerseState, attentionHint string) string {
 }
 
 // ParseTerse parses the ultra-compact terse string into a TerseState.
-// Format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|B:Rn/In/Bn|M:mail|^:NaNi|!:
+// Format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|P:period%|Wk:week%|B:Rn/In/Bn|M:mail|^:NaNi|!:
+// Older lines without P:/Wk: segments still parse (budgets stay 0).
 func ParseTerse(s string) (*TerseState, error) {
 	state := &TerseState{}
 
@@ -9390,6 +9447,12 @@ func ParseTerse(s string) (*TerseState, error) {
 		case "C":
 			// Parse "78%" format
 			fmt.Sscanf(strings.TrimSuffix(val, "%"), "%d", &state.ContextPct)
+		case "P":
+			// Parse "60%" format (token budget used, current period)
+			fmt.Sscanf(strings.TrimSuffix(val, "%"), "%d", &state.PeriodBudgetPct)
+		case "Wk":
+			// Parse "30%" format (token budget used, current week)
+			fmt.Sscanf(strings.TrimSuffix(val, "%"), "%d", &state.WeeklyBudgetPct)
 		case "B":
 			// Parse "R3/I2/B1" format
 			beadParts := strings.Split(val, "/")
@@ -9448,7 +9511,7 @@ func ParseTerse(s string) (*TerseState, error) {
 }
 
 // PrintTerse outputs ultra-compact single-line state for token-constrained scenarios.
-// Output format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|B:Rn/In/Bn|M:mail|^:NaNi|!:
+// Output format: S:session|A:active/total|W:working|I:idle|E:errors|C:ctx%|P:period%|Wk:week%|B:Rn/In/Bn|M:mail|^:NaNi|!:
 // If the attention feed is unavailable, an additional |T:feed:unavail suffix is appended.
 // Multiple sessions are separated by semicolons.
 func PrintTerse(cfg *config.Config) error {
