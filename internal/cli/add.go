@@ -260,6 +260,28 @@ func paneTitleTypeAndIndex(title string) (string, int, bool) {
 	return "", 0, false
 }
 
+// seedMaxIndices computes the highest live index per agent type from a pane
+// snapshot. It unions the resolved identity fields (Type/NTMIndex, populated
+// by GetPanes from the @ntm_* vars) with the legacy title parse, so a pane
+// retitled to an Agent Mail name still blocks re-issue of its index.
+func seedMaxIndices(panes []tmux.Pane) map[string]int {
+	maxIndices := make(map[string]int)
+	for _, p := range panes {
+		if p.NTMIndex > 0 {
+			if canonical := p.Type.Canonical(); canonical.IsValid() && canonical != tmux.AgentUser {
+				key := string(canonical)
+				if p.NTMIndex > maxIndices[key] {
+					maxIndices[key] = p.NTMIndex
+				}
+			}
+		}
+		if typeStr, num, ok := paneTitleTypeAndIndex(p.Title); ok && num > maxIndices[typeStr] {
+			maxIndices[typeStr] = num
+		}
+	}
+	return maxIndices
+}
+
 func runAdd(opts AddOptions) error {
 	totalAgents := opts.Agents.TotalCount()
 	session := opts.Session
@@ -374,19 +396,7 @@ func runAdd(opts AddOptions) error {
 		return outputError(err)
 	}
 
-	maxIndices := make(map[string]int)
-
-	// Helper to parse index from title
-	parseIndex := func(title string) {
-		typeStr, num, ok := paneTitleTypeAndIndex(title)
-		if ok && num > maxIndices[typeStr] {
-			maxIndices[typeStr] = num
-		}
-	}
-
-	for _, p := range panes {
-		parseIndex(p.Title)
-	}
+	maxIndices := seedMaxIndices(panes)
 
 	// Resolve CASS context if enabled
 	var cassContext string
@@ -447,6 +457,9 @@ func runAdd(opts AddOptions) error {
 
 	for _, agent := range flatAgents {
 		agentTypeStr := string(agent.Type)
+		// Seed keys are canonical (see seedMaxIndices); key the increment
+		// canonically too so an aliased type cannot miss its seeded maximum.
+		seedKey := string(tmux.AgentType(agent.Type).Canonical())
 
 		paneID, err := tmux.SplitWindow(session, dir)
 		if err != nil {
@@ -459,8 +472,8 @@ func runAdd(opts AddOptions) error {
 		}
 
 		// Increment index for this type
-		maxIndices[agentTypeStr]++
-		num := maxIndices[agentTypeStr]
+		maxIndices[seedKey]++
+		num := maxIndices[seedKey]
 
 		title := tmux.FormatPaneName(session, agentTypeStr, num, agent.Model)
 		if err := tmux.SetPaneTitle(paneID, title); err != nil {
