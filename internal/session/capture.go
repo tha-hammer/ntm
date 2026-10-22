@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"sort"
@@ -63,7 +64,10 @@ func Capture(sessionName string) (state *SessionState, err error) {
 	// Recorded ids win; new panes are lazily discovered and deduped. The
 	// refreshed record is stashed for Save to persist after a successful
 	// write (keyed by the live session name).
-	paneStates, refreshed := reconcilePaneIDs(panes, resolvePaneCwds(panes, cwd), loadPaneRecord(StorageDir(), sessionName), agentsession.Discover)
+	paneStates, refreshed, collisions := reconcilePaneIDs(panes, resolvePaneCwds(panes, cwd), loadPaneRecord(StorageDir(), sessionName), agentsession.Discover)
+	for _, c := range collisions {
+		fmt.Fprintf(os.Stderr, "warning: duplicate pane identity: key (window %d, type %s, index %d) shared by panes %s and %s; keeping %s, %s saves empty\n", c.Key.windowIndex, c.Key.agentType, c.Key.ntmIndex, c.WinnerPaneID, c.LoserPaneID, c.WinnerPaneID, c.LoserPaneID)
+	}
 
 	// Get git info if in a repo
 	gitBranch, gitRemote, gitCommit := getGitInfo(cwd)
@@ -192,7 +196,7 @@ func countAgents(panes []tmux.Pane) AgentConfig {
 // With no record it behaves as before (discover per pane) plus dedupe, so
 // same-cwd same-provider panes never save the same id twice.
 func mapPaneStates(panes []tmux.Pane, sessionCwd string) []PaneState {
-	states, _ := reconcilePaneIDs(panes, resolvePaneCwds(panes, sessionCwd), nil, agentsession.Discover)
+	states, _, _ := reconcilePaneIDs(panes, resolvePaneCwds(panes, sessionCwd), nil, agentsession.Discover)
 	return states
 }
 
@@ -210,14 +214,27 @@ func resolvePaneCwds(panes []tmux.Pane, sessionCwd string) []string {
 	return cwds
 }
 
+// paneKeyCollision reports one live record-key collision: two live panes
+// share a paneRecordKey. The sorted-first pane wins; the loser saves empty
+// and persists no record entry. Reported by reconcilePaneIDs (pure) and
+// emitted on stderr by Capture, exactly once per colliding key per call.
+type paneKeyCollision struct {
+	Key          paneRecordKey
+	WinnerPaneID string
+	LoserPaneID  string
+}
+
 // reconcilePaneIDs is the pure core behind save-time pane enrichment. It
 // matches live panes against the record by stable identity, fills matched
 // panes from the record (no Discover call), lazily discovers ids for panes
 // with no recorded id, and dedupes so the same id is never assigned twice
-// within a provider. It returns the saved states in live input order plus
-// the refreshed record (live matched panes only, in sorted order; a
-// refreshed filled id is never regressed to empty).
-func reconcilePaneIDs(panes []tmux.Pane, paneCwds []string, record []PaneRecordEntry, discover func(agentType, cwd string) *agentsession.Info) ([]PaneState, []PaneRecordEntry) {
+// within a provider. Live panes colliding on one record key are deduped:
+// the first in (WindowIndex, Index) order wins, later panes lose their
+// assigned linkage and persist no record entry. It returns the saved
+// states in live input order plus the refreshed record (live matched
+// panes only, in sorted order; a refreshed filled id is never regressed
+// to empty) and one collision per colliding key.
+func reconcilePaneIDs(panes []tmux.Pane, paneCwds []string, record []PaneRecordEntry, discover func(agentType, cwd string) *agentsession.Info) ([]PaneState, []PaneRecordEntry, []paneKeyCollision) {
 	stored := make(map[paneRecordKey]PaneRecordEntry, len(record))
 	for _, e := range record {
 		k := paneRecordKeyOfEntry(e)
@@ -335,6 +352,32 @@ func reconcilePaneIDs(panes []tmux.Pane, paneCwds []string, record []PaneRecordE
 		assigned[idx] = assignment{id: info.SessionID, provider: info.Provider, file: info.SourcePath}
 	}
 
+	// Dedupe live panes by record key: first in sorted order wins. Losers
+	// lose any assigned linkage (recorded or lazily discovered, even a
+	// distinct id from a distinct cwd) and persist no refreshed entry.
+	loser := make(map[int]bool, len(panes))
+	seenKey := make(map[paneRecordKey]int, len(order))
+	reportedKey := make(map[paneRecordKey]bool)
+	var collisions []paneKeyCollision
+	for _, idx := range order {
+		p := panes[idx]
+		if !isAgentPaneForRecord(p) {
+			continue
+		}
+		k := paneRecordKeyOfPane(p)
+		winnerIdx, dup := seenKey[k]
+		if !dup {
+			seenKey[k] = idx
+			continue
+		}
+		loser[idx] = true
+		assigned[idx] = assignment{}
+		if !reportedKey[k] {
+			reportedKey[k] = true
+			collisions = append(collisions, paneKeyCollision{Key: k, WinnerPaneID: panes[winnerIdx].ID, LoserPaneID: p.ID})
+		}
+	}
+
 	states := make([]PaneState, len(panes))
 	for i, p := range panes {
 		states[i] = PaneState{
@@ -358,6 +401,9 @@ func reconcilePaneIDs(panes []tmux.Pane, paneCwds []string, record []PaneRecordE
 	refreshed := make([]PaneRecordEntry, 0, len(order))
 	for _, idx := range order {
 		p := panes[idx]
+		if loser[idx] {
+			continue // deduped loser: no entry; never-regress must not resurrect it
+		}
 		if agentsession.ResumeProvider(string(p.Type)) == "" {
 			continue
 		}
@@ -375,7 +421,7 @@ func reconcilePaneIDs(panes []tmux.Pane, paneCwds []string, record []PaneRecordE
 		}
 		refreshed = append(refreshed, e)
 	}
-	return states, refreshed
+	return states, refreshed, collisions
 }
 
 // paneCurrentPath reads a single pane's current working directory via tmux.

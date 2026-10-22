@@ -1410,7 +1410,7 @@ func TestReconcilePaneRecord(t *testing.T) {
 		return &agentsession.Info{AgentType: agentType, SessionID: "disc-x", Provider: "codex", SourcePath: "/f/disc"}
 	}
 
-	states, refreshed := reconcilePaneIDs(panes, cwds, record, fakeDiscover)
+	states, refreshed, _ := reconcilePaneIDs(panes, cwds, record, fakeDiscover)
 
 	if len(calls) != 1 || calls["cod|/shared"] != 1 {
 		t.Errorf("discover calls = %v, want exactly one cod|/shared call (recorded panes need none; same provider+cwd memoizes)", calls)
@@ -1447,7 +1447,7 @@ func TestLazyFillDedupesAcrossSameProviderPanes(t *testing.T) {
 		return &agentsession.Info{AgentType: agentType, SessionID: "disc-x", Provider: "claude", SourcePath: "/f/disc"}
 	}
 
-	states, refreshed := reconcilePaneIDs(panes, cwds, nil, fakeDiscover)
+	states, refreshed, _ := reconcilePaneIDs(panes, cwds, nil, fakeDiscover)
 
 	if len(states) != 2 {
 		t.Fatalf("len(states) = %d, want 2", len(states))
@@ -1476,7 +1476,7 @@ func TestDedupeKeysByProviderNotType(t *testing.T) {
 		return &agentsession.Info{AgentType: agentType, SessionID: "shared-raw", Provider: "p-" + agentType, SourcePath: "/f/" + agentType}
 	}
 
-	states, _ := reconcilePaneIDs(panes, cwds, nil, fakeDiscover)
+	states, _, _ := reconcilePaneIDs(panes, cwds, nil, fakeDiscover)
 
 	if len(states) != 2 {
 		t.Fatalf("len(states) = %d, want 2", len(states))
@@ -1506,7 +1506,7 @@ func TestStaleRecordEntriesDroppedOnSave(t *testing.T) {
 		return nil // idle agent: nothing discoverable this cycle
 	}
 
-	states, refreshed := reconcilePaneIDs(panes, cwds, record, nilDiscover)
+	states, refreshed, _ := reconcilePaneIDs(panes, cwds, record, nilDiscover)
 
 	if discoverCalls != 0 {
 		t.Errorf("recorded pane triggered %d discover calls, want 0", discoverCalls)
@@ -1534,5 +1534,152 @@ func TestStaleRecordEntriesDroppedOnSave(t *testing.T) {
 	got := loadPaneRecord(dir, "proj")
 	if len(got) != 1 || got[0] != record[0] {
 		t.Errorf("stored after refresh = %+v, want [%+v]", got, record[0])
+	}
+}
+
+func TestReconcilePaneIDsDedupesCollidingKeys(t *testing.T) {
+	t.Parallel()
+
+	t.Run("colliding pair keeps sorted-first winner and drops loser", func(t *testing.T) {
+		t.Parallel()
+		// Fed reversed: %1 sorts first by (WindowIndex, Index) and wins.
+		panes := []tmux.Pane{
+			{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 1, Title: "RubyDog", Type: tmux.AgentClaude},
+			{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+		}
+		cwds := []string{"/proj", "/proj"}
+		// Already-duplicated stored record as persisted by the buggy save.
+		record := []PaneRecordEntry{
+			{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "sess-1", SessionProvider: "claude", SessionFile: "/f/1"},
+			{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "sess-1", SessionProvider: "claude", SessionFile: "/f/1"},
+		}
+		fakeDiscover := func(agentType, cwd string) *agentsession.Info {
+			return &agentsession.Info{AgentType: agentType, SessionID: "disc-x", Provider: "claude", SourcePath: "/f/disc"}
+		}
+
+		states, refreshed, collisions := reconcilePaneIDs(panes, cwds, record, fakeDiscover)
+
+		if len(states) != 2 {
+			t.Fatalf("len(states) = %d, want 2", len(states))
+		}
+		// Input order preserved: states[0] is the loser (%2), states[1] winner (%1).
+		if states[0].SessionID != "" || states[0].SessionProvider != "" || states[0].SessionFile != "" {
+			t.Errorf("loser state = %+v, want all session fields empty", states[0])
+		}
+		if states[1].SessionID != "sess-1" || states[1].SessionProvider != "claude" || states[1].SessionFile != "/f/1" {
+			t.Errorf("winner state = %+v, want sess-1/claude//f/1", states[1])
+		}
+		if len(refreshed) != 1 {
+			t.Fatalf("len(refreshed) = %d, want exactly 1 entry for the colliding key: %+v", len(refreshed), refreshed)
+		}
+		if refreshed[0] != record[0] {
+			t.Errorf("refreshed[0] = %+v, want winner entry %+v", refreshed[0], record[0])
+		}
+		if len(collisions) != 1 {
+			t.Fatalf("len(collisions) = %d, want 1: %+v", len(collisions), collisions)
+		}
+		wantKey := paneRecordKey{windowIndex: 0, agentType: "cc", ntmIndex: 1}
+		if collisions[0].Key != wantKey {
+			t.Errorf("collision key = %+v, want %+v", collisions[0].Key, wantKey)
+		}
+		if collisions[0].WinnerPaneID != "%1" || collisions[0].LoserPaneID != "%2" {
+			t.Errorf("collision = %+v, want winner %%1 loser %%2", collisions[0])
+		}
+	})
+
+	t.Run("distinct-cwd lazy-fill pair dedupes by key and clears loser", func(t *testing.T) {
+		t.Parallel()
+		panes := []tmux.Pane{
+			{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+			{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 1, Title: "RubyDog", Type: tmux.AgentClaude},
+		}
+		cwds := []string{"/a", "/b"}
+		fakeDiscover := func(agentType, cwd string) *agentsession.Info {
+			if cwd == "/a" {
+				return &agentsession.Info{AgentType: agentType, SessionID: "sess-a", Provider: "claude", SourcePath: "/f/a"}
+			}
+			return &agentsession.Info{AgentType: agentType, SessionID: "sess-b", Provider: "claude", SourcePath: "/f/b"}
+		}
+
+		states, refreshed, collisions := reconcilePaneIDs(panes, cwds, nil, fakeDiscover)
+
+		if len(states) != 2 {
+			t.Fatalf("len(states) = %d, want 2", len(states))
+		}
+		if states[0].SessionID != "sess-a" || states[0].SessionProvider != "claude" || states[0].SessionFile != "/f/a" {
+			t.Errorf("winner state = %+v, want sess-a/claude//f/a", states[0])
+		}
+		if states[1].SessionID != "" || states[1].SessionProvider != "" || states[1].SessionFile != "" {
+			t.Errorf("loser state = %+v, want all session fields empty (discovered sess-b discarded)", states[1])
+		}
+		if len(refreshed) != 1 || refreshed[0].SessionID != "sess-a" {
+			t.Fatalf("refreshed = %+v, want exactly one entry with sess-a", refreshed)
+		}
+		if len(collisions) != 1 || collisions[0].WinnerPaneID != "%1" || collisions[0].LoserPaneID != "%2" {
+			t.Errorf("collisions = %+v, want one %%1->%%2 collision", collisions)
+		}
+	})
+
+	t.Run("distinct keys never warn or drop", func(t *testing.T) {
+		t.Parallel()
+		panes := []tmux.Pane{
+			{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude},
+			{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 2, Title: "proj__cc_2", Type: tmux.AgentClaude},
+		}
+		cwds := []string{"/proj", "/proj"}
+		record := []PaneRecordEntry{
+			{WindowIndex: 0, AgentType: "cc", NTMIndex: 1, SessionID: "id-a", SessionProvider: "claude", SessionFile: "/f/a"},
+			{WindowIndex: 0, AgentType: "cc", NTMIndex: 2, SessionID: "id-b", SessionProvider: "claude", SessionFile: "/f/b"},
+		}
+		fakeDiscover := func(agentType, cwd string) *agentsession.Info { return nil }
+
+		states, refreshed, collisions := reconcilePaneIDs(panes, cwds, record, fakeDiscover)
+
+		if len(collisions) != 0 {
+			t.Errorf("collisions = %+v, want none for distinct keys", collisions)
+		}
+		if len(refreshed) != 2 {
+			t.Fatalf("len(refreshed) = %d, want 2", len(refreshed))
+		}
+		if states[0].SessionID != "id-a" || states[1].SessionID != "id-b" {
+			t.Errorf("states = %+v, want id-a and id-b preserved", states)
+		}
+	})
+}
+
+func TestUpsertPaneRecordEntriesDedupesByKey(t *testing.T) {
+	t.Parallel()
+	key := PaneRecordEntry{WindowIndex: 0, AgentType: "cc", NTMIndex: 1}
+	filled1 := key
+	filled1.SessionID, filled1.SessionProvider, filled1.SessionFile = "id-1", "claude", "/f/1"
+	filled2 := key
+	filled2.SessionID, filled2.SessionProvider, filled2.SessionFile = "id-2", "claude", "/f/2"
+	empty := key
+
+	tests := []struct {
+		name    string
+		entries []PaneRecordEntry
+		want    PaneRecordEntry
+	}{
+		{name: "empty then filled: filled wins", entries: []PaneRecordEntry{empty, filled1}, want: filled1},
+		{name: "filled then empty: filled wins", entries: []PaneRecordEntry{filled1, empty}, want: filled1},
+		{name: "both filled: first wins", entries: []PaneRecordEntry{filled1, filled2}, want: filled1},
+		{name: "both empty: first wins", entries: []PaneRecordEntry{empty, empty}, want: empty},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			if err := upsertPaneRecordEntries(dir, "proj", tc.entries); err != nil {
+				t.Fatalf("upsertPaneRecordEntries: %v", err)
+			}
+			got := loadPaneRecord(dir, "proj")
+			if len(got) != 1 {
+				t.Fatalf("len(stored) = %d, want exactly 1 entry for the key: %+v", len(got), got)
+			}
+			if got[0] != tc.want {
+				t.Errorf("stored[0] = %+v, want %+v", got[0], tc.want)
+			}
+		})
 	}
 }
