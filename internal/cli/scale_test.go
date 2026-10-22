@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -218,6 +221,89 @@ func TestNewScaleCmd(t *testing.T) {
 	f := cmd.Flags().ShorthandLookup("f")
 	if f == nil {
 		t.Error("expected short flag -f for --force")
+	}
+}
+
+// TestScaleUpDelegatesToRunAddIdentity pins Behavior 4 of the
+// add-pane-identity plan: scale-up inherits add's identity fix with no
+// scale-specific seeding or identity code. Per the plan's resolved path, no
+// runAdd seam is added and runScale is not driven end-to-end (it needs live
+// tmux); instead this pins (a) the delegation itself in scale.go's AST,
+// (b) the numbering runAdd derives for the RubyDog session via
+// seedMaxIndices, and (c) the identity write runAdd performs for that number
+// via writeAddPaneIdentity/setPaneIdentityHook.
+func TestScaleUpDelegatesToRunAddIdentity(t *testing.T) {
+	// (a) Delegation: runScale constructs AddOptions and calls runAdd.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "scale.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse scale.go: %v", err)
+	}
+	var runScale *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "runScale" {
+			runScale = fn
+			break
+		}
+	}
+	if runScale == nil {
+		t.Fatal("runScale not found in scale.go")
+	}
+	callsRunAdd, buildsAddOptions := false, false
+	ast.Inspect(runScale, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			if id, ok := node.Fun.(*ast.Ident); ok && id.Name == "runAdd" {
+				callsRunAdd = true
+			}
+		case *ast.CompositeLit:
+			if id, ok := node.Type.(*ast.Ident); ok && id.Name == "AddOptions" {
+				keys := map[string]bool{}
+				for _, elt := range node.Elts {
+					if kv, ok := elt.(*ast.KeyValueExpr); ok {
+						if k, ok := kv.Key.(*ast.Ident); ok {
+							keys[k.Name] = true
+						}
+					}
+				}
+				if keys["Session"] && keys["Agents"] {
+					buildsAddOptions = true
+				}
+			}
+		}
+		return true
+	})
+	if !callsRunAdd {
+		t.Error("runScale does not call runAdd; scale-up would not inherit the add identity fix")
+	}
+	if !buildsAddOptions {
+		t.Error("runScale does not build AddOptions{Session, Agents} for runAdd")
+	}
+
+	// (b) Numbering: an identity-backed, Agent Mail-titled cc pane at (cc,1)
+	// seeds the next cc index to 2, never re-issuing 1.
+	panes := []tmux.Pane{{Title: "RubyDog", Type: tmux.AgentClaude, NTMIndex: 1}}
+	next := seedMaxIndices(panes)["cc"] + 1
+	if next != 2 {
+		t.Fatalf("next cc index for RubyDog (cc,1) session = %d, want 2", next)
+	}
+
+	// (c) Identity: the pane created at that number receives the canonical
+	// type, the same number, and the model variant through the hook seam.
+	prev := setPaneIdentityHook
+	t.Cleanup(func() { setPaneIdentityHook = prev })
+	type call struct {
+		paneID, typ, variant string
+		index                int
+	}
+	var calls []call
+	setPaneIdentityHook = func(paneID, agentType string, ntmIndex int, variant string) {
+		calls = append(calls, call{paneID, agentType, variant, ntmIndex})
+	}
+	writeAddPaneIdentity("%9", FlatAgent{Type: AgentTypeClaude, Model: "opus"}, next)
+	want := call{paneID: "%9", typ: "cc", variant: "opus", index: 2}
+	if len(calls) != 1 || calls[0] != want {
+		t.Errorf("identity hook calls = %+v, want exactly [%+v]", calls, want)
 	}
 }
 
