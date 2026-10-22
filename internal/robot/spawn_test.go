@@ -200,6 +200,68 @@ func TestStartRobotSessionMonitorWithDeps(t *testing.T) {
 	})
 }
 
+func TestLaunchAgentSetsIdentityWithoutAgentMail(t *testing.T) {
+	type identityCall struct {
+		paneID  string
+		typ     string
+		index   int
+		variant string
+	}
+
+	installHooks := func(t *testing.T, titleErr error) (titles *[]string, identities *[]identityCall) {
+		t.Helper()
+		var gotTitles []string
+		var gotIdentities []identityCall
+		origTitle, origIdentity, origSend := setPaneTitleHook, setPaneIdentityHook, sendKeysForAgentHook
+		setPaneTitleHook = func(paneID, title string) error {
+			gotTitles = append(gotTitles, title)
+			return titleErr
+		}
+		setPaneIdentityHook = func(paneID, typ string, index int, variant string) {
+			gotIdentities = append(gotIdentities, identityCall{paneID, typ, index, variant})
+		}
+		sendKeysForAgentHook = func(target, keys string, enter bool, agentType tmux.AgentType) error { return nil }
+		t.Cleanup(func() {
+			setPaneTitleHook, setPaneIdentityHook, sendKeysForAgentHook = origTitle, origIdentity, origSend
+		})
+		return &gotTitles, &gotIdentities
+	}
+
+	t.Run("identity set unconditionally without agent mail", func(t *testing.T) {
+		titles, identities := installHooks(t, nil)
+		pane := tmux.Pane{ID: "%7", WindowIndex: 0, Index: 1}
+		agent := launchAgent(pane, "sess", "claude", 1, t.TempDir(), "echo hi", nil)
+		if agent.Error != "" {
+			t.Fatalf("agent.Error = %q, want empty", agent.Error)
+		}
+		if len(*titles) != 1 || (*titles)[0] != "sess__cc_1" {
+			t.Fatalf("titles = %v, want [sess__cc_1]", *titles)
+		}
+		if len(*identities) != 1 {
+			t.Fatalf("identity calls = %v, want exactly 1", *identities)
+		}
+		got := (*identities)[0]
+		if got.paneID != "%7" || got.typ != "cc" || got.index != 1 || got.variant != "" {
+			t.Errorf("identity = %+v, want {paneID:%%7 typ:cc index:1 variant:\"\"}", got)
+		}
+	})
+
+	t.Run("title error returns early without identity", func(t *testing.T) {
+		titles, identities := installHooks(t, errors.New("tmux title failed"))
+		pane := tmux.Pane{ID: "%7", WindowIndex: 0, Index: 1}
+		agent := launchAgent(pane, "sess", "claude", 1, t.TempDir(), "echo hi", nil)
+		if !strings.Contains(agent.Error, "setting title") {
+			t.Fatalf("agent.Error = %q, want setting title failure", agent.Error)
+		}
+		if len(*titles) != 1 {
+			t.Fatalf("titles = %v, want 1 attempt", *titles)
+		}
+		if len(*identities) != 0 {
+			t.Fatalf("identity calls = %v, want none after title error", *identities)
+		}
+	})
+}
+
 // TestGetSpawn_RobotMonitorDefaultFalseLeavesNoManifest covers Behavior 8's
 // "false (default) leaves no manifest/monitor (today's behavior,
 // unchanged)" requirement end-to-end through a real (non-dry-run) spawn.
