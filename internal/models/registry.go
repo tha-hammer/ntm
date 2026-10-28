@@ -49,6 +49,7 @@ var ContextLimits = map[string]int{
 	"gpt-5.1":       256000,
 	"gpt-5.3":       256000,
 	"gpt-5.6-sol":   256000,
+	"gpt-6.1-sol":   256000,
 	"gpt-5.6-terra": 256000,
 	"gpt-5.6-luna":  256000,
 	"o1":            128000,
@@ -218,7 +219,7 @@ var agentTypeBudgetPct = map[string]float64{
 // agentTypeDefaultModels maps agent types to their default model for budget calculation.
 var agentTypeDefaultModels = map[string]string{
 	"cc":       "claude-opus-4",
-	"cod":      "gpt-5.6-sol",
+	"cod":      "gpt-6.1-sol",
 	"gmi":      "gemini-2.0-flash",
 	"agy":      "gemini-3-pro-preview", // Antigravity pins Gemini 3 Pro
 	"cursor":   "claude-3.5-sonnet",

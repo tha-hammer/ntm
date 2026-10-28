@@ -53,6 +53,9 @@ func TestIsCodexFamilyModel(t *testing.T) {
 		{"GPT-5.6-SOL", true}, // case-insensitive
 		{"gpt-5.6-terra", false},
 		{"gpt-5.6-luna", false},
+		// gpt-6.1-sol is ntm's default Codex model and runs on ChatGPT
+		// logins, so the default spawn must not trip the preflight.
+		{"gpt-6.1-sol", false},
 
 		// Non-codex gpt models — must NOT be flagged.
 		{"gpt-5", false},
