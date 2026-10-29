@@ -1714,6 +1714,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			}
 			fmt.Printf("Created %s\n", dir)
 		}
+		initCreatedProjectGit(dir)
 	}
 
 	// Calculate total panes needed

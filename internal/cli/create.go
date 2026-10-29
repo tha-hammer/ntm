@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/git"
 	"github.com/Dicklesworthstone/ntm/internal/hooks"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/output"
@@ -257,6 +259,7 @@ func runCreate(session string, panes int) (err error) {
 			}
 			fmt.Printf("Created %s\n", dir)
 		}
+		initCreatedProjectGit(dir)
 	}
 
 	// Check if session already exists
@@ -447,6 +450,10 @@ func buildCreateResponse(session string, panes int) (resp output.CreateResponse,
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return output.CreateResponse{}, fmt.Errorf("creating directory: %w", err)
+		}
+		// Kernel handler: never print here; a git init failure only logs.
+		if _, err := git.InitRepository(dir); err != nil {
+			slog.Default().Warn("sessions.create: git init of new project directory failed", "dir", dir, "error", err)
 		}
 	}
 

@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/git"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
 	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/recovery"
@@ -527,10 +528,19 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	}
 
 	// Ensure directory exists (only for real spawns, not dry-run)
+	_, statErr := os.Stat(dir)
+	dirCreated := os.IsNotExist(statErr)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		output.Error = fmt.Sprintf("creating directory: %v", err)
 		output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Check directory permissions")
 		return output, nil
+	}
+	// A directory created here becomes a git repository with an initial
+	// commit so agents can use worktrees; failure never blocks the spawn.
+	if dirCreated {
+		if _, err := git.InitRepository(dir); err != nil {
+			slog.Default().Warn("robot spawn: git init of new project directory failed", "dir", dir, "error", err)
+		}
 	}
 
 	// Create session if it doesn't exist
