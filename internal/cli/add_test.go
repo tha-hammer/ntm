@@ -49,7 +49,8 @@ func TestNewAddCmd_RegistersOllamaFlag(t *testing.T) {
 // silently dropped and the added pane launched at the CLI default — the same
 // class of bug fixed for `spawn` in ntm#188. This drives the real
 // parse→Flatten→render path the add loop uses and asserts the effort flows
-// through, with a negative control proving an unset effort leaves no flag.
+// through, with controls proving an unset effort falls back to medium for
+// Opus and leaves no flag for other Claude models.
 func TestAddThreadsReasoningEffort(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
@@ -84,22 +85,35 @@ func TestAddThreadsReasoningEffort(t *testing.T) {
 		t.Errorf("add render dropped reasoning effort: got %q, want it to contain %q", withEffort, "--effort 'xhigh'")
 	}
 
-	// Negative control: no effort parsed → no dangling --effort flag.
-	noEffortSpec, err := ParseAgentSpec("1:claude-opus-4-8")
-	if err != nil {
-		t.Fatalf("ParseAgentSpec (no effort) error = %v", err)
-	}
-	noEffortSpec.Type = AgentTypeClaude
-	noEffortAgent := AgentSpecs{noEffortSpec}.Flatten()[0]
-	noEffort, err := config.GenerateAgentCommand(cfg.Agents.Claude, config.AgentTemplateVars{
-		Model:           ResolveModel(noEffortAgent.Type, noEffortAgent.Model),
-		ReasoningEffort: noEffortAgent.ReasoningEffort,
-	})
-	if err != nil {
-		t.Fatalf("GenerateAgentCommand (no effort) error = %v", err)
-	}
-	if strings.Contains(noEffort, "--effort") {
-		t.Errorf("unset effort left a dangling flag: %q", noEffort)
+	// No effort parsed: Opus falls back to medium, other models get no flag.
+	for _, tc := range []struct {
+		spec string
+		want string
+	}{
+		{"1:claude-opus-4-8", "--effort 'medium'"},
+		{"1", "--effort 'medium'"}, // default cc model is Opus
+		{"1:sonnet", ""},
+	} {
+		noEffortSpec, err := ParseAgentSpec(tc.spec)
+		if err != nil {
+			t.Fatalf("ParseAgentSpec(%q) error = %v", tc.spec, err)
+		}
+		noEffortSpec.Type = AgentTypeClaude
+		noEffortAgent := AgentSpecs{noEffortSpec}.Flatten()[0]
+		noEffort, err := config.GenerateAgentCommand(cfg.Agents.Claude, config.AgentTemplateVars{
+			Model:           ResolveModel(noEffortAgent.Type, noEffortAgent.Model),
+			ReasoningEffort: noEffortAgent.ReasoningEffort,
+		})
+		if err != nil {
+			t.Fatalf("GenerateAgentCommand(%q) error = %v", tc.spec, err)
+		}
+		if tc.want == "" {
+			if strings.Contains(noEffort, "--effort") {
+				t.Errorf("%q: unset effort on a non-Opus model left a flag: %q", tc.spec, noEffort)
+			}
+		} else if !strings.Contains(noEffort, tc.want) {
+			t.Errorf("%q: got %q, want it to contain %q", tc.spec, noEffort, tc.want)
+		}
 	}
 }
 

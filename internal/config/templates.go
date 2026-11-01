@@ -318,8 +318,10 @@ func DefaultAgentTemplates() AgentConfig {
 	// injected the way AGENT_NAME is, in internal/cli/spawn.go) so they take
 	// effect on both the `ntm spawn` and `--robot-spawn` paths, which share
 	// GenerateAgentCommand but not the CLI path's post-render env-prepending.
+	// Claude Opus defaults to medium effort when no effort is requested;
+	// other Claude models keep the CLI's own default.
 	return AgentConfig{
-		Claude: `CARGO_BUILD_JOBS={{cargoBuildJobs}} {{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .ReasoningEffort}} --effort {{shellQuote .ReasoningEffort}}{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,
+		Claude: `CARGO_BUILD_JOBS={{cargoBuildJobs}} {{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .ReasoningEffort}} --effort {{shellQuote .ReasoningEffort}}{{else if contains .Model "opus"}} --effort 'medium'{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,
 		Codex:  `CARGO_BUILD_JOBS={{cargoBuildJobs}} {{memLimitPrefix}} {{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT="$(cat {{shellQuote .SystemPromptFile}})" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "gpt-6.1-sol")}} -c model_reasoning_effort={{shellQuote (.ReasoningEffort | default "medium")}} -c model_reasoning_summary_format=experimental --search`,
 		Gemini: `CARGO_BUILD_JOBS={{cargoBuildJobs}} {{memLimitPrefix}} gemini{{if .Model}} --model {{shellQuote .Model}}{{end}} --yolo`,
 		// Antigravity (agy): the model is hard-pinned to "Gemini 3.1 Pro (High)"
