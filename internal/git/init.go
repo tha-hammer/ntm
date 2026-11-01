@@ -25,7 +25,7 @@ func InitRepository(dir string) (bool, error) {
 		return false, fmt.Errorf("git init: %w: %s", err, out)
 	}
 
-	// Fall back to a placeholder identity only when none is configured, so
+	// Fall back to a generic ntm identity only when none is configured, so
 	// the initial commit never fails on a fresh machine.
 	var identity []string
 	if out, err := runInitGit(dir, "config", "user.email"); err != nil || strings.TrimSpace(out) == "" {
