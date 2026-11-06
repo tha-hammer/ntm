@@ -5,6 +5,7 @@ package robot
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -405,6 +406,10 @@ type AttentionFeed struct {
 	journal *AttentionJournal
 	store   AttentionStore // Optional SQLite store for durable persistence
 
+	storeOpener       AttentionStoreOpener // Opens the store when the feed is built
+	storeOpenErr      error                // Why storeOpener produced no store
+	storeOpenFailedAt time.Time
+
 	appendMu            sync.Mutex
 	ephemeralFromCursor atomic.Int64 // First cursor that exists only in-memory after store write failure
 	pendingEvents       []AttentionEvent
@@ -477,6 +482,58 @@ func WithAttentionStore(store AttentionStore) AttentionFeedOption {
 	}
 }
 
+// AttentionStoreOpener opens the durable store a feed should use.
+type AttentionStoreOpener func() (AttentionStore, error)
+
+// WithAttentionStoreOpener makes the feed open its store when it is built. If
+// the opener fails, the feed still works, in memory, and StoreHealth says why.
+func WithAttentionStoreOpener(open AttentionStoreOpener) AttentionFeedOption {
+	return func(f *AttentionFeed) {
+		f.storeOpener = open
+	}
+}
+
+// AttentionStoreHealth reports whether new events reach durable storage.
+type AttentionStoreHealth struct {
+	// Configured is true when the feed has, or tried to open, a durable store.
+	Configured bool
+	// Durable is true when new events are being saved to the store.
+	Durable bool
+	// LastError describes why new events aren't being saved.
+	LastError string
+	// Since is when the current failure began. Zero when there is no failure.
+	Since time.Time
+}
+
+// StoreHealth reports whether new events reach durable storage.
+func (f *AttentionFeed) StoreHealth() AttentionStoreHealth {
+	health := AttentionStoreHealth{Configured: f.store != nil || f.storeOpener != nil}
+	if f.storeOpenErr != nil {
+		health.LastError = f.storeOpenErr.Error()
+		health.Since = f.storeOpenFailedAt
+		return health
+	}
+	health.Durable = f.store != nil && f.ephemeralFromCursor.Load() == 0
+	return health
+}
+
+func (f *AttentionFeed) openStoreFromOpener() {
+	if f.storeOpener == nil || f.store != nil {
+		return
+	}
+	store, err := f.storeOpener()
+	if err == nil && store == nil {
+		err = errors.New("attention store opener returned no store")
+	}
+	if err != nil {
+		f.storeOpenErr = err
+		f.storeOpenFailedAt = time.Now()
+		log.Printf("attention feed: store unavailable, events stay in memory for this process: %v", err)
+		return
+	}
+	f.store = store
+}
+
 // NewAttentionFeed creates a new attention feed service.
 func NewAttentionFeed(config AttentionFeedConfig, opts ...AttentionFeedOption) *AttentionFeed {
 	if config.JournalSize == 0 {
@@ -496,6 +553,8 @@ func NewAttentionFeed(config AttentionFeedConfig, opts ...AttentionFeedOption) *
 	for _, opt := range opts {
 		opt(feed)
 	}
+
+	feed.openStoreFromOpener()
 
 	// Sync cursor from store if available
 	feed.syncCursorFromStore()
@@ -2948,18 +3007,33 @@ func NewTrackedFileConflictEvent(session string, conflict tracker.Conflict) (Att
 
 // globalFeed is the default attention feed instance.
 var globalFeed *AttentionFeed
+var globalFeedOpener AttentionStoreOpener
 var globalFeedMu sync.Mutex
 
 // GetAttentionFeed returns the global attention feed instance.
-// The feed is lazily initialized with default configuration and can later be
-// replaced with a store-backed instance during application startup.
+// The feed is built on first use. It is durable when ntm's startup has registered
+// a store opener, and in memory otherwise, as it is in tests. Startup can also
+// install a store-backed instance directly with SetAttentionFeed.
 func GetAttentionFeed() *AttentionFeed {
 	globalFeedMu.Lock()
 	defer globalFeedMu.Unlock()
 	if globalFeed == nil {
-		globalFeed = NewAttentionFeed(DefaultAttentionFeedConfig())
+		var opts []AttentionFeedOption
+		if globalFeedOpener != nil {
+			opts = append(opts, WithAttentionStoreOpener(globalFeedOpener))
+		}
+		globalFeed = NewAttentionFeed(DefaultAttentionFeedConfig(), opts...)
 	}
 	return globalFeed
+}
+
+// SetAttentionStoreOpener registers how the global feed opens its durable store
+// on first use. It does not open anything itself, so commands that never use the
+// feed never touch the store. Leaving it unset keeps the feed in memory.
+func SetAttentionStoreOpener(open AttentionStoreOpener) {
+	globalFeedMu.Lock()
+	defer globalFeedMu.Unlock()
+	globalFeedOpener = open
 }
 
 // PeekAttentionFeed returns the global attention feed if it has already been

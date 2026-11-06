@@ -2,7 +2,10 @@ package robot
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4840,5 +4843,152 @@ func TestOperatorLoop_SnapshotSummaryConsistency(t *testing.T) {
 	// Next steps should reference action_required events
 	if len(summary.NextSteps) == 0 {
 		t.Error("expected next-step hints")
+	}
+}
+
+// =============================================================================
+// Durable-by-default feed (bd-bdjf4.1)
+// =============================================================================
+
+// resetGlobalFeedForTest clears the process-wide feed and opener, and restores
+// them when the test ends.
+func resetGlobalFeedForTest(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		SetAttentionFeed(nil)
+		SetAttentionStoreOpener(nil)
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+func testAttentionEvent(summary string) AttentionEvent {
+	return AttentionEvent{
+		Session:       "proj",
+		Category:      EventCategorySystem,
+		Type:          EventTypeSystemHealthChange,
+		Source:        "test",
+		Actionability: ActionabilityBackground,
+		Severity:      SeverityInfo,
+		Summary:       summary,
+	}
+}
+
+func TestGetAttentionFeed_NoOpenerStaysInMemory(t *testing.T) {
+	resetGlobalFeedForTest(t)
+	configDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("NTM_CONFIG", "")
+
+	feed := GetAttentionFeed()
+	t.Cleanup(feed.Stop)
+	if feed.StoreHealth().Configured {
+		t.Fatal("feed reports a store with no opener registered")
+	}
+	feed.Append(testAttentionEvent("memory only"))
+
+	if _, err := os.Stat(filepath.Join(configDir, "ntm", "state.db")); !os.IsNotExist(err) {
+		t.Fatalf("state.db was created with no opener: %v", err)
+	}
+}
+
+func TestGetAttentionFeed_OpensStoreOnce(t *testing.T) {
+	resetGlobalFeedForTest(t)
+	var calls atomic.Int32
+	SetAttentionStoreOpener(func() (AttentionStore, error) {
+		calls.Add(1)
+		return newStubAttentionStore(), nil
+	})
+
+	if PeekAttentionFeed() != nil {
+		t.Fatal("PeekAttentionFeed should stay nil before first use")
+	}
+
+	var wg sync.WaitGroup
+	feeds := make([]*AttentionFeed, 50)
+	for i := range feeds {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			feeds[i] = GetAttentionFeed()
+		}(i)
+	}
+	wg.Wait()
+	t.Cleanup(feeds[0].Stop)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("opener ran %d times, want 1", got)
+	}
+	for _, feed := range feeds {
+		if feed != feeds[0] {
+			t.Fatal("callers got different feeds")
+		}
+	}
+	health := feeds[0].StoreHealth()
+	if !health.Configured || !health.Durable || health.LastError != "" {
+		t.Fatalf("health = %+v, want configured and durable", health)
+	}
+}
+
+func TestGetAttentionFeed_OpenFailureFallsBackToMemory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		opener  func() (AttentionStore, error)
+		wantErr string
+	}{
+		{
+			name:    "opener returns an error",
+			opener:  func() (AttentionStore, error) { return nil, errors.New("disk full") },
+			wantErr: "disk full",
+		},
+		{
+			name:    "opener returns no store and no error",
+			opener:  func() (AttentionStore, error) { return nil, nil },
+			wantErr: "no store",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGlobalFeedForTest(t)
+			SetAttentionStoreOpener(tc.opener)
+
+			feed := GetAttentionFeed()
+			t.Cleanup(feed.Stop)
+			appended := feed.Append(testAttentionEvent("still works"))
+
+			events, _, err := feed.Replay(appended.Cursor-1, 10)
+			if err != nil {
+				t.Fatalf("Replay error: %v", err)
+			}
+			if len(events) != 1 || events[0].Summary != "still works" {
+				t.Fatalf("replayed %+v, want the appended event", events)
+			}
+
+			health := feed.StoreHealth()
+			if !health.Configured || health.Durable || !strings.Contains(health.LastError, tc.wantErr) {
+				t.Fatalf("health = %+v, want configured, not durable, error containing %q", health, tc.wantErr)
+			}
+			if health.Since.IsZero() {
+				t.Fatalf("health = %+v, want a failure time", health)
+			}
+		})
+	}
+}
+
+func TestSetAttentionFeed_ReplacesOpenerFeed(t *testing.T) {
+	resetGlobalFeedForTest(t)
+	var calls atomic.Int32
+	SetAttentionStoreOpener(func() (AttentionStore, error) {
+		calls.Add(1)
+		return newStubAttentionStore(), nil
+	})
+
+	custom := newTestAttentionFeed(t)
+	SetAttentionFeed(custom)
+
+	if GetAttentionFeed() != custom {
+		t.Fatal("GetAttentionFeed should return the feed set explicitly")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("opener ran %d times, want 0 once a feed is set", got)
 	}
 }

@@ -34,6 +34,9 @@ const (
 
 	// AvailabilityCacheTTL is how long to cache IsAvailable() results.
 	AvailabilityCacheTTL = 30 * time.Second
+
+	// registrationTokenArg is the tool argument holding an agent's token.
+	registrationTokenArg = "registration_token"
 )
 
 // Client provides methods to interact with the Agent Mail API.
@@ -54,6 +57,11 @@ type Client struct {
 	// because neither component contains it).
 	registrationTokensMu sync.RWMutex
 	registrationTokens   map[string]string
+
+	// serverRejectsRegistrationToken is set once the server refuses the
+	// argument, as servers without the parameter do (mcp_agent_mail 0.3.0),
+	// so later calls don't each pay for a failed attempt.
+	serverRejectsRegistrationToken atomic.Bool
 
 	// Availability cache (30s TTL)
 	healthCheckMu      sync.Mutex
@@ -390,6 +398,40 @@ type ToolCallParams struct {
 
 // callTool makes a JSON-RPC call to the Agent Mail server.
 func (c *Client) callTool(ctx context.Context, toolName string, args map[string]interface{}) (json.RawMessage, error) {
+	if _, hasToken := args[registrationTokenArg]; hasToken && c.serverRejectsRegistrationToken.Load() {
+		return c.postToolCall(ctx, toolName, withoutRegistrationToken(args))
+	}
+
+	result, err := c.postToolCall(ctx, toolName, args)
+	if _, hasToken := args[registrationTokenArg]; hasToken && isRegistrationTokenRejection(err) {
+		c.serverRejectsRegistrationToken.Store(true)
+		return c.postToolCall(ctx, toolName, withoutRegistrationToken(args))
+	}
+	return result, err
+}
+
+// isRegistrationTokenRejection reports whether the server refused the call
+// because its tools have no registration_token parameter.
+func isRegistrationTokenRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, registrationTokenArg) && strings.Contains(message, "unexpected_keyword_argument")
+}
+
+func withoutRegistrationToken(args map[string]interface{}) map[string]interface{} {
+	trimmed := make(map[string]interface{}, len(args))
+	for key, value := range args {
+		if key != registrationTokenArg {
+			trimmed[key] = value
+		}
+	}
+	return trimmed
+}
+
+// postToolCall sends one tools/call request and unwraps its result.
+func (c *Client) postToolCall(ctx context.Context, toolName string, args map[string]interface{}) (json.RawMessage, error) {
 	reqID := c.requestID.Add(1)
 
 	rpcReq := JSONRPCRequest{

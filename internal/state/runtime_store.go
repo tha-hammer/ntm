@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -2061,14 +2062,12 @@ func (s *Store) GetAttentionReplayWindow() (AttentionReplayWindow, error) {
 
 	window := AttentionReplayWindow{}
 	var oldest, newest sql.NullInt64
-	var lastEventAt sql.NullTime
 	err := s.db.QueryRow(`
 		SELECT
 			(SELECT MIN(cursor) FROM attention_events WHERE expires_at IS NULL OR expires_at >= datetime('now')),
 			(SELECT MAX(cursor) FROM attention_events),
-			(SELECT COUNT(*) FROM attention_events WHERE expires_at IS NULL OR expires_at >= datetime('now')),
-			(SELECT MAX(ts) FROM attention_events)`,
-	).Scan(&oldest, &newest, &window.EventCount, &lastEventAt)
+			(SELECT COUNT(*) FROM attention_events WHERE expires_at IS NULL OR expires_at >= datetime('now'))`,
+	).Scan(&oldest, &newest, &window.EventCount)
 	if err != nil {
 		return AttentionReplayWindow{}, fmt.Errorf("get attention replay window: %w", err)
 	}
@@ -2077,6 +2076,14 @@ func (s *Store) GetAttentionReplayWindow() (AttentionReplayWindow, error) {
 	}
 	if newest.Valid {
 		window.NewestCursor = newest.Int64
+	}
+
+	// Read ts as a plain column. The driver only converts declared TIMESTAMP
+	// columns to time.Time, and an aggregate like MAX(ts) comes back as text.
+	var lastEventAt sql.NullTime
+	err = s.db.QueryRow(`SELECT ts FROM attention_events ORDER BY ts DESC LIMIT 1`).Scan(&lastEventAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return AttentionReplayWindow{}, fmt.Errorf("get attention replay window last event: %w", err)
 	}
 	if lastEventAt.Valid {
 		ts := lastEventAt.Time.UTC()

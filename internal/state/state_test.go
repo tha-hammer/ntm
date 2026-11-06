@@ -1918,6 +1918,60 @@ func TestCreateOrUpdateIncidentDeduplicatesByFingerprint(t *testing.T) {
 	}
 }
 
+// A failed window read makes the feed fall back to its in-memory journal, which
+// silently hides other processes' events, so this runs against a real file.
+func TestGetAttentionReplayWindow_WithRowsOnRealFile(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open error: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("Migrate error: %v", err)
+	}
+
+	empty, err := store.GetAttentionReplayWindow()
+	if err != nil {
+		t.Fatalf("window on an empty table: %v", err)
+	}
+	if empty.EventCount != 0 || empty.NewestCursor != 0 || empty.LastEventAt != nil {
+		t.Fatalf("empty window = %+v", empty)
+	}
+
+	older := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
+	newer := older.Add(30 * time.Second)
+	expires := newer.Add(time.Hour)
+	var cursors []int64
+	for _, ts := range []time.Time{older, newer} {
+		cursor, err := store.AppendAttentionEvent(&StoredAttentionEvent{
+			Ts:            ts,
+			Category:      "mail",
+			EventType:     "mail.received",
+			Source:        "test",
+			Actionability: ActionabilityBackground,
+			Severity:      SeverityInfo,
+			Summary:       "window test",
+			DedupCount:    1,
+			ExpiresAt:     &expires,
+		})
+		if err != nil {
+			t.Fatalf("AppendAttentionEvent error: %v", err)
+		}
+		cursors = append(cursors, cursor)
+	}
+
+	window, err := store.GetAttentionReplayWindow()
+	if err != nil {
+		t.Fatalf("window with rows: %v", err)
+	}
+	if window.OldestCursor != cursors[0] || window.NewestCursor != cursors[1] || window.EventCount != 2 {
+		t.Fatalf("window = %+v, want cursors %v and 2 events", window, cursors)
+	}
+	if window.LastEventAt == nil || !window.LastEventAt.Equal(newer) {
+		t.Fatalf("LastEventAt = %v, want %v", window.LastEventAt, newer)
+	}
+}
+
 func TestAttentionReplayQueriesByIncidentAndTimeRange(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC().Truncate(time.Second)

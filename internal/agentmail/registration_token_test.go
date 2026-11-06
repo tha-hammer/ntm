@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -80,6 +81,119 @@ func TestCreateAgentIdentity_CapturesRegistrationToken(t *testing.T) {
 	}
 	if got := c.RegistrationToken("/abs/project", "StormyOwl"); got != "ZZZ-from-create-identity" {
 		t.Errorf("client cache token = %q, want ZZZ-from-create-identity", got)
+	}
+}
+
+// tokenRejectingServer behaves like mcp_agent_mail 0.3.0: tools have no
+// registration_token parameter, so sending one fails argument validation.
+func tokenRejectingServer(t *testing.T, calls *[]map[string]interface{}, mu *sync.Mutex) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     int64 `json:"id"`
+			Params struct {
+				Arguments map[string]interface{} `json:"arguments"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		mu.Lock()
+		*calls = append(*calls, req.Params.Arguments)
+		mu.Unlock()
+
+		result := map[string]interface{}{
+			"content": []map[string]string{{"type": "text", "text": "[]"}},
+		}
+		if _, sent := req.Params.Arguments["registration_token"]; sent {
+			result = map[string]interface{}{
+				"isError": true,
+				"content": []map[string]string{{
+					"type": "text",
+					"text": "1 validation error for call[fetch_inbox]\nregistration_token\n  Unexpected keyword argument [type=unexpected_keyword_argument, input_value='secret-token', input_type=str]",
+				}},
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": result})
+	}))
+}
+
+// A server without the registration_token parameter must still work: the token
+// is dropped after the first rejection, and not sent again by that client.
+func TestFetchInbox_RetriesWithoutTokenWhenServerRejectsIt(t *testing.T) {
+	t.Parallel()
+	var (
+		mu    sync.Mutex
+		calls []map[string]interface{}
+	)
+	server := tokenRejectingServer(t, &calls, &mu)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	c.SetRegistrationToken("/abs/project", "BlueLake", "secret-token")
+	opts := FetchInboxOptions{ProjectKey: "/abs/project", AgentName: "BlueLake"}
+
+	if _, err := c.FetchInbox(context.Background(), opts); err != nil {
+		t.Fatalf("first FetchInbox should succeed after dropping the token: %v", err)
+	}
+	mu.Lock()
+	if len(calls) != 2 {
+		mu.Unlock()
+		t.Fatalf("first FetchInbox made %d calls, want 2 (with token, then without)", len(calls))
+	}
+	if _, sent := calls[0]["registration_token"]; !sent {
+		t.Error("first attempt should send the token, for servers that require it")
+	}
+	if _, sent := calls[1]["registration_token"]; sent {
+		t.Error("retry must not send the token")
+	}
+	if calls[1]["agent_name"] != "BlueLake" {
+		t.Errorf("retry lost other arguments: %v", calls[1])
+	}
+	mu.Unlock()
+
+	if _, err := c.FetchInbox(context.Background(), opts); err != nil {
+		t.Fatalf("second FetchInbox: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("total calls = %d, want 3: the client should remember the rejection", len(calls))
+	}
+	if _, sent := calls[2]["registration_token"]; sent {
+		t.Error("later calls must not send the token again")
+	}
+}
+
+// Only a rejection of registration_token itself may trigger the retry.
+func TestCallTool_OtherValidationErrorsAreNotRetried(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		var req struct {
+			ID int64 `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{
+			"isError": true,
+			"content": []map[string]string{{
+				"type": "text",
+				"text": "1 validation error for call[fetch_inbox]\nlimit\n  Unexpected keyword argument [type=unexpected_keyword_argument]",
+			}},
+		}})
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	c.SetRegistrationToken("/abs/project", "BlueLake", "secret-token")
+	_, err := c.FetchInbox(context.Background(), FetchInboxOptions{ProjectKey: "/abs/project", AgentName: "BlueLake"})
+	if err == nil {
+		t.Fatal("expected the validation error to be returned")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1", got)
 	}
 }
 

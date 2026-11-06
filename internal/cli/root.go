@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -65,7 +66,12 @@ var (
 	BuiltBy = "unknown"
 )
 
-var robotStateStore *state.Store
+// processStateStore is this process's connection to state.db, opened once and
+// closed when Execute returns.
+var (
+	processStateStore   *state.Store
+	processStateStoreMu sync.Mutex
+)
 
 // VersionInput is the kernel input for core.version.
 type VersionInput struct {
@@ -90,6 +96,9 @@ Shell Integration:
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Comes first because some commands return early below.
+		registerAttentionStoreOpener(os.Args[1:])
+
 		// Configure remote client if requested
 		if sshHost != "" {
 			tmux.DefaultClient = tmux.NewClient(sshHost)
@@ -2514,18 +2523,57 @@ func robotFlagSkipsPersistence(arg string) bool {
 	}
 }
 
-func initializeRobotPersistence() error {
-	if robotStateStore != nil {
-		return nil
+// attentionStoreOpenerWanted reports whether this command line's attention feed
+// should use state.db. It follows the same exclusions as robot persistence.
+func attentionStoreOpenerWanted(args []string) bool {
+	for _, arg := range args {
+		if robotFlagSkipsPersistence(arg) {
+			return false
+		}
+	}
+	return true
+}
+
+// registerAttentionStoreOpener makes the attention feed durable from its first
+// use. Nothing is opened here, so commands that never use the feed never touch
+// state.db. Only --robot-* and ntm serve run the projection refresh.
+func registerAttentionStoreOpener(args []string) {
+	if !attentionStoreOpenerWanted(args) {
+		return
+	}
+	robot.SetAttentionStoreOpener(func() (robot.AttentionStore, error) {
+		store, err := openProcessStateStore()
+		if err != nil {
+			return nil, err
+		}
+		return store, nil
+	})
+}
+
+// openProcessStateStore opens and migrates state.db once per process.
+func openProcessStateStore() (*state.Store, error) {
+	processStateStoreMu.Lock()
+	defer processStateStoreMu.Unlock()
+	if processStateStore != nil {
+		return processStateStore, nil
 	}
 
 	store, err := state.Open("")
 	if err != nil {
-		return fmt.Errorf("open robot state store: %w", err)
+		return nil, fmt.Errorf("open state store: %w", err)
 	}
 	if err := store.Migrate(); err != nil {
 		store.Close()
-		return fmt.Errorf("migrate robot state store: %w", err)
+		return nil, fmt.Errorf("migrate state store: %w", err)
+	}
+	processStateStore = store
+	return store, nil
+}
+
+func initializeRobotPersistence() error {
+	store, err := openProcessStateStore()
+	if err != nil {
+		return err
 	}
 
 	robot.SetAttentionFeed(robot.NewAttentionFeed(
@@ -2533,7 +2581,6 @@ func initializeRobotPersistence() error {
 		robot.WithAttentionStore(store),
 	))
 	robot.SetProjectionStore(store)
-	robotStateStore = store
 
 	refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -2542,11 +2589,13 @@ func initializeRobotPersistence() error {
 }
 
 func closeRobotPersistence() {
-	if robotStateStore == nil {
+	processStateStoreMu.Lock()
+	defer processStateStoreMu.Unlock()
+	if processStateStore == nil {
 		return
 	}
-	_ = robotStateStore.Close()
-	robotStateStore = nil
+	_ = processStateStore.Close()
+	processStateStore = nil
 	robot.SetProjectionStore(nil)
 }
 

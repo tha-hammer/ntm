@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -37,6 +38,21 @@ func newTmuxIntegrationTestConfig(projectsBase string) *config.Config {
 }
 
 func TestMain(m *testing.M) {
+	// Closure tests re-exec this binary as helper processes running real ntm code.
+	if mode := os.Getenv(closureHelperModeEnv); mode != "" {
+		os.Exit(runClosureHelper(mode))
+	}
+
+	// ntm's startup makes the attention feed durable on first use, so tests that
+	// run it need their own config folder rather than the user's real state.db.
+	configDir, err := os.MkdirTemp("", "ntm-cli-test-config-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create test config folder: %v\n", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("XDG_CONFIG_HOME", configDir)
+	_ = os.Unsetenv("NTM_CONFIG")
+
 	// Clean up any orphan test sessions from previous runs before starting.
 	// This catches sessions left behind when tests are interrupted (Ctrl+C, timeout, etc.)
 	testutil.KillAllTestSessionsSilent()
@@ -45,6 +61,9 @@ func TestMain(m *testing.M) {
 
 	// Clean up after all tests complete
 	testutil.KillAllTestSessionsSilent()
+
+	closeRobotPersistence()
+	_ = os.RemoveAll(configDir)
 
 	os.Exit(code)
 }
