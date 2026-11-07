@@ -167,7 +167,7 @@ func runAgentHookStop(stdin io.Reader, stdout io.Writer, projectKey string) {
 	if len(toTell) == 0 {
 		return
 	}
-	if err := json.NewEncoder(stdout).Encode(stopDecision{Decision: "block", Reason: buildReminderText(toTell)}); err != nil {
+	if err := json.NewEncoder(stdout).Encode(stopDecision{Decision: "block", Reason: buildReminderText(toTell, agent, projectKey)}); err != nil {
 		slog.Warn("agent hook: write decision failed", "agent", agent, "error", err)
 	}
 }
@@ -242,8 +242,12 @@ func claimUnread(projectKey, agent string, msgs []agentmail.InboxMessage) []agen
 }
 
 // buildReminderText is the ReminderText contract. Senders and subjects are
-// written by other agents, so they are cleaned, cut and labeled as data.
-func buildReminderText(msgs []agentmail.InboxMessage) string {
+// written by other agents, so they are cleaned, cut and labeled as data. The
+// last line names the agent and project to fetch as, because an agent that
+// ntm registered doesn't know its own Agent Mail name, and in a worktree the
+// project isn't the agent's folder. Both are quoted Go strings, so they stay
+// on one line.
+func buildReminderText(msgs []agentmail.InboxMessage, agent, projectKey string) string {
 	var b strings.Builder
 	noun := "messages"
 	if len(msgs) == 1 {
@@ -259,7 +263,7 @@ func buildReminderText(msgs []agentmail.InboxMessage) string {
 	if extra := len(msgs) - reminderListLimit; extra > 0 {
 		fmt.Fprintf(&b, "\n...and %d more", extra)
 	}
-	b.WriteString("\nRun fetch_inbox to read them.")
+	fmt.Fprintf(&b, "\nRun fetch_inbox with agent_name %q and project_key %q to read them.", agent, projectKey)
 	return b.String()
 }
 
