@@ -1,12 +1,16 @@
 package robot
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2593,8 +2597,10 @@ func TestPublishMailAckRequired_UsesRobotMailCheckAction(t *testing.T) {
 type stubAttentionStore struct {
 	mu                 sync.Mutex
 	events             []state.StoredAttentionEvent
+	seq                int64 // Next cursor comes after this, like AUTOINCREMENT.
 	appendAttempts     atomic.Int32
 	failAppend         atomic.Bool
+	failReserve        atomic.Bool
 	blockFirst         atomic.Bool
 	firstAppendStarted chan struct{}
 	releaseFirstAppend chan struct{}
@@ -2611,7 +2617,8 @@ func (s *stubAttentionStore) seed(summary string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cursor := int64(len(s.events) + 1)
+	s.seq++
+	cursor := s.seq
 	s.events = append(s.events, state.StoredAttentionEvent{
 		Cursor:        cursor,
 		Ts:            time.Now().UTC(),
@@ -2643,11 +2650,24 @@ func (s *stubAttentionStore) AppendAttentionEvent(event *state.StoredAttentionEv
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cursor := int64(len(s.events) + 1)
+	s.seq++
+	cursor := s.seq
 	stored := *event
 	stored.Cursor = cursor
 	s.events = append(s.events, stored)
 	return cursor, nil
+}
+
+func (s *stubAttentionStore) ReserveAttentionCursor(minCursor int64) error {
+	if s.failReserve.Load() {
+		return errors.New("reserve failed")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if minCursor > s.seq {
+		s.seq = minCursor
+	}
+	return nil
 }
 
 func (s *stubAttentionStore) GetAttentionEventsSince(sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error) {
@@ -5273,6 +5293,424 @@ func TestAttentionEventToStored_ExpiryProperty(t *testing.T) {
 func TestDefaultAttentionFeedConfig_JournalSizeUnchanged(t *testing.T) {
 	if got := DefaultAttentionFeedConfig().JournalSize; got != 10000 {
 		t.Fatalf("JournalSize = %d, want 10000", got)
+	}
+}
+
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newTestClock() *testClock {
+	return &testClock{now: time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// faultInjectingStore is a real store whose appends fail on demand.
+type faultInjectingStore struct {
+	*state.Store
+	fail atomic.Bool
+}
+
+func (s *faultInjectingStore) AppendAttentionEvent(event *state.StoredAttentionEvent) (int64, error) {
+	if s.fail.Load() {
+		return 0, errors.New("injected append failure")
+	}
+	return s.Store.AppendAttentionEvent(event)
+}
+
+// holdExclusiveLock takes SQLite's write lock on a separate connection and
+// returns the function that releases it.
+func holdExclusiveLock(t *testing.T, path string) func() {
+	t.Helper()
+	store := openStoreFile(t, path)
+	conn, err := store.DB().Conn(context.Background())
+	if err != nil {
+		t.Fatalf("get lock connection: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatalf("take lock: %v", err)
+	}
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+				t.Errorf("release lock: %v", err)
+			}
+			_ = conn.Close()
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// slogCapture records structured log lines for the length of a test.
+type slogCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *slogCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *slogCapture) count(message string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Count(c.buf.String(), message)
+}
+
+func captureSlog(t *testing.T) *slogCapture {
+	t.Helper()
+	capture := &slogCapture{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(capture, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return capture
+}
+
+func cursorsOf(events []AttentionEvent) []int64 {
+	cursors := make([]int64, 0, len(events))
+	for _, event := range events {
+		cursors = append(cursors, event.Cursor)
+	}
+	return cursors
+}
+
+func TestClosure_RecoversAfterStoreLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	clock := newTestClock()
+	writer := NewAttentionFeed(DefaultAttentionFeedConfig(),
+		WithAttentionStore(openStoreFile(t, path)), WithAttentionClock(clock.Now))
+	t.Cleanup(writer.Stop)
+
+	release := holdExclusiveLock(t, path)
+	writer.Append(testAttentionEvent("during lock")) // Waits out the real busy timeout.
+	if health := writer.StoreHealth(); health.Durable || health.LastError == "" {
+		t.Fatalf("health during the lock = %+v, want not durable with an error", health)
+	}
+	release()
+
+	clock.Advance(AttentionStoreRetryInterval + time.Second)
+	writer.Append(testAttentionEvent("after lock"))
+
+	reader := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(reader.Stop)
+	events, _, err := reader.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "after lock")
+	if health := writer.StoreHealth(); !health.Durable || health.LastError != "" || !health.Since.IsZero() {
+		t.Fatalf("health after recovery = %+v, want durable with no error", health)
+	}
+}
+
+func TestAttentionFeed_RetryLimitedDuringOutage(t *testing.T) {
+	captureSlog(t)
+	store := newStubAttentionStore()
+	store.failAppend.Store(true)
+	clock := newTestClock()
+	feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 100, RetentionPeriod: time.Hour},
+		WithAttentionStore(store), WithAttentionClock(clock.Now))
+	t.Cleanup(feed.Stop)
+
+	for i := 0; i < 100; i++ {
+		feed.Append(testAttentionEvent("x"))
+	}
+	if got := store.appendAttempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1 inside the retry interval", got)
+	}
+
+	// Just short of the interval is still too soon.
+	clock.Advance(AttentionStoreRetryInterval - time.Nanosecond)
+	feed.Append(testAttentionEvent("y"))
+	if got := store.appendAttempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1 just before the interval", got)
+	}
+
+	// Exactly at the interval counts as allowed.
+	clock.Advance(time.Nanosecond)
+	feed.Append(testAttentionEvent("z"))
+	if got := store.appendAttempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2 at the interval", got)
+	}
+
+	// A retry that fails starts the wait again.
+	clock.Advance(AttentionStoreRetryInterval - time.Nanosecond)
+	feed.Append(testAttentionEvent("still too soon"))
+	if got := store.appendAttempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2 after a failed retry moved the next try", got)
+	}
+}
+
+func TestAttentionFeed_OneReportPerStateChange(t *testing.T) {
+	logs := captureSlog(t)
+	store := newStubAttentionStore()
+	clock := newTestClock()
+	feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 100, RetentionPeriod: time.Hour},
+		WithAttentionStore(store), WithAttentionClock(clock.Now))
+	t.Cleanup(feed.Stop)
+
+	outage := func() {
+		store.failAppend.Store(true)
+		for i := 0; i < 5; i++ {
+			clock.Advance(AttentionStoreRetryInterval)
+			feed.Append(testAttentionEvent("down"))
+		}
+		store.failAppend.Store(false)
+		clock.Advance(AttentionStoreRetryInterval)
+		feed.Append(testAttentionEvent("back"))
+		feed.Append(testAttentionEvent("still back"))
+	}
+
+	outage()
+	if got := logs.count(attentionStoreDownLogMessage); got != 1 {
+		t.Fatalf("failure reports = %d, want 1", got)
+	}
+	if got := logs.count(attentionStoreRecoveredLogMessage); got != 1 {
+		t.Fatalf("recovery reports = %d, want 1", got)
+	}
+	if got := logs.count("append failed"); got != 1 {
+		t.Fatalf("reports naming the error = %d, want 1", got)
+	}
+	if got := logs.count("memory_only_count=5"); got != 1 {
+		t.Fatalf("recovery report should count 5 memory-only events: %q", logs.buf.String())
+	}
+
+	outage()
+	if got := logs.count(attentionStoreDownLogMessage); got != 2 {
+		t.Fatalf("failure reports after a second outage = %d, want 2", got)
+	}
+	if got := logs.count(attentionStoreRecoveredLogMessage); got != 2 {
+		t.Fatalf("recovery reports after a second outage = %d, want 2", got)
+	}
+}
+
+func TestAttentionFeed_ReplayOrderProperty(t *testing.T) {
+	captureSlog(t)
+	rapid.Check(t, func(rt *rapid.T) {
+		store := newStubAttentionStore()
+		clock := newTestClock()
+		feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour},
+			WithAttentionStore(store), WithAttentionClock(clock.Now))
+		defer feed.Stop()
+
+		var appended []int64
+		steps := rapid.IntRange(1, 200).Draw(rt, "steps")
+		for i := 0; i < steps; i++ {
+			switch rapid.IntRange(0, 2).Draw(rt, "op") {
+			case 0:
+				appended = append(appended, feed.Append(testAttentionEvent("e")).Cursor)
+			case 1:
+				store.failAppend.Store(rapid.Bool().Draw(rt, "fail"))
+			case 2:
+				clock.Advance(time.Duration(rapid.IntRange(0, 60).Draw(rt, "secs")) * time.Second)
+			}
+		}
+
+		events, _, err := feed.Replay(0, len(appended)+1)
+		if err != nil {
+			rt.Fatal(err)
+		}
+		if got := cursorsOf(events); !slices.Equal(got, appended) {
+			rt.Fatalf("replay %v, appended %v", got, appended)
+		}
+		for i := 1; i < len(appended); i++ {
+			if appended[i] <= appended[i-1] {
+				rt.Fatalf("cursors not strictly increasing: %v", appended)
+			}
+		}
+	})
+}
+
+func TestAttentionFeed_MemoryOnlyEvents(t *testing.T) {
+	newOutageFeed := func(t *testing.T, journalSize int) (*AttentionFeed, *stubAttentionStore, *testClock) {
+		t.Helper()
+		captureSlog(t)
+		store := newStubAttentionStore()
+		clock := newTestClock()
+		feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: journalSize, RetentionPeriod: time.Hour},
+			WithAttentionStore(store), WithAttentionClock(clock.Now))
+		t.Cleanup(feed.Stop)
+		return feed, store, clock
+	}
+
+	t.Run("dropped oldest first past the journal size", func(t *testing.T) {
+		feed, store, _ := newOutageFeed(t, 3)
+		store.failAppend.Store(true)
+		for i := 0; i < 5; i++ {
+			feed.Append(testAttentionEvent(fmt.Sprintf("memory-%d", i)))
+		}
+		events, _, err := feed.Replay(0, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSummaries(t, events, "memory-2", "memory-3", "memory-4")
+		if stats := feed.Stats(); stats.Count != 3 || stats.OldestCursor != 3 || stats.NewestCursor != 5 {
+			t.Fatalf("stats = %+v, want 3 events from cursor 3 to 5", stats)
+		}
+	})
+
+	t.Run("still readable after recovery, with a limit and a resume cursor", func(t *testing.T) {
+		feed, store, clock := newOutageFeed(t, 100)
+		feed.Append(testAttentionEvent("stored-1"))
+		store.failAppend.Store(true)
+		feed.Append(testAttentionEvent("memory-2"))
+		store.failAppend.Store(false)
+		clock.Advance(AttentionStoreRetryInterval)
+		feed.Append(testAttentionEvent("stored-3"))
+
+		page, _, err := feed.Replay(0, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSummaries(t, page, "stored-1", "memory-2")
+		rest, _, err := feed.Replay(page[1].Cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSummaries(t, rest, "stored-3")
+		if stats := feed.Stats(); stats.Count != 3 {
+			t.Fatalf("stats.Count = %d, want 3 after recovery", stats.Count)
+		}
+	})
+
+	t.Run("a failed reservation leaves the feed down", func(t *testing.T) {
+		feed, store, clock := newOutageFeed(t, 100)
+		store.failAppend.Store(true)
+		feed.Append(testAttentionEvent("memory"))
+		store.failAppend.Store(false)
+		store.failReserve.Store(true)
+		clock.Advance(AttentionStoreRetryInterval)
+		feed.Append(testAttentionEvent("reserve fails"))
+		if feed.StoreHealth().Durable {
+			t.Fatal("feed reported durable after its cursor reservation failed")
+		}
+		if got := len(store.events); got != 0 {
+			t.Fatalf("store has %d events, want none", got)
+		}
+	})
+}
+
+// A cursor another process used can match a memory-only one. Neither event may be
+// lost from this process's replay. See the accepted limit in the Loop 1 plan.
+func TestClosure_CursorClashKeepsBothEvents(t *testing.T) {
+	captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	clock := newTestClock()
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(),
+		WithAttentionStore(store), WithAttentionClock(clock.Now))
+	t.Cleanup(feed.Stop)
+
+	store.fail.Store(true)
+	memory := feed.Append(testAttentionEvent("memory"))
+	other := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(other.Stop)
+	durable := other.Append(testAttentionEvent("other process"))
+	if durable.Cursor != memory.Cursor {
+		t.Fatalf("setup: cursors %d and %d should clash", durable.Cursor, memory.Cursor)
+	}
+
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "other process", "memory")
+}
+
+func TestClosure_RecoveredCursorAboveMemoryOnly(t *testing.T) {
+	captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	clock := newTestClock()
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(),
+		WithAttentionStore(store), WithAttentionClock(clock.Now))
+	t.Cleanup(feed.Stop)
+
+	store.fail.Store(true)
+	first := feed.Append(testAttentionEvent("memory one"))
+	second := feed.Append(testAttentionEvent("memory two"))
+	store.fail.Store(false)
+	clock.Advance(AttentionStoreRetryInterval)
+	third := feed.Append(testAttentionEvent("durable"))
+
+	if !(first.Cursor < second.Cursor && second.Cursor < third.Cursor) {
+		t.Fatalf("cursors %d, %d, %d", first.Cursor, second.Cursor, third.Cursor)
+	}
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "memory one", "memory two", "durable")
+}
+
+func TestAttentionFeed_FailedOpenIsRetried(t *testing.T) {
+	logs := captureSlog(t)
+	store := newStubAttentionStore()
+	var works atomic.Bool
+	clock := newTestClock()
+	feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 100, RetentionPeriod: time.Hour},
+		WithAttentionClock(clock.Now),
+		WithAttentionStoreOpener(func() (AttentionStore, error) {
+			if !works.Load() {
+				return nil, errors.New("disk full")
+			}
+			return store, nil
+		}))
+	t.Cleanup(feed.Stop)
+
+	memory := feed.Append(testAttentionEvent("memory"))
+	if health := feed.StoreHealth(); !health.Configured || health.Durable || !strings.Contains(health.LastError, "disk full") {
+		t.Fatalf("health while the open fails = %+v", health)
+	}
+
+	works.Store(true)
+	feed.Append(testAttentionEvent("too soon"))
+	if got := store.appendAttempts.Load(); got != 0 {
+		t.Fatalf("attempts = %d, want 0 inside the retry interval", got)
+	}
+
+	// Replay runs at the same time as the open, for the race detector.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			_, _, _ = feed.Replay(0, 10)
+			_ = feed.StoreHealth()
+		}
+	}()
+	clock.Advance(AttentionStoreRetryInterval)
+	durable := feed.Append(testAttentionEvent("durable"))
+	<-done
+
+	if store.appendAttempts.Load() != 1 || !feed.StoreHealth().Durable {
+		t.Fatalf("attempts %d, health %+v", store.appendAttempts.Load(), feed.StoreHealth())
+	}
+	if durable.Cursor <= memory.Cursor {
+		t.Fatalf("durable cursor %d should sort above memory cursor %d", durable.Cursor, memory.Cursor)
+	}
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "memory", "too soon", "durable")
+	if got := logs.count(attentionStoreRecoveredLogMessage); got != 1 {
+		t.Fatalf("recovery reports = %d, want 1", got)
 	}
 }
 

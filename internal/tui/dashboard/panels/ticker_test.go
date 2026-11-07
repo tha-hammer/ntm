@@ -5,6 +5,18 @@ import (
 	"testing"
 )
 
+func TestTickerPanelFeedWarningComesFirst(t *testing.T) {
+	panel := NewTickerPanel()
+	if got := panel.buildPlainSegments()[0]; strings.Contains(got, "not saving") {
+		t.Fatalf("first segment %q should not be a warning when none is set", got)
+	}
+
+	panel.SetData(TickerData{FeedWarning: "not saving"})
+	if got := panel.buildPlainSegments()[0]; got != "not saving" {
+		t.Fatalf("first segment = %q, want the warning", got)
+	}
+}
+
 func TestNewTickerPanel(t *testing.T) {
 	panel := NewTickerPanel()
 	if panel == nil {

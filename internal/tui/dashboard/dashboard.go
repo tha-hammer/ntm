@@ -3682,6 +3682,10 @@ func (m *Model) seedInitialPanes(panesWithActivity []tmux.PaneActivity) {
 }
 
 // updateTickerData updates the ticker panel with current dashboard data
+// feedMemoryOnlyWarning is shown in the ticker while new attention events can't
+// reach the store.
+const feedMemoryOnlyWarning = "⚠ Events not saving (memory only)"
+
 func (m *Model) updateTickerData() {
 	// Count active agents (those with any known status, not just "working")
 	// "Active" means status has been determined - could be working, idle, error, or compacted
@@ -3747,6 +3751,11 @@ func (m *Model) updateTickerData() {
 		BugsWarning:      m.bugsWarning,
 		BugsInfo:         m.bugsInfo,
 		BugsScanned:      m.bugsScanned,
+	}
+	if feed := robot.PeekAttentionFeed(); feed != nil {
+		if health := feed.StoreHealth(); health.Configured && !health.Durable {
+			data.FeedWarning = feedMemoryOnlyWarning
+		}
 	}
 
 	m.tickerPanel.SetData(data)

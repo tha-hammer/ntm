@@ -1731,6 +1731,32 @@ func (s *Store) GetAttentionEventsInTimeRange(start, end time.Time, limit int) (
 	return scanRangedAttentionEvents(rows)
 }
 
+// ReserveAttentionCursor makes the next attention cursor greater than minCursor.
+// A feed that recovers after an outage calls it first, so its next durable event
+// sorts above the cursors it handed out while it could only keep events in memory.
+// It never lowers the sequence.
+func (s *Store) ReserveAttentionCursor(minCursor int64) error {
+	if minCursor <= 0 {
+		return nil
+	}
+	err := s.Transaction(func(tx *Tx) error {
+		if _, err := tx.tx.Exec(
+			`UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'attention_events'`, minCursor,
+		); err != nil {
+			return err
+		}
+		_, err := tx.tx.Exec(`
+			INSERT INTO sqlite_sequence (name, seq)
+			SELECT 'attention_events', ?
+			WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'attention_events')`, minCursor)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("reserve attention cursor %d: %w", minCursor, err)
+	}
+	return nil
+}
+
 // GetLatestAttentionEventsInTimeRange returns the newest replayable attention
 // events between the provided timestamps, in ascending cursor order.
 func (s *Store) GetLatestAttentionEventsInTimeRange(start, end time.Time, limit int) ([]StoredAttentionEvent, error) {

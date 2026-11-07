@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,11 +13,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard"
@@ -36,6 +40,8 @@ const (
 	closureClosedAgentMailURL = "http://127.0.0.1:1/mcp/"
 
 	closureMailSubject = "durable feed test"
+
+	closureContentionSession = "contention"
 )
 
 // closureEnv is an isolated config, home and working folder for helper processes.
@@ -107,8 +113,50 @@ func (e *closureEnv) run(t *testing.T, mode string, args ...string) string {
 
 type closureRobotEvent struct {
 	Cursor  int64  `json:"cursor"`
+	Session string `json:"session"`
 	Type    string `json:"type"`
 	Summary string `json:"summary"`
+}
+
+// readAllCursors pages through --robot-events in new processes and returns the
+// cursors of one session's events. The reader's own startup can add other events.
+func readAllCursors(t *testing.T, env *closureEnv, session string) []int64 {
+	t.Helper()
+	const maxPages = 100
+	cursors := []int64{}
+	since := int64(0)
+	for page := 0; page < maxPages; page++ {
+		out := env.run(t, "execute", "--robot-events", fmt.Sprintf("--since-cursor=%d", since), "--events-limit=100")
+		for _, event := range parseRobotEvents(t, out) {
+			if event.Session == session {
+				cursors = append(cursors, event.Cursor)
+			}
+		}
+		var paging struct {
+			NextCursor int64 `json:"next_cursor"`
+			HasMore    bool  `json:"has_more"`
+		}
+		if err := json.Unmarshal([]byte(out), &paging); err != nil {
+			t.Fatalf("parse paging fields: %v\noutput: %s", err, out)
+		}
+		if !paging.HasMore {
+			return cursors
+		}
+		since = paging.NextCursor
+	}
+	t.Fatalf("still more events after %d pages", maxPages)
+	return nil
+}
+
+func allDistinct(cursors []int64) bool {
+	seen := make(map[int64]struct{}, len(cursors))
+	for _, cursor := range cursors {
+		if _, duplicate := seen[cursor]; duplicate {
+			return false
+		}
+		seen[cursor] = struct{}{}
+	}
+	return true
 }
 
 // parseRobotEvents requires the events array to be present, so output that
@@ -141,6 +189,8 @@ func runClosureHelper(mode string) int {
 		return closureHelperExecute(args)
 	case "append-old-events":
 		return closureHelperAppendOldEvents(args)
+	case "append-events":
+		return closureHelperAppendEvents(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown closure helper mode %q\n", mode)
 		return 2
@@ -216,6 +266,46 @@ func closureHelperAppendOldEvents(args []string) int {
 	return 0
 }
 
+// closureHelperAppendEvents goes through real startup and appends count events.
+// It exits non-zero if its feed ended up memory-only, which is how a silent drop
+// to memory shows up in the parent.
+func closureHelperAppendEvents(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "append-events needs a count")
+		return 2
+	}
+	count, err := strconv.Atoi(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	os.Args = []string{"ntm", "dashboard"}
+	if err := rootCmd.PersistentPreRunE(newDashboardCmd(), nil); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeRobotPersistence()
+
+	feed := robot.GetAttentionFeed()
+	for i := 0; i < count; i++ {
+		feed.Append(robot.AttentionEvent{
+			Session:       closureContentionSession,
+			Category:      robot.EventCategorySystem,
+			Type:          robot.EventTypeSystemHealthChange,
+			Source:        "closure-test",
+			Actionability: robot.ActionabilityBackground,
+			Severity:      robot.SeverityInfo,
+			Summary:       fmt.Sprintf("writer %d event %d", os.Getpid(), i),
+		})
+	}
+	if health := feed.StoreHealth(); !health.Durable {
+		fmt.Fprintf(os.Stderr, "feed is memory-only: %+v\n", health)
+		return 1
+	}
+	return 0
+}
+
 // closureHelperExecute runs a real ntm command line through Execute.
 func closureHelperExecute(args []string) int {
 	os.Args = append([]string{"ntm"}, args...)
@@ -263,6 +353,84 @@ func TestClosure_OldCursorNotExpired(t *testing.T) {
 		}
 	}
 	t.Fatalf("second event not returned: %s", out)
+}
+
+func TestSendDashboardLogsToFile(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataDir)
+	previousSlog := slog.Default()
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+
+	restore := sendDashboardLogsToFile("logsess")
+	slog.Warn("structured line for the file")
+	log.Print("plain line for the file")
+	restore()
+
+	if slog.Default() != previousSlog {
+		t.Fatal("slog default wasn't restored")
+	}
+	if log.Writer() != previousWriter || log.Flags() != previousFlags {
+		t.Fatal("log package output wasn't restored")
+	}
+	data, err := os.ReadFile(filepath.Join(resilience.LogDir(), "logsess-dashboard.log"))
+	if err != nil {
+		t.Fatalf("read dashboard log: %v", err)
+	}
+	for _, want := range []string{"structured line for the file", "plain line for the file"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("dashboard log lacks %q: %s", want, data)
+		}
+	}
+}
+
+func TestSendDashboardLogsToFile_UnwritableDirStaysOffScreen(t *testing.T) {
+	// A file where the log folder should go makes the log file impossible to open.
+	dataDir := t.TempDir()
+	blocker := filepath.Join(dataDir, "ntm")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatalf("create blocker: %v", err)
+	}
+	t.Setenv("XDG_DATA_HOME", dataDir)
+	previousWriter := log.Writer()
+
+	restore := sendDashboardLogsToFile("logsess")
+	defer restore()
+	if log.Writer() == previousWriter {
+		t.Fatal("log output still goes to the terminal, which would garble the screen")
+	}
+}
+
+func TestClosure_ManyWritersOneStateDB(t *testing.T) {
+	const (
+		writers         = 8
+		eventsPerWriter = 50
+	)
+	env := newClosureEnv(t)
+	var wg sync.WaitGroup
+	errs := make(chan string, writers)
+	start := time.Now()
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if out, err := env.tryRun("append-events", strconv.Itoa(eventsPerWriter)); err != nil {
+				errs <- fmt.Sprintf("%v: %s", err, out)
+			}
+		}()
+	}
+	wg.Wait()
+	writeTime := time.Since(start)
+	close(errs)
+	for failure := range errs {
+		t.Errorf("writer failed: %s", failure)
+	}
+
+	cursors := readAllCursors(t, env, closureContentionSession)
+	t.Logf("%d writers, %d events, written in %s", writers, len(cursors), writeTime)
+	if len(cursors) != writers*eventsPerWriter || !allDistinct(cursors) {
+		t.Fatalf("got %d events (distinct: %v), want %d distinct", len(cursors), allDistinct(cursors), writers*eventsPerWriter)
+	}
 }
 
 func TestClosure_VersionDoesNotOpenStore(t *testing.T) {

@@ -6,17 +6,53 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard"
 	"github.com/Dicklesworthstone/ntm/internal/watcher"
 )
+
+// sendDashboardLogsToFile routes slog and the log package to the session's
+// dashboard log, and returns the function that puts them back. The TUI owns the
+// screen, so a log line on stderr would garble it. If the file can't be opened,
+// logs are discarded for the same reason.
+func sendDashboardLogsToFile(session string) func() {
+	previousSlog := slog.Default()
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+
+	var output io.Writer = io.Discard
+	var logFile *os.File
+	logDir := resilience.LogDir()
+	if err := os.MkdirAll(logDir, 0o755); err == nil {
+		path := filepath.Join(logDir, session+"-dashboard.log")
+		if file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			logFile = file
+			output = file
+		}
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(output, nil)))
+
+	return func() {
+		// SetDefault leaves the log package pointing at the handler above when the
+		// previous logger is slog's built-in one, so restore that output directly.
+		slog.SetDefault(previousSlog)
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+	}
+}
 
 func newDashboardCmd() *cobra.Command {
 	var noTUI bool
@@ -452,6 +488,8 @@ func runDashboard(w io.Writer, errW io.Writer, session string, debug bool, popup
 			defer stopWatcher()
 		}
 	}
+
+	defer sendDashboardLogsToFile(session)()
 
 	action, err := dashboard.RunWithOptions(session, projectDir, dashboard.RunOptions{
 		PopupMode:       popup,

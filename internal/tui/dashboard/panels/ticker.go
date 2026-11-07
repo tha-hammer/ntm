@@ -12,6 +12,9 @@ import (
 
 // TickerData holds the data displayed in the ticker
 type TickerData struct {
+	// FeedWarning, when set, is shown as the first segment.
+	FeedWarning string
+
 	// Fleet status
 	TotalAgents      int
 	ActiveAgents     int
@@ -190,6 +193,11 @@ func (m *TickerPanel) attachOverflowBadge(text, badge string) string {
 // buildPlainSegments creates plain text segments without ANSI styling
 func (m *TickerPanel) buildPlainSegments() []string {
 	var segments []string
+
+	// A warning goes first, so scrolling doesn't hide it for long
+	if m.data.FeedWarning != "" {
+		segments = append(segments, m.data.FeedWarning)
+	}
 
 	// Fleet segment (plain)
 	fleetSegment := m.buildPlainFleetSegment()

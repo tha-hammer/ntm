@@ -151,7 +151,7 @@ Do this with no other ntm agents running, because the lock blocks all writers to
 2. In another shell, hold the lock for 60 seconds: `printf 'BEGIN EXCLUSIVE;\n.shell sleep 60\nCOMMIT;\n' | sqlite3 ~/.config/ntm/state.db`.
 3. Send mail: `/tmp/ntm-loop1 mail send feedtest --to <agent> "during lock"`. If the command itself is blocked by the lock, note that and send it through the agent's MCP tools instead.
 4. Within about 60 seconds, the dashboard shows the ticker warning.
-5. Let the lock end. Send another message: `/tmp/ntm-loop1 mail send feedtest --to <agent> "after lock"`.
-6. Wait for the next poll. The ticker warning clears.
+5. Let the lock end, then wait 35 seconds, because the feed waits 30 seconds between store retries. Send another message: `/tmp/ntm-loop1 mail send feedtest --to <agent> "after lock"`.
+6. Wait for the next poll, up to 60 seconds. The ticker warning clears.
 7. Run `sqlite3 -readonly ~/.config/ntm/state.db "select summary from attention_events where event_type='mail.received' order by cursor desc limit 3"`.
 8. Pass: the "after lock" message is listed, written by the same dashboard you never restarted.

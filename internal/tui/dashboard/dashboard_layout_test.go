@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -106,6 +107,113 @@ func firstNonEmptyLines(s string, limit int) []string {
 		}
 	}
 	return lines
+}
+
+// feedFaultStore is a real store whose appends fail on demand.
+type feedFaultStore struct {
+	*state.Store
+	fail atomic.Bool
+}
+
+func (s *feedFaultStore) AppendAttentionEvent(event *state.StoredAttentionEvent) (int64, error) {
+	if s.fail.Load() {
+		return 0, errors.New("injected append failure")
+	}
+	return s.Store.AppendAttentionEvent(event)
+}
+
+func feedWarningEvent(summary string) robot.AttentionEvent {
+	return robot.AttentionEvent{
+		Session:       "test",
+		Category:      robot.EventCategorySystem,
+		Type:          robot.EventTypeSystemHealthChange,
+		Source:        "test",
+		Actionability: robot.ActionabilityBackground,
+		Severity:      robot.SeverityInfo,
+		Summary:       summary,
+	}
+}
+
+func installFeedForWarningTest(t *testing.T, feed *robot.AttentionFeed) {
+	t.Helper()
+	old := robot.PeekAttentionFeed()
+	t.Cleanup(func() { robot.SetAttentionFeed(old) })
+	robot.SetAttentionFeed(feed)
+}
+
+func tickDashboard(t *testing.T, m Model) Model {
+	t.Helper()
+	updated, _ := m.Update(DashboardTickMsg(time.Now()))
+	model, ok := updated.(Model)
+	if !ok {
+		t.Fatalf("Update() returned %T, want dashboard.Model", updated)
+	}
+	return model
+}
+
+func TestClosure_DashboardWarnsWhileFeedIsMemoryOnly(t *testing.T) {
+	lockAttentionFeedForTest(t)
+	realStore, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = realStore.Close() })
+	if err := realStore.Migrate(); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+	store := &feedFaultStore{Store: realStore}
+	clockNow := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	feed := robot.NewAttentionFeed(robot.DefaultAttentionFeedConfig(),
+		robot.WithAttentionStore(store),
+		robot.WithAttentionClock(func() time.Time { return clockNow }))
+	t.Cleanup(feed.Stop)
+	installFeedForWarningTest(t, feed)
+
+	m := newTestModel(200)
+	m = tickDashboard(t, m)
+	if strings.Contains(status.StripANSI(m.View()), feedMemoryOnlyWarning) {
+		t.Fatal("warning shown while the store is working")
+	}
+
+	store.fail.Store(true)
+	feed.Append(feedWarningEvent("down"))
+	m = tickDashboard(t, m)
+	if !strings.Contains(status.StripANSI(m.View()), feedMemoryOnlyWarning) {
+		t.Fatal("no warning while memory-only")
+	}
+
+	store.fail.Store(false)
+	clockNow = clockNow.Add(robot.AttentionStoreRetryInterval)
+	feed.Append(feedWarningEvent("back"))
+	m = tickDashboard(t, m)
+	if strings.Contains(status.StripANSI(m.View()), feedMemoryOnlyWarning) {
+		t.Fatal("warning still shown after recovery")
+	}
+}
+
+func TestDashboardFeedWarning_NotShownWithoutAStore(t *testing.T) {
+	tests := []struct {
+		name string
+		feed func(t *testing.T) *robot.AttentionFeed
+	}{
+		{name: "no feed yet", feed: func(t *testing.T) *robot.AttentionFeed { return nil }},
+		{name: "feed with no store configured", feed: func(t *testing.T) *robot.AttentionFeed {
+			feed := robot.NewAttentionFeed(robot.AttentionFeedConfig{JournalSize: 16, RetentionPeriod: time.Hour})
+			t.Cleanup(feed.Stop)
+			feed.Append(feedWarningEvent("memory only by design"))
+			return feed
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lockAttentionFeedForTest(t)
+			installFeedForWarningTest(t, tt.feed(t))
+			m := tickDashboard(t, newTestModel(200))
+			if strings.Contains(status.StripANSI(m.View()), feedMemoryOnlyWarning) {
+				t.Fatal("warning shown with no store to fail")
+			}
+		})
+	}
 }
 
 func TestViewFitsHeightAndFooterOnce(t *testing.T) {

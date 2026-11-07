@@ -3,6 +3,7 @@
 package state
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
@@ -290,41 +291,60 @@ func ApplyMigrations(db *sql.DB) error {
 			return err
 		}
 
-		err = func() error {
-			tx, err := db.Begin()
-			if err != nil {
-				return fmt.Errorf("begin transaction for migration %s: %w", filename, err)
-			}
-			committed := false
-			defer func() {
-				if !committed {
-					_ = tx.Rollback()
-				}
-			}()
-
-			if _, err := tx.Exec(content); err != nil {
-				return fmt.Errorf("execute migration %s: %w", filename, err)
-			}
-
-			// Record migration
-			if _, err := tx.Exec(
-				"INSERT INTO _migrations (version, name) VALUES (?, ?)",
-				version, filename,
-			); err != nil {
-				return fmt.Errorf("record migration %s: %w", filename, err)
-			}
-
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("commit migration %s: %w", filename, err)
-			}
-			committed = true
-			return nil
-		}()
-
-		if err != nil {
+		if err := applyMigration(db, version, filename, content); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+// applyMigration runs one migration unless another process got there first.
+// Any ntm process can be the first to use a new state.db, so several can reach
+// the same pending migration at once. BEGIN IMMEDIATE takes the write lock before
+// the applied check, which makes the check and the migration one atomic step.
+func applyMigration(db *sql.DB, version int, filename, content string) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("get connection for migration %s: %w", filename, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin transaction for migration %s: %w", filename, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	var applied int
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM _migrations WHERE version = ?", version,
+	).Scan(&applied); err != nil {
+		return fmt.Errorf("check migration %s: %w", filename, err)
+	}
+	if applied > 0 {
+		return nil
+	}
+
+	if _, err := conn.ExecContext(ctx, content); err != nil {
+		return fmt.Errorf("execute migration %s: %w", filename, err)
+	}
+
+	if _, err := conn.ExecContext(ctx,
+		"INSERT INTO _migrations (version, name) VALUES (?, ?)",
+		version, filename,
+	); err != nil {
+		return fmt.Errorf("record migration %s: %w", filename, err)
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit migration %s: %w", filename, err)
+	}
+	committed = true
 	return nil
 }

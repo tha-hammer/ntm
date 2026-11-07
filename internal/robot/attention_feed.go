@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +37,9 @@ type AttentionStore interface {
 	// GetLatestAttentionEventsInTimeRange returns the newest events inside a
 	// bounded time window, in ascending cursor order.
 	GetLatestAttentionEventsInTimeRange(start, end time.Time, limit int) ([]state.StoredAttentionEvent, error)
+
+	// ReserveAttentionCursor makes the next cursor greater than minCursor.
+	ReserveAttentionCursor(minCursor int64) error
 	// GetAttentionItemStatesForCursors returns durable operator state keyed by cursor.
 	GetAttentionItemStatesForCursors(cursors []int64) (map[int64]state.AttentionItemState, error)
 	// GetAttentionReplayWindow returns the currently replayable cursor range.
@@ -285,27 +289,6 @@ func (j *AttentionJournal) Stats() JournalStats {
 	}
 }
 
-// RangeStats returns retained journal stats for entries with cursor >= minCursor.
-func (j *AttentionJournal) RangeStats(minCursor int64) (count int, oldest, newest int64) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	j.pruneLocked(time.Now())
-
-	for _, entry := range j.entries {
-		if entry.event.Cursor < minCursor {
-			continue
-		}
-		if count == 0 {
-			oldest = entry.event.Cursor
-		}
-		count++
-		newest = entry.event.Cursor
-	}
-
-	return count, oldest, newest
-}
-
 func (j *AttentionJournal) pruneLocked(now time.Time) {
 	if len(j.entries) == 0 {
 		j.oldest = 0
@@ -411,18 +394,21 @@ type AttentionFeed struct {
 	config  AttentionFeedConfig
 	cursor  *CursorAllocator
 	journal *AttentionJournal
-	store   AttentionStore // Optional SQLite store for durable persistence
 
-	storeOpener       AttentionStoreOpener // Opens the store when the feed is built
-	storeOpenErr      error                // Why storeOpener produced no store
-	storeOpenFailedAt time.Time
+	store       atomic.Pointer[AttentionStore] // Optional SQLite store; read through currentStore
+	storeOpener AttentionStoreOpener           // Opens the store when the feed is built, and on retries
+	outage      atomic.Pointer[attentionStoreOutage]
+	now         func() time.Time // Times store retries; time.Now unless a test sets it
 
-	appendMu            sync.Mutex
-	ephemeralFromCursor atomic.Int64 // First cursor that exists only in-memory after store write failure
-	pendingEvents       []AttentionEvent
-	drainingEvents      bool
-	dedupMu             sync.Mutex
-	recentDedup         map[string]attentionDedupEntry
+	memoryMu          sync.RWMutex
+	memoryOnly        []AttentionEvent // Events a store-configured feed couldn't save, in cursor order
+	outageMemoryCount int              // Memory-only events in the current outage; guarded by appendMu
+
+	appendMu       sync.Mutex
+	pendingEvents  []AttentionEvent
+	drainingEvents bool
+	dedupMu        sync.Mutex
+	recentDedup    map[string]attentionDedupEntry
 
 	subMu     sync.RWMutex
 	subNextID atomic.Uint64
@@ -485,7 +471,26 @@ type AttentionFeedOption func(*AttentionFeed)
 // When set, events are persisted to survive restarts and support cursor-based replay.
 func WithAttentionStore(store AttentionStore) AttentionFeedOption {
 	return func(f *AttentionFeed) {
-		f.store = store
+		if store != nil {
+			f.store.Store(&store)
+		}
+	}
+}
+
+const (
+	attentionStoreDownLogMessage      = "attention feed store unavailable"
+	attentionStoreRecoveredLogMessage = "attention feed store recovered"
+)
+
+// AttentionStoreRetryInterval is how long a feed waits before trying its store
+// again after a failure. Each try can block for the store's whole busy timeout,
+// and the dashboard appends inside its update loop, so tries must stay rare.
+const AttentionStoreRetryInterval = 30 * time.Second
+
+// WithAttentionClock sets the clock the feed uses to time store retries.
+func WithAttentionClock(now func() time.Time) AttentionFeedOption {
+	return func(f *AttentionFeed) {
+		f.now = now
 	}
 }
 
@@ -514,31 +519,153 @@ type AttentionStoreHealth struct {
 
 // StoreHealth reports whether new events reach durable storage.
 func (f *AttentionFeed) StoreHealth() AttentionStoreHealth {
-	health := AttentionStoreHealth{Configured: f.store != nil || f.storeOpener != nil}
-	if f.storeOpenErr != nil {
-		health.LastError = f.storeOpenErr.Error()
-		health.Since = f.storeOpenFailedAt
+	health := AttentionStoreHealth{Configured: f.storeConfigured()}
+	if outage := f.outage.Load(); outage != nil {
+		health.LastError = outage.lastErr
+		health.Since = outage.since
 		return health
 	}
-	health.Durable = f.store != nil && f.ephemeralFromCursor.Load() == 0
+	health.Durable = f.currentStore() != nil
 	return health
 }
 
-func (f *AttentionFeed) openStoreFromOpener() {
-	if f.storeOpener == nil || f.store != nil {
-		return
+// attentionStoreOutage describes a current store failure. Only Append changes it,
+// under appendMu, and it replaces the whole value, so readers never need that
+// lock. Append holds appendMu during store writes, which can block for seconds.
+type attentionStoreOutage struct {
+	lastErr   string
+	since     time.Time
+	nextRetry time.Time
+}
+
+// currentStore returns the store, or nil when the feed has none yet. A failed
+// open can succeed later, so the store can appear while other goroutines read it.
+func (f *AttentionFeed) currentStore() AttentionStore {
+	if store := f.store.Load(); store != nil {
+		return *store
 	}
+	return nil
+}
+
+func (f *AttentionFeed) storeConfigured() bool {
+	return f.currentStore() != nil || f.storeOpener != nil
+}
+
+// storeForAppendLocked returns the store to try for this append, opening it if an
+// earlier open failed. It returns nil when there's no store, or when the retry
+// interval since the last failure hasn't passed.
+func (f *AttentionFeed) storeForAppendLocked() AttentionStore {
+	if !f.storeConfigured() {
+		return nil
+	}
+	if outage := f.outage.Load(); outage != nil && f.now().Before(outage.nextRetry) {
+		return nil
+	}
+	if store := f.currentStore(); store != nil {
+		return store
+	}
+	return f.openStoreLocked()
+}
+
+// openStoreLocked opens the store through the opener. On failure the feed keeps
+// working in memory and reports the outage.
+func (f *AttentionFeed) openStoreLocked() AttentionStore {
 	store, err := f.storeOpener()
 	if err == nil && store == nil {
 		err = errors.New("attention store opener returned no store")
 	}
 	if err != nil {
-		f.storeOpenErr = err
-		f.storeOpenFailedAt = time.Now()
-		log.Printf("attention feed: store unavailable, events stay in memory for this process: %v", err)
+		f.markStoreDownLocked(err)
+		return nil
+	}
+	f.store.Store(&store)
+	f.syncCursorFromStore()
+	return store
+}
+
+// appendToStoreLocked saves an event and returns its cursor. After an outage it
+// first raises the store's sequence above every cursor this process handed out in
+// memory, so the durable event sorts after them. Another process can still take a
+// cursor a memory-only event used during the outage. That's the accepted limit in
+// the Loop 1 plan: replay here keeps both events, and other processes read only
+// the store.
+func (f *AttentionFeed) appendToStoreLocked(store AttentionStore, event AttentionEvent) (int64, error) {
+	if f.outage.Load() != nil {
+		if err := store.ReserveAttentionCursor(f.cursor.Current()); err != nil {
+			return 0, err
+		}
+	}
+	stored := attentionEventToStored(event, f.config.RetentionPeriod)
+	return store.AppendAttentionEvent(&stored)
+}
+
+// markStoreDownLocked records a failed store attempt and sets the next retry.
+// It reports only the change from working to down.
+func (f *AttentionFeed) markStoreDownLocked(err error) {
+	now := f.now()
+	outage := &attentionStoreOutage{
+		lastErr:   err.Error(),
+		since:     now,
+		nextRetry: now.Add(AttentionStoreRetryInterval),
+	}
+	if previous := f.outage.Load(); previous != nil {
+		outage.since = previous.since
+	} else {
+		slog.Warn(attentionStoreDownLogMessage, "err", err)
+	}
+	f.outage.Store(outage)
+}
+
+// markStoreRecoveredLocked ends an outage. It reports only the change back.
+func (f *AttentionFeed) markStoreRecoveredLocked() {
+	if f.outage.Load() == nil {
 		return
 	}
-	f.store = store
+	slog.Info(attentionStoreRecoveredLogMessage, "memory_only_count", f.outageMemoryCount)
+	f.outageMemoryCount = 0
+	f.outage.Store(nil)
+}
+
+// rememberMemoryOnlyLocked keeps an unsaved event readable by this process. The
+// oldest are dropped past the journal size.
+func (f *AttentionFeed) rememberMemoryOnlyLocked(event AttentionEvent) {
+	f.outageMemoryCount++
+	f.memoryMu.Lock()
+	defer f.memoryMu.Unlock()
+	f.memoryOnly = append(f.memoryOnly, cloneAttentionEvent(event))
+	if excess := len(f.memoryOnly) - f.config.JournalSize; excess > 0 {
+		f.memoryOnly = append(f.memoryOnly[:0], f.memoryOnly[excess:]...)
+	}
+}
+
+func (f *AttentionFeed) memoryOnlySince(sinceCursor int64) []AttentionEvent {
+	f.memoryMu.RLock()
+	defer f.memoryMu.RUnlock()
+	events := make([]AttentionEvent, 0, len(f.memoryOnly))
+	for _, event := range f.memoryOnly {
+		if event.Cursor > sinceCursor {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+// mergeByCursor merges two lists sorted by cursor. On equal cursors, which only
+// happen in the accepted limit described at appendToStoreLocked, both events are
+// kept and the durable one comes first.
+func mergeByCursor(durable, memoryOnly []AttentionEvent) []AttentionEvent {
+	merged := make([]AttentionEvent, 0, len(durable)+len(memoryOnly))
+	for len(durable) > 0 && len(memoryOnly) > 0 {
+		if memoryOnly[0].Cursor < durable[0].Cursor {
+			merged = append(merged, memoryOnly[0])
+			memoryOnly = memoryOnly[1:]
+			continue
+		}
+		merged = append(merged, durable[0])
+		durable = durable[1:]
+	}
+	merged = append(merged, durable...)
+	return append(merged, memoryOnly...)
 }
 
 // NewAttentionFeed creates a new attention feed service.
@@ -554,6 +681,7 @@ func NewAttentionFeed(config AttentionFeedConfig, opts ...AttentionFeedOption) *
 		recentDedup: make(map[string]attentionDedupEntry),
 		subs:        make(map[uint64]subscription),
 		stopCh:      make(chan struct{}),
+		now:         time.Now,
 	}
 
 	// Apply options
@@ -561,10 +689,12 @@ func NewAttentionFeed(config AttentionFeedConfig, opts ...AttentionFeedOption) *
 		opt(feed)
 	}
 
-	feed.openStoreFromOpener()
-
-	// Sync cursor from store if available
-	feed.syncCursorFromStore()
+	// Open the store if the feed has only an opener. Sync the cursor either way.
+	if feed.storeOpener != nil && feed.currentStore() == nil {
+		feed.openStoreLocked()
+	} else {
+		feed.syncCursorFromStore()
+	}
 
 	// Start heartbeat if configured
 	if config.HeartbeatInterval > 0 {
@@ -597,23 +727,23 @@ func (f *AttentionFeed) Append(event AttentionEvent) AttentionEvent {
 
 	f.appendMu.Lock()
 
-	// Persist to store if available (store assigns cursor via AUTOINCREMENT).
-	// If a store write fails once, switch new events to journal-only mode so
-	// cursor allocation remains monotonic and replay stays internally consistent.
-	if f.store != nil && f.ephemeralFromCursor.Load() == 0 {
-		stored := attentionEventToStored(event, f.config.RetentionPeriod)
-		cursor, err := f.store.AppendAttentionEvent(&stored)
+	// Persist to store if available (store assigns cursor via AUTOINCREMENT). While
+	// the store is down, events stay in memory and the store is retried at intervals.
+	if store := f.storeForAppendLocked(); store != nil {
+		cursor, err := f.appendToStoreLocked(store, event)
 		if err == nil {
 			event.Cursor = cursor
 			f.cursor.counter.Store(cursor)
+			f.markStoreRecoveredLocked()
 		} else {
 			event.Cursor = f.cursor.Next()
-			f.ephemeralFromCursor.CompareAndSwap(0, event.Cursor)
+			f.markStoreDownLocked(err)
+			f.rememberMemoryOnlyLocked(event)
 		}
 	} else {
 		event.Cursor = f.cursor.Next()
-		if f.store != nil {
-			f.ephemeralFromCursor.CompareAndSwap(0, event.Cursor)
+		if f.storeConfigured() {
+			f.rememberMemoryOnlyLocked(event)
 		}
 	}
 
@@ -1008,19 +1138,20 @@ func (f *AttentionFeed) drainPendingEvents() {
 // Use cursor=-1 to get no events and just the current cursor.
 // When a store is configured, replays from SQLite for durable cursor semantics.
 func (f *AttentionFeed) Replay(sinceCursor int64, limit int) ([]AttentionEvent, int64, error) {
-	if f.store != nil {
-		return f.replayFromStore(sinceCursor, limit)
+	if store := f.currentStore(); store != nil {
+		return f.replayFromStore(store, sinceCursor, limit)
 	}
 	return f.journal.Replay(sinceCursor, limit)
 }
 
 // ReplayForIncident returns replayable attention events around an incident's timeline.
 func (f *AttentionFeed) ReplayForIncident(incidentID string, windowBefore, windowAfter time.Duration) ([]AttentionEvent, int64, error) {
-	if f.store == nil {
+	store := f.currentStore()
+	if store == nil {
 		return nil, 0, fmt.Errorf("attention replay store unavailable")
 	}
 
-	incident, err := f.store.GetIncident(incidentID)
+	incident, err := store.GetIncident(incidentID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("load incident: %w", err)
 	}
@@ -1046,7 +1177,7 @@ func (f *AttentionFeed) ReplayForIncident(incidentID string, windowBefore, windo
 		maxIncidentQueryLimit = 2048
 	)
 	limit := minInt(maxInt(incident.EventCount+incidentEventPadding, minIncidentQueryLimit), maxIncidentQueryLimit)
-	linkedEvents, err := f.store.GetEventsForIncident(incidentID, limit)
+	linkedEvents, err := store.GetEventsForIncident(incidentID, limit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("load linked incident events: %w", err)
 	}
@@ -1064,7 +1195,7 @@ func (f *AttentionFeed) ReplayForIncident(incidentID string, windowBefore, windo
 		end = start
 	}
 
-	rangeEvents, err := f.store.GetAttentionEventsInTimeRange(start, end, limit)
+	rangeEvents, err := store.GetAttentionEventsInTimeRange(start, end, limit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("load incident replay window: %w", err)
 	}
@@ -1076,7 +1207,8 @@ func (f *AttentionFeed) ReplayForIncident(incidentID string, windowBefore, windo
 
 // ReconstructAsOf returns the most recent bounded replayable attention context at or before a timestamp.
 func (f *AttentionFeed) ReconstructAsOf(timestamp time.Time, limit int) ([]AttentionEvent, *ReconstructionMeta, error) {
-	if f.store == nil {
+	store := f.currentStore()
+	if store == nil {
 		return nil, nil, fmt.Errorf("attention replay store unavailable")
 	}
 
@@ -1101,7 +1233,7 @@ func (f *AttentionFeed) ReconstructAsOf(timestamp time.Time, limit int) ([]Atten
 	)
 	queryLimit := minInt(maxInt(limit*queryOverfetchFactor, limit), absoluteMaxQueryLimit)
 
-	storedEvents, err := f.store.GetLatestAttentionEventsInTimeRange(requestedAt.Add(-lookback), requestedAt, queryLimit)
+	storedEvents, err := store.GetLatestAttentionEventsInTimeRange(requestedAt.Add(-lookback), requestedAt, queryLimit)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reconstruct attention as-of: %w", err)
 	}
@@ -1152,8 +1284,8 @@ func (f *AttentionFeed) CurrentCursor() int64 {
 // Stats returns journal statistics for observability.
 // When a store is configured, returns stats based on durable storage.
 func (f *AttentionFeed) Stats() JournalStats {
-	if f.store != nil {
-		stats, err := f.storeBackedStats()
+	if store := f.currentStore(); store != nil {
+		stats, err := f.storeBackedStats(store)
 		if err == nil {
 			return stats
 		}
@@ -3953,21 +4085,24 @@ func maxInt(a, b int) int {
 // Store-backed Operations (bd-j9jo3.4.1)
 // =============================================================================
 
-// syncCursorFromStore initializes the cursor allocator from durable storage.
+// syncCursorFromStore raises the cursor allocator to the store's latest cursor. It
+// never lowers it, because a store opened late may sit below memory-only cursors.
 func (f *AttentionFeed) syncCursorFromStore() {
-	if f.store == nil {
+	store := f.currentStore()
+	if store == nil {
 		return
 	}
 
-	latestCursor, err := f.store.GetLatestEventCursor()
-	if err == nil && latestCursor > 0 {
+	latestCursor, err := store.GetLatestEventCursor()
+	if err == nil && latestCursor > f.cursor.Current() {
 		f.cursor.counter.Store(latestCursor)
 	}
 }
 
-// replayFromStore reads events from SQLite with cursor expiration handling.
-func (f *AttentionFeed) replayFromStore(sinceCursor int64, limit int) ([]AttentionEvent, int64, error) {
-	window, err := f.store.GetAttentionReplayWindow()
+// replayFromStore reads events from SQLite with cursor expiration handling, and
+// merges in events this process could only keep in memory.
+func (f *AttentionFeed) replayFromStore(store AttentionStore, sinceCursor int64, limit int) ([]AttentionEvent, int64, error) {
+	window, err := store.GetAttentionReplayWindow()
 	if err != nil {
 		// Fallback to in-memory journal
 		events, newestCursor, replayErr := f.journal.Replay(sinceCursor, limit)
@@ -3996,25 +4131,18 @@ func (f *AttentionFeed) replayFromStore(sinceCursor int64, limit int) ([]Attenti
 	}
 
 	// GC expired events periodically
-	_, _ = f.store.GCExpiredEvents()
+	_, _ = store.GCExpiredEvents()
 
-	storedEvents, err := f.store.GetAttentionEventsSince(sinceCursor, limit)
+	storedEvents, err := store.GetAttentionEventsSince(sinceCursor, limit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("replay attention events from store: %w", err)
 	}
-	events := f.hydrateStoredAttentionEvents(storedEvents)
-
-	if tailStart := f.ephemeralFromCursor.Load(); tailStart > 0 && len(events) < limit {
-		journalSince := sinceCursor
-		if journalSince < tailStart-1 {
-			journalSince = tailStart - 1
-		}
-		tail, journalCursor, err := f.journal.Replay(journalSince, limit-len(events))
-		if err != nil {
-			return nil, 0, err
-		}
-		events = append(events, f.hydrateReplayEvents(tail)...)
-		return events, maxCursor(window.NewestCursor, journalCursor), nil
+	events := mergeByCursor(
+		f.hydrateStoredAttentionEvents(storedEvents),
+		f.hydrateReplayEvents(f.memoryOnlySince(sinceCursor)),
+	)
+	if len(events) > limit {
+		events = events[:limit]
 	}
 
 	return events, maxCursor(window.NewestCursor, f.cursor.Current()), nil
@@ -4022,12 +4150,12 @@ func (f *AttentionFeed) replayFromStore(sinceCursor int64, limit int) ([]Attenti
 
 func (f *AttentionFeed) hydrateStoredAttentionEvents(storedEvents []state.StoredAttentionEvent) []AttentionEvent {
 	itemStates := map[int64]state.AttentionItemState{}
-	if len(storedEvents) > 0 {
+	if store := f.currentStore(); store != nil && len(storedEvents) > 0 {
 		cursors := make([]int64, 0, len(storedEvents))
 		for _, stored := range storedEvents {
 			cursors = append(cursors, stored.Cursor)
 		}
-		if loaded, err := f.store.GetAttentionItemStatesForCursors(cursors); err == nil {
+		if loaded, err := store.GetAttentionItemStatesForCursors(cursors); err == nil {
 			itemStates = loaded
 		}
 	}
@@ -4048,7 +4176,8 @@ func (f *AttentionFeed) hydrateStoredAttentionEvents(storedEvents []state.Stored
 }
 
 func (f *AttentionFeed) hydrateReplayEvents(events []AttentionEvent) []AttentionEvent {
-	if f.store == nil || len(events) == 0 {
+	store := f.currentStore()
+	if store == nil || len(events) == 0 {
 		return events
 	}
 
@@ -4061,7 +4190,7 @@ func (f *AttentionFeed) hydrateReplayEvents(events []AttentionEvent) []Attention
 
 	itemStates := map[int64]state.AttentionItemState{}
 	if len(cursors) > 0 {
-		if loaded, err := f.store.GetAttentionItemStatesForCursors(cursors); err == nil {
+		if loaded, err := store.GetAttentionItemStatesForCursors(cursors); err == nil {
 			itemStates = loaded
 		}
 	}
@@ -4123,8 +4252,8 @@ func maxStoredAttentionCursor(events []state.StoredAttentionEvent, fallback int6
 }
 
 // storeBackedStats returns journal stats from durable storage.
-func (f *AttentionFeed) storeBackedStats() (JournalStats, error) {
-	window, err := f.store.GetAttentionReplayWindow()
+func (f *AttentionFeed) storeBackedStats(store AttentionStore) (JournalStats, error) {
+	window, err := store.GetAttentionReplayWindow()
 	if err != nil {
 		return JournalStats{}, err
 	}
@@ -4145,13 +4274,12 @@ func (f *AttentionFeed) storeBackedStats() (JournalStats, error) {
 	}
 	stats.RetentionPeriod = f.config.RetentionPeriod
 
-	if tailStart := f.ephemeralFromCursor.Load(); tailStart > 0 {
-		tailCount, tailOldest, tailNewest := f.journal.RangeStats(tailStart)
-		stats.Count += tailCount
-		if stats.OldestCursor == 0 && tailCount > 0 {
-			stats.OldestCursor = tailOldest
+	if memoryOnly := f.memoryOnlySince(0); len(memoryOnly) > 0 {
+		stats.Count += len(memoryOnly)
+		if stats.OldestCursor == 0 || memoryOnly[0].Cursor < stats.OldestCursor {
+			stats.OldestCursor = memoryOnly[0].Cursor
 		}
-		stats.NewestCursor = maxCursor(stats.NewestCursor, tailNewest)
+		stats.NewestCursor = maxCursor(stats.NewestCursor, memoryOnly[len(memoryOnly)-1].Cursor)
 	}
 
 	return stats, nil

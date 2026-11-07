@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2236,5 +2237,131 @@ func appendRangeEvent(t *testing.T, store *Store, ts time.Time, summary string, 
 		ExpiresAt:     expiresAt,
 	}); err != nil {
 		t.Fatalf("AppendAttentionEvent() error: %v", err)
+	}
+}
+
+func TestReserveAttentionCursor(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	nextCursor := func() int64 {
+		t.Helper()
+		cursor, err := store.AppendAttentionEvent(&StoredAttentionEvent{
+			Ts:            now,
+			Category:      "system",
+			EventType:     "system.health_change",
+			Source:        "test",
+			Actionability: "background",
+			Severity:      "info",
+			Summary:       "reserve",
+		})
+		if err != nil {
+			t.Fatalf("AppendAttentionEvent() error: %v", err)
+		}
+		return cursor
+	}
+
+	steps := []struct {
+		name    string
+		reserve int64
+		want    int64
+	}{
+		{name: "empty table with no sequence row", reserve: 10, want: 11},
+		{name: "never lowers", reserve: 5, want: 12},
+		{name: "equal to the current value", reserve: 12, want: 13},
+		{name: "raises an existing row", reserve: 50, want: 51},
+		{name: "zero does nothing", reserve: 0, want: 52},
+	}
+	for _, step := range steps {
+		if err := store.ReserveAttentionCursor(step.reserve); err != nil {
+			t.Fatalf("%s: ReserveAttentionCursor() error: %v", step.name, err)
+		}
+		if got := nextCursor(); got != step.want {
+			t.Fatalf("%s: next cursor = %d, want %d", step.name, got, step.want)
+		}
+	}
+}
+
+// TestOpen_WaitsWhenNewFileIsBusy covers the switch to WAL mode, which fails
+// straight away when another connection is writing, without using busy_timeout.
+func TestOpen_WaitsWhenNewFileIsBusy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	other, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(path))
+	if err != nil {
+		t.Fatalf("open other connection: %v", err)
+	}
+	defer other.Close()
+	other.SetMaxOpenConns(1)
+	if _, err := other.Exec(`CREATE TABLE holder (id INTEGER)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := other.Exec(`BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, err := other.Exec(`COMMIT`)
+		released <- err
+	}()
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() while the file is busy: %v", err)
+	}
+	defer store.Close()
+	if err := <-released; err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var mode string
+	if err := store.DB().QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatalf("read journal mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal mode = %q, want wal", mode)
+	}
+}
+
+func TestApplyMigrations_ConcurrentFirstUse(t *testing.T) {
+	const writers = 8
+	files, err := GetMigrationFiles()
+	if err != nil {
+		t.Fatalf("GetMigrationFiles() error: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			store, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer store.Close()
+			errs <- store.Migrate()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent first use: %v", err)
+		}
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+	var applied int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM _migrations`).Scan(&applied); err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
+	if applied != len(files) {
+		t.Fatalf("applied %d migrations, want %d", applied, len(files))
 	}
 }

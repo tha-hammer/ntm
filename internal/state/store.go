@@ -13,6 +13,12 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
 )
 
+const (
+	// openBusyWait matches the busy_timeout set on every connection.
+	openBusyWait       = 5 * time.Second
+	openBusyRetryDelay = 50 * time.Millisecond
+)
+
 // Store provides SQLite-backed storage for NTM state.
 type Store struct {
 	db   *sql.DB
@@ -101,12 +107,26 @@ func Open(path string) (*Store, error) {
 	db.SetConnMaxLifetime(0) // Don't close idle connections
 
 	// Verify connection
-	if err := db.Ping(); err != nil {
+	if err := pingWhileBusy(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
 	return &Store{db: db, path: path}, nil
+}
+
+// pingWhileBusy connects, waiting out a file that's locked. A connection's first
+// use switches a new file to WAL mode, and that switch fails straight away when
+// another connection is writing, so busy_timeout doesn't cover it.
+func pingWhileBusy(db *sql.DB) error {
+	deadline := time.Now().Add(openBusyWait)
+	for {
+		err := db.Ping()
+		if err == nil || !strings.Contains(err.Error(), "database is locked") || !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(openBusyRetryDelay)
+	}
 }
 
 // Close closes the database connection.

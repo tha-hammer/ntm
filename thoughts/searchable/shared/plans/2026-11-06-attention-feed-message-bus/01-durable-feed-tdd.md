@@ -1177,6 +1177,36 @@ Same change as Behavior 10.
 | Cursors stay in increasing order within a process after recovery, and events held in memory stay readable by that process until it exits | 18, 19 |
 | A process that can't open the store at all keeps working in memory, reports it, and tries again | 4, 20 |
 
+**Build notes (2026-11-07):**
+
+**Evidence check result:** the first runs failed, on two bugs that only affect a brand-new `state.db`. Both are fixed, with tests, and neither changed the retry design.
+- `ApplyMigrations` raced: processes applied the same migration and collided. In one run only 250 of 400 events were saved. Each migration now takes the write lock, then re-checks whether it was applied.
+- The switch to WAL mode fails straight away with `database is locked` when another connection is writing, without using `busy_timeout`. This showed up in 1 of 5 runs after the first fix. `Open` now retries for up to 5 seconds.
+
+With both fixes, 8 writers of 50 events each passed 40 of 40 runs, with 400 distinct events written in 168 to 247 ms, median 220 ms.
+
+**Design changes from this plan:**
+- Store health is one `atomic.Pointer[attentionStoreOutage]`, not a struct guarded by `appendMu`. `Append` holds `appendMu` during store writes, so a dashboard tick reading health could otherwise wait up to 5 seconds.
+- `TestClosure_RecoversAfterStoreLock` also checks the health during the lock.
+- `TestClosure_CursorClashKeepsBothEvents` was added for the scope's Cursor clash scenario. Replay keeps both events, durable first. Resuming from that cursor can still skip the memory-only one, which is the accepted limit above.
+
+| Test | Red result | Red setup |
+|---|---|---|
+| `TestClosure_ManyWritersOneStateDB` | No events, every helper reported memory-only | `registerAttentionStoreOpener` disconnected |
+| `TestApplyMigrations_ConcurrentFirstUse` | `UNIQUE constraint failed: _migrations.version` | Before the migration fix |
+| `TestOpen_WaitsWhenNewFileIsBusy` | `database is locked`, in 0.00 s | Before the `Open` fix |
+| `TestClosure_RecoversAfterStoreLock` | `summaries = [], want ["after lock"]` | Retries disabled, recreating the one-way switch |
+| `TestAttentionFeed_RetryLimitedDuringOutage` | Attempts stayed at 1 at the interval | One-way switch |
+| `TestAttentionFeed_OneReportPerStateChange` | 0 failure reports | One-way switch |
+| `TestAttentionFeed_FailedOpenIsRetried` | 0 attempts after the open started working | One-way switch |
+| `TestAttentionFeed_ReplayOrderProperty` | Cursors `[1 1]` | `ReserveAttentionCursor` call removed |
+| `TestClosure_RecoveredCursorAboveMemoryOnly` | Cursors `1, 2, 1` | `ReserveAttentionCursor` call removed |
+| `TestClosure_DashboardWarnsWhileFeedIsMemoryOnly` | No warning while memory-only | Health check not yet in `updateTickerData` |
+
+The shrunk property failure `[1 1]` is a failed write followed by recovery, the same sequence `TestClosure_RecoveredCursorAboveMemoryOnly` runs, so no separate regression test was added.
+
+The human test script now waits 35 seconds after the lock ends. Without that, the "after lock" mail can land inside the 30 second retry wait and stay memory-only.
+
 ### Behavior 14: Many writers succeed [BLOCKING]
 
 #### Test Specification
@@ -1755,8 +1785,8 @@ Do this with no other ntm agents running, because the lock blocks all writers to
 2. In another shell, hold the lock for 60 seconds: `printf 'BEGIN EXCLUSIVE;\n.shell sleep 60\nCOMMIT;\n' | sqlite3 ~/.config/ntm/state.db`.
 3. Send mail: `/tmp/ntm-loop1 mail send feedtest --to <agent> "during lock"`. If the command itself is blocked by the lock, note that and send it through the agent's MCP tools instead.
 4. Within about 60 seconds, the dashboard shows the ticker warning.
-5. Let the lock end. Send another message: `/tmp/ntm-loop1 mail send feedtest --to <agent> "after lock"`.
-6. Wait for the next poll. The ticker warning clears.
+5. Let the lock end, then wait 35 seconds, because the feed waits 30 seconds between store retries. Send another message: `/tmp/ntm-loop1 mail send feedtest --to <agent> "after lock"`.
+6. Wait for the next poll, up to 60 seconds. The ticker warning clears.
 7. Run `sqlite3 -readonly ~/.config/ntm/state.db "select summary from attention_events where event_type='mail.received' order by cursor desc limit 3"`.
 8. Pass: the "after lock" message is listed, written by the same dashboard you never restarted.
 
