@@ -2691,6 +2691,30 @@ func (s *stubAttentionStore) GetAttentionEventsSince(sinceCursor int64, limit in
 	return events, nil
 }
 
+func (s *stubAttentionStore) AppendAddressedAttentionEvent(event *state.StoredAttentionEvent) (int64, bool, error) {
+	if existing, err := s.GetAddressedAttentionEvent(event.RecipientProject, event.RecipientAgent, *event.MessageID); err != nil || existing != nil {
+		if existing == nil {
+			return 0, false, err
+		}
+		return existing.Cursor, false, nil
+	}
+	cursor, err := s.AppendAttentionEvent(event)
+	return cursor, err == nil, err
+}
+
+func (s *stubAttentionStore) GetAddressedAttentionEvent(project, agent string, messageID int64) (*state.StoredAttentionEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, event := range s.events {
+		if event.MessageID != nil && *event.MessageID == messageID &&
+			event.RecipientProject == project && strings.EqualFold(event.RecipientAgent, agent) {
+			found := event
+			return &found, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *stubAttentionStore) GetAttentionEventsForRecipient(agent string, sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5340,7 +5364,8 @@ func (c *testClock) Advance(d time.Duration) {
 // faultInjectingStore is a real store whose appends fail on demand.
 type faultInjectingStore struct {
 	*state.Store
-	fail atomic.Bool
+	fail              atomic.Bool
+	addressedAttempts atomic.Int32
 }
 
 func (s *faultInjectingStore) AppendAttentionEvent(event *state.StoredAttentionEvent) (int64, error) {
@@ -5348,6 +5373,14 @@ func (s *faultInjectingStore) AppendAttentionEvent(event *state.StoredAttentionE
 		return 0, errors.New("injected append failure")
 	}
 	return s.Store.AppendAttentionEvent(event)
+}
+
+func (s *faultInjectingStore) AppendAddressedAttentionEvent(event *state.StoredAttentionEvent) (int64, bool, error) {
+	s.addressedAttempts.Add(1)
+	if s.fail.Load() {
+		return 0, false, errors.New("injected append failure")
+	}
+	return s.Store.AppendAddressedAttentionEvent(event)
 }
 
 // holdExclusiveLock takes SQLite's write lock on a separate connection and
@@ -5970,6 +6003,211 @@ func TestRobotEventsCapabilities_ListRecipientFlag(t *testing.T) {
 	}
 	if !inContract {
 		t.Fatal("the attention contract doesn't list --events-recipient")
+	}
+}
+
+func TestAppendAddressed_RepeatDoesNothing(t *testing.T) {
+	feed := newRecipientFeed(t)
+	var delivered atomic.Int32
+	unsubscribe := feed.Subscribe(func(AttentionEvent) { delivered.Add(1) })
+	defer unsubscribe()
+
+	first := feed.PublishMailPending("/proj", "Sender", "RedStone", "subject", 42, "")
+	cursorAfterFirst := feed.cursor.Current()
+	second := feed.PublishMailAckRequired("/proj", "Sender", "RedStone", "subject", 42, "")
+
+	if second.Cursor != first.Cursor || second.Type != EventTypeMailReceived {
+		t.Fatalf("second = %+v, want the first event", second)
+	}
+	if got := delivered.Load(); got != 1 {
+		t.Fatalf("delivered %d times, want 1", got)
+	}
+	if got := feed.cursor.Current(); got != cursorAfterFirst {
+		t.Fatalf("cursor counter moved from %d to %d", cursorAfterFirst, got)
+	}
+
+	repeat := first
+	repeat.Cursor = 0
+	if _, created := feed.AppendAddressed(repeat); created {
+		t.Fatal("a repeat reported created")
+	}
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %+v", events)
+	}
+	if got := feed.Stats(); got.Count != 1 {
+		t.Fatalf("stats.Count = %d, want 1", got.Count)
+	}
+}
+
+func TestAppendAddressed_UnaddressedAppendsNormally(t *testing.T) {
+	feed := newRecipientFeed(t)
+	for i := 0; i < 2; i++ {
+		if _, created := feed.AppendAddressed(testAttentionEvent("plain")); !created {
+			t.Fatal("an unaddressed event should always be appended")
+		}
+	}
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "plain", "plain")
+}
+
+func TestAppendAddressed_FoundDuringOutageKeepsOutage(t *testing.T) {
+	captureSlog(t)
+	store := &faultInjectingStore{Store: openStoreFile(t, filepath.Join(t.TempDir(), "state.db"))}
+	clock := newTestClock()
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(store), WithAttentionClock(clock.Now))
+	t.Cleanup(feed.Stop)
+
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "recorded", 42, "")
+	store.fail.Store(true)
+	feed.Append(testAttentionEvent("fails"))
+	clock.Advance(AttentionStoreRetryInterval)
+
+	// The store can still be read, and the message is already there.
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "recorded", 42, "")
+	if feed.StoreHealth().Durable {
+		t.Fatal("finding an existing row cleared the outage, but no write succeeded")
+	}
+}
+
+func TestAppendAddressed_ManyGoroutines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(feed.Stop)
+	var delivered atomic.Int32
+	unsubscribe := feed.Subscribe(func(AttentionEvent) { delivered.Add(1) })
+	defer unsubscribe()
+
+	var created atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			event := addressMailEvent(testAttentionEvent("race"), "/proj", "RedStone", 42)
+			if _, ok := feed.AppendAddressed(event); ok {
+				created.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if created.Load() != 1 || delivered.Load() != 1 {
+		t.Fatalf("created %d, delivered %d, want 1 and 1", created.Load(), delivered.Load())
+	}
+	reader := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(reader.Stop)
+	events, _, err := reader.ReplayForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("stored events = %+v", events)
+	}
+}
+
+func TestAppendAddressed_OutageThenRecovery(t *testing.T) {
+	captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	clock := newTestClock()
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(store), WithAttentionClock(clock.Now))
+	t.Cleanup(feed.Stop)
+	var delivered atomic.Int32
+	unsubscribe := feed.Subscribe(func(AttentionEvent) { delivered.Add(1) })
+	defer unsubscribe()
+
+	store.fail.Store(true)
+	for i := 0; i < 3; i++ {
+		feed.PublishMailPending("/proj", "Sender", "RedStone", "held", 42, "")
+		feed.PublishMailPending("/proj", "Sender", "RedStone", "also held", 43, "")
+	}
+	if got := store.addressedAttempts.Load(); got != 1 {
+		t.Fatalf("write attempts during the outage = %d, want 1 per retry interval", got)
+	}
+	events, _, err := feed.ReplayForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("during the outage: %+v", events)
+	}
+
+	store.fail.Store(false)
+	clock.Advance(AttentionStoreRetryInterval)
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "held", 42, "")
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "also held", 43, "")
+
+	events, _, err = feed.ReplayForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("after recovery: %+v", events)
+	}
+	if got := delivered.Load(); got != 2 {
+		t.Fatalf("delivered %d times, want 2, one per message", got)
+	}
+	if !feed.StoreHealth().Durable {
+		t.Fatalf("health = %+v", feed.StoreHealth())
+	}
+
+	reader := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(reader.Stop)
+	saved, _, err := reader.ReplayForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 2 {
+		t.Fatalf("another process sees %+v, want both held messages", saved)
+	}
+}
+
+func TestAppendAddressed_OtherProcessSavedItFirst(t *testing.T) {
+	captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	clock := newTestClock()
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(store), WithAttentionClock(clock.Now))
+	t.Cleanup(feed.Stop)
+
+	store.fail.Store(true)
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "held", 42, "")
+	other := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(other.Stop)
+	saved := other.PublishMailPending("/proj", "Sender", "RedStone", "held", 42, "")
+
+	store.fail.Store(false)
+	clock.Advance(AttentionStoreRetryInterval)
+	got := feed.PublishMailPending("/proj", "Sender", "RedStone", "held", 42, "")
+	if got.Cursor != saved.Cursor {
+		t.Fatalf("got cursor %d, want the other process's %d", got.Cursor, saved.Cursor)
+	}
+	events, _, err := feed.ReplayForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cursorsOf(events); !slices.Equal(got, []int64{saved.Cursor}) {
+		t.Fatalf("replay cursors = %v, want only %d", got, saved.Cursor)
+	}
+}
+
+func TestAppendAddressed_NoStoreRecordsOnce(t *testing.T) {
+	feed := newTestAttentionFeed(t)
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "once", 42, "")
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "once", 42, "")
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %+v", events)
 	}
 }
 

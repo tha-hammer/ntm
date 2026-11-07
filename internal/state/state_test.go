@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
+	"pgregory.net/rapid"
 )
 
 // testStore creates a test store with in-memory SQLite and runs migrations.
@@ -2456,6 +2457,167 @@ func TestGetAttentionEventsForRecipient_FiltersAndPages(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Fatalf("unknown name returned %+v", none)
+	}
+}
+
+func TestAppendAddressed_OneRowPerKeyProperty(t *testing.T) {
+	dir := t.TempDir()
+	var run int
+	rapid.Check(t, func(rt *rapid.T) {
+		run++
+		store, err := Open(filepath.Join(dir, fmt.Sprintf("state-%d.db", run)))
+		if err != nil {
+			rt.Fatal(err)
+		}
+		defer store.Close()
+		if err := store.Migrate(); err != nil {
+			rt.Fatal(err)
+		}
+
+		seen := map[string]int64{}
+		now := time.Now().UTC()
+		steps := rapid.IntRange(1, 50).Draw(rt, "steps")
+		for i := 0; i < steps; i++ {
+			project := rapid.SampledFrom([]string{"/one", "/two", "/three"}).Draw(rt, "project")
+			agent := rapid.SampledFrom([]string{"RedStone", "redstone", "BlueLake"}).Draw(rt, "agent")
+			id := int64(rapid.IntRange(1, 5).Draw(rt, "id"))
+			key := fmt.Sprintf("%s|%s|%d", project, strings.ToLower(agent), id)
+
+			cursor, created, err := store.AppendAddressedAttentionEvent(addressedStoredEvent(now, project, agent, id))
+			if err != nil {
+				rt.Fatal(err)
+			}
+			first, repeat := seen[key]
+			if created == repeat {
+				rt.Fatalf("created = %v for key %s, seen before: %v", created, key, repeat)
+			}
+			if repeat && cursor != first {
+				rt.Fatalf("repeat cursor = %d, want %d", cursor, first)
+			}
+			seen[key] = cursor
+		}
+		var rows int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM attention_events`).Scan(&rows); err != nil {
+			rt.Fatal(err)
+		}
+		if rows != len(seen) {
+			rt.Fatalf("rows = %d, keys = %d", rows, len(seen))
+		}
+	})
+}
+
+func TestAddressed_DistinctKeysGetTheirOwnRows(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	for _, event := range []*StoredAttentionEvent{
+		addressedStoredEvent(now, "/one", "RedStone", 42),
+		addressedStoredEvent(now, "/one", "BlueLake", 42), // same message, other recipient
+		addressedStoredEvent(now, "/two", "RedStone", 42), // same id, other project
+	} {
+		if _, created, err := store.AppendAddressedAttentionEvent(event); err != nil || !created {
+			t.Fatalf("insert %s %s: created %v, err %v", event.RecipientProject, event.RecipientAgent, created, err)
+		}
+	}
+	if _, created, err := store.AppendAddressedAttentionEvent(addressedStoredEvent(now, "/one", "REDSTONE", 42)); err != nil || created {
+		t.Fatalf("name in another letter case: created %v, err %v, want the existing row", created, err)
+	}
+}
+
+func TestAddressed_NullMessageIDNeverConflicts(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		event := addressedStoredEvent(now, "/one", "RedStone", 0)
+		event.MessageID = nil
+		if _, err := store.AppendAttentionEvent(event); err != nil {
+			t.Fatalf("plain insert %d with no message id: %v", i, err)
+		}
+	}
+	event := addressedStoredEvent(now, "/one", "RedStone", 0)
+	event.MessageID = nil
+	if _, _, err := store.AppendAddressedAttentionEvent(event); err == nil {
+		t.Fatal("an addressed insert with no message id should fail")
+	}
+}
+
+func TestAddressed_ExpiredRowCountsUntilRemoved(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	past := now.Add(-time.Minute)
+	expired := addressedStoredEvent(now.Add(-8*24*time.Hour), "/one", "RedStone", 42)
+	expired.ExpiresAt = &past
+	first, created, err := store.AppendAddressedAttentionEvent(expired)
+	if err != nil || !created {
+		t.Fatalf("first insert: created %v, err %v", created, err)
+	}
+
+	if cursor, created, err := store.AppendAddressedAttentionEvent(addressedStoredEvent(now, "/one", "RedStone", 42)); err != nil || created || cursor != first {
+		t.Fatalf("before cleanup: cursor %d created %v err %v, want the expired row %d", cursor, created, err, first)
+	}
+	if _, err := store.GCExpiredEvents(); err != nil {
+		t.Fatalf("GCExpiredEvents() error: %v", err)
+	}
+	if cursor, created, err := store.AppendAddressedAttentionEvent(addressedStoredEvent(now, "/one", "RedStone", 42)); err != nil || !created || cursor == first {
+		t.Fatalf("after cleanup: cursor %d created %v err %v, want a new row", cursor, created, err)
+	}
+}
+
+func TestGetAddressedAttentionEvent(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	none, err := store.GetAddressedAttentionEvent("/one", "RedStone", 42)
+	if err != nil || none != nil {
+		t.Fatalf("no row: event %+v, err %v", none, err)
+	}
+	cursor, _, err := store.AppendAddressedAttentionEvent(addressedStoredEvent(time.Now().UTC(), "/one", "RedStone", 42))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := store.GetAddressedAttentionEvent("/one", "redstone", 42)
+	if err != nil || found == nil || found.Cursor != cursor || found.RecipientAgent != "RedStone" {
+		t.Fatalf("found %+v, err %v, want cursor %d", found, err, cursor)
+	}
+}
+
+func TestMigration017_RemovesSprintOneDuplicates(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+	applyMigrationsThrough(t, store, 16)
+
+	now := time.Now().UTC()
+	insert := func(event *StoredAttentionEvent) int64 {
+		t.Helper()
+		cursor, err := store.AppendAttentionEvent(event)
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		return cursor
+	}
+	oldest := insert(addressedStoredEvent(now, "/one", "RedStone", 42))
+	insert(addressedStoredEvent(now, "/one", "RedStone", 42))
+	insert(addressedStoredEvent(now, "/one", "redstone", 42))
+	blue := insert(addressedStoredEvent(now, "/one", "BlueLake", 42))
+	unaddressed := addressedStoredEvent(now, "", "", 0)
+	unaddressed.MessageID = nil
+	plain := insert(unaddressed)
+	plainAgain := insert(unaddressed)
+
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("Migrate() error: %v", err)
+	}
+	events, err := store.GetAttentionEventsSince(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cursors []int64
+	for _, event := range events {
+		cursors = append(cursors, event.Cursor)
+	}
+	want := []int64{oldest, blue, plain, plainAgain}
+	if fmt.Sprint(cursors) != fmt.Sprint(want) {
+		t.Fatalf("cursors after 017 = %v, want %v", cursors, want)
 	}
 }
 

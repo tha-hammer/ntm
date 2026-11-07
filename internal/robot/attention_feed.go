@@ -32,6 +32,14 @@ type AttentionStore interface {
 	// GetAttentionEventsSince returns events with cursor > sinceCursor.
 	GetAttentionEventsSince(sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error)
 
+	// AppendAddressedAttentionEvent saves a mail event unless one exists for its
+	// project, recipient and message, and reports whether it created the row.
+	AppendAddressedAttentionEvent(event *state.StoredAttentionEvent) (int64, bool, error)
+
+	// GetAddressedAttentionEvent returns the event for a project, recipient and
+	// message, or nil when there is none.
+	GetAddressedAttentionEvent(project, agent string, messageID int64) (*state.StoredAttentionEvent, error)
+
 	// GetAttentionEventsForRecipient returns one agent's events after sinceCursor.
 	GetAttentionEventsForRecipient(agent string, sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error)
 	// GetAttentionEventsInTimeRange returns events inside a bounded time window.
@@ -218,6 +226,20 @@ func (j *AttentionJournal) Append(event AttentionEvent) {
 	j.newest = event.Cursor
 	j.lastEvent = now
 	j.totalAppended.Add(1)
+}
+
+// FindAddressed returns the newest journal event with the same project,
+// recipient and message as target. The journal's size is capped, so the scan is
+// bounded, and it runs only when the feed has no working store.
+func (j *AttentionJournal) FindAddressed(target AttentionEvent) (AttentionEvent, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for i := len(j.entries) - 1; i >= 0; i-- {
+		if sameAddressedKey(j.entries[i].event, target) {
+			return cloneAttentionEvent(j.entries[i].event), true
+		}
+	}
+	return AttentionEvent{}, false
 }
 
 // Replay returns events with cursor > sinceCursor.
@@ -593,13 +615,28 @@ func (f *AttentionFeed) openStoreLocked() AttentionStore {
 // the Loop 1 plan: replay here keeps both events, and other processes read only
 // the store.
 func (f *AttentionFeed) appendToStoreLocked(store AttentionStore, event AttentionEvent) (int64, error) {
-	if f.outage.Load() != nil {
-		if err := store.ReserveAttentionCursor(f.cursor.Current()); err != nil {
-			return 0, err
-		}
+	if err := f.reserveAfterOutageLocked(store); err != nil {
+		return 0, err
 	}
 	stored := attentionEventToStored(event, f.config.RetentionPeriod)
 	return store.AppendAttentionEvent(&stored)
+}
+
+// appendAddressedToStoreLocked is appendToStoreLocked for an addressed event,
+// which the store saves only once.
+func (f *AttentionFeed) appendAddressedToStoreLocked(store AttentionStore, event AttentionEvent) (int64, bool, error) {
+	if err := f.reserveAfterOutageLocked(store); err != nil {
+		return 0, false, err
+	}
+	stored := attentionEventToStored(event, f.config.RetentionPeriod)
+	return store.AppendAddressedAttentionEvent(&stored)
+}
+
+func (f *AttentionFeed) reserveAfterOutageLocked(store AttentionStore) error {
+	if f.outage.Load() == nil {
+		return nil
+	}
+	return store.ReserveAttentionCursor(f.cursor.Current())
 }
 
 // markStoreDownLocked records a failed store attempt and sets the next retry.
@@ -639,6 +676,25 @@ func (f *AttentionFeed) rememberMemoryOnlyLocked(event AttentionEvent) {
 	if excess := len(f.memoryOnly) - f.config.JournalSize; excess > 0 {
 		f.memoryOnly = append(f.memoryOnly[:0], f.memoryOnly[excess:]...)
 	}
+}
+
+// forgetMemoryOnlyLocked drops the memory-only copy of an addressed event, now
+// that the store holds it. It reports whether there was one, which means
+// subscribers have already been handed this message.
+func (f *AttentionFeed) forgetMemoryOnlyLocked(event AttentionEvent) bool {
+	f.memoryMu.Lock()
+	defer f.memoryMu.Unlock()
+	kept := f.memoryOnly[:0]
+	found := false
+	for _, held := range f.memoryOnly {
+		if sameAddressedKey(held, event) {
+			found = true
+			continue
+		}
+		kept = append(kept, held)
+	}
+	f.memoryOnly = kept
+	return found
 }
 
 func (f *AttentionFeed) memoryOnlySince(sinceCursor int64) []AttentionEvent {
@@ -721,12 +777,7 @@ func (f *AttentionFeed) enqueuePendingEventLocked(event AttentionEvent) bool {
 // The caller provides an event without a cursor; this method assigns one.
 // When a store is configured, events are persisted to SQLite for durability.
 func (f *AttentionFeed) Append(event AttentionEvent) AttentionEvent {
-	event.NextActions = sanitizeNextActions(event.NextActions)
-
-	// Ensure timestamp if not set
-	if event.Ts == "" {
-		event.Ts = time.Now().UTC().Format(time.RFC3339Nano)
-	}
+	event = normalizeAppendedEvent(event)
 
 	f.appendMu.Lock()
 
@@ -750,7 +801,22 @@ func (f *AttentionFeed) Append(event AttentionEvent) AttentionEvent {
 		}
 	}
 
-	// Store in journal (also serves as in-memory cache)
+	f.publishLocked(event)
+	return event
+}
+
+// normalizeAppendedEvent cleans next actions and fills in a missing timestamp.
+func normalizeAppendedEvent(event AttentionEvent) AttentionEvent {
+	event.NextActions = sanitizeNextActions(event.NextActions)
+	if event.Ts == "" {
+		event.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	return event
+}
+
+// publishLocked keeps the event in the journal, which is also the in-memory
+// cache, and queues it for subscribers. It releases appendMu before delivery.
+func (f *AttentionFeed) publishLocked(event AttentionEvent) {
 	f.journal.Append(event)
 	startDrain := f.enqueuePendingEventLocked(event)
 	f.appendMu.Unlock()
@@ -758,8 +824,83 @@ func (f *AttentionFeed) Append(event AttentionEvent) AttentionEvent {
 	if startDrain {
 		f.drainPendingEvents()
 	}
+}
 
-	return event
+// AppendAddressed appends a mail event unless one exists for its project,
+// recipient and message, in the store or, with no working store, in this
+// process's journal. It returns that event and whether this call created it. A
+// repeat writes nothing and isn't delivered to subscribers. An event with no
+// recipient or message id is appended as usual.
+func (f *AttentionFeed) AppendAddressed(event AttentionEvent) (AttentionEvent, bool) {
+	if event.MessageID == 0 || strings.TrimSpace(event.RecipientAgent) == "" {
+		return f.Append(event), true
+	}
+	event = normalizeAppendedEvent(event)
+
+	f.appendMu.Lock()
+	if store := f.storeForAppendLocked(); store != nil {
+		// A read works during a write outage, so finding the row proves nothing
+		// about writes, and the outage state stays as it is.
+		if existing, ok := f.storedAddressedEvent(store, event); ok {
+			f.forgetMemoryOnlyLocked(event)
+			f.appendMu.Unlock()
+			return existing, false
+		}
+		cursor, created, err := f.appendAddressedToStoreLocked(store, event)
+		if err == nil {
+			f.markStoreRecoveredLocked()
+			alreadyDelivered := f.forgetMemoryOnlyLocked(event)
+			if !created {
+				// Another process saved it between the read and the insert.
+				existing, ok := f.storedAddressedEvent(store, event)
+				f.appendMu.Unlock()
+				if !ok {
+					event.Cursor = cursor
+					return event, false
+				}
+				return existing, false
+			}
+			event.Cursor = cursor
+			f.cursor.counter.Store(cursor)
+			if alreadyDelivered {
+				f.appendMu.Unlock()
+				return event, false
+			}
+			f.publishLocked(event)
+			return event, true
+		}
+		f.markStoreDownLocked(err)
+	}
+
+	// No store, or it's down or waiting to retry.
+	if existing, ok := f.journal.FindAddressed(event); ok {
+		f.appendMu.Unlock()
+		return existing, false
+	}
+	event.Cursor = f.cursor.Next()
+	if f.storeConfigured() {
+		f.rememberMemoryOnlyLocked(event)
+	}
+	f.publishLocked(event)
+	return event, true
+}
+
+// storedAddressedEvent returns the stored event with the same project, recipient
+// and message, if there is one.
+func (f *AttentionFeed) storedAddressedEvent(store AttentionStore, event AttentionEvent) (AttentionEvent, bool) {
+	stored, err := store.GetAddressedAttentionEvent(event.RecipientProject, event.RecipientAgent, event.MessageID)
+	if err != nil || stored == nil {
+		return AttentionEvent{}, false
+	}
+	return f.hydrateStoredAttentionEvents([]state.StoredAttentionEvent{*stored})[0], true
+}
+
+// sameAddressedKey reports whether two events are the same message for the same
+// recipient. Agent names match in any letter case, as Agent Mail treats them.
+func sameAddressedKey(a, b AttentionEvent) bool {
+	return a.MessageID != 0 && a.MessageID == b.MessageID &&
+		a.RecipientProject == b.RecipientProject &&
+		strings.EqualFold(a.RecipientAgent, b.RecipientAgent)
 }
 
 // PublishEphemeral allocates a cursor and notifies subscribers without
@@ -2276,7 +2417,8 @@ func (f *AttentionFeed) PublishMailPending(projectKey, from, to, subject string,
 		},
 		NextActions: attentionMailCheckActions(projectKey, to, threadID, true, "Inspect the unread message"),
 	}
-	return f.Append(annotateAttentionSignal(addressMailEvent(event, projectKey, to, messageID)))
+	recorded, _ := f.AppendAddressed(annotateAttentionSignal(addressMailEvent(event, projectKey, to, messageID)))
+	return recorded
 }
 
 // addressMailEvent names the event's recipient. With no known recipient the event
@@ -2312,7 +2454,8 @@ func (f *AttentionFeed) PublishMailAckRequired(projectKey, from, to, subject str
 		},
 		NextActions: attentionMailCheckActions(projectKey, to, threadID, false, "Inspect the message before acknowledging it"),
 	}
-	return f.Append(annotateAttentionSignal(addressMailEvent(event, projectKey, to, messageID)))
+	recorded, _ := f.AppendAddressed(annotateAttentionSignal(addressMailEvent(event, projectKey, to, messageID)))
+	return recorded
 }
 
 // PublishActuation appends a first-class actuation event to the durable feed.

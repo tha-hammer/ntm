@@ -175,6 +175,8 @@ Behavior 13.
 
 **Build notes (2026-11-07):**
 
+**Result (2026-11-07):** passed on rocketman at `b56c4c5d`, with agents SunnyLynx and RusticLantern. Migration `016` applied at 08:52:43 UTC. `Mail: 2 unread` showed within 2 seconds. `--events-recipient=SunnyLynx` returned only "for first", and `NoSuchAgent` returned `success: true` with `events: []`. The older installed dashboard (`810fcca6`) kept writing the same mail as unaddressed rows, with empty recipient and NULL `message_id`, which migration `017` leaves alone. Step 3 was corrected, because `--robot-status` shows no agent names. Evidence: `/home/debian/Dev/ntm-test-evidence/loop2-sprint1-local-2026-11-07/`.
+
 **Found during verification:** applying pending migration `016` changed the real `state.db` on the VPS. `internal/robot` tests reached `ensemble.NewStateStore`, which opens the default database when given no path, and that package had no `TestMain`. Loop 1's check compared the file's modified time, which can't see an open that writes nothing. So its claim that robot tests never touch the real file was wrong, though only migrations ran, with no events written. `internal/robot/testmain_test.go` now redirects the config folder, and the verification command is replaced.
 
 **Corrections to this plan:**
@@ -875,7 +877,7 @@ Add the entry to `capabilities.go:594` and `attention_contract.go:446`, with the
 
 1. Build the binary: `go build -o /tmp/ntm-loop2 ./cmd/ntm`.
 2. In a scratch project folder, create a session: `/tmp/ntm-loop2 spawn addrtest --cc=2`.
-3. Find the two agent names: `/tmp/ntm-loop2 --robot-status`.
+3. Find the two agent names in the spawn output, or in the pane titles: `tmux list-panes -t addrtest -F '#{pane_title}'`. `--robot-status` shows only an agent count.
 4. Send one message to each: `/tmp/ntm-loop2 mail send addrtest --to <first> "for first"`, then the same for `<second>`.
 5. Open `/tmp/ntm-loop2 dashboard addrtest`, wait until the bottom ticker shows `Mail: 2 unread`, then quit.
 6. Run `/tmp/ntm-loop2 --robot-events --events-recipient=<first> | jq '.events[] | {recipient_agent, summary}'`.
@@ -901,6 +903,27 @@ Add the entry to `capabilities.go:594` and `attention_contract.go:446`, with the
 | Two processes publishing the same message at once produce one event, and neither fails | 9, 12 |
 | A new message after the restart still produces one new event | 13 |
 | The dedup is durable, and doesn't depend on the in-memory `seenMailAttentionIDs` map or a time window | 10, 11, 14, 15 |
+
+**Build notes (2026-11-07):**
+
+- `AppendAddressed` reads first, then inserts with `ON CONFLICT ... DO NOTHING`. A row found by the read doesn't clear an outage, because reads work during a write lock. `TestAppendAddressed_FoundDuringOutageKeepsOutage` pins that.
+- When the store saves a message that was held in memory, the memory copy is dropped and the message isn't delivered again. In that case `AppendAddressed` reports `created` false, because subscribers already have it.
+- `Append` and `AppendAddressed` share `normalizeAppendedEvent`, `publishLocked` and `reserveAfterOutageLocked`.
+- `TestAppendAddressed_ManyGoroutines` passes even without `ON CONFLICT`, because the feed's own lock serializes writers in one process. Only `TestClosure_ManyProcessesPublishOneMessage` proves the conflict clause.
+- Removing `seenMailAttentionIDs` exposed a second repeat: a pane with no known agent name published an unaddressed event on every poll. The dashboard now publishes only when it knows the recipient, as the scope's precondition requires.
+- Added `TestAppendAddressed_UnaddressedAppendsNormally` and `TestAppendAddressed_OtherProcessSavedItFirst` for the edge cases in Behaviors 10 and 14.
+
+| Test | Red result | Red setup |
+|---|---|---|
+| `TestAppendAddressed_OneRowPerKeyProperty` and the other store tests | `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint` | Before migration `017` |
+| `TestMigration017_RemovesSprintOneDuplicates` | Cursors `[1 2 3 4 5 6]`, want `[1 4 5 6]` | Before migration `017` |
+| `TestAppendAddressed_*` (6 tests) | Repeats appended, nothing delivered, no write attempt | `AppendAddressed` as a placeholder |
+| `TestDashboardMailPoll_NoStoreRecordsOnce` | Several events | Before the dashboard change |
+| `TestClosure_DashboardRestartWritesNoNewEvents` | `UNIQUE constraint failed`, helper memory-only | Publish using plain `Append` |
+| `TestClosure_ManyProcessesPublishOneMessage` | A writer failed with `UNIQUE constraint failed`, 3 of 3 runs | `ON CONFLICT` removed |
+| `TestClosure_NewMessageAfterRestartGetsOneEvent` | Cursors `[1] -> [1]` | Lookup always finding message 1 |
+| `TestAppendAddressed_OutageThenRecovery`, `_OtherProcessSavedItFirst` | Duplicates in replay | Memory copy never dropped |
+| `TestAppendAddressed_NoStoreRecordsOnce`, `TestDashboardMailPoll_NoStoreRecordsOnce` | Repeated events | Journal lookup turned off |
 
 ### Behavior 9: The store keeps one row per message [LEAF: state package only, synchronous]
 
@@ -1484,7 +1507,7 @@ Run after each sprint, with Go on the PATH:
 export PATH=$PATH:/usr/local/go/bin
 go build ./cmd/ntm
 go test -short ./...
-go test -short -race ./internal/robot/ ./internal/cli/ ./internal/state/ ./internal/tui/dashboard/
+go test -short -race -timeout 560s ./internal/robot/ ./internal/cli/ ./internal/state/ ./internal/tui/dashboard/   # internal/cli takes about 4 min 40 s under -race
 gofmt -l .
 go vet ./internal/robot/ ./internal/cli/ ./internal/state/ ./internal/tui/dashboard/
 ubs <changed-files>

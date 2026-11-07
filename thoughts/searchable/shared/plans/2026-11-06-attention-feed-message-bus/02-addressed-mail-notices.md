@@ -54,7 +54,7 @@ Covers deliverables 3 and 6. Needs Loop 1.
 
 1. Build the binary: `go build -o /tmp/ntm-loop2 ./cmd/ntm`.
 2. In a scratch project folder, create a session: `/tmp/ntm-loop2 spawn addrtest --cc=2`.
-3. Find the two agent names: `/tmp/ntm-loop2 --robot-status`.
+3. Find the two agent names in the spawn output, or in the pane titles: `tmux list-panes -t addrtest -F '#{pane_title}'`. `--robot-status` shows only an agent count.
 4. Send one message to each: `/tmp/ntm-loop2 mail send addrtest --to <first> "for first"`, then the same for `<second>`.
 5. Open `/tmp/ntm-loop2 dashboard addrtest`, wait until the bottom ticker shows `Mail: 2 unread`, then quit.
 6. Run `/tmp/ntm-loop2 --robot-events --events-recipient=<first> | jq '.events[] | {recipient_agent, summary}'`.

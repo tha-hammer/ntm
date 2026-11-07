@@ -1615,6 +1615,75 @@ func (s *Store) AppendAttentionEvent(event *StoredAttentionEvent) (int64, error)
 	return cursor, nil
 }
 
+// AppendAddressedAttentionEvent saves a mail event unless one exists for its
+// project, recipient and message. It returns the cursor and whether this call
+// created the row. Another process inserting the same message isn't an error: the
+// unique index settles the race, and the existing cursor is returned.
+func (s *Store) AppendAddressedAttentionEvent(event *StoredAttentionEvent) (int64, bool, error) {
+	if event.MessageID == nil {
+		return 0, false, errors.New("append addressed attention event: no message id")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(attentionEventInsert+`
+		ON CONFLICT (recipient_project, recipient_agent COLLATE NOCASE, message_id)
+		WHERE message_id IS NOT NULL DO NOTHING`,
+		attentionEventInsertArgs(event)...)
+	if err != nil {
+		return 0, false, fmt.Errorf("append addressed attention event: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("append addressed attention event: %w", err)
+	}
+	if inserted == 1 {
+		cursor, err := result.LastInsertId()
+		if err != nil {
+			return 0, false, fmt.Errorf("get event cursor: %w", err)
+		}
+		return cursor, true, nil
+	}
+
+	existing, err := s.getAddressedAttentionEventLocked(event.RecipientProject, event.RecipientAgent, *event.MessageID)
+	if err != nil {
+		return 0, false, err
+	}
+	if existing == nil {
+		return 0, false, errors.New("append addressed attention event: conflicting row not found")
+	}
+	return existing.Cursor, false, nil
+}
+
+// GetAddressedAttentionEvent returns the event for a project, recipient and
+// message, or nil when there is none. An expired row still counts until cleanup
+// removes it, because the unique index still holds it.
+func (s *Store) GetAddressedAttentionEvent(project, agent string, messageID int64) (*StoredAttentionEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getAddressedAttentionEventLocked(project, agent, messageID)
+}
+
+func (s *Store) getAddressedAttentionEventLocked(project, agent string, messageID int64) (*StoredAttentionEvent, error) {
+	rows, err := s.db.Query(`
+		SELECT `+attentionEventColumns+`
+		FROM attention_events
+		WHERE recipient_project = ?
+		  AND recipient_agent = ? COLLATE NOCASE
+		  AND message_id = ?
+		LIMIT 1`, project, agent, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("get addressed attention event: %w", err)
+	}
+	defer rows.Close()
+	events, err := scanAttentionEvents(rows)
+	if err != nil || len(events) == 0 {
+		return nil, err
+	}
+	return &events[0], nil
+}
+
 // AppendAttentionEvent inserts an attention event and returns its cursor in an existing transaction.
 func (tx *Tx) AppendAttentionEvent(event *StoredAttentionEvent) (int64, error) {
 	result, err := tx.tx.Exec(attentionEventInsert, attentionEventInsertArgs(event)...)

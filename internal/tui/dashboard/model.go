@@ -267,7 +267,6 @@ type Model struct {
 	lastMailInboxFetch       time.Time
 	mailInboxRefreshInterval time.Duration
 	showInboxDetails         bool
-	seenMailAttentionIDs     map[int]struct{} // Track messages with attention signals emitted
 
 	// Config watcher
 	configSub    chan *config.Config
@@ -572,7 +571,6 @@ func New(session, projectDir string) Model {
 		agentMailInboxBodyCache:    make(map[int]string),
 		agentMailInboxBodyKnown:    make(map[int]bool),
 		agentMailAgents:            make(map[string]string),
-		seenMailAttentionIDs:       make(map[int]struct{}),
 		helpVerbosity:              "full",
 		helpModel:                  newHelpModel(t),
 		cassSearch: components.NewCassSearch(func(hit cass.SearchHit) tea.Cmd {

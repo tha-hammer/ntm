@@ -60,7 +60,7 @@ Covers the end-to-end and doc parts of deliverable 18. The tests for each item w
 Do this in a new scratch git repo, with no dashboard or `ntm serve` running.
 
 1. Build the binary: `go build -o /tmp/ntm-release ./cmd/ntm`.
-2. Run `/tmp/ntm-release spawn release --cc=1`, and wait for the agent to be idle. Find its name with `/tmp/ntm-release --robot-status`.
+2. Run `/tmp/ntm-release spawn release --cc=1`, and wait for the agent to be idle. Find its name in the spawn output, or in its pane title: `tmux list-panes -t release -F '#{pane_title}'`. `--robot-status` shows only an agent count.
 3. Give it slow work: `/tmp/ntm-release send release --cc "Run sleep 60, then reply done."`.
 4. While it works, send mail: `/tmp/ntm-release mail send release --to <agent> "mid turn"`.
 5. Pass: when the turn ends, it's told about `mid turn`, with the sender and subject, and runs `fetch_inbox`.

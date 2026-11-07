@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -462,6 +463,96 @@ func TestClosure_UnknownRecipientReturnsEmptyList(t *testing.T) {
 	all := parseRobotEvents(t, env.run(t, "execute", "--robot-events", "--events-recipient= "))
 	if len(all) == 0 {
 		t.Fatal("a blank recipient should mean no filter")
+	}
+}
+
+func closureInboxOfTen() []string {
+	args := make([]string, 0, 10)
+	for id := 1; id <= 10; id++ {
+		args = append(args, inboxArg(id, "RedStone", fmt.Sprintf("message %d", id)))
+	}
+	return args
+}
+
+// readRecipientCursors pages --events-recipient in new processes and returns
+// the cursors in order.
+func readRecipientCursors(t *testing.T, env *closureEnv, agent string) []int64 {
+	t.Helper()
+	const maxPages = 20
+	cursors := []int64{}
+	since := int64(0)
+	for page := 0; page < maxPages; page++ {
+		out := env.run(t, "execute", "--robot-events", "--events-recipient="+agent,
+			fmt.Sprintf("--since-cursor=%d", since), "--events-limit=5")
+		for _, event := range parseRobotEvents(t, out) {
+			cursors = append(cursors, event.Cursor)
+		}
+		var paging struct {
+			NextCursor int64 `json:"next_cursor"`
+			HasMore    bool  `json:"has_more"`
+		}
+		if err := json.Unmarshal([]byte(out), &paging); err != nil {
+			t.Fatalf("parse paging fields: %v\noutput: %s", err, out)
+		}
+		if !paging.HasMore {
+			return cursors
+		}
+		since = paging.NextCursor
+	}
+	t.Fatalf("still more events after %d pages", maxPages)
+	return nil
+}
+
+func TestClosure_DashboardRestartWritesNoNewEvents(t *testing.T) {
+	env := newClosureEnv(t)
+	env.run(t, "publish-inbox", closureInboxOfTen()...)
+	before := readRecipientCursors(t, env, "RedStone")
+	if len(before) != 10 {
+		t.Fatalf("first process recorded %d events, want 10", len(before))
+	}
+
+	env.run(t, "publish-inbox", closureInboxOfTen()...)
+	after := readRecipientCursors(t, env, "RedStone")
+	if !slices.Equal(after, before) {
+		t.Fatalf("cursors changed after restart: %v -> %v", before, after)
+	}
+}
+
+func TestClosure_ManyProcessesPublishOneMessage(t *testing.T) {
+	const writers = 8
+	env := newClosureEnv(t)
+	var wg sync.WaitGroup
+	errs := make(chan string, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if out, err := env.tryRun("publish-inbox", closureInboxOfTen()...); err != nil {
+				errs <- fmt.Sprintf("%v: %s", err, out)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for failure := range errs {
+		t.Errorf("writer failed: %s", failure)
+	}
+
+	cursors := readRecipientCursors(t, env, "RedStone")
+	if len(cursors) != 10 || !allDistinct(cursors) {
+		t.Fatalf("cursors = %v, want 10 distinct", cursors)
+	}
+}
+
+func TestClosure_NewMessageAfterRestartGetsOneEvent(t *testing.T) {
+	env := newClosureEnv(t)
+	env.run(t, "publish-inbox", closureInboxOfTen()...)
+	before := readRecipientCursors(t, env, "RedStone")
+
+	env.run(t, "publish-inbox", append(closureInboxOfTen(), inboxArg(11, "RedStone", "new one"))...)
+	after := readRecipientCursors(t, env, "RedStone")
+	if len(after) != 11 || !slices.Equal(after[:10], before) || after[10] <= before[len(before)-1] {
+		t.Fatalf("cursors %v -> %v", before, after)
 	}
 }
 

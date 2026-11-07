@@ -110,7 +110,7 @@ The nudge reuses these existing functions:
 
 1. Create a session: `/tmp/ntm-loop5 spawn addnudge --cc=1`.
 2. Add an agent: `/tmp/ntm-loop5 add addnudge --cc=1`.
-3. Wait for both to be idle, and find the new agent's name with `/tmp/ntm-loop5 --robot-status`.
+3. Wait for both to be idle, and find the new agent's name in the command's output, or in its pane title with `tmux list-panes -F '#{pane_title}'`. `--robot-status` shows only an agent count.
 4. Send mail only to the new agent: `/tmp/ntm-loop5 mail send addnudge --to <new agent> "added nudge"`.
 5. Wait about 30 seconds, and run `/tmp/ntm-loop5 --robot-tail=addnudge --lines=30`.
 6. Pass: the reminder is in the new agent's pane only.

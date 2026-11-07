@@ -63,7 +63,7 @@ Two gaps found while writing this document:
 
 1. Build the binary: `go build -o /tmp/ntm-loop3 ./cmd/ntm`.
 2. In a scratch project folder, create a session: `/tmp/ntm-loop3 spawn hooktest --cc=1`.
-3. Get the agent's name and pane ID: `/tmp/ntm-loop3 --robot-status`.
+3. Get the agent's name and pane ID: `tmux list-panes -a -F '#{pane_id} #{pane_title}'`, or the spawn output. `--robot-status` shows only an agent count.
 4. Send mail: `/tmp/ntm-loop3 mail send hooktest --to <agent> "hook test"`.
 5. Run `echo '{}' | TMUX_PANE=<pane id> AGENT_NAME=<agent> /tmp/ntm-loop3 agent-hook stop --project "$PWD"`.
 6. Pass: it prints JSON with `"decision":"block"` and a reason naming `HumanOverseer` and your subject.
@@ -297,7 +297,7 @@ Two gaps found while writing this document:
 
 1. Create a session with one agent: `/tmp/ntm-loop3 spawn addtest --cc=1`.
 2. Add another: `/tmp/ntm-loop3 add addtest --cc=1`.
-3. Run `/tmp/ntm-loop3 --robot-status`, and note the new agent's name and pane.
+3. Run `tmux list-panes -a -F '#{pane_id} #{pane_title}'`, and note the new agent's name and pane. `--robot-status` shows only an agent count.
 4. Pass: the new pane has its own Agent Mail name.
 5. Run `jq '.hooks.Stop | length' .claude/settings.local.json`.
 6. Pass: it prints `1`, since both agents share the folder.

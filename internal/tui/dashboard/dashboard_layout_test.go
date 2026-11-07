@@ -216,6 +216,43 @@ func TestDashboardFeedWarning_NotShownWithoutAStore(t *testing.T) {
 	}
 }
 
+func TestDashboardMailPoll_NoStoreRecordsOnce(t *testing.T) {
+	lockAttentionFeedForTest(t)
+	feed := robot.NewAttentionFeed(robot.AttentionFeedConfig{JournalSize: 16, RetentionPeriod: time.Hour})
+	t.Cleanup(feed.Stop)
+	installFeedForWarningTest(t, feed)
+
+	poll := func(m Model, inbox []agentmail.InboxMessage) Model {
+		updated, _ := m.Update(AgentMailInboxSummaryMsg{
+			ProjectKey: "proj",
+			Inboxes: map[string][]agentmail.InboxMessage{
+				"1": inbox,
+				"2": {{ID: 43, Subject: "no known agent"}},
+			},
+			AgentMap: map[string]string{"1": "RedStone"},
+		})
+		model, ok := updated.(Model)
+		if !ok {
+			t.Fatalf("Update() returned %T, want dashboard.Model", updated)
+		}
+		return model
+	}
+	m := newTestModel(200)
+	m = poll(m, []agentmail.InboxMessage{{ID: 42, Subject: "unread"}})
+	m = poll(m, []agentmail.InboxMessage{{ID: 42, Subject: "unread"}})
+	// The message drops out of the inbox, then comes back while still in the journal.
+	m = poll(m, nil)
+	poll(m, []agentmail.InboxMessage{{ID: 42, Subject: "unread"}})
+
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].MessageID != 42 || events[0].RecipientAgent != "RedStone" {
+		t.Fatalf("events = %+v, want one event for message 42", events)
+	}
+}
+
 func TestViewFitsHeightAndFooterOnce(t *testing.T) {
 
 	m := newTestModel(140)

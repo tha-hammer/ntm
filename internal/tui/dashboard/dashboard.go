@@ -2929,9 +2929,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.EqualFold(mm.Importance, "urgent") {
 					paneUrgent++
 				}
-				// Emit attention signals for new unread messages.
-				if _, seen := m.seenMailAttentionIDs[mm.ID]; !seen {
-					m.seenMailAttentionIDs[mm.ID] = struct{}{}
+				// Record unread messages. The feed checks the store for each one, so
+				// this is safe on every poll and across restarts. A notice needs a
+				// recipient, so a pane with no known agent name records nothing.
+				if toAgent != "" {
 					threadID := ""
 					if mm.ThreadID != nil {
 						threadID = *mm.ThreadID
