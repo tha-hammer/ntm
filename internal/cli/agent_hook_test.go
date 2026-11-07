@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -476,6 +477,70 @@ func TestAgentHookStop_StoreDownStillReminds(t *testing.T) {
 	}
 }
 
+func TestAgentHookStop_BreadcrumbToken(t *testing.T) {
+	cases := []struct {
+		name          string
+		agentEnv      string
+		registryToken string
+		wantToken     string
+	}{
+		{name: "no registry uses the breadcrumb's token", wantToken: "tok-crumb"},
+		{name: "a registry token wins", registryToken: "tok-registry", wantToken: "tok-registry"},
+		{name: "a name from AGENT_NAME never takes the breadcrumb's token", agentEnv: "GreenCastle", wantToken: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mail := newFakeAgentMail(t) // issues no token, so it accepts any and records it
+			mail.addMessage("GreenCastle", agentmail.InboxMessage{ID: 7, From: "RedStone", Subject: "crumb"})
+			withHookTestEnv(t, mail, tc.agentEnv)
+			t.Setenv("MCP_AGENT_MAIL_AGENT_NAME", "")
+			t.Setenv("TMUX_PANE", "")
+			repo := gitInitForTest(t, t.TempDir())
+			writeBreadcrumb(t, repo, "identity.json", "GreenCastle", "tok-crumb")
+			t.Chdir(repo)
+			if tc.registryToken != "" {
+				registry := agentmail.NewSessionAgentRegistry("crumbtest", repo)
+				registry.SetRegistrationToken("GreenCastle", tc.registryToken)
+				if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var out bytes.Buffer
+			runAgentHookStop(strings.NewReader("{}"), &out, repo)
+			if parseStopDecision(t, out.String()).Decision != "block" {
+				t.Fatalf("printed %q", out.String())
+			}
+			assertFetchesUsed(t, mail, 1, repo, "GreenCastle", tc.wantToken)
+		})
+	}
+}
+
+func TestStopHookProject_Fallbacks(t *testing.T) {
+	cwd := t.TempDir()
+	cases := []struct {
+		name, flag, env, want string
+	}{
+		{name: "flag wins", flag: "/proj/flag", env: "/proj/env", want: "/proj/flag"},
+		{name: "relative flag is made absolute", flag: "sub", env: "/proj/env", want: filepath.Join(cwd, "sub")},
+		{name: "environment when no flag", flag: "  ", env: "/proj/env", want: "/proj/env"},
+		{name: "folder when neither", env: "   ", want: cwd},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			getenv := func(key string) string {
+				if key == "MCP_AGENT_MAIL_PROJECT" {
+					return tc.env
+				}
+				return ""
+			}
+			if got := stopHookProject(tc.flag, getenv, cwd); got != tc.want {
+				t.Fatalf("stopHookProject(%q, env %q) = %q, want %q", tc.flag, tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestClosure_StopHookTellsOnce(t *testing.T) {
 	mail := newFakeAgentMail(t)
 	mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 42, From: "RedStone", Subject: "Review auth change"})
@@ -585,6 +650,103 @@ func TestClosure_ConcurrentStopHooksTellOnce(t *testing.T) {
 	}
 	if told != 1 {
 		t.Fatalf("told %d times, want 1: %q", told, outs)
+	}
+}
+
+// clearIdentityEnv removes every way the hook could learn a name from the
+// environment, including the test runner's own tmux pane.
+func (e *closureEnv) clearIdentityEnv() {
+	for _, key := range []string{"AGENT_NAME", "MCP_AGENT_MAIL_AGENT_NAME", "MCP_AGENT_MAIL_PROJECT", "TMUX", "TMUX_PANE"} {
+		e.set(key, "")
+	}
+}
+
+// runWithStdinIn runs one helper in dir and fails the test if it fails.
+func (e *closureEnv) runWithStdinIn(t *testing.T, dir, stdin, mode string, args ...string) string {
+	t.Helper()
+	cmd, stdout, stderr := e.helperCommand(mode, stdin, args...)
+	cmd.Dir = dir
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper %q: %v", mode, err)
+	}
+	run := finishRun(mode, cmd, stdout, stderr)
+	if run.err != nil {
+		t.Fatalf("%v\nstdout: %s", run.err, run.stdout)
+	}
+	return run.stdout
+}
+
+// gitForTest runs git in dir with a fixed identity and fails the test on error.
+func gitForTest(t testing.TB, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=ntm test", "-c", "user.email=ntm-test@example.invalid"}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitInitForTest makes dir a git repo and returns its absolute path.
+func gitInitForTest(t testing.TB, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create %s: %v", dir, err)
+	}
+	gitForTest(t, dir, "init", "-q")
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+// writeBreadcrumb writes an Agent Mail identity file under the repo's git folder.
+func writeBreadcrumb(t testing.TB, repo, file, agent, token string) {
+	t.Helper()
+	dir := filepath.Join(repo, ".git", "agent-mail")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create %s: %v", dir, err)
+	}
+	data, err := json.Marshal(map[string]string{"agent_name": agent, "registration_token": token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, file), data, 0o600); err != nil {
+		t.Fatalf("write breadcrumb: %v", err)
+	}
+}
+
+func TestClosure_StopHookBreadcrumbIdentity(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	mail.addMessage("GreenCastle", agentmail.InboxMessage{ID: 7, From: "RedStone", Subject: "crumb test"})
+	token := mail.issueToken("GreenCastle")
+
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.clearIdentityEnv()
+	repo := gitInitForTest(t, env.workDir)
+	writeBreadcrumb(t, repo, "identity.json", "GreenCastle", token)
+
+	out := env.runWithStdinIn(t, repo, "{}", "execute", "agent-hook", "stop", "--project", repo)
+	if d := parseStopDecision(t, out); !strings.Contains(d.Reason, "from RedStone: crumb test") {
+		t.Fatalf("breadcrumb run = %q", out)
+	}
+	assertFetchesUsed(t, mail, 1, repo, "GreenCastle", token)
+
+	bareEnv := newClosureEnv(t)
+	bareEnv.useAgentMail(mail)
+	bareEnv.clearIdentityEnv()
+	bare := gitInitForTest(t, bareEnv.workDir)
+	before := len(mail.allCalls())
+	if out := bareEnv.runWithStdinIn(t, bare, "{}", "execute", "agent-hook", "stop", "--project", bare); out != "" {
+		t.Fatalf("no-name run printed %q", out)
+	}
+	if calls := mail.allCalls(); len(calls) != before {
+		t.Fatalf("no-name run called Agent Mail: %+v", calls[before:])
+	}
+	if _, err := os.Stat(bareEnv.stateDB()); !os.IsNotExist(err) {
+		t.Fatalf("no-name run opened state.db: %v", err)
 	}
 }
 

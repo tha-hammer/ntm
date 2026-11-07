@@ -1,11 +1,18 @@
 package agentmail
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"pgregory.net/rapid"
 )
 
 func TestSanitizeSessionName(t *testing.T) {
@@ -697,5 +704,202 @@ func TestLoadSessionAgentRegistryContinuesPastMismatchedCandidate(t *testing.T) 
 	}
 	if loaded.ProjectKey != projectKey {
 		t.Fatalf("expected project key %s, got %s", projectKey, loaded.ProjectKey)
+	}
+}
+
+// hookTB is what the hook test helpers need from *testing.T and *rapid.T.
+type hookTB interface {
+	Helper()
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+}
+
+// hookGit runs git in dir with a fixed identity and fails the test on error.
+func hookGit(t hookTB, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=ntm test", "-c", "user.email=ntm-test@example.invalid"}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
+
+// hookRepo makes a new git repo under parent and returns its path.
+func hookRepo(t hookTB, parent, name string) string {
+	t.Helper()
+	repo := filepath.Join(parent, name)
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hookGit(t, repo, "init", "-q")
+	return repo
+}
+
+// writeHookBreadcrumb writes raw content to an identity file in repo's git folder.
+func writeHookBreadcrumb(t hookTB, repo, file, content string) {
+	t.Helper()
+	dir := filepath.Join(repo, ".git", "agent-mail")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func breadcrumbJSON(agent, token string) string {
+	data, _ := json.Marshal(map[string]string{"agent_name": agent, "registration_token": token})
+	return string(data)
+}
+
+// hookSources returns lookup sources over a fixed environment.
+func hookSources(env map[string]string, dir, windowIDDir string) HookIdentitySources {
+	return HookIdentitySources{
+		Getenv:      func(key string) string { return env[key] },
+		Dir:         dir,
+		WindowIDDir: windowIDDir,
+	}
+}
+
+func TestResolveHookIdentity_OrderProperty(t *testing.T) {
+	parent := t.TempDir()
+	var run int
+	rapid.Check(t, func(rt *rapid.T) {
+		run++
+		values := [3]string{}
+		for i := range values {
+			values[i] = rapid.SampledFrom([]string{"", "   ", " BlueLake", "RedStone ", "GreenCastle"}).Draw(rt, fmt.Sprintf("source%d", i))
+		}
+		repo := hookRepo(rt, parent, fmt.Sprintf("repo-%d", run))
+		if values[2] != "" {
+			writeHookBreadcrumb(rt, repo, "identity.json", breadcrumbJSON(values[2], "tok"))
+		}
+		env := map[string]string{envAgentName: values[0], envAgentMailAgentName: values[1]}
+		got := ResolveHookIdentity(hookSources(env, repo, parent))
+
+		want, wantSource := "", ""
+		for i, v := range values {
+			if strings.TrimSpace(v) != "" {
+				want = strings.TrimSpace(v)
+				wantSource = []string{envAgentName, envAgentMailAgentName, "breadcrumb"}[i]
+				break
+			}
+		}
+		if got.Name != want {
+			rt.Fatalf("values %q: got %q, want %q", values, got.Name, want)
+		}
+		if want != "" && !strings.Contains(got.Source, wantSource) && !(wantSource == "breadcrumb" && strings.HasSuffix(got.Source, "identity.json")) {
+			rt.Fatalf("values %q: source %q, want %q", values, got.Source, wantSource)
+		}
+		if wantSource != "breadcrumb" && got.Token != "" {
+			rt.Fatalf("values %q: a name from the environment took token %q", values, got.Token)
+		}
+	})
+}
+
+func TestResolveHookIdentity_Breadcrumbs(t *testing.T) {
+	type setup struct {
+		repo, windowIDDir string
+		env               map[string]string
+	}
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, s *setup)
+		want    string
+		logs    int
+	}{
+		{
+			name: "per-pane file in tmux",
+			prepare: func(t *testing.T, s *setup) {
+				s.env[envTmuxPane] = "%7"
+				writeFile(t, filepath.Join(s.windowIDDir, "mcp-window-id-tmux-%7"), " w1\n")
+				writeHookBreadcrumb(t, s.repo, "identity-w1.json", breadcrumbJSON("GreenCastle", "tok-w1"))
+				writeHookBreadcrumb(t, s.repo, "identity.json", breadcrumbJSON("RedStone", "tok-shared"))
+			},
+			want: "GreenCastle",
+		},
+		{
+			name: "another agent's shared file in tmux",
+			prepare: func(t *testing.T, s *setup) {
+				s.env[envTmuxPane] = "%7"
+				writeFile(t, filepath.Join(s.windowIDDir, "mcp-window-id-tmux-%7"), "w1")
+				writeHookBreadcrumb(t, s.repo, "identity.json", breadcrumbJSON("RedStone", "tok-shared"))
+			},
+		},
+		{
+			name: "missing window id file in tmux",
+			prepare: func(t *testing.T, s *setup) {
+				s.env[envTmuxPane] = "%7"
+				writeHookBreadcrumb(t, s.repo, "identity.json", breadcrumbJSON("RedStone", "tok-shared"))
+			},
+		},
+		{
+			name: "outside tmux",
+			prepare: func(t *testing.T, s *setup) {
+				writeHookBreadcrumb(t, s.repo, "identity.json", breadcrumbJSON("GreenCastle", "tok"))
+			},
+			want: "GreenCastle",
+		},
+		{
+			name: "corrupt file",
+			prepare: func(t *testing.T, s *setup) {
+				writeHookBreadcrumb(t, s.repo, "identity.json", "{bad")
+			},
+			logs: 1,
+		},
+		{
+			name: "empty agent name",
+			prepare: func(t *testing.T, s *setup) {
+				writeHookBreadcrumb(t, s.repo, "identity.json", breadcrumbJSON("  ", "tok"))
+			},
+		},
+		{
+			name: "not a git repo",
+			prepare: func(t *testing.T, s *setup) {
+				s.repo = t.TempDir()
+				writeHookBreadcrumb(t, s.repo, "identity.json", breadcrumbJSON("GreenCastle", "tok"))
+			},
+		},
+		{
+			name: "linked worktree",
+			prepare: func(t *testing.T, s *setup) {
+				hookGit(t, s.repo, "commit", "-q", "--allow-empty", "-m", "first")
+				worktree := filepath.Join(t.TempDir(), "wt")
+				hookGit(t, s.repo, "worktree", "add", "-q", worktree)
+				writeHookBreadcrumb(t, s.repo, "identity.json", breadcrumbJSON("GreenCastle", "tok"))
+				s.repo = worktree
+			},
+			want: "GreenCastle",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &setup{repo: hookRepo(t, t.TempDir(), "repo"), windowIDDir: t.TempDir(), env: map[string]string{}}
+			tc.prepare(t, s)
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			got := ResolveHookIdentity(hookSources(s.env, s.repo, s.windowIDDir))
+			slog.SetDefault(previous)
+
+			if got.Name != tc.want {
+				t.Fatalf("name = %q, want %q (source %q)", got.Name, tc.want, got.Source)
+			}
+			if tc.want != "" && got.Token == "" {
+				t.Fatalf("breadcrumb token missing: %+v", got)
+			}
+			if lines := strings.Count(logs.String(), "agent hook: unreadable breadcrumb"); lines != tc.logs {
+				t.Fatalf("breadcrumb log lines = %d, want %d: %s", lines, tc.logs, logs.String())
+			}
+			if tc.logs > 0 && !strings.Contains(logs.String(), "identity.json") {
+				t.Fatalf("log doesn't name the file: %s", logs.String())
+			}
+		})
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

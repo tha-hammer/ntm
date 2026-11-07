@@ -62,7 +62,7 @@ Two gaps found while writing this document:
 ### Human test script
 
 1. Build the binary: `go build -o /tmp/ntm-loop3 ./cmd/ntm`.
-2. In a scratch project folder, create a session: `/tmp/ntm-loop3 spawn hooktest --cc=1`.
+2. Create a session: `/tmp/ntm-loop3 spawn hooktest --cc=1`. Spawn doesn't print its folder, so `cd` into `<projects_base>/hooktest` (for example `~/ntm_Dev/hooktest`).
 3. Get the agent's name and pane ID: `tmux list-panes -a -F '#{pane_id} #{pane_title}'`, or the spawn output. `--robot-status` shows only an agent count.
 4. Send mail: `/tmp/ntm-loop3 mail send hooktest --to <agent> "hook test"`.
 5. Run `echo '{}' | TMUX_PANE=<pane id> AGENT_NAME=<agent> /tmp/ntm-loop3 agent-hook stop --project "$PWD"`.

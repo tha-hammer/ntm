@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,6 +34,10 @@ const (
 
 	// agentHookLogName is the hook's log file in ntm's log folder.
 	agentHookLogName = "agent-hook.log"
+
+	// stopHookWindowIDDir holds Agent Mail's mcp-window-id-tmux-<pane> files.
+	// The old shell hook reads them from /tmp by name, not from $TMPDIR.
+	stopHookWindowIDDir = "/tmp"
 )
 
 // turnEndInput is the TurnEndInput contract: the JSON Claude Code passes on stdin.
@@ -67,12 +72,28 @@ func newAgentHookStopCmd() *cobra.Command {
 		// problems are written to agent-hook.log and the agent stops (Fail Open).
 		RunE: func(cmd *cobra.Command, args []string) error {
 			defer sendLogsToFile(agentHookLogName)()
-			runAgentHookStop(cmd.InOrStdin(), cmd.OutOrStdout(), projectKey)
+			cwd, _ := os.Getwd()
+			runAgentHookStop(cmd.InOrStdin(), cmd.OutOrStdout(), stopHookProject(projectKey, os.Getenv, cwd))
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&projectKey, "project", "", "Agent Mail project key (the agent's project folder)")
+	cmd.Flags().StringVar(&projectKey, "project", "", "Agent Mail project key (default: $MCP_AGENT_MAIL_PROJECT, then the current folder)")
 	return cmd
+}
+
+// stopHookProject picks the Agent Mail project key for the hook: the flag,
+// then MCP_AGENT_MAIL_PROJECT, then the current folder. A relative path is
+// taken from the current folder.
+func stopHookProject(flag string, getenv func(string) string, cwd string) string {
+	for _, candidate := range []string{flag, getenv("MCP_AGENT_MAIL_PROJECT")} {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			if !filepath.IsAbs(candidate) {
+				candidate = filepath.Join(cwd, candidate)
+			}
+			return filepath.Clean(candidate)
+		}
+	}
+	return cwd
 }
 
 // runAgentHookStop tells the agent about mail it hasn't been told about.
@@ -82,14 +103,31 @@ func runAgentHookStop(stdin io.Reader, stdout io.Writer, projectKey string) {
 	if !ok || input.StopHookActive || cfg == nil || !cfg.AgentMail.Enabled {
 		return
 	}
-	agent := strings.TrimSpace(os.Getenv("AGENT_NAME"))
-	if agent == "" || projectKey == "" {
+	if projectKey == "" {
 		return
+	}
+	cwd, _ := os.Getwd()
+	identity := agentmail.ResolveHookIdentity(agentmail.HookIdentitySources{
+		Getenv:      os.Getenv,
+		Dir:         cwd,
+		WindowIDDir: stopHookWindowIDDir,
+	})
+	agent := identity.Name
+	if agent == "" {
+		slog.Info("agent hook: no agent name", "checked", "AGENT_NAME, MCP_AGENT_MAIL_AGENT_NAME, breadcrumb", "dir", cwd)
+		return
+	}
+
+	client := newAgentMailClient(projectKey)
+	// A token ntm saved for this name wins. A breadcrumb's token is only for a
+	// name that ntm didn't register.
+	if identity.Token != "" && client.RegistrationToken(projectKey, agent) == "" {
+		client.SetRegistrationToken(projectKey, agent, identity.Token)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), stopHookTimeout)
 	defer cancel()
-	msgs, err := newAgentMailClient(projectKey).FetchInbox(ctx, agentmail.FetchInboxOptions{
+	msgs, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 		ProjectKey: projectKey,
 		AgentName:  agent,
 		Limit:      stopHookFetchLimit,

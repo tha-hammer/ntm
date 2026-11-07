@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -431,6 +433,100 @@ func NewSessionAgentRegistry(sessionName, projectKey string) *SessionAgentRegist
 		RegisteredAt:       now,
 		UpdatedAt:          now,
 	}
+}
+
+// Environment names the Stop hook reads to learn which agent it speaks for.
+const (
+	envAgentName          = "AGENT_NAME"
+	envAgentMailAgentName = "MCP_AGENT_MAIL_AGENT_NAME"
+	envTmuxPane           = "TMUX_PANE"
+)
+
+// HookIdentitySources is what the Stop hook can see. Getenv and WindowIDDir
+// are fields so tests never read the real environment or /tmp.
+type HookIdentitySources struct {
+	Getenv      func(string) string
+	Dir         string // folder the hook runs in
+	WindowIDDir string // where the mcp-window-id-tmux-<pane> files live
+}
+
+// HookIdentity is the agent the hook speaks for.
+type HookIdentity struct {
+	Name   string
+	Token  string // set only when the name came from a breadcrumb
+	Source string // envAgentName, envAgentMailAgentName or the breadcrumb path
+}
+
+// ResolveHookIdentity applies Agent Identity Order: AGENT_NAME, then
+// MCP_AGENT_MAIL_AGENT_NAME, then Agent Mail's breadcrumb file. It never
+// errors: a source that can't be read counts as absent, and the reason is
+// logged. With no name, the result's Name is empty.
+func ResolveHookIdentity(src HookIdentitySources) HookIdentity {
+	for _, key := range []string{envAgentName, envAgentMailAgentName} {
+		if name := strings.TrimSpace(src.Getenv(key)); name != "" {
+			return HookIdentity{Name: name, Source: key}
+		}
+	}
+	path, ok := breadcrumbPath(src)
+	if !ok {
+		return HookIdentity{}
+	}
+	crumb, err := readBreadcrumb(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("agent hook: unreadable breadcrumb", "path", path, "error", err)
+		}
+		return HookIdentity{}
+	}
+	name := strings.TrimSpace(crumb.AgentName)
+	if name == "" {
+		return HookIdentity{}
+	}
+	return HookIdentity{Name: name, Token: strings.TrimSpace(crumb.RegistrationToken), Source: path}
+}
+
+// identityBreadcrumb is the identity file Agent Mail writes when an agent registers.
+type identityBreadcrumb struct {
+	AgentName         string `json:"agent_name"`
+	RegistrationToken string `json:"registration_token"`
+}
+
+// breadcrumbPath returns the identity file the old check_critical_on_stop.sh
+// reads, under the repo's common git folder so a linked worktree finds it too.
+// Inside tmux it is the pane's own identity-<window_id>.json. The shared
+// identity.json belongs to whichever agent in the repo registered last, so
+// inside tmux with no window id there is no file rather than a fallback.
+func breadcrumbPath(src HookIdentitySources) (string, bool) {
+	out, err := exec.Command("git", "-C", src.Dir, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Join(strings.TrimSpace(string(out)), "agent-mail")
+	pane := strings.TrimSpace(src.Getenv(envTmuxPane))
+	if pane == "" {
+		return filepath.Join(dir, "identity.json"), true
+	}
+	data, err := os.ReadFile(filepath.Join(src.WindowIDDir, "mcp-window-id-tmux-"+pane))
+	if err != nil {
+		return "", false
+	}
+	windowID := strings.TrimSpace(string(data))
+	if windowID == "" || strings.ContainsAny(windowID, `/\`) {
+		return "", false
+	}
+	return filepath.Join(dir, "identity-"+windowID+".json"), true
+}
+
+func readBreadcrumb(path string) (identityBreadcrumb, error) {
+	var crumb identityBreadcrumb
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return crumb, err
+	}
+	if err := json.Unmarshal(data, &crumb); err != nil {
+		return crumb, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return crumb, nil
 }
 
 // HydrateClientTokensForProject scans every session under the ntm

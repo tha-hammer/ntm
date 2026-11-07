@@ -891,13 +891,15 @@ Where the build differs from the plan:
 ### Human test script
 
 1. Build the binary: `go build -o /tmp/ntm-loop3 ./cmd/ntm`.
-2. In a scratch project folder, create a session: `/tmp/ntm-loop3 spawn hooktest --cc=1`.
+2. Create a session: `/tmp/ntm-loop3 spawn hooktest --cc=1`. Spawn doesn't print its folder, so `cd` into `<projects_base>/hooktest` (for example `~/ntm_Dev/hooktest`).
 3. Get the agent's name and pane ID: `tmux list-panes -a -F '#{pane_id} #{pane_title}'`, or the spawn output. `--robot-status` shows only an agent count.
 4. Send mail: `/tmp/ntm-loop3 mail send hooktest --to <agent> "hook test"`.
 5. Run `echo '{}' | TMUX_PANE=<pane id> AGENT_NAME=<agent> /tmp/ntm-loop3 agent-hook stop --project "$PWD"`.
 6. Pass: it prints JSON with `"decision":"block"` and a reason naming `HumanOverseer` and your subject.
 7. Run the same command again.
 8. Pass: it prints nothing.
+
+**Result (2026-11-07):** passed on rocketman at `885abbe9`, with agent RoseStone in `~/ntm_Dev/hooktest`. Run 1 exited 0 in 180 ms with `"decision":"block"` and the reason "1) from HumanOverseer: hook test". Run 2 exited 0 in 204 ms with no output. Migration `018` applied at 19:17:00 UTC. `told_records` has one row: RoseStone, message 12488, `told_by` `stop_hook`. Feed event 569443 has recipient RoseStone and `message_id` 12488, with an empty `session_name`, because the hook finds tokens by project and doesn't know the session. `agent-hook.log` stayed empty. Notes: the first `mail send` failed with "HumanOverseer not found in project '/home/maceo'", because the new folder has no `.ntm/config.toml`, `.beads` or git repo, so `ResolveProjectDir`'s beads walk climbed to `~/.beads`. Creating `hooktest/.ntm/config.toml` worked around it. Step 2 was corrected, because spawn doesn't print its folder. Evidence: `/home/debian/Dev/ntm-test-evidence/loop3-sprint1-local-2026-11-07/`.
 
 ---
 
@@ -1198,6 +1200,22 @@ func stopHookProject(flag string, getenv func(string) string, cwd string) string
 #### Success Criteria
 
 **Automated:** `go test -short -run TestStopHookProject_Fallbacks ./internal/cli/` fails first, then passes.
+
+### Build record (2026-11-07)
+
+Red, then green, for each behavior:
+- **11:** red was the breadcrumb run printing nothing, because Sprint 1 read only `AGENT_NAME`. **Red-at-seam:** that same run, a lookup with no breadcrumb source. The no-name run also checks that `state.db` isn't created.
+- **8:** red was `undefined: envAgentName` and the other names, before `ResolveHookIdentity` existed. With the environment order in place and breadcrumbs stubbed, the property failed on `["" "" " BlueLake"]`.
+- **9:** red was the rows that expect a name (per-pane, outside tmux, worktree) getting none, and the corrupt row getting no log line. Added an "empty agent name" row.
+- **10:** red was nothing printed. Added a third case: a name from `AGENT_NAME` sends no token, even when the breadcrumb names the same agent.
+- **12:** red was `undefined: stopHookProject`. A relative `MCP_AGENT_MAIL_PROJECT` is made absolute the same way as the flag.
+
+**Real-server check:** `register_agent` on the real Agent Mail server, for a scratch git repo, wrote `.git/agent-mail/identity.json` with `agent_name` and `registration_token` (schema version 2). The hook ran with no `--project`, no name in the environment and outside tmux. It told JadeGate about "breadcrumb check" once, using the breadcrumb's token, then stayed silent. In a plain folder it printed nothing and logged "agent hook: no agent name". Outside tmux, the shared `identity.json` names whichever agent registered last: registering a second agent with no window id overwrote it.
+
+Where the build differs from the plan:
+- The window id folder is `/tmp`, not `os.TempDir()`, because the old script and `ensure_window_id.sh` use `/tmp` by name. A `$TMPDIR` set by Claude Code would otherwise hide the file.
+- A window id holding `/` or `\` counts as missing, so it can't point the lookup at another folder.
+- The breadcrumb tests use a small `hookTB` interface, so the same helpers work with `*testing.T` and `*rapid.T`.
 
 ### Human test script
 
