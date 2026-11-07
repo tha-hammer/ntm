@@ -8,6 +8,8 @@ A Stop hook only fires when a turn ends, so a message to an idle agent waits unt
 
 Covers deliverables 12, 13 and the nudge half of 16. Needs Loop 3, for the told record and reminder text.
 
+**Prerequisite: bead `bd-ndisv`.** The monitor's process pattern is invalid for `pgrep` and `pkill`, so `isMonitorAlive` is always false and a re-spawn can't replace an existing monitor. A session could then run two monitors, and each would send nudges. Resolve that bead before Sprint 1 of this loop.
+
 The nudge reuses these existing functions:
 - Idle detection: `determineAgentState` (`internal/cli/assign.go:1211`), `robot.IsLiveBusy` (`internal/robot/activity.go:844`), `tmux.CaptureForStatusDetection`
 - Sending: `tmux.SendKeysForAgentDoubleEnter` (`internal/tmux/session.go:1279`)

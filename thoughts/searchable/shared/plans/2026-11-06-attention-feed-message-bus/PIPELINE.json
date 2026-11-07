@@ -39,7 +39,9 @@
       "doc": "01-durable-feed.md",
       "tdd_plan": "01-durable-feed-tdd.md",
       "status": "building",
-      "sprints_passed": []
+      "sprints_passed": [
+        "Sprint 1: Durable feed everywhere"
+      ]
     },
     {
       "doc": "02-addressed-mail-notices.md",
@@ -221,8 +223,14 @@
       "step": "build",
       "event": "started",
       "detail": "01-durable-feed-tdd.md"
+    },
+    {
+      "at": "2026-11-07T01:48:39.278Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 1: Durable feed everywhere"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-06T20:38:56.792Z"
+  "updated_at": "2026-11-07T01:48:39.278Z"
 }

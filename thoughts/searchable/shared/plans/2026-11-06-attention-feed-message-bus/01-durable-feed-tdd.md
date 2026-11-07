@@ -249,6 +249,14 @@ All three ran through helper processes in `go test -short`, with no skips.
 - **Bug fixed:** `BuildEventsOutput` applied `--events-limit` before the filters, so the limit counted events examined rather than matches, and `has_more` only looked at what was left after filtering. Matching events beyond the first page were silently missed. It now scans until it has enough matches or reaches the end, up to 50,000 events per request, and past that reports `has_more` with a cursor to resume from. Tests: `TestBuildEventsOutput_FilterFindsEventsBeyondLimit`, `TestBuildEventsOutput_NextCursorPassesNonMatchingTail`, `TestBuildEventsOutput_FilteredPagingReturnsEveryMatchOnce`, `TestBuildEventsOutput_NoFilterKeepsLimitBehavior`, `TestReplayMatchingEvents_StopsAtScanLimit`.
 - **Script error, not a code bug:** the `✉` badge exists only in `renderPaneGrid`, used under 120 columns. Wider layouts use `renderPaneList`, which has no badge, so the script now checks the ticker.
 
+**Human test, local rerun by the user on 5d2e2d9a, machine rocketman:** the event was written at cursor 560412, and the dashboard showed `Mail: 1 unread` within 2 seconds. Following `next_cursor` from a separate process reached it on page 3, and paging was correct. Step 6 as written printed nothing, because a replay starts from the oldest event and 207 mail events were in the window. The script now notes the cursor before sending. This changes the script, not the code, and the user decides whether the sprint passes.
+
+**Sprint 1 passed, by the user's decision, on that run's paging evidence.** The rewritten step 6 hasn't been run.
+
+**Event volume, from that run:** 465 cursors in 57 minutes, about 490 an hour, or roughly 82,000 retained over 7 days at that rate. Of 207 mail events, 199 were `mail.unread`, repeating the same "9 unread" summary (bead filed).
+
+**`ntm kill` and the monitor:** the user's report was right. The pattern uses `(?:...)`, which `pgrep` and `pkill` reject as a regex error, and `ntm` ignores that error. So the kill never reaches the monitor, which exits by itself about 25 seconds after the session dies. An earlier note here blamed differing program names, which was wrong: that VPS check waited 40 seconds, so it didn't show the kill working. Not fixed yet, because that exit path also does cleanup `runKill` doesn't. Bead `bd-ndisv`.
+
 | Acceptance criterion | Behaviors |
 |---|---|
 | Testable function | 1 |
@@ -853,11 +861,12 @@ If `Store` has no `DB()` accessor, assert with a failing query method instead.
 1. Build the binary: `go build -o /tmp/ntm-loop1 ./cmd/ntm`.
 2. Make a scratch project folder and create a session: `/tmp/ntm-loop1 spawn feedtest --cc=1`.
 3. Find the agent's name: `/tmp/ntm-loop1 --robot-status`.
-4. Send it mail: `/tmp/ntm-loop1 mail send feedtest --to <agent> "durable feed test"`.
-5. Open `/tmp/ntm-loop1 dashboard feedtest`, and wait up to 60 seconds for `Mail: 1 unread` in the bottom ticker. The per-pane `✉` badge only appears in terminals under 120 columns.
-6. Quit the dashboard.
-7. In another shell, run `/tmp/ntm-loop1 --robot-events --events-category=mail | jq '.events[] | select(.type=="mail.received") | .summary'`.
-8. Pass: the summary names your message.
+4. Note the feed's position, because a replay starts from the oldest event: `CUR=$(/tmp/ntm-loop1 --robot-events --events-limit=1 | jq .replay_window.latest_cursor)`.
+5. Send it mail: `/tmp/ntm-loop1 mail send feedtest --to <agent> "durable feed test"`.
+6. Open `/tmp/ntm-loop1 dashboard feedtest`, and wait up to 60 seconds for `Mail: 1 unread` in the bottom ticker. The per-pane `✉` badge only appears in terminals under 120 columns.
+7. Quit the dashboard.
+8. In the same shell as step 4, run `/tmp/ntm-loop1 --robot-events --events-category=mail --since-cursor="$CUR" | jq '.events[] | select(.type=="mail.received") | .summary'`.
+9. Pass: the summary names your message.
 
 ---
 
