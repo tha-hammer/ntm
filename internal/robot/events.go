@@ -157,6 +157,7 @@ func BuildEventsOutput(opts EventsOptions) (EventsOutput, int) {
 	var (
 		events          []AttentionEvent
 		newestCursor    int64
+		replayPage      *matchingEvents
 		err             error
 		reconstruction  *ReconstructionMeta
 		replayTarget    *HistoricalReplayTarget
@@ -259,7 +260,14 @@ func BuildEventsOutput(opts EventsOptions) (EventsOutput, int) {
 			Truncated:        reconstruction != nil && reconstruction.Partial,
 		}
 	default:
-		events, newestCursor, err = feed.Replay(opts.SinceCursor, limit+1)
+		pageSize := limit + 1
+		if eventsFiltersActive(opts) && pageSize < eventsFilterScanPageSize {
+			pageSize = eventsFilterScanPageSize
+		}
+		var matching matchingEvents
+		matching, err = replayMatchingEvents(feed, opts, limit, pageSize, eventsFilterMaxScan)
+		events, newestCursor = matching.events, matching.newestCursor
+		replayPage = &matching
 		if err != nil {
 			var cursorErr *CursorExpiredError
 			if errors.As(err, &cursorErr) {
@@ -302,6 +310,10 @@ func BuildEventsOutput(opts EventsOptions) (EventsOutput, int) {
 	} else if newestCursor > 0 {
 		nextCursor = newestCursor
 	}
+	if replayPage != nil {
+		hasMore = replayPage.hasMore
+		nextCursor = replayPage.resumeCursor
+	}
 
 	// Build replay window info
 	stats := feed.Stats()
@@ -342,15 +354,78 @@ func BuildEventsOutput(opts EventsOptions) (EventsOutput, int) {
 	}, 200
 }
 
+const (
+	// eventsFilterScanPageSize is how many events a filtered replay reads at a time.
+	eventsFilterScanPageSize = 1000
+	// eventsFilterMaxScan bounds one filtered request, so a rare filter on a big
+	// feed stays quick. Past it, the reply says there's more and where to resume.
+	eventsFilterMaxScan = 50000
+)
+
+// matchingEvents is one page of a replay, after filtering.
+type matchingEvents struct {
+	events       []AttentionEvent
+	newestCursor int64
+	// resumeCursor is where the next request should continue from.
+	resumeCursor int64
+	hasMore      bool
+}
+
+// replayMatchingEvents reads the feed until it has limit matching events, reaches
+// the end, or has scanned maxScan events. Filtering happens as it reads, so limit
+// counts matches rather than the events examined.
+func replayMatchingEvents(feed *AttentionFeed, opts EventsOptions, limit, pageSize, maxScan int) (matchingEvents, error) {
+	var result matchingEvents
+	var matched []AttentionEvent
+	cursor := opts.SinceCursor
+	scanned := 0
+	for {
+		page, newestCursor, err := feed.Replay(cursor, pageSize)
+		if err != nil {
+			return matchingEvents{}, err
+		}
+		result.newestCursor = newestCursor
+		if len(page) == 0 {
+			if scanned == 0 {
+				result.resumeCursor = newestCursor
+			}
+			break
+		}
+
+		scanned += len(page)
+		cursor = page[len(page)-1].Cursor
+		result.resumeCursor = cursor
+		matched = append(matched, filterEventsForRobot(page, opts)...)
+
+		if len(matched) > limit {
+			matched = matched[:limit]
+			result.hasMore = true
+			result.resumeCursor = matched[limit-1].Cursor
+			break
+		}
+		if len(page) < pageSize {
+			break
+		}
+		if scanned >= maxScan {
+			result.hasMore = true
+			break
+		}
+	}
+	result.events = matched
+	return result, nil
+}
+
+// eventsFiltersActive reports whether any event filter applies to this request.
+func eventsFiltersActive(opts EventsOptions) bool {
+	return opts.Profile != "" || opts.Session != "" ||
+		len(opts.CategoryFilter) > 0 || len(opts.ActionabilityFilter) > 0 ||
+		len(opts.SeverityFilter) > 0
+}
+
 // filterEventsForRobot applies profile-based and explicit filters.
 // Profile filters use minimum thresholds; explicit filters are exact matches.
 func filterEventsForRobot(events []AttentionEvent, opts EventsOptions) []AttentionEvent {
-	// Check if any filters are active
-	hasFilters := opts.Profile != "" || opts.Session != "" ||
-		len(opts.CategoryFilter) > 0 || len(opts.ActionabilityFilter) > 0 ||
-		len(opts.SeverityFilter) > 0
-
-	if !hasFilters {
+	if !eventsFiltersActive(opts) {
 		return events
 	}
 

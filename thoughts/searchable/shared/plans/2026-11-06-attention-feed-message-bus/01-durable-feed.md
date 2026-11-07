@@ -53,7 +53,7 @@ Covers deliverables 1, 5 and 2, in that order. Needs nothing from earlier loops.
 2. Make a scratch project folder and create a session: `/tmp/ntm-loop1 spawn feedtest --cc=1`.
 3. Find the agent's name: `/tmp/ntm-loop1 --robot-status`.
 4. Send it mail: `/tmp/ntm-loop1 mail send feedtest --to <agent> "durable feed test"`.
-5. Open `/tmp/ntm-loop1 dashboard feedtest`, and wait up to 60 seconds for the `✉` mail badge on the pane.
+5. Open `/tmp/ntm-loop1 dashboard feedtest`, and wait up to 60 seconds for `Mail: 1 unread` in the bottom ticker. The per-pane `✉` badge only appears in terminals under 120 columns.
 6. Quit the dashboard.
 7. In another shell, run `/tmp/ntm-loop1 --robot-events --events-category=mail | jq '.events[] | select(.type=="mail.received") | .summary'`.
 8. Pass: the summary names your message.

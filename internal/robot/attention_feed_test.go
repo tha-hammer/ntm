@@ -4974,6 +4974,145 @@ func TestGetAttentionFeed_OpenFailureFallsBackToMemory(t *testing.T) {
 	}
 }
 
+// newEventsFilterFeed returns a global store-backed feed holding system events,
+// with mail events at the given 1-based positions.
+func newEventsFilterFeed(t *testing.T, total int, mailAt ...int) []int64 {
+	t.Helper()
+	resetGlobalFeedForTest(t)
+	feed := NewAttentionFeed(AttentionFeedConfig{
+		JournalSize:     100,
+		RetentionPeriod: time.Hour,
+	}, WithAttentionStore(newTestAttentionStore(t)))
+	t.Cleanup(feed.Stop)
+	SetAttentionFeed(feed)
+
+	isMail := make(map[int]bool, len(mailAt))
+	for _, position := range mailAt {
+		isMail[position] = true
+	}
+	var mailCursors []int64
+	for position := 1; position <= total; position++ {
+		event := testAttentionEvent(fmt.Sprintf("event %d", position))
+		if isMail[position] {
+			event.Category = EventCategoryMail
+			event.Type = EventTypeMailReceived
+		}
+		appended := feed.Append(event)
+		if isMail[position] {
+			mailCursors = append(mailCursors, appended.Cursor)
+		}
+	}
+	return mailCursors
+}
+
+// A filter must apply to the whole replay, not to the first page. Found by the
+// Sprint 1 human test: on a busy feed, mail sat beyond the first 100 events.
+func TestBuildEventsOutput_FilterFindsEventsBeyondLimit(t *testing.T) {
+	mail := newEventsFilterFeed(t, 150, 150)
+
+	output, status := BuildEventsOutput(EventsOptions{Limit: 100, CategoryFilter: []string{"mail"}})
+	if status != 200 {
+		t.Fatalf("status = %d", status)
+	}
+	if len(output.Events) != 1 || output.Events[0].Cursor != mail[0] {
+		t.Fatalf("events = %+v, want the one mail event at cursor %d", output.Events, mail[0])
+	}
+	if output.HasMore {
+		t.Fatal("HasMore = true with nothing left to read")
+	}
+	if output.NextCursor != mail[0] {
+		t.Fatalf("NextCursor = %d, want %d", output.NextCursor, mail[0])
+	}
+}
+
+// With no more matches, the cursor moves past non-matching events, so the reader
+// doesn't scan them again, and it reaches the feed's latest cursor.
+func TestBuildEventsOutput_NextCursorPassesNonMatchingTail(t *testing.T) {
+	newEventsFilterFeed(t, 150, 10)
+
+	output, _ := BuildEventsOutput(EventsOptions{Limit: 100, CategoryFilter: []string{"mail"}})
+	if len(output.Events) != 1 || output.HasMore {
+		t.Fatalf("events = %d, HasMore = %v", len(output.Events), output.HasMore)
+	}
+	if output.NextCursor != output.ReplayWindow.LatestCursor {
+		t.Fatalf("NextCursor = %d, want latest cursor %d", output.NextCursor, output.ReplayWindow.LatestCursor)
+	}
+}
+
+func TestBuildEventsOutput_FilteredPagingReturnsEveryMatchOnce(t *testing.T) {
+	for _, limit := range []int{1, 2, 3, 7, 100} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			want := newEventsFilterFeed(t, 300, 5, 6, 7, 120, 121, 250, 300)
+
+			var got []int64
+			cursor := int64(0)
+			for page := 0; ; page++ {
+				if page > len(want)+1 {
+					t.Fatalf("paging didn't finish; got %v", got)
+				}
+				output, status := BuildEventsOutput(EventsOptions{
+					SinceCursor:    cursor,
+					Limit:          limit,
+					CategoryFilter: []string{"mail"},
+				})
+				if status != 200 {
+					t.Fatalf("status = %d", status)
+				}
+				if len(output.Events) > limit {
+					t.Fatalf("page has %d events, over the limit of %d", len(output.Events), limit)
+				}
+				for _, event := range output.Events {
+					got = append(got, event.Cursor)
+				}
+				cursor = output.NextCursor
+				if !output.HasMore {
+					break
+				}
+			}
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("got %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestBuildEventsOutput_NoFilterKeepsLimitBehavior(t *testing.T) {
+	newEventsFilterFeed(t, 5)
+
+	output, _ := BuildEventsOutput(EventsOptions{Limit: 2})
+	if len(output.Events) != 2 || !output.HasMore {
+		t.Fatalf("events = %d, HasMore = %v, want 2 and true", len(output.Events), output.HasMore)
+	}
+	if output.NextCursor != output.Events[1].Cursor {
+		t.Fatalf("NextCursor = %d, want %d", output.NextCursor, output.Events[1].Cursor)
+	}
+}
+
+// A rare filter on a huge feed must not scan without limit. It stops, reports
+// more, and hands back a cursor to continue from.
+func TestReplayMatchingEvents_StopsAtScanLimit(t *testing.T) {
+	mail := newEventsFilterFeed(t, 35, 35)
+	opts := EventsOptions{Limit: 5, CategoryFilter: []string{"mail"}}
+	feed := GetAttentionFeed()
+
+	first, err := replayMatchingEvents(feed, opts, 5, 10, 20)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if len(first.events) != 0 || !first.hasMore || first.resumeCursor != 20 {
+		t.Fatalf("first scan = %+v, want no events, more, resume at 20", first)
+	}
+
+	opts.SinceCursor = first.resumeCursor
+	second, err := replayMatchingEvents(feed, opts, 5, 10, 20)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if len(second.events) != 1 || second.events[0].Cursor != mail[0] || second.hasMore {
+		t.Fatalf("second scan = %+v, want the mail event and no more", second)
+	}
+}
+
 func TestSetAttentionFeed_ReplacesOpenerFeed(t *testing.T) {
 	resetGlobalFeedForTest(t)
 	var calls atomic.Int32

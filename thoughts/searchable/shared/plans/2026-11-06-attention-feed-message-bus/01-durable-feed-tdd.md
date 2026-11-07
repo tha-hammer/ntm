@@ -244,6 +244,11 @@ All three ran through helper processes in `go test -short`, with no skips.
 
 **Human test, final run by the agent:** dashboard started with those three settings removed. It showed `Mail: 1 unread`. After it quit, a separate `--robot-events` process returned "New mail from HumanOverseer: durable feed test", and the event is in the real `state.db` as cursor 6. The per-pane `✉` badge wasn't seen in the captured screen.
 
+**Human test, local run by the user on 7f9f22a1: not passed as written.** The event was saved, but step 6 returned no `mail.received`.
+
+- **Bug fixed:** `BuildEventsOutput` applied `--events-limit` before the filters, so the limit counted events examined rather than matches, and `has_more` only looked at what was left after filtering. Matching events beyond the first page were silently missed. It now scans until it has enough matches or reaches the end, up to 50,000 events per request, and past that reports `has_more` with a cursor to resume from. Tests: `TestBuildEventsOutput_FilterFindsEventsBeyondLimit`, `TestBuildEventsOutput_NextCursorPassesNonMatchingTail`, `TestBuildEventsOutput_FilteredPagingReturnsEveryMatchOnce`, `TestBuildEventsOutput_NoFilterKeepsLimitBehavior`, `TestReplayMatchingEvents_StopsAtScanLimit`.
+- **Script error, not a code bug:** the `✉` badge exists only in `renderPaneGrid`, used under 120 columns. Wider layouts use `renderPaneList`, which has no badge, so the script now checks the ticker.
+
 | Acceptance criterion | Behaviors |
 |---|---|
 | Testable function | 1 |
@@ -849,7 +854,7 @@ If `Store` has no `DB()` accessor, assert with a failing query method instead.
 2. Make a scratch project folder and create a session: `/tmp/ntm-loop1 spawn feedtest --cc=1`.
 3. Find the agent's name: `/tmp/ntm-loop1 --robot-status`.
 4. Send it mail: `/tmp/ntm-loop1 mail send feedtest --to <agent> "durable feed test"`.
-5. Open `/tmp/ntm-loop1 dashboard feedtest`, and wait up to 60 seconds for the `✉` mail badge on the pane.
+5. Open `/tmp/ntm-loop1 dashboard feedtest`, and wait up to 60 seconds for `Mail: 1 unread` in the bottom ticker. The per-pane `✉` badge only appears in terminals under 120 columns.
 6. Quit the dashboard.
 7. In another shell, run `/tmp/ntm-loop1 --robot-events --events-category=mail | jq '.events[] | select(.type=="mail.received") | .summary'`.
 8. Pass: the summary names your message.

@@ -56,7 +56,7 @@ Covers deliverables 3 and 6. Needs Loop 1.
 2. In a scratch project folder, create a session: `/tmp/ntm-loop2 spawn addrtest --cc=2`.
 3. Find the two agent names: `/tmp/ntm-loop2 --robot-status`.
 4. Send one message to each: `/tmp/ntm-loop2 mail send addrtest --to <first> "for first"`, then the same for `<second>`.
-5. Open `/tmp/ntm-loop2 dashboard addrtest`, wait until both panes show the `✉` badge, then quit.
+5. Open `/tmp/ntm-loop2 dashboard addrtest`, wait until the bottom ticker shows `Mail: 2 unread`, then quit.
 6. Run `/tmp/ntm-loop2 --robot-events --events-recipient=<first> | jq '.events[] | {recipient_agent, summary}'`.
 7. Pass: only the first agent's message is listed.
 8. Run `/tmp/ntm-loop2 --robot-events --events-recipient=NoSuchAgent | jq '{success, events}'`.
@@ -105,10 +105,10 @@ Covers deliverables 3 and 6. Needs Loop 1.
 
 1. Keep the session and unread mail from Sprint 1, or set them up the same way.
 2. Count mail events: `sqlite3 -readonly ~/.config/ntm/state.db "select count(*) from attention_events where event_type in ('mail.received','mail.ack_required')"`.
-3. Open `/tmp/ntm-loop2 dashboard addrtest`, wait for the `✉` badges and at least one more 30 second poll, then quit.
+3. Open `/tmp/ntm-loop2 dashboard addrtest`, wait for the ticker's `Mail:` unread count and at least one more 30 second poll, then quit.
 4. Run the same count.
 5. Pass: the number hasn't changed.
 6. Send one more message: `/tmp/ntm-loop2 mail send addrtest --to <first> "new one"`.
-7. Open the dashboard, wait for the badge count to rise, then quit.
+7. Open the dashboard, wait for the ticker's `Mail:` unread count to rise, then quit.
 8. Run the same count.
 9. Pass: the number went up by exactly 1.

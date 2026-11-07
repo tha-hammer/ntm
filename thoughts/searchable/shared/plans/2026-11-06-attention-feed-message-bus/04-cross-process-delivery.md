@@ -57,7 +57,7 @@ Covers deliverable 7. Needs Loop 1. The hook doesn't depend on this loop, so not
 3. Start the server: `/tmp/ntm-loop4 serve --port 8080`.
 4. In a second shell, watch the stream: `curl -N http://127.0.0.1:8080/api/v1/attention/stream | grep --line-buffered mail.received`.
 5. In a third shell, send mail: `/tmp/ntm-loop4 mail send streamtest --to <agent> "stream test"`.
-6. Open `/tmp/ntm-loop4 dashboard streamtest`, and wait for the `✉` badge.
+6. Open `/tmp/ntm-loop4 dashboard streamtest`, and wait for `Mail: 1 unread` in the bottom ticker.
 7. Pass: within a few seconds, the second shell shows one `mail.received` event naming your message.
 8. Quit the dashboard and wait a minute.
 9. Pass: the same event hasn't appeared again.
