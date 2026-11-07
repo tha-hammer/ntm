@@ -85,8 +85,15 @@ func (e *closureEnv) stateDB() string {
 	return filepath.Join(e.configDir, "ntm", "state.db")
 }
 
-// tryRun starts one helper process and returns its stdout and any failure.
-func (e *closureEnv) tryRun(mode string, args ...string) (string, error) {
+// closureRun is one finished helper process.
+type closureRun struct {
+	stdout, stderr string
+	code           int
+	err            error
+}
+
+// helperCommand builds one helper process with the environment's variables.
+func (e *closureEnv) helperCommand(mode, stdin string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
 	cmd := exec.Command(os.Args[0])
 	cmd.Dir = e.workDir
 	cmd.Env = append(os.Environ(),
@@ -96,13 +103,67 @@ func (e *closureEnv) tryRun(mode string, args ...string) (string, error) {
 	for key, value := range e.vars {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
+	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("helper %q: %w\nstderr: %s", mode, err, stderr.String())
+	return cmd, &stdout, &stderr
+}
+
+// finishRun waits for a started helper and records how it ended.
+func finishRun(mode string, cmd *exec.Cmd, stdout, stderr *bytes.Buffer) closureRun {
+	err := cmd.Wait()
+	run := closureRun{stdout: stdout.String(), stderr: stderr.String(), code: cmd.ProcessState.ExitCode()}
+	if err != nil {
+		run.err = fmt.Errorf("helper %q: %w\nstderr: %s", mode, err, run.stderr)
 	}
-	return stdout.String(), nil
+	return run
+}
+
+// runHelper starts one helper process with stdin and waits for it.
+func (e *closureEnv) runHelper(mode, stdin string, args ...string) closureRun {
+	cmd, stdout, stderr := e.helperCommand(mode, stdin, args...)
+	if err := cmd.Start(); err != nil {
+		return closureRun{code: -1, err: fmt.Errorf("start helper %q: %w", mode, err)}
+	}
+	return finishRun(mode, cmd, stdout, stderr)
+}
+
+// runParallel starts count helpers before waiting for any, and fails the test
+// if any of them fails. It returns each helper's stdout.
+func (e *closureEnv) runParallel(t *testing.T, count int, stdin, mode string, args ...string) []string {
+	t.Helper()
+	runs := make([]closureRun, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		cmd, stdout, stderr := e.helperCommand(mode, stdin, args...)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start helper %d: %v", i, err)
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			runs[i] = finishRun(mode, cmd, stdout, stderr)
+		}(i)
+	}
+	wg.Wait()
+	outs := make([]string, count)
+	for i, run := range runs {
+		if run.err != nil {
+			t.Errorf("helper %d: %v\nstdout: %s", i, run.err, run.stdout)
+		}
+		outs[i] = run.stdout
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+	return outs
+}
+
+// tryRun starts one helper process and returns its stdout and any failure.
+func (e *closureEnv) tryRun(mode string, args ...string) (string, error) {
+	run := e.runHelper(mode, "", args...)
+	return run.stdout, run.err
 }
 
 func (e *closureEnv) run(t *testing.T, mode string, args ...string) string {
@@ -200,6 +261,8 @@ func runClosureHelper(mode string) int {
 		return closureHelperAppendEvents(args)
 	case "publish-inbox":
 		return closureHelperPublishInbox(args)
+	case "seed-registry":
+		return closureHelperSeedRegistry(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown closure helper mode %q\n", mode)
 		return 2
@@ -521,22 +584,7 @@ func TestClosure_DashboardRestartWritesNoNewEvents(t *testing.T) {
 func TestClosure_ManyProcessesPublishOneMessage(t *testing.T) {
 	const writers = 8
 	env := newClosureEnv(t)
-	var wg sync.WaitGroup
-	errs := make(chan string, writers)
-	for i := 0; i < writers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if out, err := env.tryRun("publish-inbox", closureInboxOfTen()...); err != nil {
-				errs <- fmt.Sprintf("%v: %s", err, out)
-			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for failure := range errs {
-		t.Errorf("writer failed: %s", failure)
-	}
+	env.runParallel(t, writers, "", "publish-inbox", closureInboxOfTen()...)
 
 	cursors := readRecipientCursors(t, env, "RedStone")
 	if len(cursors) != 10 || !allDistinct(cursors) {
@@ -556,14 +604,14 @@ func TestClosure_NewMessageAfterRestartGetsOneEvent(t *testing.T) {
 	}
 }
 
-func TestSendDashboardLogsToFile(t *testing.T) {
+func TestSendLogsToFile(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", dataDir)
 	previousSlog := slog.Default()
 	previousWriter := log.Writer()
 	previousFlags := log.Flags()
 
-	restore := sendDashboardLogsToFile("logsess")
+	restore := sendLogsToFile("logsess-dashboard.log")
 	slog.Warn("structured line for the file")
 	log.Print("plain line for the file")
 	restore()
@@ -585,7 +633,7 @@ func TestSendDashboardLogsToFile(t *testing.T) {
 	}
 }
 
-func TestSendDashboardLogsToFile_UnwritableDirStaysOffScreen(t *testing.T) {
+func TestSendLogsToFile_UnwritableDirStaysOffScreen(t *testing.T) {
 	// A file where the log folder should go makes the log file impossible to open.
 	dataDir := t.TempDir()
 	blocker := filepath.Join(dataDir, "ntm")
@@ -595,7 +643,7 @@ func TestSendDashboardLogsToFile_UnwritableDirStaysOffScreen(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", dataDir)
 	previousWriter := log.Writer()
 
-	restore := sendDashboardLogsToFile("logsess")
+	restore := sendLogsToFile("logsess-dashboard.log")
 	defer restore()
 	if log.Writer() == previousWriter {
 		t.Fatal("log output still goes to the terminal, which would garble the screen")

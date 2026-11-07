@@ -2621,6 +2621,135 @@ func TestMigration017_RemovesSprintOneDuplicates(t *testing.T) {
 	}
 }
 
+func toldRecord(project, agent string, messageID int64, toldAt time.Time) ToldRecord {
+	return ToldRecord{ProjectKey: project, AgentName: agent, MessageID: messageID, ToldBy: ToldByStopHook, ToldAt: toldAt}
+}
+
+func TestClaimToldRecord_OneWinnerProperty(t *testing.T) {
+	dir := t.TempDir()
+	var run int
+	rapid.Check(t, func(rt *rapid.T) {
+		run++
+		store, err := Open(filepath.Join(dir, fmt.Sprintf("state-%d.db", run)))
+		if err != nil {
+			rt.Fatal(err)
+		}
+		defer store.Close()
+		if err := store.Migrate(); err != nil {
+			rt.Fatal(err)
+		}
+
+		seen := map[string]bool{}
+		now := time.Now().UTC()
+		steps := rapid.IntRange(1, 50).Draw(rt, "steps")
+		for i := 0; i < steps; i++ {
+			project := rapid.SampledFrom([]string{"/one", "/two", "/three"}).Draw(rt, "project")
+			base := rapid.SampledFrom([]string{"RedStone", "BlueLake", "GreenCastle"}).Draw(rt, "agent")
+			agent := randomCase(rt, base)
+			id := int64(rapid.IntRange(1, 5).Draw(rt, "id"))
+			key := fmt.Sprintf("%s|%s|%d", project, strings.ToLower(agent), id)
+
+			won, err := store.ClaimToldRecord(toldRecord(project, agent, id, now))
+			if err != nil {
+				rt.Fatal(err)
+			}
+			if won == seen[key] {
+				rt.Fatalf("claim %s won = %v, seen before: %v", key, won, seen[key])
+			}
+			seen[key] = true
+		}
+	})
+}
+
+// randomCase changes the letter case of each letter in name at random.
+func randomCase(rt *rapid.T, name string) string {
+	var b strings.Builder
+	for i, r := range name {
+		if rapid.Bool().Draw(rt, fmt.Sprintf("upper-%d", i)) {
+			b.WriteString(strings.ToUpper(string(r)))
+		} else {
+			b.WriteString(strings.ToLower(string(r)))
+		}
+	}
+	return b.String()
+}
+
+func TestClaimToldRecord_ExpiredClaimWinsAgain(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	if won, err := store.ClaimToldRecord(toldRecord("/one", "BlueLake", 42, now.Add(-8*24*time.Hour))); err != nil || !won {
+		t.Fatalf("old claim: won %v, err %v", won, err)
+	}
+	if won, err := store.ClaimToldRecord(toldRecord("/one", "bluelake", 42, now)); err != nil || !won {
+		t.Fatalf("claim after expiry: won %v, err %v, want a win", won, err)
+	}
+	if won, err := store.ClaimToldRecord(toldRecord("/one", "BlueLake", 42, now)); err != nil || won {
+		t.Fatalf("repeat of a fresh claim: won %v, err %v, want no win", won, err)
+	}
+}
+
+func TestClaimToldRecord_DistinctKeysAndBadInput(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	for _, rec := range []ToldRecord{
+		toldRecord("/one", "BlueLake", 42, now),
+		toldRecord("/one", "RedStone", 42, now), // same message, other agent
+		toldRecord("/two", "BlueLake", 42, now), // same agent and message, other project
+	} {
+		if won, err := store.ClaimToldRecord(rec); err != nil || !won {
+			t.Fatalf("claim %+v: won %v, err %v", rec, won, err)
+		}
+	}
+	for _, rec := range []ToldRecord{
+		toldRecord("/one", "BlueLake", 0, now),
+		toldRecord("", "BlueLake", 1, now),
+		toldRecord("/one", " ", 1, now),
+	} {
+		if won, err := store.ClaimToldRecord(rec); err == nil || won {
+			t.Fatalf("claim %+v: won %v, err %v, want an error", rec, won, err)
+		}
+	}
+}
+
+func TestRunGC_RemovesOldToldRecords(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	for i, toldAt := range []time.Time{now.Add(-8 * 24 * time.Hour), now.Add(-10 * 24 * time.Hour), now.Add(-time.Hour)} {
+		if _, err := store.ClaimToldRecord(toldRecord("/one", "BlueLake", int64(i+1), toldAt)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := store.RunGC(DefaultRuntimeGCConfig())
+	if err != nil {
+		t.Fatalf("RunGC() error: %v", err)
+	}
+	if result.ExpiredToldRecords != 2 {
+		t.Fatalf("ExpiredToldRecords = %d, want 2", result.ExpiredToldRecords)
+	}
+	var left int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM told_records`).Scan(&left); err != nil || left != 1 {
+		t.Fatalf("rows left = %d, err %v, want 1", left, err)
+	}
+}
+
+func TestMigration018_CreatesToldRecords(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+	applyMigrationsThrough(t, store, 17)
+	if _, err := store.DB().Exec(`SELECT 1 FROM told_records`); err == nil {
+		t.Fatal("told_records exists before migration 018")
+	}
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("Migrate() error: %v", err)
+	}
+	if won, err := store.ClaimToldRecord(toldRecord("/one", "BlueLake", 42, time.Now().UTC())); err != nil || !won {
+		t.Fatalf("claim after 018: won %v, err %v", won, err)
+	}
+}
+
 func TestReserveAttentionCursor(t *testing.T) {
 	store := testRuntimeAttentionStore(t)
 	now := time.Now().UTC()

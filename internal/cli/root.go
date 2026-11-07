@@ -4184,6 +4184,7 @@ func init() {
 
 		// Internal commands
 		newMonitorCmd(),
+		newAgentHookCmd(),
 
 		// Memory integration
 		newMemoryCmd(),

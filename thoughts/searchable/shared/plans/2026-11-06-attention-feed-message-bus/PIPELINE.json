@@ -11,7 +11,7 @@
   },
   "cursor": {
     "step": "build",
-    "loop": "02-addressed-mail-notices.md"
+    "loop": "03-claude-turn-end-push.md"
   },
   "steps": {
     "scope": {
@@ -48,15 +48,16 @@
     {
       "doc": "02-addressed-mail-notices.md",
       "tdd_plan": "02-addressed-mail-notices-tdd.md",
-      "status": "building",
+      "status": "built",
       "sprints_passed": [
-        "Sprint 1: Events addressed to an agent"
+        "Sprint 1: Events addressed to an agent",
+        "Sprint 2: No duplicates after restart"
       ]
     },
     {
       "doc": "03-claude-turn-end-push.md",
-      "tdd_plan": null,
-      "status": "pending",
+      "tdd_plan": "03-claude-turn-end-push-tdd.md",
+      "status": "building",
       "sprints_passed": []
     },
     {
@@ -287,8 +288,50 @@
       "step": "build",
       "event": "sprint",
       "detail": "Sprint 1: Events addressed to an agent"
+    },
+    {
+      "at": "2026-11-07T13:48:03.258Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 2: No duplicates after restart"
+    },
+    {
+      "at": "2026-11-07T13:48:03.271Z",
+      "step": "build",
+      "event": "done",
+      "detail": "02-addressed-mail-notices-tdd.md"
+    },
+    {
+      "at": "2026-11-07T13:52:59.235Z",
+      "step": "tdd",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-07T13:53:16.120Z",
+      "step": "tdd",
+      "event": "started",
+      "detail": "03-claude-turn-end-push.md"
+    },
+    {
+      "at": "2026-11-07T16:56:46.739Z",
+      "step": "tdd",
+      "event": "done",
+      "detail": "03-claude-turn-end-push.md"
+    },
+    {
+      "at": "2026-11-07T17:56:11.931Z",
+      "step": "build",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-07T17:56:30.437Z",
+      "step": "build",
+      "event": "started",
+      "detail": "03-claude-turn-end-push-tdd.md"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-07T09:05:46.755Z"
+  "updated_at": "2026-11-07T17:56:30.437Z"
 }

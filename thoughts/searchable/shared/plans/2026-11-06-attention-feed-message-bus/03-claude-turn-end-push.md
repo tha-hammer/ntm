@@ -9,7 +9,7 @@ This loop tells a Claude agent about new mail when its turn ends, once per messa
 Covers deliverables 4, 8, 9, 11, 15 and the hook half of 16. Needs Loop 2.
 
 Two gaps found while writing this document:
-- **Tokens.** Agent Mail registration tokens are cached in the memory of a running client (`internal/agentmail/client.go:93`), so a fresh hook process has none. The hook loads the token from the session's `agent_registry.json`, or from the breadcrumb file for sessions ntm didn't spawn. Tokens are never written to hook files.
+- **Tokens.** Agent Mail registration tokens are cached in the memory of a running client (`internal/agentmail/client.go:93`), so a fresh hook process has none. The hook loads the token by project and agent name, through `HydrateClientTokensForProject` (`internal/agentmail/session.go:444`), which reads every session registry for the project. For sessions ntm didn't spawn, it uses the breadcrumb file's token. Tokens are never written to hook files. (Approved at the TDD step, replacing a session lookup through `TMUX_PANE`.)
 - **`ntm add`.** `internal/cli/add.go` doesn't register an Agent Mail identity or set `AGENT_NAME`, so Sprint 6 has to add that.
 
 ---
@@ -38,9 +38,9 @@ Two gaps found while writing this document:
 
 **API:**
 - New command `ntm agent-hook stop [--project <key>]`, with `stdin` as `TurnEndInput`.
-- Finds the session from `TMUX_PANE`, not from the hook file, because several sessions can share one work folder.
-- Loads the token from `LoadBestSessionAgentRegistry` (`internal/agentmail/session.go:550`).
-- Calls `FetchInbox`, drops read and already told messages, runs **Mail Notice Recording**, claims them, then responds. It doesn't use `--robot-*`, so it skips the projection refresh, which calls `fetch_inbox` for every agent.
+- Loads the token by project and agent name through `HydrateClientTokensForProject` (`internal/agentmail/session.go:444`), so it needs no tmux session lookup and works when several sessions share one work folder.
+- Calls `FetchInbox` with a limit of 50, drops read and already told messages, runs **Mail Notice Recording**, claims them, then responds. It doesn't use `--robot-*`, so it skips the projection refresh, which calls `fetch_inbox` for every agent.
+- Failures are logged to `~/.local/share/ntm/logs/agent-hook.log`, one line each, and never shown to the agent.
 - The command does nothing when `agent_mail.enabled` is false.
 
 **UI:** None. The reason text is the agent-facing output, following the **ReminderText** contract.
@@ -127,6 +127,8 @@ Two gaps found while writing this document:
 ### Evidence check at sprint start
 
 **First-run folder trust (scope Evidence Needed item 4).** Check whether Claude Code runs a `settings.local.json` hook in a brand-new work folder, and how its trust prompt affects that. If the hook doesn't run until the folder is trusted, the plan changes before building.
+
+**`CLAUDE_CODE_HOOKS` interplay.** ntm passes DCG and RCH hooks in the `CLAUDE_CODE_HOOKS` environment variable (`internal/cli/spawn.go:2102`). Check whether a `settings.local.json` Stop hook still runs when that variable is set. If it doesn't, the plan changes before building.
 
 ### Acceptance criteria
 
@@ -239,7 +241,7 @@ Two gaps found while writing this document:
 
 **Data:** No new data.
 
-**API:** Calls the Sprint 3 hook writer from the robot spawn path (`launchAgent`, `internal/robot/spawn.go:729`). It already sets `AGENT_NAME` (`:769`). The writer must be in a package that both `internal/cli` and `internal/robot` can import.
+**API:** Calls the Sprint 3 hook writer from the robot spawn path (`launchAgent`, `internal/robot/spawn.go:729`). It already sets `AGENT_NAME` (`:769`). The writer must be in a package that both `internal/cli` and `internal/robot` can import. `SpawnOutput` has no `warnings` field today, so this sprint adds `Warnings []string` with `omitempty`.
 
 **UI:** None. JSON only, following the field rules in `AGENTS.md`.
 

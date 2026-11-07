@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	ntmevents "github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/integrations/pt"
 	"github.com/Dicklesworthstone/ntm/internal/state"
@@ -2419,6 +2420,20 @@ func (f *AttentionFeed) PublishMailPending(projectKey, from, to, subject string,
 	}
 	recorded, _ := f.AppendAddressed(annotateAttentionSignal(addressMailEvent(event, projectKey, to, messageID)))
 	return recorded
+}
+
+// RecordMailNotice writes the addressed notice for one unread message, choosing
+// the ack-required event when the message asks for one. A repeat of a message
+// already recorded for this recipient writes nothing.
+func (f *AttentionFeed) RecordMailNotice(projectKey, to string, msg agentmail.InboxMessage) AttentionEvent {
+	threadID := ""
+	if msg.ThreadID != nil {
+		threadID = *msg.ThreadID
+	}
+	if msg.AckRequired {
+		return f.PublishMailAckRequired(projectKey, msg.From, to, msg.Subject, msg.ID, threadID)
+	}
+	return f.PublishMailPending(projectKey, msg.From, to, msg.Subject, msg.ID, threadID)
 }
 
 // addressMailEvent names the event's recipient. With no known recipient the event

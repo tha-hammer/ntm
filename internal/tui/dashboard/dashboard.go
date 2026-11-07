@@ -2933,15 +2933,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// this is safe on every poll and across restarts. A notice needs a
 				// recipient, so a pane with no known agent name records nothing.
 				if toAgent != "" {
-					threadID := ""
-					if mm.ThreadID != nil {
-						threadID = *mm.ThreadID
-					}
-					if mm.AckRequired {
-						attentionFeed.PublishMailAckRequired(msg.ProjectKey, mm.From, toAgent, mm.Subject, mm.ID, threadID)
-					} else {
-						attentionFeed.PublishMailPending(msg.ProjectKey, mm.From, toAgent, mm.Subject, mm.ID, threadID)
-					}
+					attentionFeed.RecordMailNotice(msg.ProjectKey, toAgent, mm)
 				}
 			}
 			unread += paneUnread

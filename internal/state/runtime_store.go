@@ -46,6 +46,7 @@ type RuntimeGCResult struct {
 	ExpiredAttentionEvents int64 `json:"expired_attention_events"`
 	ExpiredAuditEvents     int64 `json:"expired_audit_events"`
 	ExpiredAuditDecisions  int64 `json:"expired_audit_decisions"`
+	ExpiredToldRecords     int64 `json:"expired_told_records"`
 }
 
 // DefaultRuntimeGCConfig returns conservative cleanup windows for routine maintenance.
@@ -1363,6 +1364,9 @@ func (s *Store) RunGC(cfg RuntimeGCConfig) (RuntimeGCResult, error) {
 	if result.ExpiredAuditDecisions, err = s.GCExpiredAuditDecisions(); err != nil {
 		return result, err
 	}
+	if result.ExpiredToldRecords, err = s.GCExpiredToldRecords(); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
@@ -2242,6 +2246,66 @@ func (s *Store) GCExpiredEvents() (int64, error) {
 
 	result, err := s.db.Exec(`DELETE FROM attention_events WHERE expires_at < datetime('now')`)
 	return rowsAffected(result, err, "gc expired events")
+}
+
+// =============================================================================
+// Told Record Operations
+// =============================================================================
+
+// ToldRecordRetention matches the attention event retention. A message told
+// longer ago than this can be told again.
+const ToldRecordRetention = 7 * 24 * time.Hour
+
+// ToldByStopHook is the told_by value for the turn-end Stop hook.
+const ToldByStopHook = "stop_hook"
+
+// ToldRecord says an agent was told about one Agent Mail message.
+type ToldRecord struct {
+	ProjectKey string
+	AgentName  string
+	MessageID  int64
+	ToldBy     string
+	ToldAt     time.Time
+}
+
+// ClaimToldRecord records that an agent was told about a message. It reports
+// true only for the first claim of a project, agent and message, with the agent
+// compared without case. A record past retention counts as gone, so its message
+// can be claimed again. The claim is one statement, so two processes claiming
+// the same key at once can't both win.
+func (s *Store) ClaimToldRecord(rec ToldRecord) (bool, error) {
+	agent := strings.TrimSpace(rec.AgentName)
+	if rec.ProjectKey == "" || agent == "" || rec.MessageID <= 0 {
+		return false, fmt.Errorf("claim told record: need a project, an agent and a message id, got %q %q %d",
+			rec.ProjectKey, rec.AgentName, rec.MessageID)
+	}
+	toldAt := rec.ToldAt.UTC()
+	cutoff := toldAt.Add(-ToldRecordRetention)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(`
+		INSERT INTO told_records (project_key, agent_name, message_id, told_by, told_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (project_key, agent_name, message_id) DO UPDATE SET
+			told_by = excluded.told_by,
+			told_at = excluded.told_at
+		WHERE told_records.told_at < ?`,
+		rec.ProjectKey, agent, rec.MessageID, rec.ToldBy, toldAt.Format(time.RFC3339), cutoff.Format(time.RFC3339))
+	won, err := rowsAffected(result, err, "claim told record")
+	return won == 1, err
+}
+
+// GCExpiredToldRecords deletes told records past retention and returns how many.
+func (s *Store) GCExpiredToldRecords() (int64, error) {
+	cutoff := time.Now().UTC().Add(-ToldRecordRetention).Format(time.RFC3339)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(`DELETE FROM told_records WHERE told_at < ?`, cutoff)
+	return rowsAffected(result, err, "gc expired told records")
 }
 
 // =============================================================================

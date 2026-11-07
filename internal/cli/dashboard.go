@@ -21,11 +21,12 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/watcher"
 )
 
-// sendDashboardLogsToFile routes slog and the log package to the session's
-// dashboard log, and returns the function that puts them back. The TUI owns the
-// screen, so a log line on stderr would garble it. If the file can't be opened,
+// sendLogsToFile routes slog and the log package to the named file in ntm's
+// log folder, and returns the function that puts them back. It is for commands
+// whose terminal output isn't for logs: the dashboard's TUI owns the screen,
+// and a hook's stdout and stderr go to the agent. If the file can't be opened,
 // logs are discarded for the same reason.
-func sendDashboardLogsToFile(session string) func() {
+func sendLogsToFile(name string) func() {
 	previousSlog := slog.Default()
 	previousWriter := log.Writer()
 	previousFlags := log.Flags()
@@ -34,7 +35,7 @@ func sendDashboardLogsToFile(session string) func() {
 	var logFile *os.File
 	logDir := resilience.LogDir()
 	if err := os.MkdirAll(logDir, 0o755); err == nil {
-		path := filepath.Join(logDir, session+"-dashboard.log")
+		path := filepath.Join(logDir, name)
 		if file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 			logFile = file
 			output = file
@@ -489,7 +490,7 @@ func runDashboard(w io.Writer, errW io.Writer, session string, debug bool, popup
 		}
 	}
 
-	defer sendDashboardLogsToFile(session)()
+	defer sendLogsToFile(session + "-dashboard.log")()
 
 	action, err := dashboard.RunWithOptions(session, projectDir, dashboard.RunOptions{
 		PopupMode:       popup,

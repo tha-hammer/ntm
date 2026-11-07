@@ -904,6 +904,8 @@ Add the entry to `capabilities.go:594` and `attention_contract.go:446`, with the
 | A new message after the restart still produces one new event | 13 |
 | The dedup is durable, and doesn't depend on the in-memory `seenMailAttentionIDs` map or a time window | 10, 11, 14, 15 |
 
+**Result (2026-11-07):** passed on rocketman at `247d4be1`, in a re-spawned `addrtest` session with agents TopazBeaver and MistyDesert. Migration `017` applied at 13:19:05 UTC on the first dashboard open, and removed nothing: Sprint 1's rows had no duplicates with a message id, and the older build's duplicates have none. The baseline after that open was 4. A 79 second dashboard run, covering at least 2 polls, left it at 4. A new message to TopazBeaver raised it to 5, with cursor 565479 and message id 12481. The unique index exists, with no duplicate groups. Evidence: `/home/debian/Dev/ntm-test-evidence/loop2-sprint2-local-2026-11-07/`.
+
 **Build notes (2026-11-07):**
 
 - `AppendAddressed` reads first, then inserts with `ON CONFLICT ... DO NOTHING`. A row found by the read doesn't clear an outage, because reads work during a write lock. `TestAppendAddressed_FoundDuringOutageKeepsOutage` pins that.
