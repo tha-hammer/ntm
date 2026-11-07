@@ -293,6 +293,14 @@ type AttentionEvent struct {
 	// Empty string for system-wide events.
 	Session string `json:"session,omitempty"`
 
+	// RecipientProject and RecipientAgent name the agent a mail event is addressed
+	// to. Both are empty for other events.
+	RecipientProject string `json:"recipient_project,omitempty"`
+	RecipientAgent   string `json:"recipient_agent,omitempty"`
+
+	// MessageID is the Agent Mail message id of an addressed mail event.
+	MessageID int64 `json:"message_id,omitempty"`
+
 	// Pane is the pane index where the event occurred.
 	// -1 or omitted for session-wide or system-wide events.
 	Pane int `json:"pane,omitempty"`
@@ -425,6 +433,9 @@ type CommandArg struct {
 	Description string `json:"description"`
 }
 
+// EventsRecipientFlagDescription describes --events-recipient wherever it's listed.
+const EventsRecipientFlagDescription = "Only events addressed to this agent, in any project (any letter case)"
+
 // AttentionCommands defines the minimal command cluster.
 // These are the commands that form the attention feed interface.
 var AttentionCommands = []AttentionCommand{
@@ -446,6 +457,7 @@ var AttentionCommands = []AttentionCommand{
 			{Name: "--events-category", Type: "string", Required: false, Description: "Filter by category"},
 			{Name: "--events-actionability", Type: "string", Required: false, Description: "Filter by actionability"},
 			{Name: "--events-session", Type: "string", Required: false, Description: "Filter by session"},
+			{Name: "--events-recipient", Type: "string", Required: false, Description: EventsRecipientFlagDescription},
 		},
 		Returns: "EventsOutput with events array and next_cursor",
 		Example: "ntm --robot-events --since-cursor=42 --events-limit=50",

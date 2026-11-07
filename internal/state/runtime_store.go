@@ -1568,22 +1568,42 @@ func (s *Store) GetDegradedSources() ([]SourceHealth, error) {
 // Attention Event Operations
 // =============================================================================
 
+const (
+	// attentionEventInsert adds one row to attention_events.
+	attentionEventInsert = `
+		INSERT INTO attention_events (
+			ts, session_name, pane, category, event_type, source,
+			actionability, severity, reason_code, summary, details, next_actions,
+			dedup_key, dedup_count, expires_at,
+			recipient_project, recipient_agent, message_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	// attentionEventColumns is the column list scanAttentionEvents reads.
+	attentionEventColumns = `
+		cursor, ts, COALESCE(session_name, ''), COALESCE(pane, ''),
+		category, event_type, source, actionability, severity, COALESCE(reason_code, ''),
+		summary, COALESCE(details, ''), COALESCE(next_actions, ''),
+		COALESCE(dedup_key, ''), dedup_count, expires_at,
+		recipient_project, recipient_agent, message_id`
+)
+
+// attentionEventInsertArgs returns the values for attentionEventInsert.
+func attentionEventInsertArgs(event *StoredAttentionEvent) []any {
+	return []any{
+		event.Ts, event.SessionName, event.Pane, event.Category,
+		event.EventType, event.Source, event.Actionability, event.Severity, event.ReasonCode,
+		event.Summary, event.Details, event.NextActions,
+		event.DedupKey, event.DedupCount, event.ExpiresAt,
+		event.RecipientProject, event.RecipientAgent, event.MessageID,
+	}
+}
+
 // AppendAttentionEvent inserts an attention event and returns its cursor.
 func (s *Store) AppendAttentionEvent(event *StoredAttentionEvent) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result, err := s.db.Exec(`
-		INSERT INTO attention_events (
-			ts, session_name, pane, category, event_type, source,
-			actionability, severity, reason_code, summary, details, next_actions,
-			dedup_key, dedup_count, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.Ts, event.SessionName, event.Pane, event.Category,
-		event.EventType, event.Source, event.Actionability, event.Severity, event.ReasonCode,
-		event.Summary, event.Details, event.NextActions,
-		event.DedupKey, event.DedupCount, event.ExpiresAt,
-	)
+	result, err := s.db.Exec(attentionEventInsert, attentionEventInsertArgs(event)...)
 	if err != nil {
 		return 0, fmt.Errorf("append attention event: %w", err)
 	}
@@ -1597,17 +1617,7 @@ func (s *Store) AppendAttentionEvent(event *StoredAttentionEvent) (int64, error)
 
 // AppendAttentionEvent inserts an attention event and returns its cursor in an existing transaction.
 func (tx *Tx) AppendAttentionEvent(event *StoredAttentionEvent) (int64, error) {
-	result, err := tx.tx.Exec(`
-		INSERT INTO attention_events (
-			ts, session_name, pane, category, event_type, source,
-			actionability, severity, reason_code, summary, details, next_actions,
-			dedup_key, dedup_count, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.Ts, event.SessionName, event.Pane, event.Category,
-		event.EventType, event.Source, event.Actionability, event.Severity, event.ReasonCode,
-		event.Summary, event.Details, event.NextActions,
-		event.DedupKey, event.DedupCount, event.ExpiresAt,
-	)
+	result, err := tx.tx.Exec(attentionEventInsert, attentionEventInsertArgs(event)...)
 	if err != nil {
 		return 0, fmt.Errorf("append attention event: %w", err)
 	}
@@ -1629,10 +1639,7 @@ func (s *Store) GetAttentionEventsSince(sinceCursor int64, limit int) ([]StoredA
 	}
 
 	rows, err := s.db.Query(`
-		SELECT cursor, ts, COALESCE(session_name, ''), COALESCE(pane, ''),
-			category, event_type, source, actionability, severity, COALESCE(reason_code, ''),
-			summary, COALESCE(details, ''), COALESCE(next_actions, ''),
-			COALESCE(dedup_key, ''), dedup_count, expires_at
+		SELECT `+attentionEventColumns+`
 		FROM attention_events
 		WHERE cursor > ?
 		  AND (expires_at IS NULL OR expires_at >= datetime('now'))
@@ -1642,22 +1649,33 @@ func (s *Store) GetAttentionEventsSince(sinceCursor int64, limit int) ([]StoredA
 		return nil, fmt.Errorf("get events since cursor: %w", err)
 	}
 	defer rows.Close()
+	return scanAttentionEvents(rows)
+}
 
-	var events []StoredAttentionEvent
-	for rows.Next() {
-		var event StoredAttentionEvent
-		if err := rows.Scan(
-			&event.Cursor, &event.Ts, &event.SessionName, &event.Pane,
-			&event.Category, &event.EventType, &event.Source,
-			&event.Actionability, &event.Severity, &event.ReasonCode, &event.Summary,
-			&event.Details, &event.NextActions, &event.DedupKey,
-			&event.DedupCount, &event.ExpiresAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan attention event: %w", err)
-		}
-		events = append(events, event)
+// GetAttentionEventsForRecipient returns events addressed to one agent, in any
+// project and any letter case, with cursor > sinceCursor. The filter runs in SQL,
+// so other events can't push an agent's events out of a page.
+func (s *Store) GetAttentionEventsForRecipient(agent string, sinceCursor int64, limit int) ([]StoredAttentionEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 100
 	}
-	return events, rows.Err()
+
+	rows, err := s.db.Query(`
+		SELECT `+attentionEventColumns+`
+		FROM attention_events
+		WHERE recipient_agent = ? COLLATE NOCASE
+		  AND cursor > ?
+		  AND (expires_at IS NULL OR expires_at >= datetime('now'))
+		ORDER BY cursor ASC
+		LIMIT ?`, agent, sinceCursor, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get events for recipient: %w", err)
+	}
+	defer rows.Close()
+	return scanAttentionEvents(rows)
 }
 
 // GetEventsForIncident returns replayable attention events linked to the given incident.
@@ -1670,10 +1688,7 @@ func (s *Store) GetEventsForIncident(incidentID string, limit int) ([]StoredAtte
 	}
 
 	rows, err := s.db.Query(`
-		SELECT ae.cursor, ae.ts, COALESCE(ae.session_name, ''), COALESCE(ae.pane, ''),
-			ae.category, ae.event_type, ae.source, ae.actionability, ae.severity, COALESCE(ae.reason_code, ''),
-			ae.summary, COALESCE(ae.details, ''), COALESCE(ae.next_actions, ''),
-			COALESCE(ae.dedup_key, ''), ae.dedup_count, ae.expires_at
+		SELECT `+attentionEventColumns+`
 		FROM incident_events ie
 		JOIN attention_events ae ON ae.cursor = ie.event_cursor
 		WHERE ie.incident_id = ?
@@ -1684,22 +1699,7 @@ func (s *Store) GetEventsForIncident(incidentID string, limit int) ([]StoredAtte
 		return nil, fmt.Errorf("get events for incident: %w", err)
 	}
 	defer rows.Close()
-
-	var events []StoredAttentionEvent
-	for rows.Next() {
-		var event StoredAttentionEvent
-		if err := rows.Scan(
-			&event.Cursor, &event.Ts, &event.SessionName, &event.Pane,
-			&event.Category, &event.EventType, &event.Source,
-			&event.Actionability, &event.Severity, &event.ReasonCode, &event.Summary,
-			&event.Details, &event.NextActions, &event.DedupKey,
-			&event.DedupCount, &event.ExpiresAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan incident attention event: %w", err)
-		}
-		events = append(events, event)
-	}
-	return events, rows.Err()
+	return scanAttentionEvents(rows)
 }
 
 // GetAttentionEventsInTimeRange returns replayable attention events between the provided timestamps.
@@ -1715,10 +1715,7 @@ func (s *Store) GetAttentionEventsInTimeRange(start, end time.Time, limit int) (
 	}
 
 	rows, err := s.db.Query(`
-		SELECT cursor, ts, COALESCE(session_name, ''), COALESCE(pane, ''),
-			category, event_type, source, actionability, severity, COALESCE(reason_code, ''),
-			summary, COALESCE(details, ''), COALESCE(next_actions, ''),
-			COALESCE(dedup_key, ''), dedup_count, expires_at
+		SELECT `+attentionEventColumns+`
 		FROM attention_events
 		WHERE ts BETWEEN ? AND ?
 		  AND (expires_at IS NULL OR expires_at >= datetime('now'))
@@ -1728,7 +1725,7 @@ func (s *Store) GetAttentionEventsInTimeRange(start, end time.Time, limit int) (
 		return nil, fmt.Errorf("get events in time range: %w", err)
 	}
 	defer rows.Close()
-	return scanRangedAttentionEvents(rows)
+	return scanAttentionEvents(rows)
 }
 
 // ReserveAttentionCursor makes the next attention cursor greater than minCursor.
@@ -1772,10 +1769,7 @@ func (s *Store) GetLatestAttentionEventsInTimeRange(start, end time.Time, limit 
 
 	rows, err := s.db.Query(`
 		SELECT * FROM (
-			SELECT cursor, ts, COALESCE(session_name, ''), COALESCE(pane, ''),
-				category, event_type, source, actionability, severity, COALESCE(reason_code, ''),
-				summary, COALESCE(details, ''), COALESCE(next_actions, ''),
-				COALESCE(dedup_key, ''), dedup_count, expires_at
+			SELECT `+attentionEventColumns+`
 			FROM attention_events
 			WHERE ts BETWEEN ? AND ?
 			  AND (expires_at IS NULL OR expires_at >= datetime('now'))
@@ -1786,10 +1780,11 @@ func (s *Store) GetLatestAttentionEventsInTimeRange(start, end time.Time, limit 
 		return nil, fmt.Errorf("get latest events in time range: %w", err)
 	}
 	defer rows.Close()
-	return scanRangedAttentionEvents(rows)
+	return scanAttentionEvents(rows)
 }
 
-func scanRangedAttentionEvents(rows *sql.Rows) ([]StoredAttentionEvent, error) {
+// scanAttentionEvents reads rows selected with attentionEventColumns.
+func scanAttentionEvents(rows *sql.Rows) ([]StoredAttentionEvent, error) {
 	var events []StoredAttentionEvent
 	for rows.Next() {
 		var event StoredAttentionEvent
@@ -1799,8 +1794,9 @@ func scanRangedAttentionEvents(rows *sql.Rows) ([]StoredAttentionEvent, error) {
 			&event.Actionability, &event.Severity, &event.ReasonCode, &event.Summary,
 			&event.Details, &event.NextActions, &event.DedupKey,
 			&event.DedupCount, &event.ExpiresAt,
+			&event.RecipientProject, &event.RecipientAgent, &event.MessageID,
 		); err != nil {
-			return nil, fmt.Errorf("scan ranged attention event: %w", err)
+			return nil, fmt.Errorf("scan attention event: %w", err)
 		}
 		events = append(events, event)
 	}

@@ -413,6 +413,11 @@ type StoredAttentionEvent struct {
 
 	// Retention
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// Recipient. Empty for events not addressed to one agent.
+	RecipientProject string `json:"recipient_project,omitempty"`
+	RecipientAgent   string `json:"recipient_agent,omitempty"`
+	MessageID        *int64 `json:"message_id,omitempty"`
 }
 
 // AttentionState represents durable operator state for an attention item.

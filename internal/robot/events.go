@@ -52,6 +52,11 @@ type EventsOptions struct {
 
 	// SeverityFilter restricts to specific severity levels.
 	SeverityFilter []string
+
+	// Recipient limits results to events addressed to this agent name, in any
+	// project and any letter case. The store applies it, so a busy feed can't hide
+	// an agent's events.
+	Recipient string
 }
 
 // EventsOutput is the JSON response for --robot-events.
@@ -376,11 +381,11 @@ type matchingEvents struct {
 // counts matches rather than the events examined.
 func replayMatchingEvents(feed *AttentionFeed, opts EventsOptions, limit, pageSize, maxScan int) (matchingEvents, error) {
 	var result matchingEvents
-	var matched []AttentionEvent
+	matched := []AttentionEvent{} // Robot output lists an empty result as [], never null.
 	cursor := opts.SinceCursor
 	scanned := 0
 	for {
-		page, newestCursor, err := feed.Replay(cursor, pageSize)
+		page, newestCursor, err := replayEventsPage(feed, opts, cursor, pageSize)
 		if err != nil {
 			return matchingEvents{}, err
 		}
@@ -415,9 +420,18 @@ func replayMatchingEvents(feed *AttentionFeed, opts EventsOptions, limit, pageSi
 	return result, nil
 }
 
+// replayEventsPage reads one page. A recipient filter goes to the store, so the
+// page holds only that agent's events and the scan limit counts only those.
+func replayEventsPage(feed *AttentionFeed, opts EventsOptions, cursor int64, pageSize int) ([]AttentionEvent, int64, error) {
+	if opts.Recipient != "" {
+		return feed.ReplayForRecipient(opts.Recipient, cursor, pageSize)
+	}
+	return feed.Replay(cursor, pageSize)
+}
+
 // eventsFiltersActive reports whether any event filter applies to this request.
 func eventsFiltersActive(opts EventsOptions) bool {
-	return opts.Profile != "" || opts.Session != "" ||
+	return opts.Profile != "" || opts.Session != "" || opts.Recipient != "" ||
 		len(opts.CategoryFilter) > 0 || len(opts.ActionabilityFilter) > 0 ||
 		len(opts.SeverityFilter) > 0
 }
@@ -458,6 +472,10 @@ func filterEventsForRobot(events []AttentionEvent, opts EventsOptions) []Attenti
 			continue
 		}
 		if opts.Session != "" && event.Session != opts.Session {
+			continue
+		}
+		// Replay already filters by recipient. Incident and as-of reads rely on this.
+		if opts.Recipient != "" && !strings.EqualFold(event.RecipientAgent, opts.Recipient) {
 			continue
 		}
 		filtered = append(filtered, event)

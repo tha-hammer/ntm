@@ -2691,6 +2691,26 @@ func (s *stubAttentionStore) GetAttentionEventsSince(sinceCursor int64, limit in
 	return events, nil
 }
 
+func (s *stubAttentionStore) GetAttentionEventsForRecipient(agent string, sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if limit <= 0 {
+		limit = 100
+	}
+	events := []state.StoredAttentionEvent{}
+	for _, event := range s.events {
+		if event.Cursor <= sinceCursor || !strings.EqualFold(event.RecipientAgent, agent) {
+			continue
+		}
+		events = append(events, event)
+		if len(events) == limit {
+			break
+		}
+	}
+	return events, nil
+}
+
 func (s *stubAttentionStore) GetLatestAttentionEventsInTimeRange(start, end time.Time, limit int) ([]state.StoredAttentionEvent, error) {
 	events, err := s.GetAttentionEventsInTimeRange(start, end, math.MaxInt)
 	if err != nil {
@@ -5711,6 +5731,245 @@ func TestAttentionFeed_FailedOpenIsRetried(t *testing.T) {
 	assertSummaries(t, events, "memory", "too soon", "durable")
 	if got := logs.count(attentionStoreRecoveredLogMessage); got != 1 {
 		t.Fatalf("recovery reports = %d, want 1", got)
+	}
+}
+
+func newRecipientFeed(t *testing.T) *AttentionFeed {
+	t.Helper()
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(),
+		WithAttentionStore(openStoreFile(t, filepath.Join(t.TempDir(), "state.db"))))
+	t.Cleanup(feed.Stop)
+	return feed
+}
+
+func TestAttentionEventStored_RecipientRoundtrip(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		event := testAttentionEvent("x")
+		event.RecipientProject = rapid.StringN(1, 64, -1).Draw(rt, "project")
+		event.RecipientAgent = rapid.StringN(1, 64, -1).Draw(rt, "agent")
+		event.MessageID = rapid.Int64Range(1, 1<<53).Draw(rt, "message")
+
+		back := attentionEventFromStored(attentionEventToStored(event, time.Hour))
+		if back.RecipientProject != event.RecipientProject || back.RecipientAgent != event.RecipientAgent || back.MessageID != event.MessageID {
+			rt.Fatalf("round trip %+v -> %+v", event, back)
+		}
+	})
+}
+
+func TestAttentionEventStored_NoMessageIDStaysNull(t *testing.T) {
+	stored := attentionEventToStored(testAttentionEvent("x"), time.Hour)
+	if stored.MessageID != nil {
+		t.Fatalf("MessageID = %d, want nil for an unaddressed event", *stored.MessageID)
+	}
+}
+
+func TestPublishMail_FillsRecipientFields(t *testing.T) {
+	publishers := map[string]func(*AttentionFeed, string, int) AttentionEvent{
+		"pending": func(f *AttentionFeed, to string, id int) AttentionEvent {
+			return f.PublishMailPending("/proj", "Sender", to, "subject", id, "thread")
+		},
+		"ack required": func(f *AttentionFeed, to string, id int) AttentionEvent {
+			return f.PublishMailAckRequired("/proj", "Sender", to, "subject", id, "thread")
+		},
+	}
+	for name, publish := range publishers {
+		t.Run(name, func(t *testing.T) {
+			feed := newTestAttentionFeed(t)
+			got := publish(feed, "RedStone", 42)
+			if got.RecipientProject != "/proj" || got.RecipientAgent != "RedStone" || got.MessageID != 42 {
+				t.Fatalf("event = %+v", got)
+			}
+			if got.Details["to"] != "RedStone" || got.Details["message_id"] != 42 {
+				t.Fatalf("details changed: %+v", got.Details)
+			}
+			if empty := publish(feed, " ", 43); empty.RecipientProject != "" || empty.RecipientAgent != "" || empty.MessageID != 0 {
+				t.Fatalf("event with no recipient = %+v", empty)
+			}
+		})
+	}
+}
+
+func TestReplayMatchingEvents_RecipientIgnoresOtherEventsInScanLimit(t *testing.T) {
+	feed := newRecipientFeed(t)
+	for i := 0; i < 50; i++ {
+		feed.Append(testAttentionEvent("other"))
+	}
+	wanted := feed.PublishMailPending("/proj", "Sender", "RedStone", "for red", 42, "")
+
+	// A scan limit smaller than the other events would stop a read that filters
+	// after fetching, before it reached RedStone's event.
+	result, err := replayMatchingEvents(feed, EventsOptions{Recipient: "RedStone"}, 10, 5, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.events) != 1 || result.events[0].Cursor != wanted.Cursor || result.hasMore {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestBuildEventsOutput_RecipientPagesEachEventOnce(t *testing.T) {
+	resetGlobalFeedForTest(t)
+	feed := newRecipientFeed(t)
+	SetAttentionFeed(feed)
+
+	var want []int64
+	for i := 0; i < 25; i++ {
+		feed.Append(testAttentionEvent("other"))
+		want = append(want, feed.PublishMailPending("/proj", "Sender", "RedStone", "for red", i+1, "").Cursor)
+	}
+
+	var got []int64
+	since := int64(0)
+	for page := 0; ; page++ {
+		if page > 5 {
+			t.Fatalf("still more after %d pages: %v", page, got)
+		}
+		output, code := BuildEventsOutput(EventsOptions{Recipient: "RedStone", SinceCursor: since, Limit: 10})
+		if code != 200 || !output.Success {
+			t.Fatalf("code %d, output %+v", code, output)
+		}
+		got = append(got, cursorsOf(output.Events)...)
+		if !output.HasMore {
+			break
+		}
+		since = output.NextCursor
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("paged cursors %v, want %v", got, want)
+	}
+}
+
+func TestBuildEventsOutput_EmptyFeedReturnsEmptyList(t *testing.T) {
+	for name, opts := range map[string]EventsOptions{
+		"no filter":      {},
+		"recipient only": {Recipient: "NoSuchAgent"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resetGlobalFeedForTest(t)
+			SetAttentionFeed(newRecipientFeed(t))
+			output, code := BuildEventsOutput(opts)
+			if code != 200 || output.Events == nil || len(output.Events) != 0 {
+				t.Fatalf("code %d, events %#v, want an empty non-nil list", code, output.Events)
+			}
+		})
+	}
+}
+
+func TestUnaddressedEvents_HaveNoRecipient(t *testing.T) {
+	feed := newRecipientFeed(t)
+	event := testAttentionEvent("9 unread message(s) across the swarm")
+	event.Category, event.Type = EventCategoryMail, EventTypeMailUnread
+	feed.Append(event)
+
+	events, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "9 unread message(s) across the swarm")
+	raw, err := json.Marshal(events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"recipient_project", "recipient_agent", "message_id"} {
+		if strings.Contains(string(raw), key) {
+			t.Fatalf("JSON has %q: %s", key, raw)
+		}
+	}
+
+	matches, _, err := feed.ReplayForRecipient(" ", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches == nil || len(matches) != 0 {
+		t.Fatalf("a blank name matched unaddressed events: %+v", matches)
+	}
+}
+
+func TestReplayForRecipient_NoStore(t *testing.T) {
+	feed := newTestAttentionFeed(t)
+	feed.PublishMailPending("/proj", "Sender", "BlueLake", "for blue", 41, "")
+	feed.PublishMailPending("/proj", "Sender", "RedStone", "for red", 42, "")
+
+	events, _, err := feed.ReplayForRecipient("redstone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].MessageID != 42 {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestReplayForRecipient_MergesMemoryOnlyEvents(t *testing.T) {
+	captureSlog(t)
+	store := &faultInjectingStore{Store: openStoreFile(t, filepath.Join(t.TempDir(), "state.db"))}
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(store))
+	t.Cleanup(feed.Stop)
+
+	stored := feed.PublishMailPending("/proj", "Sender", "RedStone", "stored", 41, "")
+	store.fail.Store(true)
+	memory := feed.PublishMailPending("/proj", "Sender", "RedStone", "memory", 42, "")
+	feed.PublishMailPending("/proj", "Sender", "BlueLake", "not this one", 43, "")
+
+	events, _, err := feed.ReplayForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cursorsOf(events); !slices.Equal(got, []int64{stored.Cursor, memory.Cursor}) {
+		t.Fatalf("cursors = %v, want %d and %d", got, stored.Cursor, memory.Cursor)
+	}
+
+	limited, _, err := feed.ReplayForRecipient("RedStone", 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cursorsOf(limited); !slices.Equal(got, []int64{stored.Cursor}) {
+		t.Fatalf("limit across both sources: cursors = %v", got)
+	}
+}
+
+func TestReplayForRecipient_SameNameInTwoProjects(t *testing.T) {
+	feed := newRecipientFeed(t)
+	feed.PublishMailPending("/one", "Sender", "RedStone", "in one", 42, "")
+	feed.PublishMailPending("/two", "Sender", "RedStone", "in two", 42, "")
+
+	events, _, err := feed.ReplayForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].RecipientProject != "/one" || events[1].RecipientProject != "/two" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestRobotEventsCapabilities_ListRecipientFlag(t *testing.T) {
+	capabilities, err := GetCapabilities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := false
+	for _, command := range capabilities.Commands {
+		if command.Flag != "--robot-events" {
+			continue
+		}
+		for _, parameter := range command.Parameters {
+			listed = listed || parameter.Flag == "--events-recipient"
+		}
+	}
+	if !listed {
+		t.Fatal("--robot-capabilities doesn't list --events-recipient")
+	}
+
+	inContract := false
+	for _, command := range AttentionCommands {
+		if command.Name != "--robot-events" {
+			continue
+		}
+		for _, arg := range command.Args {
+			inContract = inContract || arg.Name == "--events-recipient"
+		}
+	}
+	if !inContract {
+		t.Fatal("the attention contract doesn't list --events-recipient")
 	}
 }
 

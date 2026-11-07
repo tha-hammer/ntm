@@ -310,6 +310,7 @@ Shell Integration:
 				IncidentID:  robotEventsIncident,
 				Session:     session,
 				Profile:     robotProfile,
+				Recipient:   strings.TrimSpace(robotEventsRecipient),
 			}
 			if robotEventsAsOf != "" {
 				asOf, err := time.Parse(time.RFC3339, robotEventsAsOf)
@@ -2800,6 +2801,7 @@ var (
 	robotEventsWindowAfter     string // duration after incident end for replay context
 	robotEventsCategory        string // category filter for --robot-events
 	robotEventsSession         string // session filter for --robot-events
+	robotEventsRecipient       string // recipient agent filter for --robot-events
 	robotEventsActionability   string // actionability filter for --robot-events
 	robotProfile               string // filter profile for attention-feed commands (br-91gti)
 	robotAttention             bool   // one obvious tending primitive (br-t540i)
@@ -3321,6 +3323,7 @@ func init() {
 	rootCmd.Flags().StringVar(&robotEventsWindowBefore, "events-window-before", "", "Replay context before incident start. Optional with --robot-events --events-incident. Example: --events-window-before=5m")
 	rootCmd.Flags().StringVar(&robotEventsWindowAfter, "events-window-after", "", "Replay context after incident end. Optional with --robot-events --events-incident. Example: --events-window-after=1m")
 	rootCmd.Flags().StringVar(&robotEventsCategory, "events-category", "", "Filter by event category. Optional with --robot-events. Example: --events-category=agent")
+	rootCmd.Flags().StringVar(&robotEventsRecipient, "events-recipient", "", robot.EventsRecipientFlagDescription+". Optional with --robot-events.")
 	rootCmd.Flags().StringVar(&robotEventsSession, "events-session", "", "Filter by session name. Optional with --robot-events. Example: --events-session=myproject")
 	rootCmd.Flags().StringVar(&robotEventsActionability, "events-actionability", "", "Filter by actionability level. Optional with --robot-events. Values: action_required, interesting, background")
 	rootCmd.Flags().StringVar(&robotProfile, "profile", "", "Attention-feed filter profile. Applies to --robot-events, --robot-attention, --robot-digest, --robot-wait. Values: operator, debug, minimal, alerts")

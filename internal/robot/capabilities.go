@@ -593,6 +593,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "events-window-after", Flag: "--events-window-after", Type: "duration", Required: false, Default: "1m", Description: "Context after incident end for incident replay"},
 				{Name: "events-category", Flag: "--events-category", Type: "string", Required: false, Description: "Filter by event category"},
 				{Name: "events-session", Flag: "--events-session", Type: "string", Required: false, Description: "Filter by session name"},
+				{Name: "events-recipient", Flag: "--events-recipient", Type: "string", Required: false, Description: EventsRecipientFlagDescription},
 				{Name: "events-actionability", Flag: "--events-actionability", Type: "string", Required: false, Description: "Filter by actionability level"},
 				{Name: "profile", Flag: "--profile", Type: "string", Required: false, Default: "operator", Description: "Attention profile: operator, debug, minimal, alerts"},
 			},

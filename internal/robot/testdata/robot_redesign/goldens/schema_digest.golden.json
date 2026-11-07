@@ -25,6 +25,10 @@
             "description": "Details",
             "type": "object"
           },
+          "message_id": {
+            "description": "Message i d",
+            "type": "integer"
+          },
           "next_actions": {
             "description": "Next actions",
             "items": {
@@ -38,6 +42,14 @@
           },
           "reason_code": {
             "description": "Reason code",
+            "type": "string"
+          },
+          "recipient_agent": {
+            "description": "Recipient agent",
+            "type": "string"
+          },
+          "recipient_project": {
+            "description": "Recipient project",
             "type": "string"
           },
           "session": {

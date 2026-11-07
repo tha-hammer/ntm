@@ -42,6 +42,8 @@ const (
 	closureMailSubject = "durable feed test"
 
 	closureContentionSession = "contention"
+
+	closureInboxArgSep = "|"
 )
 
 // closureEnv is an isolated config, home and working folder for helper processes.
@@ -116,6 +118,10 @@ type closureRobotEvent struct {
 	Session string `json:"session"`
 	Type    string `json:"type"`
 	Summary string `json:"summary"`
+
+	RecipientProject string `json:"recipient_project"`
+	RecipientAgent   string `json:"recipient_agent"`
+	MessageID        int64  `json:"message_id"`
 }
 
 // readAllCursors pages through --robot-events in new processes and returns the
@@ -191,6 +197,8 @@ func runClosureHelper(mode string) int {
 		return closureHelperAppendOldEvents(args)
 	case "append-events":
 		return closureHelperAppendEvents(args)
+	case "publish-inbox":
+		return closureHelperPublishInbox(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown closure helper mode %q\n", mode)
 		return 2
@@ -306,6 +314,54 @@ func closureHelperAppendEvents(args []string) int {
 	return 0
 }
 
+// closureHelperPublishInbox goes through ntm's real startup for the dashboard
+// command, then hands the real model one poll's inboxes. Each arg is
+// "<message id>|<agent>|<subject>". It fails if the feed ended up memory-only.
+func closureHelperPublishInbox(args []string) int {
+	os.Args = []string{"ntm", "dashboard"}
+	if err := rootCmd.PersistentPreRunE(newDashboardCmd(), nil); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeRobotPersistence()
+
+	inboxes := map[string][]agentmail.InboxMessage{}
+	agents := map[string]string{}
+	for _, arg := range args {
+		parts := strings.SplitN(arg, closureInboxArgSep, 3)
+		if len(parts) != 3 {
+			fmt.Fprintf(os.Stderr, "bad inbox arg %q\n", arg)
+			return 2
+		}
+		id, err := strconv.Atoi(parts[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bad inbox arg %q: %v\n", arg, err)
+			return 2
+		}
+		paneID := "%" + parts[1]
+		agents[paneID] = parts[1]
+		inboxes[paneID] = append(inboxes[paneID], agentmail.InboxMessage{ID: id, From: "Sender", Subject: parts[2]})
+	}
+
+	project := os.Getenv(closureHelperProjectEnv)
+	model := dashboard.New("closure", project)
+	model.Update(dashboard.AgentMailInboxSummaryMsg{
+		ProjectKey: project,
+		Inboxes:    inboxes,
+		AgentMap:   agents,
+		Gen:        1,
+	})
+	if health := robot.GetAttentionFeed().StoreHealth(); !health.Durable {
+		fmt.Fprintf(os.Stderr, "feed is memory-only: %+v\n", health)
+		return 1
+	}
+	return 0
+}
+
+func inboxArg(id int, agent, subject string) string {
+	return strings.Join([]string{strconv.Itoa(id), agent, subject}, closureInboxArgSep)
+}
+
 // closureHelperExecute runs a real ntm command line through Execute.
 func closureHelperExecute(args []string) int {
 	os.Args = append([]string{"ntm"}, args...)
@@ -353,6 +409,60 @@ func TestClosure_OldCursorNotExpired(t *testing.T) {
 		}
 	}
 	t.Fatalf("second event not returned: %s", out)
+}
+
+func TestClosure_EventsRecipientListsOneAgent(t *testing.T) {
+	env := newClosureEnv(t)
+	env.run(t, "publish-inbox", inboxArg(41, "BlueLake", "for blue"), inboxArg(42, "RedStone", "for red"))
+
+	for _, name := range []string{"RedStone", "redstone"} {
+		events := parseRobotEvents(t, env.run(t, "execute", "--robot-events", "--events-recipient="+name))
+		if len(events) != 1 {
+			t.Fatalf("%s: got %d events: %+v", name, len(events), events)
+		}
+		got := events[0]
+		if got.RecipientAgent != "RedStone" || got.RecipientProject != env.workDir || got.MessageID != 42 || !strings.Contains(got.Summary, "for red") {
+			t.Fatalf("%s: event = %+v", name, got)
+		}
+	}
+
+	filtered := parseRobotEvents(t, env.run(t, "execute", "--robot-events", "--events-recipient=RedStone", "--events-category=agent"))
+	if len(filtered) != 0 {
+		t.Fatalf("category filter ignored: %+v", filtered)
+	}
+}
+
+func TestClosure_BusyFeedKeepsRecipientEvents(t *testing.T) {
+	env := newClosureEnv(t)
+	env.run(t, "publish-inbox", inboxArg(42, "RedStone", "for red"))
+	env.run(t, "append-events", "500")
+
+	events := parseRobotEvents(t, env.run(t, "execute", "--robot-events", "--events-recipient=RedStone", "--events-limit=10"))
+	if len(events) != 1 || events[0].MessageID != 42 {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestClosure_UnknownRecipientReturnsEmptyList(t *testing.T) {
+	env := newClosureEnv(t)
+	env.run(t, "publish-inbox", inboxArg(42, "RedStone", "for red"))
+
+	out := env.run(t, "execute", "--robot-events", "--events-recipient=NoSuchAgent")
+	var response struct {
+		Success bool            `json:"success"`
+		Events  json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(out), &response); err != nil {
+		t.Fatalf("parse: %v\n%s", err, out)
+	}
+	if !response.Success || string(response.Events) != "[]" {
+		t.Fatalf("response = %s", out)
+	}
+
+	all := parseRobotEvents(t, env.run(t, "execute", "--robot-events", "--events-recipient= "))
+	if len(all) == 0 {
+		t.Fatal("a blank recipient should mean no filter")
+	}
 }
 
 func TestSendDashboardLogsToFile(t *testing.T) {

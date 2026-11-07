@@ -31,6 +31,9 @@ type AttentionStore interface {
 	AppendAttentionEvent(event *state.StoredAttentionEvent) (int64, error)
 	// GetAttentionEventsSince returns events with cursor > sinceCursor.
 	GetAttentionEventsSince(sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error)
+
+	// GetAttentionEventsForRecipient returns one agent's events after sinceCursor.
+	GetAttentionEventsForRecipient(agent string, sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error)
 	// GetAttentionEventsInTimeRange returns events inside a bounded time window.
 	GetAttentionEventsInTimeRange(start, end time.Time, limit int) ([]state.StoredAttentionEvent, error)
 
@@ -1139,7 +1142,7 @@ func (f *AttentionFeed) drainPendingEvents() {
 // When a store is configured, replays from SQLite for durable cursor semantics.
 func (f *AttentionFeed) Replay(sinceCursor int64, limit int) ([]AttentionEvent, int64, error) {
 	if store := f.currentStore(); store != nil {
-		return f.replayFromStore(store, sinceCursor, limit)
+		return f.replayFromStore(store, sinceCursor, limit, store.GetAttentionEventsSince, nil)
 	}
 	return f.journal.Replay(sinceCursor, limit)
 }
@@ -2273,7 +2276,19 @@ func (f *AttentionFeed) PublishMailPending(projectKey, from, to, subject string,
 		},
 		NextActions: attentionMailCheckActions(projectKey, to, threadID, true, "Inspect the unread message"),
 	}
-	return f.Append(annotateAttentionSignal(event))
+	return f.Append(annotateAttentionSignal(addressMailEvent(event, projectKey, to, messageID)))
+}
+
+// addressMailEvent names the event's recipient. With no known recipient the event
+// stays unaddressed, since recording a mail notice needs both.
+func addressMailEvent(event AttentionEvent, projectKey, to string, messageID int) AttentionEvent {
+	if strings.TrimSpace(to) == "" {
+		return event
+	}
+	event.RecipientProject = projectKey
+	event.RecipientAgent = to
+	event.MessageID = int64(messageID)
+	return event
 }
 
 // PublishMailAckRequired creates and appends a mail_ack_required signal for messages needing acknowledgment.
@@ -2297,7 +2312,7 @@ func (f *AttentionFeed) PublishMailAckRequired(projectKey, from, to, subject str
 		},
 		NextActions: attentionMailCheckActions(projectKey, to, threadID, false, "Inspect the message before acknowledging it"),
 	}
-	return f.Append(annotateAttentionSignal(event))
+	return f.Append(annotateAttentionSignal(addressMailEvent(event, projectKey, to, messageID)))
 }
 
 // PublishActuation appends a first-class actuation event to the durable feed.
@@ -4099,13 +4114,72 @@ func (f *AttentionFeed) syncCursorFromStore() {
 	}
 }
 
+// ReplayForRecipient returns events addressed to one agent, in any project and any
+// letter case. A blank name matches nothing, because a blank recipient means the
+// event isn't addressed.
+func (f *AttentionFeed) ReplayForRecipient(agent string, sinceCursor int64, limit int) ([]AttentionEvent, int64, error) {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return []AttentionEvent{}, f.cursor.Current(), nil
+	}
+	match := func(event AttentionEvent) bool {
+		return strings.EqualFold(event.RecipientAgent, agent)
+	}
+	store := f.currentStore()
+	if store == nil {
+		return f.journalReplayMatching(sinceCursor, limit, match)
+	}
+	fetch := func(since int64, n int) ([]state.StoredAttentionEvent, error) {
+		return store.GetAttentionEventsForRecipient(agent, since, n)
+	}
+	return f.replayFromStore(store, sinceCursor, limit, fetch, match)
+}
+
+// journalReplayMatching reads the journal, which is what a feed with no store has.
+// With a match function it reads the whole journal, so the limit counts matches.
+func (f *AttentionFeed) journalReplayMatching(sinceCursor int64, limit int, match func(AttentionEvent) bool) ([]AttentionEvent, int64, error) {
+	if match == nil {
+		return f.journal.Replay(sinceCursor, limit)
+	}
+	events, newestCursor, err := f.journal.Replay(sinceCursor, f.config.JournalSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	matched := filterAttentionEvents(events, match)
+	if limit > 0 && len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, newestCursor, nil
+}
+
+// filterAttentionEvents keeps the events match accepts. A nil match keeps them all.
+func filterAttentionEvents(events []AttentionEvent, match func(AttentionEvent) bool) []AttentionEvent {
+	if match == nil {
+		return events
+	}
+	matched := make([]AttentionEvent, 0, len(events))
+	for _, event := range events {
+		if match(event) {
+			matched = append(matched, event)
+		}
+	}
+	return matched
+}
+
 // replayFromStore reads events from SQLite with cursor expiration handling, and
-// merges in events this process could only keep in memory.
-func (f *AttentionFeed) replayFromStore(store AttentionStore, sinceCursor int64, limit int) ([]AttentionEvent, int64, error) {
+// merges in events this process could only keep in memory. The fetch function
+// reads stored events, and match applies the same condition to memory-only ones.
+func (f *AttentionFeed) replayFromStore(
+	store AttentionStore,
+	sinceCursor int64,
+	limit int,
+	fetch func(since int64, n int) ([]state.StoredAttentionEvent, error),
+	match func(AttentionEvent) bool,
+) ([]AttentionEvent, int64, error) {
 	window, err := store.GetAttentionReplayWindow()
 	if err != nil {
 		// Fallback to in-memory journal
-		events, newestCursor, replayErr := f.journal.Replay(sinceCursor, limit)
+		events, newestCursor, replayErr := f.journalReplayMatching(sinceCursor, limit, match)
 		if replayErr != nil {
 			return nil, 0, replayErr
 		}
@@ -4133,13 +4207,13 @@ func (f *AttentionFeed) replayFromStore(store AttentionStore, sinceCursor int64,
 	// GC expired events periodically
 	_, _ = store.GCExpiredEvents()
 
-	storedEvents, err := store.GetAttentionEventsSince(sinceCursor, limit)
+	storedEvents, err := fetch(sinceCursor, limit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("replay attention events from store: %w", err)
 	}
 	events := mergeByCursor(
 		f.hydrateStoredAttentionEvents(storedEvents),
-		f.hydrateReplayEvents(f.memoryOnlySince(sinceCursor)),
+		f.hydrateReplayEvents(filterAttentionEvents(f.memoryOnlySince(sinceCursor), match)),
 	)
 	if len(events) > limit {
 		events = events[:limit]
@@ -4330,6 +4404,13 @@ func attentionEventToStored(event AttentionEvent, retention time.Duration) state
 		DedupKey:      event.DedupKey,
 		DedupCount:    1,
 		ExpiresAt:     expiresAt,
+
+		RecipientProject: event.RecipientProject,
+		RecipientAgent:   event.RecipientAgent,
+	}
+	if event.MessageID != 0 {
+		messageID := event.MessageID
+		stored.MessageID = &messageID
 	}
 	if event.Pane > 0 {
 		stored.Pane = strconv.Itoa(event.Pane)
@@ -4352,6 +4433,12 @@ func attentionEventFromStored(event state.StoredAttentionEvent) AttentionEvent {
 		Summary:       event.Summary,
 		NextActions:   []NextAction{},
 		DedupKey:      event.DedupKey,
+
+		RecipientProject: event.RecipientProject,
+		RecipientAgent:   event.RecipientAgent,
+	}
+	if event.MessageID != nil {
+		result.MessageID = *event.MessageID
 	}
 	if event.Pane != "" {
 		if pane, err := strconv.Atoi(event.Pane); err == nil {

@@ -2,6 +2,7 @@ package state
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2237,6 +2238,224 @@ func appendRangeEvent(t *testing.T, store *Store, ts time.Time, summary string, 
 		ExpiresAt:     expiresAt,
 	}); err != nil {
 		t.Fatalf("AppendAttentionEvent() error: %v", err)
+	}
+}
+
+// applyMigrationsThrough applies migration files up to and including a version,
+// with the same function production uses.
+func applyMigrationsThrough(t *testing.T, store *Store, lastVersion int) {
+	t.Helper()
+	if _, err := store.DB().Exec(`
+		CREATE TABLE IF NOT EXISTS _migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`); err != nil {
+		t.Fatalf("create migrations table: %v", err)
+	}
+	files, err := GetMigrationFiles()
+	if err != nil {
+		t.Fatalf("GetMigrationFiles() error: %v", err)
+	}
+	for _, filename := range files {
+		var version int
+		if _, err := fmt.Sscanf(filename, "%03d_", &version); err != nil {
+			t.Fatalf("parse version from %s: %v", filename, err)
+		}
+		if version > lastVersion {
+			return
+		}
+		content, err := ReadMigration(filename)
+		if err != nil {
+			t.Fatalf("ReadMigration(%s) error: %v", filename, err)
+		}
+		if err := applyMigration(store.DB(), version, filename, content); err != nil {
+			t.Fatalf("applyMigration(%s) error: %v", filename, err)
+		}
+	}
+}
+
+func TestMigration016_KeepsRowsWithEmptyRecipient(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+	applyMigrationsThrough(t, store, 15)
+
+	olderBuildInsert := func(summary string) {
+		t.Helper()
+		// An older build's insert names none of the new columns.
+		if _, err := store.DB().Exec(`
+			INSERT INTO attention_events (ts, category, event_type, source, actionability, severity, summary)
+			VALUES (?, 'system', 'system.health_change', 'old', 'background', 'info', ?)`,
+			time.Now().UTC(), summary); err != nil {
+			t.Fatalf("insert %q: %v", summary, err)
+		}
+	}
+	olderBuildInsert("old row")
+
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("Migrate() error: %v", err)
+	}
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("second Migrate() error: %v", err)
+	}
+	olderBuildInsert("older build after the upgrade")
+
+	var project, agent string
+	var messageID *int64
+	if err := store.DB().QueryRow(`
+		SELECT recipient_project, recipient_agent, message_id FROM attention_events WHERE summary = 'old row'`,
+	).Scan(&project, &agent, &messageID); err != nil {
+		t.Fatalf("read recipient columns: %v", err)
+	}
+	if project != "" || agent != "" || messageID != nil {
+		t.Fatalf("old row has recipient %q %q %v, want empty", project, agent, messageID)
+	}
+
+	events, err := store.GetAttentionEventsSince(0, 10)
+	if err != nil {
+		t.Fatalf("GetAttentionEventsSince() error: %v", err)
+	}
+	if len(events) != 2 || events[0].Summary != "old row" {
+		t.Fatalf("events = %+v, want both rows", events)
+	}
+	if got := events[0]; got.RecipientProject != "" || got.RecipientAgent != "" || got.MessageID != nil {
+		t.Fatalf("recipient fields should be empty: %+v", got)
+	}
+}
+
+func addressedStoredEvent(ts time.Time, project, agent string, messageID int64) *StoredAttentionEvent {
+	return &StoredAttentionEvent{
+		Ts:               ts,
+		Category:         "mail",
+		EventType:        "mail.received",
+		Source:           "agent_mail",
+		Actionability:    "interesting",
+		Severity:         "info",
+		Summary:          "mail for " + agent,
+		RecipientProject: project,
+		RecipientAgent:   agent,
+		MessageID:        &messageID,
+	}
+}
+
+func TestAttentionRecipient_EveryReadPathKeepsFields(t *testing.T) {
+	now := time.Now().UTC()
+	assertFields := func(t *testing.T, events []StoredAttentionEvent, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("read error: %v", err)
+		}
+		if len(events) != 1 {
+			t.Fatalf("events = %+v, want one", events)
+		}
+		got := events[0]
+		if got.RecipientProject != "/proj" || got.RecipientAgent != "RedStone" || got.MessageID == nil || *got.MessageID != 42 {
+			t.Fatalf("recipient fields lost: project %q agent %q message %v", got.RecipientProject, got.RecipientAgent, got.MessageID)
+		}
+	}
+
+	tests := []struct {
+		name string
+		read func(t *testing.T, store *Store, cursor int64) ([]StoredAttentionEvent, error)
+	}{
+		{name: "since cursor", read: func(t *testing.T, store *Store, cursor int64) ([]StoredAttentionEvent, error) {
+			return store.GetAttentionEventsSince(0, 10)
+		}},
+		{name: "time range", read: func(t *testing.T, store *Store, cursor int64) ([]StoredAttentionEvent, error) {
+			return store.GetAttentionEventsInTimeRange(now.Add(-time.Minute), now.Add(time.Minute), 10)
+		}},
+		{name: "latest in time range", read: func(t *testing.T, store *Store, cursor int64) ([]StoredAttentionEvent, error) {
+			return store.GetLatestAttentionEventsInTimeRange(now.Add(-time.Minute), now.Add(time.Minute), 10)
+		}},
+		{name: "for recipient", read: func(t *testing.T, store *Store, cursor int64) ([]StoredAttentionEvent, error) {
+			return store.GetAttentionEventsForRecipient("RedStone", 0, 10)
+		}},
+		{name: "for recipient in another letter case", read: func(t *testing.T, store *Store, cursor int64) ([]StoredAttentionEvent, error) {
+			return store.GetAttentionEventsForRecipient("redstone", 0, 10)
+		}},
+		{name: "for incident", read: func(t *testing.T, store *Store, cursor int64) ([]StoredAttentionEvent, error) {
+			t.Helper()
+			if err := store.CreateIncident(&Incident{
+				ID: "inc-recipient", Title: "recipient", Status: IncidentStatusOpen, Severity: SeverityWarning,
+				StartedAt: now, LastEventAt: now,
+			}); err != nil {
+				t.Fatalf("CreateIncident() error: %v", err)
+			}
+			if err := store.LinkEventToIncident("inc-recipient", cursor); err != nil {
+				t.Fatalf("LinkEventToIncident() error: %v", err)
+			}
+			return store.GetEventsForIncident("inc-recipient", 10)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := testRuntimeAttentionStore(t)
+			cursor, err := store.AppendAttentionEvent(addressedStoredEvent(now, "/proj", "RedStone", 42))
+			if err != nil {
+				t.Fatalf("AppendAttentionEvent() error: %v", err)
+			}
+			events, err := tt.read(t, store, cursor)
+			assertFields(t, events, err)
+		})
+	}
+
+	t.Run("insert inside a transaction", func(t *testing.T) {
+		store := testRuntimeAttentionStore(t)
+		if err := store.Transaction(func(tx *Tx) error {
+			_, err := tx.AppendAttentionEvent(addressedStoredEvent(now, "/proj", "RedStone", 42))
+			return err
+		}); err != nil {
+			t.Fatalf("Transaction() error: %v", err)
+		}
+		events, err := store.GetAttentionEventsSince(0, 10)
+		assertFields(t, events, err)
+	})
+}
+
+func TestGetAttentionEventsForRecipient_FiltersAndPages(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	add := func(event *StoredAttentionEvent) int64 {
+		t.Helper()
+		cursor, err := store.AppendAttentionEvent(event)
+		if err != nil {
+			t.Fatalf("AppendAttentionEvent() error: %v", err)
+		}
+		return cursor
+	}
+	first := add(addressedStoredEvent(now, "/one", "RedStone", 1))
+	add(addressedStoredEvent(now, "/one", "BlueLake", 2))
+	second := add(addressedStoredEvent(now, "/two", "RedStone", 1))
+	past := now.Add(-time.Minute)
+	expired := addressedStoredEvent(now, "/one", "RedStone", 3)
+	expired.ExpiresAt = &past
+	add(expired)
+
+	all, err := store.GetAttentionEventsForRecipient("RedStone", 0, 10)
+	if err != nil {
+		t.Fatalf("GetAttentionEventsForRecipient() error: %v", err)
+	}
+	if len(all) != 2 || all[0].Cursor != first || all[1].Cursor != second {
+		t.Fatalf("events = %+v, want both projects and not the expired row", all)
+	}
+
+	page, err := store.GetAttentionEventsForRecipient("RedStone", first, 1)
+	if err != nil {
+		t.Fatalf("GetAttentionEventsForRecipient() error: %v", err)
+	}
+	if len(page) != 1 || page[0].Cursor != second {
+		t.Fatalf("page after the first cursor = %+v", page)
+	}
+
+	none, err := store.GetAttentionEventsForRecipient("NoSuchAgent", 0, 10)
+	if err != nil {
+		t.Fatalf("GetAttentionEventsForRecipient() error: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("unknown name returned %+v", none)
 	}
 }
 
