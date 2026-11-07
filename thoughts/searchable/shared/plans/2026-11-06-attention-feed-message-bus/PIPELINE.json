@@ -11,7 +11,7 @@
   },
   "cursor": {
     "step": "build",
-    "loop": "01-durable-feed.md"
+    "loop": "02-addressed-mail-notices.md"
   },
   "steps": {
     "scope": {
@@ -38,16 +38,17 @@
     {
       "doc": "01-durable-feed.md",
       "tdd_plan": "01-durable-feed-tdd.md",
-      "status": "building",
+      "status": "built",
       "sprints_passed": [
         "Sprint 1: Durable feed everywhere",
-        "Sprint 2: 7 day retention"
+        "Sprint 2: 7 day retention",
+        "Sprint 3: No silent drop to memory"
       ]
     },
     {
       "doc": "02-addressed-mail-notices.md",
-      "tdd_plan": null,
-      "status": "pending",
+      "tdd_plan": "02-addressed-mail-notices-tdd.md",
+      "status": "building",
       "sprints_passed": []
     },
     {
@@ -236,8 +237,50 @@
       "step": "build",
       "event": "sprint",
       "detail": "Sprint 2: 7 day retention"
+    },
+    {
+      "at": "2026-11-07T07:56:15.981Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 3: No silent drop to memory"
+    },
+    {
+      "at": "2026-11-07T07:56:15.994Z",
+      "step": "build",
+      "event": "done",
+      "detail": "01-durable-feed-tdd.md"
+    },
+    {
+      "at": "2026-11-07T07:57:54.603Z",
+      "step": "tdd",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-07T07:58:47.194Z",
+      "step": "tdd",
+      "event": "started",
+      "detail": "02-addressed-mail-notices.md"
+    },
+    {
+      "at": "2026-11-07T08:22:18.263Z",
+      "step": "tdd",
+      "event": "done",
+      "detail": "02-addressed-mail-notices.md"
+    },
+    {
+      "at": "2026-11-07T08:22:58.684Z",
+      "step": "build",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-07T08:23:13.038Z",
+      "step": "build",
+      "event": "started",
+      "detail": "02-addressed-mail-notices-tdd.md"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-07T02:05:30.762Z"
+  "updated_at": "2026-11-07T08:23:13.038Z"
 }

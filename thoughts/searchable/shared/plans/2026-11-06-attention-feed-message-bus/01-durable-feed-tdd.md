@@ -1177,6 +1177,8 @@ Same change as Behavior 10.
 | Cursors stay in increasing order within a process after recovery, and events held in memory stay readable by that process until it exits | 18, 19 |
 | A process that can't open the store at all keeps working in memory, reports it, and tries again | 4, 20 |
 
+**Result (2026-11-07):** passed on rocketman at `810fcca6`, with 7 other ntm sessions running the older installed ntm. The lock ran 07:44:32 to 07:45:32 UTC, and the warning showed by 07:45:03. The "after lock" mail went at 07:46:08, and the warning cleared by 07:46:21. The dashboard process never changed. Its log shows one unavailable line and one recovered line with `memory_only_count=1`. The "during lock" event stayed in memory and never reached `state.db`, as designed. Evidence: `/home/debian/Dev/ntm-test-evidence/loop1-sprint3-local-2026-11-07/`.
+
 **Build notes (2026-11-07):**
 
 **Evidence check result:** the first runs failed, on two bugs that only affect a brand-new `state.db`. Both are fixed, with tests, and neither changed the retry design.

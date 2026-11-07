@@ -80,7 +80,7 @@ Covers deliverables 3 and 6. Needs Loop 1.
 
 ### Requirements
 
-**Data:** A unique index on `recipient_project`, `recipient_agent` and `message_id`, applying only where `message_id` is set. It goes in the same migration as Sprint 1 or a new one, as the TDD step decides.
+**Data:** A unique index on `recipient_project`, `recipient_agent` and `message_id`, applying only where `message_id` is set. It goes in a new migration, `017`, which first removes any duplicates a Sprint 1 build wrote. In Sprint 1's migration it would turn a repeat publish into a store failure.
 
 **API:**
 - A store insert that reports "already exists" rather than failing. The feed's existing `AppendDeduplicated` is window-based, so it doesn't meet this need.
@@ -88,7 +88,7 @@ Covers deliverables 3 and 6. Needs Loop 1.
 - The Publish functions use this path whenever `message_id` is set.
 - A message that changes from pending to ack-required still counts as one message. **Assumption:** the first event stands.
 
-**UI:** The dashboard's popups only show events that are new to the store, so a restart doesn't replay old mail popups. **Assumption.**
+**UI:** None. The dashboard has no popup for each new mail message, so a restart has none to replay. Its in-memory `seenMailAttentionIDs` map is removed, so every poll checks the store (approved at the TDD step).
 
 ### Test scenarios
 
@@ -104,7 +104,7 @@ Covers deliverables 3 and 6. Needs Loop 1.
 ### Human test script
 
 1. Keep the session and unread mail from Sprint 1, or set them up the same way.
-2. Count mail events: `sqlite3 -readonly ~/.config/ntm/state.db "select count(*) from attention_events where event_type in ('mail.received','mail.ack_required')"`.
+2. Count mail events that name a message, because other code paths write unaddressed mail events: `sqlite3 -readonly ~/.config/ntm/state.db "select count(*) from attention_events where event_type in ('mail.received','mail.ack_required') and message_id is not null"`.
 3. Open `/tmp/ntm-loop2 dashboard addrtest`, wait for the ticker's `Mail:` unread count and at least one more 30 second poll, then quit.
 4. Run the same count.
 5. Pass: the number hasn't changed.
