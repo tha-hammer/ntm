@@ -32,6 +32,10 @@ type AttentionStore interface {
 	GetAttentionEventsSince(sinceCursor int64, limit int) ([]state.StoredAttentionEvent, error)
 	// GetAttentionEventsInTimeRange returns events inside a bounded time window.
 	GetAttentionEventsInTimeRange(start, end time.Time, limit int) ([]state.StoredAttentionEvent, error)
+
+	// GetLatestAttentionEventsInTimeRange returns the newest events inside a
+	// bounded time window, in ascending cursor order.
+	GetLatestAttentionEventsInTimeRange(start, end time.Time, limit int) ([]state.StoredAttentionEvent, error)
 	// GetAttentionItemStatesForCursors returns durable operator state keyed by cursor.
 	GetAttentionItemStatesForCursors(cursors []int64) (map[int64]state.AttentionItemState, error)
 	// GetAttentionReplayWindow returns the currently replayable cursor range.
@@ -86,7 +90,7 @@ type AttentionFeedConfig struct {
 
 	// RetentionPeriod is the minimum time events are retained.
 	// Events older than this may be garbage-collected even if within JournalSize.
-	// Default: 1 hour
+	// Default: 7 days
 	RetentionPeriod time.Duration
 
 	// HeartbeatInterval is how often heartbeat events are emitted.
@@ -95,11 +99,14 @@ type AttentionFeedConfig struct {
 	HeartbeatInterval time.Duration
 }
 
+// attentionEventRetention is how long events stay replayable by default.
+const attentionEventRetention = 7 * 24 * time.Hour
+
 // DefaultAttentionFeedConfig returns sensible defaults.
 func DefaultAttentionFeedConfig() AttentionFeedConfig {
 	return AttentionFeedConfig{
 		JournalSize:       10000,
-		RetentionPeriod:   time.Hour,
+		RetentionPeriod:   attentionEventRetention,
 		HeartbeatInterval: 30 * time.Second,
 	}
 }
@@ -1094,7 +1101,7 @@ func (f *AttentionFeed) ReconstructAsOf(timestamp time.Time, limit int) ([]Atten
 	)
 	queryLimit := minInt(maxInt(limit*queryOverfetchFactor, limit), absoluteMaxQueryLimit)
 
-	storedEvents, err := f.store.GetAttentionEventsInTimeRange(requestedAt.Add(-lookback), requestedAt, queryLimit)
+	storedEvents, err := f.store.GetLatestAttentionEventsInTimeRange(requestedAt.Add(-lookback), requestedAt, queryLimit)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reconstruct attention as-of: %w", err)
 	}

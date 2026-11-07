@@ -2145,3 +2145,96 @@ func TestCreateOrUpdateIncidentCreatesNewRowAfterResolvedWindow(t *testing.T) {
 		t.Fatalf("expected a new incident after reopen window, got reused ID %q", fresh.ID)
 	}
 }
+
+func TestGCExpiredEvents_Boundary(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name     string
+		expiry   time.Time
+		wantGone bool
+	}{
+		{name: "expired two seconds ago", expiry: now.Add(-2 * time.Second), wantGone: true},
+		{name: "expires in two seconds", expiry: now.Add(2 * time.Second), wantGone: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := testRuntimeAttentionStore(t)
+			expiry := tt.expiry
+			appendRangeEvent(t, store, now.Add(-time.Hour), "boundary", &expiry)
+
+			removed, err := store.GCExpiredEvents()
+			if err != nil {
+				t.Fatalf("GCExpiredEvents() error: %v", err)
+			}
+			if got := removed == 1; got != tt.wantGone {
+				t.Fatalf("removed = %d, wantGone %v", removed, tt.wantGone)
+			}
+		})
+	}
+}
+
+func TestGetLatestAttentionEventsInTimeRange(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC()
+	for _, offset := range []time.Duration{-50, -40, -30, -20, -10} {
+		appendRangeEvent(t, store, now.Add(offset*time.Second), offset.String(), nil)
+	}
+
+	tests := []struct {
+		name  string
+		start time.Time
+		end   time.Time
+		limit int
+		want  []string
+	}{
+		{name: "keeps the newest, oldest first", start: now.Add(-time.Minute), end: now, limit: 2, want: []string{"-20ns", "-10ns"}},
+		{name: "end bound excludes later events", start: now.Add(-time.Minute), end: now.Add(-25 * time.Second), limit: 2, want: []string{"-40ns", "-30ns"}},
+		{name: "limit above the row count", start: now.Add(-35 * time.Second), end: now, limit: 10, want: []string{"-30ns", "-20ns", "-10ns"}},
+		{name: "reversed range", start: now, end: now.Add(-time.Minute), limit: 10, want: []string{}},
+		{name: "nothing in range", start: now.Add(time.Minute), end: now.Add(2 * time.Minute), limit: 10, want: []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events, err := store.GetLatestAttentionEventsInTimeRange(tt.start, tt.end, tt.limit)
+			if err != nil {
+				t.Fatalf("GetLatestAttentionEventsInTimeRange() error: %v", err)
+			}
+			got := make([]string, 0, len(events))
+			for _, event := range events {
+				got = append(got, event.Summary)
+			}
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
+				t.Fatalf("summaries = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func testRuntimeAttentionStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("Migrate() error: %v", err)
+	}
+	return store
+}
+
+func appendRangeEvent(t *testing.T, store *Store, ts time.Time, summary string, expiresAt *time.Time) {
+	t.Helper()
+	if _, err := store.AppendAttentionEvent(&StoredAttentionEvent{
+		Ts:            ts,
+		Category:      "system",
+		EventType:     "system.health_change",
+		Source:        "test",
+		Actionability: "background",
+		Severity:      "info",
+		Summary:       summary,
+		ExpiresAt:     expiresAt,
+	}); err != nil {
+		t.Fatalf("AppendAttentionEvent() error: %v", err)
+	}
+}

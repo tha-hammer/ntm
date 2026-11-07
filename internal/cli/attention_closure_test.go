@@ -9,11 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard"
 )
@@ -136,6 +139,8 @@ func runClosureHelper(mode string) int {
 		return closureHelperPublishDashboardMail()
 	case "execute":
 		return closureHelperExecute(args)
+	case "append-old-events":
+		return closureHelperAppendOldEvents(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown closure helper mode %q\n", mode)
 		return 2
@@ -165,6 +170,52 @@ func closureHelperPublishDashboardMail() int {
 	return 0
 }
 
+// closureHelperAppendOldEvents goes through real startup, appends count events
+// dated age in the past to the process's feed, and prints their cursors as JSON.
+func closureHelperAppendOldEvents(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "append-old-events needs an age and a count")
+		return 2
+	}
+	age, err := time.ParseDuration(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	count, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	os.Args = []string{"ntm", "dashboard"}
+	if err := rootCmd.PersistentPreRunE(newDashboardCmd(), nil); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeRobotPersistence()
+
+	cursors := make([]int64, 0, count)
+	for i := 0; i < count; i++ {
+		event := robot.GetAttentionFeed().Append(robot.AttentionEvent{
+			Session:       "closure",
+			Category:      robot.EventCategorySystem,
+			Type:          robot.EventTypeSystemHealthChange,
+			Source:        "closure-test",
+			Actionability: robot.ActionabilityBackground,
+			Severity:      robot.SeverityInfo,
+			Summary:       fmt.Sprintf("old event %d", i),
+			Ts:            time.Now().Add(-age).UTC().Format(time.RFC3339Nano),
+		})
+		cursors = append(cursors, event.Cursor)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(cursors); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
+}
+
 // closureHelperExecute runs a real ntm command line through Execute.
 func closureHelperExecute(args []string) int {
 	os.Args = append([]string{"ntm"}, args...)
@@ -186,6 +237,32 @@ func TestClosure_DashboardMailReadableFromAnotherProcess(t *testing.T) {
 		}
 	}
 	t.Fatalf("mail.received not readable from another process; output: %s", out)
+}
+
+func TestClosure_OldCursorNotExpired(t *testing.T) {
+	env := newClosureEnv(t)
+	var cursors []int64
+	out := env.run(t, "append-old-events", "2h", "2")
+	if err := json.Unmarshal([]byte(out), &cursors); err != nil {
+		t.Fatalf("parse cursors: %v\noutput: %s", err, out)
+	}
+	if len(cursors) != 2 {
+		t.Fatalf("cursors = %v, want 2", cursors)
+	}
+
+	out, err := env.tryRun("execute", "--robot-events", fmt.Sprintf("--since-cursor=%d", cursors[0]))
+	if strings.Contains(out, "CURSOR_EXPIRED") {
+		t.Fatalf("cursor expired: %s", out)
+	}
+	if err != nil {
+		t.Fatalf("%v\nstdout: %s", err, out)
+	}
+	for _, event := range parseRobotEvents(t, out) {
+		if event.Cursor == cursors[1] {
+			return
+		}
+	}
+	t.Fatalf("second event not returned: %s", out)
 }
 
 func TestClosure_VersionDoesNotOpenStore(t *testing.T) {

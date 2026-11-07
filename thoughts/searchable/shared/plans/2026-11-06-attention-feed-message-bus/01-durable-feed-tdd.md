@@ -887,6 +887,23 @@ If `Store` has no `DB()` accessor, assert with a failing query method instead.
 | An event past 7 days is removed by the existing cleanup | 12, 13 |
 | The in-memory journal's size limit stays at 10,000 events | 13 |
 
+**Result (2026-11-07):** passed on automated tests. The user chose to skip the human test's one-hour wait, because `TestClosure_OldCursorNotExpired` already reads back events dated 2 hours ago in a new process. The human test script below was not run.
+
+**Build notes (2026-11-07):**
+
+| Test | Red result | Red setup |
+|---|---|---|
+| `TestClosure_TwoHourOldEventStillReplayed` | No events returned | Retention at 1 hour |
+| `TestClosure_OldCursorNotExpired` | `CURSOR_EXPIRED`, with `retention_period` `1h0m0s` | Retention at 1 hour |
+| `TestClosure_PastRetentionRemovedAndCursorExpires` | Returned `new` only | Retention at 1 hour |
+| `TestClosure_PastRetentionRemovedAndCursorExpires` | Returned all four events | Retention set to 30 days for this run, then restored |
+| `TestAttentionEventToStored_ExpiryProperty` | Expiry was 1 hour after the timestamp | Retention at 1 hour |
+| `TestClosure_AsOfReturnsNewestEventsAcrossRetention` | Returned `old-9`, `old-10`, `old-11` | Retention at 7 days, old query |
+
+**A fix the plan didn't foresee:** `ReconstructAsOf`, used by `--robot-events --as-of`, searches back over the retention period, and its query keeps the oldest rows up to a limit. Moving to 7 days would have made it return week-old events and miss recent ones. It now uses a new store query, `GetLatestAttentionEventsInTimeRange`. `ReplayForIncident` keeps the old query, because its window doesn't depend on retention.
+
+`TestClosure_RowSavedWithOneHourExpiryKeepsIt` was added for the edge case in Behavior 13. It passed before the change too, as it should, because no migration touches old rows.
+
 ### Behavior 10: Two-hour-old event survives [BLOCKING]
 
 #### Test Specification

@@ -255,7 +255,7 @@ Example: `evt_20260321023045123456789`
 
 ### 6.3 Retention and Expiration
 
-- Events are retained for at least **1 hour** after generation
+- Events are retained for at least **7 days** after generation
 - Retention may be extended based on system load and storage
 - When a cursor expires, `CURSOR_EXPIRED` error is returned (see §2.2)
 
@@ -652,7 +652,7 @@ Schema version follows semver:
     "profiles": ["default", "quiet", "verbose"],
     "wait_conditions": ["idle", "any_idle", "busy", "all_busy", "any_output", "any_error", "action_required", "bead_ready", "mail_received"],
     "heartbeat_interval_sec": 30,
-    "cursor_retention_min_sec": 3600
+    "cursor_retention_min_sec": 604800
   }
 }
 ```

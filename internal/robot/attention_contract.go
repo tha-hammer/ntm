@@ -39,7 +39,7 @@
 //
 // ## Cursor Expiration
 //
-// Events are retained for a configurable period (default: 1 hour).
+// Events are retained for a configurable period (default: 7 days).
 // When a cursor references an expired event:
 //
 //   - Response includes "error_code": "CURSOR_EXPIRED"
@@ -1156,7 +1156,7 @@ var ExampleCursorExpired = `{
   "details": {
     "requested_cursor": 42,
     "earliest_cursor": 100,
-    "retention_period": "1h",
+    "retention_period": "168h0m0s",
     "resync_command": "ntm --robot-snapshot"
   }
 }`

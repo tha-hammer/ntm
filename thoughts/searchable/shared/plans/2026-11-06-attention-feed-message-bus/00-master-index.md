@@ -17,7 +17,7 @@ Human tests run on this VPS, except Loop 8, Sprint 3, which runs on your local m
 
 | # | Document | Loop | Sprints | Status |
 |---|---|---|---|---|
-| 1 | [01-durable-feed.md](01-durable-feed.md) | Durable feed | 3 | In progress: Sprint 1 passed |
+| 1 | [01-durable-feed.md](01-durable-feed.md) | Durable feed | 3 | In progress: Sprints 1 and 2 passed |
 | 2 | [02-addressed-mail-notices.md](02-addressed-mail-notices.md) | Addressed mail notices | 2 | Not started |
 | 3 | [03-claude-turn-end-push.md](03-claude-turn-end-push.md) | Claude turn-end push | 7 | Not started |
 | 4 | [04-cross-process-delivery.md](04-cross-process-delivery.md) | Cross-process delivery | 1 | Not started |

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
 	"github.com/Dicklesworthstone/ntm/internal/watcher"
+	"pgregory.net/rapid"
 )
 
 func newTestAttentionFeed(t *testing.T) *AttentionFeed {
@@ -2669,6 +2671,20 @@ func (s *stubAttentionStore) GetAttentionEventsSince(sinceCursor int64, limit in
 	return events, nil
 }
 
+func (s *stubAttentionStore) GetLatestAttentionEventsInTimeRange(start, end time.Time, limit int) ([]state.StoredAttentionEvent, error) {
+	events, err := s.GetAttentionEventsInTimeRange(start, end, math.MaxInt)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if len(events) > limit {
+		events = events[len(events)-limit:]
+	}
+	return events, nil
+}
+
 func (s *stubAttentionStore) GetAttentionEventsInTimeRange(start, end time.Time, limit int) ([]state.StoredAttentionEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5110,6 +5126,153 @@ func TestReplayMatchingEvents_StopsAtScanLimit(t *testing.T) {
 	}
 	if len(second.events) != 1 || second.events[0].Cursor != mail[0] || second.hasMore {
 		t.Fatalf("second scan = %+v, want the mail event and no more", second)
+	}
+}
+
+// openStoreFile opens and migrates its own connection to a store file, so two
+// feeds on one path behave like two processes.
+func openStoreFile(t *testing.T, path string) *state.Store {
+	t.Helper()
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open store %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("migrate store %s: %v", path, err)
+	}
+	return store
+}
+
+// appendAged appends an event whose timestamp is age in the past. Expiry is
+// computed from the timestamp, so no clock needs faking.
+func appendAged(feed *AttentionFeed, summary string, age time.Duration) AttentionEvent {
+	event := testAttentionEvent(summary)
+	event.Ts = time.Now().Add(-age).UTC().Format(time.RFC3339Nano)
+	return feed.Append(event)
+}
+
+func assertSummaries(t *testing.T, events []AttentionEvent, want ...string) {
+	t.Helper()
+	got := make([]string, 0, len(events))
+	for _, event := range events {
+		got = append(got, event.Summary)
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("summaries = %q, want %q", got, want)
+	}
+}
+
+func TestClosure_TwoHourOldEventStillReplayed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	writer := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(writer.Stop)
+	appendAged(writer, "two hours old", 2*time.Hour)
+
+	reader := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(reader.Stop)
+	events, _, err := reader.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "two hours old")
+}
+
+func TestClosure_PastRetentionRemovedAndCursorExpires(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	writer := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(writer.Stop)
+	eightDays := appendAged(writer, "eight days", 8*24*time.Hour)
+	// A cursor only counts as expired below OldestCursor-1, so the stale cursor
+	// needs a second removed event after it.
+	appendAged(writer, "padding", 8*24*time.Hour)
+	appendAged(writer, "six days", 6*24*time.Hour)
+	appendAged(writer, "new", 0)
+
+	reader := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(reader.Stop)
+	// Replay reads the window before cleanup runs, so the first call removes the
+	// old rows and the second one sees the new window.
+	first, _, err := reader.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, first, "six days", "new")
+
+	_, _, err = reader.Replay(eightDays.Cursor, 10)
+	var expired *CursorExpiredError
+	if !errors.As(err, &expired) {
+		t.Fatalf("err = %v, want CursorExpiredError", err)
+	}
+}
+
+func TestClosure_RowSavedWithOneHourExpiryKeepsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := openStoreFile(t, path)
+	ts := time.Now().Add(-2 * time.Hour).UTC()
+	oldExpiry := ts.Add(time.Hour)
+	if _, err := store.AppendAttentionEvent(&state.StoredAttentionEvent{
+		Ts:            ts,
+		Category:      string(EventCategorySystem),
+		EventType:     string(EventTypeSystemHealthChange),
+		Source:        "test",
+		Actionability: state.Actionability(ActionabilityBackground),
+		Severity:      state.Severity(SeverityInfo),
+		Summary:       "saved before the change",
+		ExpiresAt:     &oldExpiry,
+	}); err != nil {
+		t.Fatalf("seed old row: %v", err)
+	}
+
+	reader := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(reader.Stop)
+	events, _, err := reader.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events)
+}
+
+// TestClosure_AsOfReturnsNewestEventsAcrossRetention guards the lookback, which
+// is the retention period. A week of events must not crowd out the recent ones.
+func TestClosure_AsOfReturnsNewestEventsAcrossRetention(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	writer := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(writer.Stop)
+	for i := 0; i < 50; i++ {
+		appendAged(writer, fmt.Sprintf("old-%d", i), 6*24*time.Hour)
+	}
+	for i := 0; i < 3; i++ {
+		appendAged(writer, fmt.Sprintf("recent-%d", i), 10*time.Minute)
+	}
+
+	reader := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(reader.Stop)
+	events, meta, err := reader.ReconstructAsOf(time.Now(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaries(t, events, "recent-0", "recent-1", "recent-2")
+	if meta == nil || !meta.Partial {
+		t.Fatalf("meta = %+v, want a partial result, since older events were left out", meta)
+	}
+}
+
+func TestAttentionEventToStored_ExpiryProperty(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		ts := time.Unix(rapid.Int64Range(946684800, 4102444800).Draw(rt, "sec"),
+			rapid.Int64Range(0, 999999999).Draw(rt, "nsec")).UTC()
+		stored := attentionEventToStored(AttentionEvent{Ts: ts.Format(time.RFC3339Nano)},
+			DefaultAttentionFeedConfig().RetentionPeriod)
+		if stored.ExpiresAt == nil || !stored.ExpiresAt.Equal(ts.Add(7*24*time.Hour)) {
+			rt.Fatalf("expiry = %v for ts %v", stored.ExpiresAt, ts)
+		}
+	})
+}
+
+func TestDefaultAttentionFeedConfig_JournalSizeUnchanged(t *testing.T) {
+	if got := DefaultAttentionFeedConfig().JournalSize; got != 10000 {
+		t.Fatalf("JournalSize = %d, want 10000", got)
 	}
 }
 

@@ -1728,7 +1728,42 @@ func (s *Store) GetAttentionEventsInTimeRange(start, end time.Time, limit int) (
 		return nil, fmt.Errorf("get events in time range: %w", err)
 	}
 	defer rows.Close()
+	return scanRangedAttentionEvents(rows)
+}
 
+// GetLatestAttentionEventsInTimeRange returns the newest replayable attention
+// events between the provided timestamps, in ascending cursor order.
+func (s *Store) GetLatestAttentionEventsInTimeRange(start, end time.Time, limit int) ([]StoredAttentionEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if end.Before(start) {
+		return []StoredAttentionEvent{}, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := s.db.Query(`
+		SELECT * FROM (
+			SELECT cursor, ts, COALESCE(session_name, ''), COALESCE(pane, ''),
+				category, event_type, source, actionability, severity, COALESCE(reason_code, ''),
+				summary, COALESCE(details, ''), COALESCE(next_actions, ''),
+				COALESCE(dedup_key, ''), dedup_count, expires_at
+			FROM attention_events
+			WHERE ts BETWEEN ? AND ?
+			  AND (expires_at IS NULL OR expires_at >= datetime('now'))
+			ORDER BY cursor DESC
+			LIMIT ?
+		) ORDER BY cursor ASC`, start.UTC(), end.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("get latest events in time range: %w", err)
+	}
+	defer rows.Close()
+	return scanRangedAttentionEvents(rows)
+}
+
+func scanRangedAttentionEvents(rows *sql.Rows) ([]StoredAttentionEvent, error) {
 	var events []StoredAttentionEvent
 	for rows.Next() {
 		var event StoredAttentionEvent
