@@ -165,7 +165,7 @@ Two gaps found while writing this document:
 
 ### Human test script
 
-1. In a new scratch git repo, create `.claude/settings.local.json` with `{"permissions":{"allow":[]}}`.
+1. Spawn uses `<projects_base>/pushtest`, so make that folder a new git repo (for example `git init ~/ntm_Dev/pushtest`), `cd` into it, and create `.claude/settings.local.json` with `{"permissions":{"allow":[]}}`.
 2. Create a session: `/tmp/ntm-loop3 spawn pushtest --cc=1`. Make sure no dashboard or `ntm serve` is running.
 3. Run `jq '.permissions, .hooks.Stop' .claude/settings.local.json`.
 4. Pass: `permissions` is kept, and there's one Stop entry with the absolute ntm path.

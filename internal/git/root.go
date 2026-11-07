@@ -2,7 +2,12 @@ package git
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -19,4 +24,54 @@ func FindProjectRoot(startDir string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+// EnsureExcluded adds pattern to the repo's info/exclude unless a line already
+// equals it, so it's safe to call again. In a linked worktree git reports the
+// common exclude file, which applies to every worktree. It reports false with
+// no error for a folder that isn't in a git repo.
+func EnsureExcluded(dir, pattern string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
+	output, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return false, nil // not a git repo
+		}
+		return false, fmt.Errorf("find info/exclude for %s: %w", dir, err)
+	}
+	path := strings.TrimSpace(string(output))
+
+	// #nosec G304 -- the path comes from git for this repo.
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == pattern {
+			return true, nil
+		}
+	}
+
+	addition := pattern + "\n"
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		addition = "\n" + addition
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return false, fmt.Errorf("open %s: %w", path, err)
+	}
+	if _, err := file.WriteString(addition); err != nil {
+		_ = file.Close()
+		return false, fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return false, fmt.Errorf("close %s: %w", path, err)
+	}
+	return true, nil
 }

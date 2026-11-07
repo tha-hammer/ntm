@@ -2364,6 +2364,12 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			return outputError(fmt.Errorf("building %s agent command: %w", agent.Type, err))
 		}
 
+		// Claude Code reads its settings at startup, so the Stop hook is written
+		// before the launch below. The project key is the session folder.
+		if agent.Type == AgentTypeClaude && cfg.AgentMail.Enabled {
+			installClaudeStopHook(workingDir, dir)
+		}
+
 		if err := tmux.SendKeys(pane.ID, cmd, true); err != nil {
 			return outputError(fmt.Errorf("launching %s agent: %w", agent.Type, err))
 		}

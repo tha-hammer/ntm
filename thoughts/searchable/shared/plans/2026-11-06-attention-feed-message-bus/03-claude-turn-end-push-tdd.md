@@ -1227,6 +1227,8 @@ Where the build differs from the plan:
 6. Run the same command again.
 7. Pass: it prints the block JSON with your subject.
 
+**Result (2026-11-07):** passed on rocketman at `b99612cd`, in the scratch repo `/mnt/agent-tmp/ntm-hook-scratch-repo`. It's outside the home folder, so bd-nftwx didn't apply. Every run was outside tmux, with `TMUX`, `TMUX_PANE`, `AGENT_NAME`, `MCP_AGENT_MAIL_AGENT_NAME` and `MCP_AGENT_MAIL_PROJECT` unset and no `--project`. The nameless run exited 0 with no output and logged "agent hook: no agent name". BlackCastle, then TealCastle, registered through Agent Mail's MCP tools (`ensure_project` was needed first), and the server wrote `.git/agent-mail/identity.json` naming TealCastle, with `window_id` "". BlackCastle sent TealCastle "breadcrumb hook test" (message 12489). The hook run exited 0 in 573 ms with the block JSON "1) from BlackCastle: breadcrumb hook test". The next run exited 0 with no output. `told_records` has one row, and the feed event is 570840. Evidence: `/home/debian/Dev/ntm-test-evidence/loop3-sprint2-local-2026-11-07/`.
+
 ---
 
 ## Sprint 3: Hook written by `ntm spawn`
@@ -1240,6 +1242,10 @@ Where the build differs from the plan:
 - **`CLAUDE_CODE_HOOKS` interplay.** Spawn one agent with DCG or RCH hooks configured, so `CLAUDE_CODE_HOOKS` is set, and one without. Record whether a `settings.local.json` Stop hook runs in each. If the variable replaces settings-file hooks, stop and change the plan.
 
 Record both results here before writing code.
+
+**Evidence result (2026-11-07), Claude Code 2.1.319 on the VPS, model Haiku 5.5, on a separately named tmux server (`tmux -L ntmtrust`):**
+- **Folder trust: the plan holds.** The scratch folder had no trust entry in `~/.claude.json`. Its `.claude/settings.local.json`, written before launch, held a Stop hook that appends to `stop.log`. Claude Code showed the trust prompt ("Is this a project you created or one you trust?"), and no `stop.log` existed while it waited, because no turn can run before the prompt is answered. After "Yes, I trust this folder", the first turn ("Reply with only the word ok.") ran the Stop hook: `stop.log` got one line. No hook approval prompt appeared. This first session inherited my session's `CLAUDE_CODE_CHILD_SESSION` marker.
+- **`CLAUDE_CODE_HOOKS`: the plan holds.** With every `CLAUDE*`, `TMUX*` and Agent Mail variable removed, a session with `CLAUDE_CODE_HOOKS` set to a PreToolUse config in ntm's shape ran the settings-file Stop hook (`stop.log` went from 1 to 2 lines), and so did a session without it (2 to 3). The screen showed "running Stop hooks… 0/7", so the user's global Stop hooks ran next to it. The test PreToolUse hook from `CLAUDE_CODE_HOOKS` didn't write its file in either session. The agent may not have run Bash, so this doesn't show whether Claude Code reads `CLAUDE_CODE_HOOKS` at all. That question is outside this loop.
 
 **Order of work:** write 15 as the outer test, then 13, 14, 16. Behavior 15 goes green with 13 and 14. Behavior 16 closes the chain.
 
@@ -1560,9 +1566,26 @@ No new production code. This test fails only if the command text, the token path
 
 **Automated:** `go test -short -run TestClosure_WrittenStopHookCommandTellsAgent ./internal/cli/` passes, with red-at-seam recorded.
 
+### Build record (2026-11-07)
+
+Red, then green, for each behavior:
+- **15:** red was "ntm Stop entries = [], want exactly 1, in map[permissions:map[allow:[]]]". The stand-in launched on the private tmux server in about 2 seconds, and its copy had only `permissions`. **Red-at-seam:** that same run, with no `InstallStopHook` call in spawn. `TestClosure_SpawnStopHookJSONModeClean` and `TestClosure_SpawnStopHookBadSettingsStillLaunches` cover the edge cases: with an unparseable file, the agent launches with the file unchanged and the warning names it.
+- **13:** red was `undefined: StopHookTimeoutSeconds`, before the writer existed. The quoting test then caught a real bug: the first-word scanner didn't skip a backslash, so a path holding `'` wasn't recognized. The property passes 100 checks.
+- **14:** red was `undefined: EnsureExcluded`.
+- **16:** green on first run, once 15 was in place. **Red-at-seam:** with the project key unquoted, `sh` split `.../my projects/pushtest`, and the command exited 1 with `unknown command "projects/pushtest"` on stderr.
+
+Where the build differs from the plan:
+- Spawn has no `--dir` flag. A session's folder is `<projects_base>/<session>`, so the tests set `projects_base` in the helper's `config.toml` to a folder named `my projects`, and every spawn closure test checks the quoting. The kill flag is `--force`.
+- The stand-in agent is one shell script for both Claude and Codex in `[agents]`. It copies `pwd`, `env` and the settings file, then runs `exec sleep 300`. The config also switches off CASS context, recovery, Gemini setup, spawn headroom, DCG and RCH, as `newTmuxIntegrationTestConfig` does.
+- The private tmux server uses a `TMUX_TMPDIR` under `/tmp`, because a Unix socket path under the session scratchpad is too long. Cleanup stops it with `tmux -S <its socket> kill-server`, so no other server can be hit.
+- `LocalSettingsPath` (`.claude/settings.local.json`) is an exported constant, used for both the writer and the exclude pattern.
+- With `--json`, a failed write goes to `slog`, not stdout.
+
+Note for Loop 8: a hook command with a broken argument list fails in cobra's argument check, before `RunE`, so it exits 1 with an error on stderr. Claude Code shows that to the user, not the agent. Only a hand-edited or wrongly quoted entry can cause it.
+
 ### Human test script
 
-1. In a new scratch git repo, create `.claude/settings.local.json` with `{"permissions":{"allow":[]}}`.
+1. Spawn uses `<projects_base>/pushtest`, so make that folder a new git repo (for example `git init ~/ntm_Dev/pushtest`), `cd` into it, and create `.claude/settings.local.json` with `{"permissions":{"allow":[]}}`.
 2. Create a session: `/tmp/ntm-loop3 spawn pushtest --cc=1`. Make sure no dashboard or `ntm serve` is running.
 3. Run `jq '.permissions, .hooks.Stop' .claude/settings.local.json`.
 4. Pass: `permissions` is kept, and there's one Stop entry with the absolute ntm path.

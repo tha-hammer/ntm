@@ -15,6 +15,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/claudeconfig"
+	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
@@ -79,6 +82,29 @@ func newAgentHookStopCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&projectKey, "project", "", "Agent Mail project key (default: $MCP_AGENT_MAIL_PROJECT, then the current folder)")
 	return cmd
+}
+
+// installClaudeStopHook writes the ntm Stop entry into a Claude agent's work
+// folder before the agent launches, because Claude Code reads its settings at
+// startup. projectKey is the Agent Mail project. A failure is a warning: the
+// agent still launches, only without turn-end mail.
+func installClaudeStopHook(workDir, projectKey string) {
+	ntmPath, err := resilience.CurrentExecutablePath()
+	if err == nil {
+		var result claudeconfig.StopHookResult
+		result, err = claudeconfig.InstallStopHook(workDir, ntmPath, projectKey)
+		if err == nil {
+			if !IsJSONOutput() {
+				output.PrintInfof("Claude Stop hook written: %s", result.SettingsPath)
+			}
+			return
+		}
+	}
+	if IsJSONOutput() {
+		slog.Warn("claude stop hook not written", "dir", workDir, "error", err)
+		return
+	}
+	output.PrintWarningf("Claude Stop hook not written in %s: %v", workDir, err)
 }
 
 // stopHookProject picks the Agent Mail project key for the hook: the flag,

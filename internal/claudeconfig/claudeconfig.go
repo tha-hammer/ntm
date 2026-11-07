@@ -37,6 +37,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Dicklesworthstone/ntm/internal/git"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // SnapshotFilename is the on-disk name of the pre-swarm model snapshot
@@ -203,6 +206,13 @@ func WriteModel(settingsPath, model string) error {
 		return nil
 	}
 
+	return writeSettingsAtomic(settingsPath, parsed)
+}
+
+// writeSettingsAtomic writes a settings object through a temp file in the same
+// folder and a rename, creating the folder if needed, so a crash mid-write
+// can't leave a truncated settings file behind.
+func writeSettingsAtomic(settingsPath string, parsed map[string]any) error {
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
 		return fmt.Errorf("ensure parent dir: %w", err)
 	}
@@ -234,6 +244,207 @@ func WriteModel(settingsPath, model string) error {
 		return fmt.Errorf("rename tmpfile to settings: %w", err)
 	}
 	return nil
+}
+
+const (
+	// StopHookTimeoutSeconds is HookRegistration's timeout for the ntm Stop entry.
+	StopHookTimeoutSeconds = 5
+
+	// LocalSettingsPath is the per-folder Claude Code settings file, relative
+	// to the agent's work folder. Claude Code reads it at startup, and it's
+	// meant to stay out of git.
+	LocalSettingsPath = ".claude/settings.local.json"
+
+	// stopHookMarker follows the binary path in every ntm Stop entry.
+	stopHookMarker = " agent-hook stop"
+)
+
+// ErrUnparseableSettings means a settings file was left unchanged because it
+// isn't the JSON shape the writer can merge into.
+var ErrUnparseableSettings = errors.New("settings file can't be parsed")
+
+// StopHookCommand is the command Claude Code runs at turn end. Hooks don't
+// get an interactive PATH, so the binary is absolute. Both paths are shell
+// quoted, because Claude Code runs the command with sh -c.
+func StopHookCommand(ntmPath, projectKey string) string {
+	return tmux.ShellQuote(ntmPath) + stopHookMarker + " --project " + tmux.ShellQuote(projectKey)
+}
+
+// IsStopHookCommand reports whether a hook command is an ntm Stop entry,
+// whatever binary path it names: one shell word, then " agent-hook stop",
+// then the end or a space.
+func IsStopHookCommand(command string) bool {
+	rest, ok := afterFirstShellWord(command)
+	if !ok || !strings.HasPrefix(rest, stopHookMarker) {
+		return false
+	}
+	rest = strings.TrimPrefix(rest, stopHookMarker)
+	return rest == "" || rest[0] == ' '
+}
+
+// afterFirstShellWord skips one word, plain or single quoted as ShellQuote
+// writes it, and returns the rest of the command. ShellQuote writes a quote
+// inside the word as a closing quote, a backslash-escaped quote and an
+// opening quote, so a backslash skips the character after it.
+func afterFirstShellWord(command string) (string, bool) {
+	i := 0
+	for i < len(command) && command[i] != ' ' {
+		switch command[i] {
+		case '\\':
+			i += 2
+		case '\'':
+			end := strings.IndexByte(command[i+1:], '\'')
+			if end < 0 {
+				return "", false
+			}
+			i += end + 2
+		default:
+			i++
+		}
+	}
+	if i > len(command) {
+		return "", false
+	}
+	if i == 0 {
+		return "", false
+	}
+	return command[i:], true
+}
+
+// WriteStopHook makes <workDir>/.claude/settings.local.json hold exactly one
+// ntm Stop entry with this command: it removes any ntm entries, whatever
+// binary they name, drops groups that removal emptied, and appends one group.
+// Every other field and hook is kept. A file that isn't the expected shape is
+// left unchanged and ErrUnparseableSettings is returned. It reports the path
+// and whether the file was written; a run that would change nothing doesn't
+// write.
+func WriteStopHook(workDir, command string) (path string, changed bool, err error) {
+	path = filepath.Join(workDir, filepath.FromSlash(LocalSettingsPath))
+	// #nosec G304 -- the path is the agent work folder's settings file.
+	raw, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return path, false, fmt.Errorf("read %s: %w", path, err)
+	}
+	existed := err == nil
+
+	parsed := map[string]any{}
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return path, false, fmt.Errorf("%w: %s: %v", ErrUnparseableSettings, path, err)
+		}
+		if parsed == nil { // JSON null
+			parsed = map[string]any{}
+		}
+	}
+
+	merged, err := mergeStopHook(parsed, command)
+	if err != nil {
+		return path, false, fmt.Errorf("%w: %s: %v", ErrUnparseableSettings, path, err)
+	}
+	if existed && sameJSON(parsed, merged) {
+		return path, false, nil
+	}
+	if err := writeSettingsAtomic(path, merged); err != nil {
+		return path, false, fmt.Errorf("write %s: %w", path, err)
+	}
+	return path, true, nil
+}
+
+// StopHookResult is what InstallStopHook did.
+type StopHookResult struct {
+	SettingsPath string
+	Changed      bool
+	Excluded     bool // false when the folder isn't in a git repo
+}
+
+// InstallStopHook writes the ntm Stop entry into workDir's local settings and
+// keeps that file out of git status. projectKey is the Agent Mail project,
+// which differs from workDir in a worktree. The command holds paths only,
+// never a token.
+func InstallStopHook(workDir, ntmPath, projectKey string) (StopHookResult, error) {
+	path, changed, err := WriteStopHook(workDir, StopHookCommand(ntmPath, projectKey))
+	result := StopHookResult{SettingsPath: path, Changed: changed}
+	if err != nil {
+		return result, err
+	}
+	result.Excluded, err = git.EnsureExcluded(workDir, LocalSettingsPath)
+	return result, err
+}
+
+// mergeStopHook returns a copy of settings with ntm's Stop entries replaced
+// by one entry for command. It only reads settings.
+func mergeStopHook(settings map[string]any, command string) (map[string]any, error) {
+	hooks := map[string]any{}
+	switch existing := settings["hooks"].(type) {
+	case nil:
+	case map[string]any:
+		for event, value := range existing {
+			hooks[event] = value
+		}
+	default:
+		return nil, fmt.Errorf("hooks is %T, not an object", existing)
+	}
+
+	var groups []any
+	switch existing := hooks["Stop"].(type) {
+	case nil:
+	case []any:
+		groups = existing
+	default:
+		return nil, fmt.Errorf("hooks.Stop is %T, not a list", existing)
+	}
+
+	kept := make([]any, 0, len(groups)+1)
+	for i, group := range groups {
+		groupMap, ok := group.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("hooks.Stop[%d] is %T, not an object", i, group)
+		}
+		list, ok := groupMap["hooks"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("hooks.Stop[%d].hooks is %T, not a list", i, groupMap["hooks"])
+		}
+		remaining := make([]any, 0, len(list))
+		for j, hook := range list {
+			hookMap, ok := hook.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("hooks.Stop[%d].hooks[%d] is %T, not an object", i, j, hook)
+			}
+			if existingCommand, _ := hookMap["command"].(string); IsStopHookCommand(existingCommand) {
+				continue
+			}
+			remaining = append(remaining, hook)
+		}
+		if len(remaining) == 0 && len(list) > 0 {
+			continue // the group held only ntm entries
+		}
+		copied := make(map[string]any, len(groupMap))
+		for key, value := range groupMap {
+			copied[key] = value
+		}
+		copied["hooks"] = remaining
+		kept = append(kept, copied)
+	}
+	kept = append(kept, map[string]any{"hooks": []any{map[string]any{
+		"type":    "command",
+		"command": command,
+		"timeout": StopHookTimeoutSeconds,
+	}}})
+	hooks["Stop"] = kept
+
+	merged := make(map[string]any, len(settings)+1)
+	for key, value := range settings {
+		merged[key] = value
+	}
+	merged["hooks"] = hooks
+	return merged, nil
+}
+
+// sameJSON reports whether two settings objects encode to the same JSON.
+func sameJSON(a, b map[string]any) bool {
+	encodedA, errA := json.Marshal(a)
+	encodedB, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(encodedA) == string(encodedB)
 }
 
 // Snapshot captures the current Claude Code model value into snapshotPath.

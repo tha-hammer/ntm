@@ -263,6 +263,10 @@ func runClosureHelper(mode string) int {
 		return closureHelperPublishInbox(args)
 	case "seed-registry":
 		return closureHelperSeedRegistry(args)
+	case "argv":
+		// A hook command names this binary, so its own arguments are the
+		// ntm command line, as they are for the real binary.
+		return closureHelperExecute(os.Args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown closure helper mode %q\n", mode)
 		return 2

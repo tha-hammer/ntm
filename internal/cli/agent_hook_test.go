@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/claudeconfig"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"pgregory.net/rapid"
 )
@@ -748,6 +749,411 @@ func TestClosure_StopHookBreadcrumbIdentity(t *testing.T) {
 	if _, err := os.Stat(bareEnv.stateDB()); !os.IsNotExist(err) {
 		t.Fatalf("no-name run opened state.db: %v", err)
 	}
+}
+
+// privateTmux gives the environment's helpers their own tmux server, so a
+// spawn never touches the tmux sessions of the person running the tests. The
+// socket folder is short because Unix socket paths have a length limit.
+func (e *closureEnv) privateTmux(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Fatalf("tmux is required for this closure test: %v", err)
+	}
+	dir, err := os.MkdirTemp("/tmp", "ntmtx")
+	if err != nil {
+		t.Fatalf("create tmux folder: %v", err)
+	}
+	e.set("TMUX_TMPDIR", dir)
+	e.set("TMUX", "")
+	e.set("TMUX_PANE", "")
+	socket := filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()), "default")
+	t.Cleanup(func() {
+		// -S names this server's socket, so only the private server is stopped.
+		kill := exec.Command("tmux", "-S", socket, "kill-server")
+		kill.Env = append(os.Environ(), "TMUX=")
+		_ = kill.Run()
+		_ = os.RemoveAll(dir)
+	})
+}
+
+// projectsBase is the helpers' projects_base. Its name has a space, so every
+// spawn closure test checks that paths are quoted.
+func (e *closureEnv) projectsBase() string {
+	return filepath.Join(filepath.Dir(e.workDir), "my projects")
+}
+
+// projectDir is where spawn puts a session, under the helper's projects_base.
+func (e *closureEnv) projectDir(session string) string {
+	return filepath.Join(e.projectsBase(), session)
+}
+
+// runShell runs command with sh -c in cwd, as Claude Code runs a hook, with
+// the environment's variables plus extra, and returns its stdout.
+func (e *closureEnv) runShell(t *testing.T, cwd, command, stdin string, extra ...string) string {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Dir = cwd
+	cmd.Env = os.Environ()
+	for key, value := range e.vars {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	cmd.Env = append(cmd.Env, extra...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("sh -c %q: %v\nstdout: %s\nstderr: %s", command, err, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("sh -c %q wrote to stderr: %s", command, stderr.String())
+	}
+	return stdout.String()
+}
+
+// launchedAgent is what a stand-in agent saw when it started.
+type launchedAgent struct {
+	Dir         string
+	Env         map[string]string
+	Settings    map[string]any // nil when the folder had no settings file or it wasn't JSON
+	SettingsRaw string         // the copy as written
+}
+
+// agentCapture is the folder stand-in agents write into.
+type agentCapture struct {
+	dir string
+}
+
+// standInAgentConfig writes the helpers' config.toml with stand-in Claude and
+// Codex commands. Each stand-in copies its folder, environment and
+// .claude/settings.local.json into the capture folder at launch, then sleeps.
+// The copy shows what the settings file held before the agent started.
+func (e *closureEnv) standInAgentConfig(t *testing.T, extra string) *agentCapture {
+	t.Helper()
+	root := filepath.Dir(e.workDir)
+	capture := &agentCapture{dir: filepath.Join(root, "capture")}
+	script := filepath.Join(root, "stand-in-agent.sh")
+	body := "#!/bin/sh\n" +
+		"d=" + shellQuoteForTest(capture.dir) + "/$$\n" +
+		"mkdir -p \"$d\"\n" +
+		"pwd > \"$d/pwd\"\n" +
+		"env > \"$d/env\"\n" +
+		"if [ -f .claude/settings.local.json ]; then cp .claude/settings.local.json \"$d/settings.json\"; fi\n" +
+		"touch \"$d/done\"\n" +
+		"exec sleep 300\n"
+	if err := os.MkdirAll(capture.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write stand-in agent: %v", err)
+	}
+	if err := os.MkdirAll(e.projectsBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.writeConfig(t, fmt.Sprintf(`projects_base = %q
+
+[agents]
+claude = %q
+codex = %q
+
+[cass.context]
+enabled = false
+
+[recovery]
+enabled = false
+auto_inject_on_spawn = false
+include_agent_mail = false
+include_beads_context = false
+include_cm_memories = false
+
+[gemini_setup]
+auto_select_pro_model = false
+
+[spawn_pacing.headroom]
+enabled = false
+
+[integrations.dcg]
+enabled = false
+
+[integrations.rch]
+enabled = false
+%s`, e.projectsBase(), script, script, extra))
+	return capture
+}
+
+// writeFile writes content to path, creating its folder.
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func shellQuoteForTest(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// waitForAgents waits until count stand-in agents have written their capture.
+func (c *agentCapture) waitForAgents(t *testing.T, count int, timeout time.Duration) []launchedAgent {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		done, _ := filepath.Glob(filepath.Join(c.dir, "*", "done"))
+		if len(done) >= count {
+			agents := make([]launchedAgent, 0, len(done))
+			for _, marker := range done {
+				agents = append(agents, readLaunchedAgent(t, filepath.Dir(marker)))
+			}
+			return agents
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d stand-in agents launched within %s", len(done), count, timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func readLaunchedAgent(t *testing.T, dir string) launchedAgent {
+	t.Helper()
+	agent := launchedAgent{Env: map[string]string{}}
+	agent.Dir = strings.TrimSpace(string(mustReadFile(t, filepath.Join(dir, "pwd"))))
+	for _, line := range strings.Split(string(mustReadFile(t, filepath.Join(dir, "env"))), "\n") {
+		if key, value, ok := strings.Cut(line, "="); ok {
+			agent.Env[key] = value
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "settings.json")); err == nil {
+		agent.SettingsRaw = string(data)
+		_ = json.Unmarshal(data, &agent.Settings) // stays nil when the copy isn't JSON
+	}
+	return agent
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
+
+// ntmStopEntry is one command hook in a settings file's Stop list.
+type ntmStopEntry struct {
+	Command string
+	Timeout float64
+}
+
+// stopEntries returns every command hook under hooks.Stop.
+func stopEntries(t *testing.T, settings map[string]any) []ntmStopEntry {
+	t.Helper()
+	hooks, _ := settings["hooks"].(map[string]any)
+	groups, _ := hooks["Stop"].([]any)
+	var entries []ntmStopEntry
+	for _, group := range groups {
+		groupMap, _ := group.(map[string]any)
+		list, _ := groupMap["hooks"].([]any)
+		for _, hook := range list {
+			hookMap, _ := hook.(map[string]any)
+			command, _ := hookMap["command"].(string)
+			timeout, _ := hookMap["timeout"].(float64)
+			entries = append(entries, ntmStopEntry{Command: command, Timeout: timeout})
+		}
+	}
+	return entries
+}
+
+// onlyNtmStopEntry fails unless the settings hold exactly one ntm Stop entry.
+func onlyNtmStopEntry(t *testing.T, settings map[string]any) ntmStopEntry {
+	t.Helper()
+	var found []ntmStopEntry
+	for _, entry := range stopEntries(t, settings) {
+		if strings.Contains(entry.Command, " agent-hook stop") {
+			found = append(found, entry)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("ntm Stop entries = %+v, want exactly 1, in %v", found, settings)
+	}
+	return found[0]
+}
+
+func readSettingsFile(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	var settings map[string]any
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(dir, ".claude", "settings.local.json")), &settings); err != nil {
+		t.Fatalf("settings file isn't JSON: %v", err)
+	}
+	return settings
+}
+
+// assertNoIssuedTokens fails if any token the fake server issued is in the file.
+func assertNoIssuedTokens(t *testing.T, mail *fakeAgentMail, path string) {
+	t.Helper()
+	data := string(mustReadFile(t, path))
+	mail.mu.Lock()
+	defer mail.mu.Unlock()
+	if len(mail.tokens) == 0 {
+		t.Fatal("the fake server issued no tokens, so the check would prove nothing")
+	}
+	for agent, token := range mail.tokens {
+		if strings.Contains(data, token) {
+			t.Fatalf("%s holds %s's token", path, agent)
+		}
+	}
+}
+
+// assertSettingsNotInGitStatus fails if git status lists the settings file.
+func assertSettingsNotInGitStatus(t *testing.T, dir string) {
+	t.Helper()
+	if status := gitForTest(t, dir, "status", "--porcelain", "--untracked-files=all"); strings.Contains(status, "settings.local.json") {
+		t.Fatalf("git status lists the settings file:\n%s", status)
+	}
+}
+
+func countExcludeLines(t *testing.T, dir, pattern string) int {
+	t.Helper()
+	path := gitForTest(t, dir, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == pattern {
+			count++
+		}
+	}
+	return count
+}
+
+func TestClosure_SpawnWritesStopHookBeforeLaunch(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("hooktest"))
+	writeFile(t, filepath.Join(repo, ".claude", "settings.local.json"), `{"permissions":{"allow":[]}}`)
+
+	out := env.run(t, "execute", "spawn", "hooktest", "--cc=1")
+	launched := capture.waitForAgents(t, 1, 20*time.Second)
+
+	entry := onlyNtmStopEntry(t, launched[0].Settings)
+	wantCmd := claudeconfig.StopHookCommand(helperBinary(t), repo)
+	if entry.Command != wantCmd || entry.Timeout != claudeconfig.StopHookTimeoutSeconds {
+		t.Fatalf("entry = %+v, want %q with timeout %d", entry, wantCmd, claudeconfig.StopHookTimeoutSeconds)
+	}
+	if _, ok := launched[0].Settings["permissions"]; !ok {
+		t.Fatalf("permissions dropped: %v", launched[0].Settings)
+	}
+	assertNoIssuedTokens(t, mail, filepath.Join(repo, ".claude", "settings.local.json"))
+	assertSettingsNotInGitStatus(t, repo)
+	if strings.Count(out, "Claude Stop hook written") != 1 {
+		t.Fatalf("spawn output = %q", out)
+	}
+
+	env.run(t, "execute", "kill", "hooktest", "--force")
+	env.run(t, "execute", "spawn", "hooktest", "--cc=1")
+	capture.waitForAgents(t, 2, 20*time.Second)
+	onlyNtmStopEntry(t, readSettingsFile(t, repo))
+	if n := countExcludeLines(t, repo, ".claude/settings.local.json"); n != 1 {
+		t.Fatalf("exclude lines = %d, want 1", n)
+	}
+}
+
+func TestClosure_SpawnStopHookJSONModeClean(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("jsontest"))
+
+	out := env.run(t, "execute", "spawn", "jsontest", "--cc=1", "--json")
+	capture.waitForAgents(t, 1, 20*time.Second)
+	var parsed map[string]any
+	decoder := json.NewDecoder(strings.NewReader(out))
+	if err := decoder.Decode(&parsed); err != nil || decoder.More() {
+		t.Fatalf("--json stdout isn't one JSON object (err %v): %q", err, out)
+	}
+	if strings.Contains(out, "Claude Stop hook written") {
+		t.Fatalf("--json stdout has the info line: %q", out)
+	}
+	onlyNtmStopEntry(t, readSettingsFile(t, repo))
+}
+
+func TestClosure_SpawnStopHookBadSettingsStillLaunches(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("badtest"))
+	path := filepath.Join(repo, ".claude", "settings.local.json")
+	writeFile(t, path, `{"hooks": `)
+
+	out := env.run(t, "execute", "spawn", "badtest", "--cc=1")
+	launched := capture.waitForAgents(t, 1, 20*time.Second)
+	if launched[0].SettingsRaw != `{"hooks": ` {
+		t.Fatalf("the agent launched with settings %q", launched[0].SettingsRaw)
+	}
+	if got := string(mustReadFile(t, path)); got != `{"hooks": ` {
+		t.Fatalf("unparseable settings file changed to %q", got)
+	}
+	if !strings.Contains(out, "Claude Stop hook not written") || !strings.Contains(out, path) {
+		t.Fatalf("spawn output has no warning naming %s: %q", path, out)
+	}
+}
+
+func TestClosure_WrittenStopHookCommandTellsAgent(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("pushtest"))
+	if !strings.Contains(repo, " ") {
+		t.Fatalf("project folder %q has no space, so quoting isn't tested", repo)
+	}
+
+	env.run(t, "execute", "spawn", "pushtest", "--cc=1")
+	agent := capture.waitForAgents(t, 1, 20*time.Second)[0]
+	name := agent.Env["AGENT_NAME"]
+	if name == "" || mail.token(name) == "" {
+		t.Fatalf("spawned agent has name %q and token %q", name, mail.token(name))
+	}
+	mail.addMessage(name, agentmail.InboxMessage{ID: 9, From: "HumanOverseer", Subject: "turn end test"})
+	command := onlyNtmStopEntry(t, agent.Settings).Command
+
+	// Claude Code runs the hook from the work folder. The run from / is silent
+	// because the message was already told, which also shows the project
+	// comes from --project and not the folder.
+	for _, cwd := range []string{repo, "/"} {
+		out := env.runShell(t, cwd, command, "{}", "AGENT_NAME="+name, closureHelperModeEnv+"=argv", closureHelperArgsEnv+"=")
+		if cwd == repo {
+			if d := parseStopDecision(t, out); !strings.Contains(d.Reason, "from HumanOverseer: turn end test") {
+				t.Fatalf("hook output = %q", out)
+			}
+		} else if out != "" {
+			t.Fatalf("second run printed %q", out)
+		}
+	}
+	assertFetchesUsed(t, mail, 2, repo, name, mail.token(name))
+}
+
+// helperBinary is the binary helpers run, which a spawn in a helper writes
+// into the hook command.
+func helperBinary(t *testing.T) string {
+	t.Helper()
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestClosure_StopHookSkipsReadMailAndRecordsAck(t *testing.T) {
