@@ -15,6 +15,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/claudeconfig"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/git"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
@@ -72,6 +73,7 @@ type SpawnOutput struct {
 	Assignments    []SpawnAssignment        `json:"assignments,omitempty"`     // Work assignments when AssignWork is enabled
 	AssignStrategy string                   `json:"assign_strategy,omitempty"` // Strategy used for assignments
 	Recovery       *SpawnRecovery           `json:"recovery,omitempty"`        // Session recovery context from handoff
+	Warnings       []string                 `json:"warnings,omitempty"`        // Problems that didn't stop the spawn, such as a Claude Stop hook that couldn't be written
 	Admission      *pressure.SpawnAdmission `json:"admission,omitempty"`       // Pre-spawn resource-pressure admission result
 }
 
@@ -631,9 +633,13 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 
 	var manifestAgents []resilience.AgentConfig
 
-	// Launch Claude agents
+	// Launch Claude agents. Claude Code reads its settings at startup, so the
+	// Stop hook is written before each launch.
 	for i := 0; i < opts.CCCount && agentNum < len(panes); i++ {
 		pane := panes[agentNum]
+		if cfg != nil && cfg.AgentMail.Enabled {
+			output.Warnings = append(output.Warnings, writeClaudeStopHook(dir)...)
+		}
 		agent := launchAgent(pane, opts.Session, "claude", i+1, dir, agentCommands["claude"], amState)
 		agent.Name = nameMap.AssignNew("claude", agent.Pane)
 		output.Agents = append(output.Agents, agent)
@@ -726,6 +732,20 @@ var (
 )
 
 // launchAgent launches a single agent and returns its info.
+// writeClaudeStopHook writes the ntm Stop entry into dir with the same writer
+// as ntm spawn. Robot output must stay one JSON object, so it prints nothing
+// and returns any failure as a warning naming the settings file.
+func writeClaudeStopHook(dir string) []string {
+	ntmPath, err := resilience.CurrentExecutablePath()
+	if err != nil {
+		return []string{fmt.Sprintf("Claude Stop hook not written in %s: %v", dir, err)}
+	}
+	if _, err := claudeconfig.InstallStopHook(dir, ntmPath, dir); err != nil {
+		return []string{fmt.Sprintf("Claude Stop hook not written: %v", err)}
+	}
+	return nil
+}
+
 func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, command string, am *agentMailState) SpawnedAgent {
 	startTime := time.Now()
 

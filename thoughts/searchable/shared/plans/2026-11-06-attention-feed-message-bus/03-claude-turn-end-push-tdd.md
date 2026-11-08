@@ -1768,6 +1768,8 @@ Where the build differs from the plan:
 7. Run steps 7 to 10 of the Sprint 3 script, for one of the agents.
 8. Pass: that agent is told at turn end.
 
+**Result (2026-11-08):** passed on rocketman at `d2e36864`. WindyLynx ran in `.ntm/worktrees/wttest/cc_1` and RainyBridge in `cc_2`. Both Stop commands are `'/tmp/ntm-loop3' agent-hook stop --project '/home/maceo/ntm_Dev/wttest'`, one entry each, and the main folder has no settings file. Both worktrees are clean in `git status`, the main folder shows only `?? .ntm/`, and the shared `info/exclude` has the line once. Mail 12494, "worktree retest", was sent during WindyLynx's sleep. At turn end (00:33:44 UTC) the reminder said `Run fetch_inbox with agent_name "WindyLynx" and project_key "/home/maceo/ntm_Dev/wttest"`, and the agent called `fetch_inbox` with those values. `told_records` has 12493 and 12494. Notes: `ntm worktrees list` printed "No worktrees found for session: wttest" until the main folder had `.ntm/config.toml`, another bd-nftwx case. Both agents exited at the trust prompt (bd-57xdn). The user's relaunch of pane 1 from shared zsh history briefly brought back pane 2's command, a tester error fixed before steps 7 to 10. Evidence: `/home/debian/Dev/ntm-test-evidence/loop3-sprint4-local-2026-11-08/`.
+
 ---
 
 ## Sprint 5: Hook written by robot spawn
@@ -1921,6 +1923,17 @@ No new code beyond Behavior 19.
 #### Success Criteria
 
 **Automated:** `go test -short -run TestGetSpawn_StopHookWriteFailureIsWarning ./internal/robot/` fails first, then passes.
+
+### Build record (2026-11-08)
+
+Red, then green, for each behavior:
+- **19:** red was "ntm Stop entries = [], want exactly 1, in map[]": the Claude stand-in found no settings file. **Red-at-seam:** that same run, with no `writeClaudeStopHook` call in `GetSpawn`. The test also checks that the Codex agent ran in repo 1, that the written command tells the Claude agent using its registration token, and that the Codex-only spawn left repo 2 with no Claude file.
+- **20:** red was `resp.Warnings undefined`.
+- **Found by the full suite:** `internal/serve`'s `TestHandleAgentSpawnV1_KernelError` calls `GetSpawn` with a nil config, and the new `cfg.AgentMail.Enabled` check panicked with a nil pointer at `spawn.go:640`. The check is now `cfg != nil && cfg.AgentMail.Enabled`, and that test passes. In the same run, `TestPaletteConfigContextDirPrefersExplicitSessionProject` and `TestLoadPaletteRuntimeConfigPrefersExplicitSessionProject` failed with "getting project root failed". Both pass alone, and the next full run had only the 7 known failures, so they weren't reproduced.
+
+Where the build differs from the plan:
+- The stand-in config now writes one script per agent type, and each records its type, so tests can wait for Claude and Codex agents separately.
+- `spawnTestConfig` turns Agent Mail off. Without that, `TestGetSpawn_RobotMonitorDefaultFalseLeavesNoManifest`, which has no `WorkingDir`, spawned in the real `~/ntm_Dev/test_robot_monitor_default_false` and registered with the real Agent Mail server. With this sprint's change, it also wrote a Stop hook there: one run on 2026-11-08 at 00:38:51 left `~/ntm_Dev/test_robot_monitor_default_false/.claude/settings.local.json`, naming a `go-build` test binary. The folder itself was already left behind by earlier runs. The file is left in place until the user says to remove it. The warning test sets Agent Mail on, with `AGENT_MAIL_URL` on a closed port and a temp `WorkingDir`.
 
 ### Human test script
 

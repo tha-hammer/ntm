@@ -815,6 +815,7 @@ func (e *closureEnv) runShell(t *testing.T, cwd, command, stdin string, extra ..
 
 // launchedAgent is what a stand-in agent saw when it started.
 type launchedAgent struct {
+	Type        string // "claude" or "codex"
 	Dir         string
 	Env         map[string]string
 	Settings    map[string]any // nil when the folder had no settings file or it wasn't JSON
@@ -834,20 +835,25 @@ func (e *closureEnv) standInAgentConfig(t *testing.T, extra string) *agentCaptur
 	t.Helper()
 	root := filepath.Dir(e.workDir)
 	capture := &agentCapture{dir: filepath.Join(root, "capture")}
-	script := filepath.Join(root, "stand-in-agent.sh")
-	body := "#!/bin/sh\n" +
-		"d=" + shellQuoteForTest(capture.dir) + "/$$\n" +
-		"mkdir -p \"$d\"\n" +
-		"pwd > \"$d/pwd\"\n" +
-		"env > \"$d/env\"\n" +
-		"if [ -f .claude/settings.local.json ]; then cp .claude/settings.local.json \"$d/settings.json\"; fi\n" +
-		"touch \"$d/done\"\n" +
-		"exec sleep 300\n"
 	if err := os.MkdirAll(capture.dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
-		t.Fatalf("write stand-in agent: %v", err)
+	scripts := map[string]string{}
+	for _, agentType := range []string{"claude", "codex"} {
+		script := filepath.Join(root, "stand-in-"+agentType+".sh")
+		body := "#!/bin/sh\n" +
+			"d=" + shellQuoteForTest(capture.dir) + "/$$\n" +
+			"mkdir -p \"$d\"\n" +
+			"echo " + agentType + " > \"$d/type\"\n" +
+			"pwd > \"$d/pwd\"\n" +
+			"env > \"$d/env\"\n" +
+			"if [ -f .claude/settings.local.json ]; then cp .claude/settings.local.json \"$d/settings.json\"; fi\n" +
+			"touch \"$d/done\"\n" +
+			"exec sleep 300\n"
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatalf("write stand-in agent: %v", err)
+		}
+		scripts[agentType] = script
 	}
 	if err := os.MkdirAll(e.projectsBase(), 0o755); err != nil {
 		t.Fatal(err)
@@ -879,7 +885,7 @@ enabled = false
 
 [integrations.rch]
 enabled = false
-%s`, e.projectsBase(), script, script, extra))
+%s`, e.projectsBase(), scripts["claude"], scripts["codex"], extra))
 	return capture
 }
 
@@ -901,18 +907,27 @@ func shellQuoteForTest(s string) string {
 // waitForAgents waits until count stand-in agents have written their capture.
 func (c *agentCapture) waitForAgents(t *testing.T, count int, timeout time.Duration) []launchedAgent {
 	t.Helper()
+	return c.waitForType(t, "", count, timeout)
+}
+
+// waitForType waits until count stand-ins of one type ("" for any) have
+// written their capture, and returns those.
+func (c *agentCapture) waitForType(t *testing.T, agentType string, count int, timeout time.Duration) []launchedAgent {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		done, _ := filepath.Glob(filepath.Join(c.dir, "*", "done"))
-		if len(done) >= count {
-			agents := make([]launchedAgent, 0, len(done))
-			for _, marker := range done {
-				agents = append(agents, readLaunchedAgent(t, filepath.Dir(marker)))
+		var agents []launchedAgent
+		for _, marker := range done {
+			if agent := readLaunchedAgent(t, filepath.Dir(marker)); agentType == "" || agent.Type == agentType {
+				agents = append(agents, agent)
 			}
+		}
+		if len(agents) >= count {
 			return agents
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d of %d stand-in agents launched within %s", len(done), count, timeout)
+			t.Fatalf("%d of %d %q stand-in agents launched within %s", len(agents), count, agentType, timeout)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -921,6 +936,7 @@ func (c *agentCapture) waitForAgents(t *testing.T, count int, timeout time.Durat
 func readLaunchedAgent(t *testing.T, dir string) launchedAgent {
 	t.Helper()
 	agent := launchedAgent{Env: map[string]string{}}
+	agent.Type = strings.TrimSpace(string(mustReadFile(t, filepath.Join(dir, "type"))))
 	agent.Dir = strings.TrimSpace(string(mustReadFile(t, filepath.Join(dir, "pwd"))))
 	for _, line := range strings.Split(string(mustReadFile(t, filepath.Join(dir, "env"))), "\n") {
 		if key, value, ok := strings.Cut(line, "="); ok {
@@ -1195,6 +1211,71 @@ func TestClosure_WorktreeSpawnHooksUseMainProject(t *testing.T) {
 		t.Fatalf("hook output = %q", out)
 	}
 	assertFetchesUsed(t, mail, 1, repo, name, mail.token(name))
+}
+
+// robotSpawnResponse is the part of --robot-spawn's JSON these tests read.
+type robotSpawnResponse struct {
+	Success  bool     `json:"success"`
+	Warnings []string `json:"warnings"`
+	Error    string   `json:"error"`
+}
+
+// parseRobotSpawn fails unless stdout is exactly one JSON object.
+func parseRobotSpawn(t *testing.T, out string) robotSpawnResponse {
+	t.Helper()
+	var resp robotSpawnResponse
+	decoder := json.NewDecoder(strings.NewReader(out))
+	if err := decoder.Decode(&resp); err != nil {
+		t.Fatalf("robot spawn stdout isn't JSON: %v\n%q", err, out)
+	}
+	if decoder.More() {
+		t.Fatalf("robot spawn stdout holds more than one JSON value: %q", out)
+	}
+	return resp
+}
+
+func TestClosure_RobotSpawnWritesClaudeStopHook(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo1 := gitInitForTest(t, filepath.Join(env.projectsBase(), "one"))
+	repo2 := gitInitForTest(t, filepath.Join(env.projectsBase(), "two"))
+
+	resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=robottest", "--spawn-cc=1", "--spawn-cod=1", "--spawn-dir="+repo1))
+	if !resp.Success || len(resp.Warnings) != 0 {
+		t.Fatalf("response = %+v", resp)
+	}
+	claude := capture.waitForType(t, "claude", 1, 20*time.Second)[0]
+	codex := capture.waitForType(t, "codex", 1, 20*time.Second)[0]
+	entry := onlyNtmStopEntry(t, claude.Settings)
+	if entry.Command != claudeconfig.StopHookCommand(helperBinary(t), repo1) {
+		t.Fatalf("command = %q", entry.Command)
+	}
+	if codex.Dir != repo1 {
+		t.Fatalf("codex ran in %q, want %q", codex.Dir, repo1)
+	}
+
+	name := claude.Env["AGENT_NAME"]
+	if name == "" {
+		t.Fatalf("robot-spawned Claude agent has no AGENT_NAME")
+	}
+	mail.addMessage(name, agentmail.InboxMessage{ID: 3, From: "HumanOverseer", Subject: "robot test"})
+	out := env.runShell(t, repo1, entry.Command, "{}", "AGENT_NAME="+name, closureHelperModeEnv+"=argv", closureHelperArgsEnv+"=")
+	if d := parseStopDecision(t, out); !strings.Contains(d.Reason, "from HumanOverseer: robot test") {
+		t.Fatalf("hook output = %q", out)
+	}
+	assertFetchesUsed(t, mail, 1, repo1, name, mail.token(name))
+
+	resp = parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=codonly", "--spawn-cod=1", "--spawn-dir="+repo2))
+	if !resp.Success {
+		t.Fatalf("codex-only response = %+v", resp)
+	}
+	capture.waitForType(t, "codex", 2, 20*time.Second)
+	if _, err := os.Stat(filepath.Join(repo2, ".claude", "settings.local.json")); !os.IsNotExist(err) {
+		t.Fatalf("codex-only spawn wrote a Claude file: %v", err)
+	}
 }
 
 // helperBinary is the binary helpers run, which a spawn in a helper writes

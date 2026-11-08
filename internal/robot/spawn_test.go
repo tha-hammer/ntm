@@ -3,10 +3,14 @@ package robot
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -262,6 +266,61 @@ func TestLaunchAgentSetsIdentityWithoutAgentMail(t *testing.T) {
 	})
 }
 
+// spawnTestConfig is the default config with an echo agent, no live-memory
+// headroom check, and agent caps raised above any plausible runner state.
+// Agent Mail is off, so a spawn neither registers agents with a real server
+// nor writes a Claude Stop hook into the session folder, which for a test
+// without WorkingDir is under the real projects_base.
+func spawnTestConfig() *config.Config {
+	cfg := config.Default()
+	cfg.AgentMail.Enabled = false
+	cfg.Agents.Claude = "echo test"
+	cfg.SpawnPacing.Headroom.Enabled = false // avoid a live-memory read flaking these tests
+	// Hoist the agent cap above any plausible runner state, matching
+	// TestSpawnOptions_DryRunIncludesAdmission's precedent: on a busy
+	// CI/agent-swarm host, real running_agents can otherwise trip the
+	// default cap before a test's single requested agent is considered.
+	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
+	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
+	return cfg
+}
+
+// TestGetSpawn_StopHookWriteFailureIsWarning checks that a Claude Stop hook
+// that can't be written is a JSON warning and the agent still launches. A
+// folder where the settings file should be stands in for a read-only folder,
+// because tests may run as root, which ignores folder permissions.
+func TestGetSpawn_StopHookWriteFailureIsWarning(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	// A closed port, so the spawn never registers agents with a real server.
+	t.Setenv("AGENT_MAIL_URL", "http://127.0.0.1:1/mcp/")
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".claude", "settings.local.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := spawnTestConfig()
+	cfg.AgentMail.Enabled = true
+	sessionName := fmt.Sprintf("test_stop_hook_warning_%d", time.Now().UnixNano())
+	resp, err := GetSpawn(SpawnOptions{Session: sessionName, CCCount: 1, NoUserPane: true, WorkingDir: dir}, cfg)
+	if err != nil {
+		t.Fatalf("GetSpawn returned error: %v", err)
+	}
+	defer tmux.KillSession(sessionName)
+	if !resp.Success || len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], filepath.Join(dir, ".claude", "settings.local.json")) {
+		t.Fatalf("response = %+v", resp)
+	}
+	var claude *SpawnedAgent
+	for i := range resp.Agents {
+		if resp.Agents[i].Type == "claude" {
+			claude = &resp.Agents[i]
+		}
+	}
+	if claude == nil || claude.Error != "" {
+		t.Fatalf("claude agent = %+v, want one that launched", claude)
+	}
+}
+
 // TestGetSpawn_RobotMonitorDefaultFalseLeavesNoManifest covers Behavior 8's
 // "false (default) leaves no manifest/monitor (today's behavior,
 // unchanged)" requirement end-to-end through a real (non-dry-run) spawn.
@@ -269,16 +328,7 @@ func TestGetSpawn_RobotMonitorDefaultFalseLeavesNoManifest(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 
 	sessionName := "test_robot_monitor_default_false"
-	cfg := config.Default() // RobotMonitorEnabled defaults to false
-	cfg.Agents.Claude = "echo test"
-	cfg.SpawnPacing.Headroom.Enabled = false // avoid a live-memory read flaking this test
-	// Hoist the agent cap above any plausible runner state, matching
-	// TestSpawnOptions_DryRunIncludesAdmission's precedent: on a busy
-	// CI/agent-swarm host, real running_agents can otherwise trip the
-	// default cap before this test's single requested agent is considered.
-	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
-	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
-	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
+	cfg := spawnTestConfig() // RobotMonitorEnabled defaults to false
 
 	opts := SpawnOptions{Session: sessionName, CCCount: 1, NoUserPane: true}
 	resp, err := GetSpawn(opts, cfg)
