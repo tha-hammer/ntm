@@ -55,7 +55,7 @@ Covers deliverable 7. Needs Loop 1. The hook doesn't depend on this loop, so not
 1. Build the binary: `go build -o /tmp/ntm-loop4 ./cmd/ntm`.
 2. In a scratch project folder, create a session: `/tmp/ntm-loop4 spawn streamtest --cc=1`.
 3. Start the server: `/tmp/ntm-loop4 serve --port 8080`.
-4. In a second shell, watch the stream: `curl -N http://127.0.0.1:8080/api/v1/attention/stream | grep --line-buffered mail.received`.
+4. In a second shell, watch the stream from now: `curl -N 'http://127.0.0.1:8080/api/v1/attention/stream?since_cursor=-1' | grep --line-buffered mail.received`. Without `since_cursor=-1`, the stream first replays every stored event, up to 7 days of them.
 5. In a third shell, send mail: `/tmp/ntm-loop4 mail send streamtest --to <agent> "stream test"`.
 6. Open `/tmp/ntm-loop4 dashboard streamtest`, and wait for `Mail: 1 unread` in the bottom ticker.
 7. Pass: within a few seconds, the second shell shows one `mail.received` event naming your message.

@@ -32,7 +32,7 @@ There are 14 testable behaviors in 1 sprint: 5 BLOCKING and 9 LEAF.
 
 ## Desired End State
 
-`curl -N http://127.0.0.1:8080/api/v1/attention/stream` shows a `mail.received` event within about a second of a dashboard in another shell writing it, once. The same holds for a WebSocket client on the `attention` topic. Stopping the server stops the poll. A short command that never subscribes never polls.
+`curl -N 'http://127.0.0.1:8080/api/v1/attention/stream?since_cursor=-1'` shows a `mail.received` event within about a second of a dashboard in another shell writing it, once. The same holds for a WebSocket client on the `attention` topic. Stopping the server stops the poll. A short command that never subscribes never polls.
 
 ### Observable Behaviors
 
@@ -1306,12 +1306,14 @@ Verification on the VPS:
 1. Build the binary: `go build -o /tmp/ntm-loop4 ./cmd/ntm`.
 2. In a scratch project folder, create a session: `/tmp/ntm-loop4 spawn streamtest --cc=1`.
 3. Start the server: `/tmp/ntm-loop4 serve --port 8080`.
-4. In a second shell, watch the stream: `curl -N http://127.0.0.1:8080/api/v1/attention/stream | grep --line-buffered mail.received`.
+4. In a second shell, watch the stream from now: `curl -N 'http://127.0.0.1:8080/api/v1/attention/stream?since_cursor=-1' | grep --line-buffered mail.received`. Without `since_cursor=-1`, the stream first replays every stored event, up to 7 days of them.
 5. In a third shell, send mail: `/tmp/ntm-loop4 mail send streamtest --to <agent> "stream test"`.
 6. Open `/tmp/ntm-loop4 dashboard streamtest`, and wait for `Mail: 1 unread` in the bottom ticker.
 7. Pass: within a few seconds, the second shell shows one `mail.received` event naming your message.
 8. Quit the dashboard and wait a minute.
 9. Pass: the same event hasn't appeared again.
+
+**Result (2026-11-08):** passed on rocketman at `0bf1f648`, with agent BlueMountain in `~/ntm_Dev/streamtest`, after one correction to step 4. As first written, step 4's URL had no `since_cursor`, so it started at 0 and replayed the whole 7-day store first: 21,665 events, newest 584637 and oldest 562960. The test message (cursor 584642, message 12507, stored 18:52:34 UTC) arrived at 19:01:11, 8m37s late, behind the replay. That stream was read at about 40 events per second. On the VPS, a plain `curl` into a file got a 20,001-event replay within 1 second, so the reading speed came from the capture pipeline, not the server. A second watcher with `?since_cursor=-1` got "stream test 2" (cursor 584691, message 12508, written by another process at 18:53:35) at 18:53:37. 75 seconds after the dashboard quit, it still had exactly one copy. Both streams had each message once, no repeated cursors and nothing out of order. Step 4 now uses `since_cursor=-1`. Bead `bd-vn7ln` asks whether a stream with no cursor should start from now. Spawn's trust prompt stayed up and was accepted by hand (`bd-57xdn`). Evidence: `/home/debian/Dev/ntm-test-evidence/loop4-sprint1-local-2026-11-08/`.
 
 ## Integration & E2E Testing
 
