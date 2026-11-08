@@ -1605,6 +1605,8 @@ Note for Loop 8: a hook command with a broken argument list fails in cobra's arg
 
 Evidence, with the agent transcript: `/home/debian/Dev/ntm-test-evidence/loop3-sprint3-local-2026-11-07/`.
 
+**Result (2026-11-07):** passed on rocketman at `ed187a6b`, after the reminder fix, in a live `pushtest` session with agent WhiteBeacon. At 22:53:07 the Stop hook feedback said `Run fetch_inbox with agent_name "WhiteBeacon" and project_key "/home/maceo/ntm_Dev/pushtest" to read them.` At 22:53:11 the agent called `fetch_inbox` with those exact values and got message 12492. The turn ended at 22:53:16 with no second block, and `told_records` has one row. Steps 4, 6 and 12 had passed on the first run. Note: the Claude transcript JSONL holds the agent's `registration_token`, from its own `register_agent` result. The user redacted it from the evidence copy, and anyone collecting transcripts as evidence should scrub that field. Evidence: `/home/debian/Dev/ntm-test-evidence/loop3-sprint3-retest-local-2026-11-07/`.
+
 ---
 
 ## Sprint 4: Hook written with `--worktrees`
@@ -1745,9 +1747,19 @@ func agentWorkDir(dir string, useWorktrees bool, lookup worktreeLookup, agent Fl
 
 **Automated:** `go test -short -run TestAgentWorkDir_FallbackAndNamedWorktree ./internal/cli/` fails first, then passes.
 
+### Build record (2026-11-08)
+
+Red, then green, for each behavior:
+- **17:** green on the first run, as the plan expected: Sprint 3's call already writes into `workingDir` after the worktree is chosen, with `dir` as the key. Worktrees are at `<project>/.ntm/worktrees/<session>/cc_N`. **Red-at-seam:** with the worktree folder passed as the project key, the test failed on `cc_1: command "... --project '.../wttest/.ntm/worktrees/wttest/cc_1'", want "... --project '.../wttest'"`. The test also runs one worktree's written command and checks that the fetch used the main project and the registration token.
+- **18:** red was `undefined: agentWorkDir`. Added a "worktree not created" row and a nil lookup check.
+
+Where the build differs from the plan:
+- `git status --porcelain` isn't required to be empty, because spawn itself creates `.ntm/` in the project, as the Sprint 3 human test showed (`?? .ntm/`). The test checks that the settings file isn't listed in the main repo or any worktree.
+- `worktreeLookupOrNil` keeps a nil `*WorktreeManager` from becoming a non-nil interface.
+
 ### Human test script
 
-1. In a scratch git repo with one commit, run `/tmp/ntm-loop3 spawn wttest --cc=2 --worktrees`.
+1. Spawn uses `<projects_base>/wttest`, so make that folder a git repo with one commit (for example `git init ~/ntm_Dev/wttest && git -C ~/ntm_Dev/wttest commit --allow-empty -m first`), `cd` into it, and run `/tmp/ntm-loop3 spawn wttest --cc=2 --worktrees`.
 2. Run `/tmp/ntm-loop3 worktrees list` to see the two paths.
 3. For each path, run `jq -r '.hooks.Stop[0].hooks[0].command' <path>/.claude/settings.local.json`.
 4. Pass: each command's `--project` is the main repo folder.

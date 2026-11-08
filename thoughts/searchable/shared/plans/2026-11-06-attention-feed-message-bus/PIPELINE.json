@@ -60,7 +60,8 @@
       "status": "building",
       "sprints_passed": [
         "Sprint 1: Hook command tells an agent once",
-        "Sprint 2: Identity lookup"
+        "Sprint 2: Identity lookup",
+        "Sprint 3: Hook written by `ntm spawn`"
       ]
     },
     {
@@ -345,8 +346,14 @@
       "step": "build",
       "event": "sprint",
       "detail": "Sprint 2: Identity lookup"
+    },
+    {
+      "at": "2026-11-07T22:55:19.251Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 3: Hook written by `ntm spawn`"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-07T20:48:52.478Z"
+  "updated_at": "2026-11-07T22:55:19.251Z"
 }

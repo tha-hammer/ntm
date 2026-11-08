@@ -19,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/worktrees"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
@@ -1397,5 +1398,61 @@ func TestWizardLaunchAgentSpecs_RecipeAndTemplateSelectionsDeferCounts(t *testin
 	}
 	if wizardDeferredSelection(SpawnWizardResult{CCCount: 1}) {
 		t.Fatal("wizardDeferredSelection(manual) = true, want false")
+	}
+}
+
+// fakeWorktreeLookup returns a fixed result per agent name and records the
+// names it was asked for.
+type fakeWorktreeLookup struct {
+	results map[string]*worktrees.WorktreeInfo
+	err     error
+	asked   []string
+}
+
+func (f *fakeWorktreeLookup) GetWorktreeForAgent(agentName string) (*worktrees.WorktreeInfo, error) {
+	f.asked = append(f.asked, agentName)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.results[agentName], nil
+}
+
+func TestAgentWorkDir_FallbackAndNamedWorktree(t *testing.T) {
+	const main = "/proj/main"
+	agent := FlatAgent{Type: AgentTypeClaude, Index: 1}
+	created := &worktrees.WorktreeInfo{Path: "/proj/wt/cc_1", Created: true}
+	cases := []struct {
+		name         string
+		useWorktrees bool
+		lookup       *fakeWorktreeLookup
+		worktreeName string
+		want         string
+		wantAsked    string
+	}{
+		{name: "created worktree", useWorktrees: true, lookup: &fakeWorktreeLookup{results: map[string]*worktrees.WorktreeInfo{"cc_1": created}}, want: created.Path, wantAsked: "cc_1"},
+		{name: "lookup error falls back", useWorktrees: true, lookup: &fakeWorktreeLookup{err: fmt.Errorf("no worktree")}, want: main, wantAsked: "cc_1"},
+		{name: "worktree with an error falls back", useWorktrees: true, lookup: &fakeWorktreeLookup{results: map[string]*worktrees.WorktreeInfo{
+			"cc_1": {Path: "/proj/wt/cc_1", Created: true, Error: "checkout failed"},
+		}}, want: main, wantAsked: "cc_1"},
+		{name: "worktree not created falls back", useWorktrees: true, lookup: &fakeWorktreeLookup{results: map[string]*worktrees.WorktreeInfo{
+			"cc_1": {Path: "/proj/wt/cc_1"},
+		}}, want: main, wantAsked: "cc_1"},
+		{name: "named worktree", useWorktrees: true, worktreeName: "foo", lookup: &fakeWorktreeLookup{results: map[string]*worktrees.WorktreeInfo{
+			"foo": {Path: "/proj/wt/foo", Created: true},
+		}}, want: "/proj/wt/foo", wantAsked: "foo"},
+		{name: "worktrees off", useWorktrees: false, lookup: &fakeWorktreeLookup{results: map[string]*worktrees.WorktreeInfo{"cc_1": created}}, want: main},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agentWorkDir(main, tc.useWorktrees, tc.lookup, agent, tc.worktreeName); got != tc.want {
+				t.Fatalf("agentWorkDir = %q, want %q", got, tc.want)
+			}
+			if asked := strings.Join(tc.lookup.asked, ","); asked != tc.wantAsked {
+				t.Fatalf("lookup asked for %q, want %q", asked, tc.wantAsked)
+			}
+		})
+	}
+	if got := agentWorkDir(main, true, nil, agent, ""); got != main {
+		t.Fatalf("no lookup: agentWorkDir = %q, want %q", got, main)
 	}
 }

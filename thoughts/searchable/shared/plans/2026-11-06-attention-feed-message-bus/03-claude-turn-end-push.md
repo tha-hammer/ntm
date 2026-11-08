@@ -213,7 +213,7 @@ Two gaps found while writing this document:
 
 ### Human test script
 
-1. In a scratch git repo with one commit, run `/tmp/ntm-loop3 spawn wttest --cc=2 --worktrees`.
+1. Spawn uses `<projects_base>/wttest`, so make that folder a git repo with one commit (for example `git init ~/ntm_Dev/wttest && git -C ~/ntm_Dev/wttest commit --allow-empty -m first`), `cd` into it, and run `/tmp/ntm-loop3 spawn wttest --cc=2 --worktrees`.
 2. Run `/tmp/ntm-loop3 worktrees list` to see the two paths.
 3. For each path, run `jq -r '.hooks.Stop[0].hooks[0].command' <path>/.claude/settings.local.json`.
 4. Pass: each command's `--project` is the main repo folder.

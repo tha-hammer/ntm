@@ -1153,6 +1153,50 @@ func TestClosure_WrittenStopHookCommandTellsAgent(t *testing.T) {
 	assertFetchesUsed(t, mail, 2, repo, name, mail.token(name))
 }
 
+func TestClosure_WorktreeSpawnHooksUseMainProject(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("wttest"))
+	gitForTest(t, repo, "commit", "-q", "--allow-empty", "-m", "first")
+
+	env.run(t, "execute", "spawn", "wttest", "--cc=2", "--worktrees")
+	agents := capture.waitForAgents(t, 2, 30*time.Second)
+
+	wantCmd := claudeconfig.StopHookCommand(helperBinary(t), repo)
+	seen := map[string]bool{}
+	for _, a := range agents {
+		if a.Dir == repo || seen[a.Dir] {
+			t.Fatalf("agent didn't run in its own worktree: %+v", a.Dir)
+		}
+		seen[a.Dir] = true
+		if entry := onlyNtmStopEntry(t, a.Settings); entry.Command != wantCmd {
+			t.Fatalf("%s: command %q, want %q", a.Dir, entry.Command, wantCmd)
+		}
+		assertSettingsNotInGitStatus(t, a.Dir)
+	}
+	assertSettingsNotInGitStatus(t, repo)
+	if _, err := os.Stat(filepath.Join(repo, ".claude", "settings.local.json")); !os.IsNotExist(err) {
+		t.Fatalf("main folder got a settings file: %v", err)
+	}
+	if n := countExcludeLines(t, repo, claudeconfig.LocalSettingsPath); n != 1 {
+		t.Fatalf("exclude lines = %d, want 1", n)
+	}
+
+	first := agents[0]
+	name := first.Env["AGENT_NAME"]
+	mail.addMessage(name, agentmail.InboxMessage{ID: 5, From: "HumanOverseer", Subject: "worktree test"})
+	out := env.runShell(t, first.Dir, onlyNtmStopEntry(t, first.Settings).Command, "{}",
+		"AGENT_NAME="+name, closureHelperModeEnv+"=argv", closureHelperArgsEnv+"=")
+	d := parseStopDecision(t, out)
+	if !strings.Contains(d.Reason, "from HumanOverseer: worktree test") || !strings.Contains(d.Reason, fmt.Sprintf("project_key %q", repo)) {
+		t.Fatalf("hook output = %q", out)
+	}
+	assertFetchesUsed(t, mail, 1, repo, name, mail.token(name))
+}
+
 // helperBinary is the binary helpers run, which a spawn in a helper writes
 // into the hook command.
 func helperBinary(t *testing.T) string {

@@ -2339,14 +2339,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			return outputError(fmt.Errorf("invalid %s agent command: %w", agent.Type, err))
 		}
 
-		// Use worktree directory if worktree isolation is enabled
-		workingDir := dir
-		if opts.UseWorktrees && worktreeManager != nil {
-			agentName := worktreeAgentName(agent, opts.WorktreeName)
-			if wtInfo, err := worktreeManager.GetWorktreeForAgent(agentName); err == nil && wtInfo.Created && wtInfo.Error == "" {
-				workingDir = wtInfo.Path
-			}
-		}
+		workingDir := agentWorkDir(dir, opts.UseWorktrees, worktreeLookupOrNil(worktreeManager), agent, opts.WorktreeName)
 
 		if agent.Type == AgentTypeCodex {
 			var cooldown time.Duration
@@ -2365,7 +2358,9 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		}
 
 		// Claude Code reads its settings at startup, so the Stop hook is written
-		// before the launch below. The project key is the session folder.
+		// before the launch below, in the folder the agent runs in. The project
+		// key is the session folder even for a worktree agent, because that is
+		// the key the agent was registered under with Agent Mail.
 		if agent.Type == AgentTypeClaude && cfg.AgentMail.Enabled {
 			installClaudeStopHook(workingDir, dir)
 		}
@@ -4549,6 +4544,34 @@ func worktreeAgentName(a FlatAgent, override string) string {
 		return override
 	}
 	return fmt.Sprintf("%s_%d", strings.ToLower(string(a.Type)), a.Index)
+}
+
+// worktreeLookup is the part of the worktree manager that picks an agent's folder.
+type worktreeLookup interface {
+	GetWorktreeForAgent(agentName string) (*worktrees.WorktreeInfo, error)
+}
+
+// agentWorkDir is the folder an agent runs in, and so where its Claude Stop
+// hook is written: its worktree when one was created without error, or the
+// main folder otherwise.
+func agentWorkDir(dir string, useWorktrees bool, lookup worktreeLookup, agent FlatAgent, worktreeName string) string {
+	if !useWorktrees || lookup == nil {
+		return dir
+	}
+	info, err := lookup.GetWorktreeForAgent(worktreeAgentName(agent, worktreeName))
+	if err != nil || info == nil || !info.Created || info.Error != "" {
+		return dir
+	}
+	return info.Path
+}
+
+// worktreeLookupOrNil keeps a nil manager a nil interface, so agentWorkDir
+// sees that no worktrees were made.
+func worktreeLookupOrNil(manager *worktrees.WorktreeManager) worktreeLookup {
+	if manager == nil {
+		return nil
+	}
+	return manager
 }
 
 // waitForAgentsReady waits for spawned agents to show ready/idle prompts.
