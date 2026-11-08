@@ -63,7 +63,8 @@
         "Sprint 2: Identity lookup",
         "Sprint 3: Hook written by `ntm spawn`",
         "Sprint 4: Hook written with `--worktrees`",
-        "Sprint 5: Hook written by robot spawn"
+        "Sprint 5: Hook written by robot spawn",
+        "Sprint 6: Hook written by `ntm add`"
       ]
     },
     {
@@ -366,8 +367,14 @@
       "step": "build",
       "event": "sprint",
       "detail": "Sprint 5: Hook written by robot spawn"
+    },
+    {
+      "at": "2026-11-08T13:42:40.307Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 6: Hook written by `ntm add`"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-08T00:54:29.456Z"
+  "updated_at": "2026-11-08T13:42:40.307Z"
 }

@@ -637,7 +637,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	// Stop hook is written before each launch.
 	for i := 0; i < opts.CCCount && agentNum < len(panes); i++ {
 		pane := panes[agentNum]
-		if cfg != nil && cfg.AgentMail.Enabled {
+		if cfg != nil && cfg.AgentMail.StopHookActive() {
 			output.Warnings = append(output.Warnings, writeClaudeStopHook(dir)...)
 		}
 		agent := launchAgent(pane, opts.Session, "claude", i+1, dir, agentCommands["claude"], amState)

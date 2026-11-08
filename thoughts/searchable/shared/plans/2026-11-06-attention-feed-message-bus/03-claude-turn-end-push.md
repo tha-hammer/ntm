@@ -343,7 +343,7 @@ Two gaps found while writing this document:
 ### Human test script
 
 1. Add this to your ntm config: `[agent_mail]` with `stop_hook_enabled = false`.
-2. In a new scratch git repo, run `/tmp/ntm-loop3 spawn offtest --cc=1`.
+2. Spawn uses `<projects_base>/offtest`, so make that folder a new git repo (for example `git init ~/ntm_Dev/offtest`), `cd` into it, and run `/tmp/ntm-loop3 spawn offtest --cc=1`.
 3. Run `ls .claude/settings.local.json`.
 4. Pass: the file doesn't exist, or has no ntm Stop entry.
 5. Give the agent slow work and send it mail, as in Sprint 3.

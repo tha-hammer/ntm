@@ -132,6 +132,25 @@ func TestDiff_AgentMailSettings(t *testing.T) {
 	}
 }
 
+func TestDiff_StopHookEnabled(t *testing.T) {
+	t.Parallel()
+
+	for _, d := range Diff(Default()) {
+		if d.Path == "agent_mail.stop_hook_enabled" {
+			t.Fatalf("default config lists a stop_hook_enabled diff: %+v", d)
+		}
+	}
+	cfg := Default()
+	off := false
+	cfg.AgentMail.StopHookEnabled = &off
+	for _, d := range Diff(cfg) {
+		if d.Path == "agent_mail.stop_hook_enabled" {
+			return
+		}
+	}
+	t.Fatal("expected a diff for agent_mail.stop_hook_enabled")
+}
+
 func TestDiff_AlertsSettings(t *testing.T) {
 	t.Parallel()
 

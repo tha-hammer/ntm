@@ -2160,6 +2160,8 @@ Where the build differs from the plan:
 
 Now the config and beads walks share `walkUpForMarker`, which stops at the home folder without checking it. As a second guard, `InstallStopHook` refuses the home folder with `ErrHomeFolder`, which spawn and add print as a warning and robot spawn returns in `warnings`. All three tests pass.
 
+**Result (2026-11-08):** passed on rocketman at `e5b8da23`. The user's build matched the commit exactly (internal diff sha256 `7d22b7a8bdcd3422`, 0 lines differ). The test used a bare git folder, `~/ntm_Dev/addtest2`, with no `.ntm/config.toml`. Add printed `Claude Stop hook written: /home/maceo/ntm_Dev/addtest2/.claude/settings.local.json`. RubyGate runs in `addtest2` with `AGENT_NAME` and its pane title set, and its registry project key is `addtest2`. `~/.claude/settings.local.json` is still `{}`, and the Stop list length is 1. `mail send` worked with no marker file, so bd-nftwx is fixed. At turn end only RubyGate was told (`Run fetch_inbox with agent_name "RubyGate" and project_key "/home/maceo/ntm_Dev/addtest2"`), and it called `fetch_inbox`. QuietCove was not told. bd-57xdn still happens on spawn. Evidence: `/home/debian/Dev/ntm-test-evidence/loop3-sprint6-retest-local-2026-11-08/`.
+
 ---
 
 ## Sprint 7: Hook switch
@@ -2360,10 +2362,23 @@ The three call sites from Sprints 3, 5 and 6 change `cfg.AgentMail.Enabled` to `
 
 **Automated:** `go test -short -run TestInstallClaudeStopHookIfActive_OffThenOn ./internal/cli/` fails first, then passes.
 
+### Build record (2026-11-08)
+
+Red, then green, for each behavior:
+- **25 and 26, first red:** the config loader rejects unknown keys ("unknown field(s): agent_mail.stop_hook_enabled") and falls back to the built-in defaults, so the stand-ins never launched, and the hook printed the config warning on stderr.
+- **24:** red was `cfg.AgentMail.StopHookEnabled undefined`. Green covers the four combinations, `Print`, `GetValue` and `Diff`.
+- **25 and 26, red-at-seam:** with the setting parsed but the callers still checking only `enabled`, spawn, `--worktrees`, robot spawn and add each launched their agent with a Stop entry, and the switched-off command printed a block decision. The "Agent Mail off" case already passed. Green after the callers changed to `StopHookActive()`.
+- **27:** red was `undefined: installClaudeStopHookIfActive`. Switching off left an existing file byte for byte unchanged, and switching back on replaced the old `/old/ntm` entry with one entry.
+
+Where the build differs from the plan:
+- `installClaudeStopHookIfActive` takes the config as a parameter and returns for a nil config.
+
+Note: when the config file has an error, ntm's startup prints "ntm: warning: config load failed ..." on stderr before `agent-hook stop`'s log redirect. Claude Code shows a Stop hook's stderr only in its transcript view, and the hook still exits 0, but this is the one path where hook output isn't in `agent-hook.log`. Left for Loop 8, which reviews hook output.
+
 ### Human test script
 
 1. Add this to your ntm config: `[agent_mail]` with `stop_hook_enabled = false`.
-2. In a new scratch git repo, run `/tmp/ntm-loop3 spawn offtest --cc=1`.
+2. Spawn uses `<projects_base>/offtest`, so make that folder a new git repo (for example `git init ~/ntm_Dev/offtest`), `cd` into it, and run `/tmp/ntm-loop3 spawn offtest --cc=1`.
 3. Run `ls .claude/settings.local.json`.
 4. Pass: the file doesn't exist, or has no ntm Stop entry.
 5. Give the agent slow work and send it mail, as in Sprint 3.

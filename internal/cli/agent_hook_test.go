@@ -1485,6 +1485,115 @@ func TestAdd_CodexWritesNoClaudeFile(t *testing.T) {
 	}
 }
 
+const (
+	stopHookOffConfig        = "\n[agent_mail]\nstop_hook_enabled = false\n"
+	agentMailOffHookOnConfig = "\n[agent_mail]\nenabled = false\nstop_hook_enabled = true\n"
+)
+
+// assertNoSettingsFile fails if dir has a Claude local settings file.
+func assertNoSettingsFile(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, claudeconfig.LocalSettingsPath)); !os.IsNotExist(err) {
+		t.Fatalf("%s has a Claude settings file (stat err %v)", dir, err)
+	}
+}
+
+func TestClosure_StopHookSwitchOffWritesNothing(t *testing.T) {
+	cases := []struct {
+		name, config string
+		agents       int
+		run          func(t *testing.T, env *closureEnv, session, repo string)
+	}{
+		{"spawn", stopHookOffConfig, 1, func(t *testing.T, env *closureEnv, session, repo string) {
+			env.run(t, "execute", "spawn", session, "--cc=1")
+		}},
+		{"worktrees", stopHookOffConfig, 2, func(t *testing.T, env *closureEnv, session, repo string) {
+			gitForTest(t, repo, "commit", "-q", "--allow-empty", "-m", "first")
+			env.run(t, "execute", "spawn", session, "--cc=2", "--worktrees")
+		}},
+		{"robot", stopHookOffConfig, 1, func(t *testing.T, env *closureEnv, session, repo string) {
+			if resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn="+session, "--spawn-cc=1", "--spawn-dir="+repo)); !resp.Success {
+				t.Fatalf("robot spawn = %+v", resp)
+			}
+		}},
+		{"add", stopHookOffConfig, 2, func(t *testing.T, env *closureEnv, session, repo string) {
+			env.run(t, "execute", "spawn", session, "--cc=1")
+			env.run(t, "execute", "add", session, "--cc=1")
+		}},
+		{"agent mail off", agentMailOffHookOnConfig, 1, func(t *testing.T, env *closureEnv, session, repo string) {
+			env.run(t, "execute", "spawn", session, "--cc=1")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mail := newFakeAgentMail(t)
+			env := newClosureEnv(t)
+			env.useAgentMail(mail)
+			env.privateTmux(t)
+			capture := env.standInAgentConfig(t, tc.config)
+			session := "offtest"
+			repo := gitInitForTest(t, env.projectDir(session))
+
+			tc.run(t, env, session, repo)
+			for _, agent := range capture.waitForAgents(t, tc.agents, 30*time.Second) {
+				if agent.Settings != nil || agent.SettingsRaw != "" {
+					t.Fatalf("agent in %s launched with settings %q", agent.Dir, agent.SettingsRaw)
+				}
+				assertNoSettingsFile(t, agent.Dir)
+			}
+			assertNoSettingsFile(t, repo)
+			if n := countExcludeLines(t, repo, claudeconfig.LocalSettingsPath); n != 0 {
+				t.Fatalf("exclude lines = %d, want 0", n)
+			}
+		})
+	}
+}
+
+func TestInstallClaudeStopHookIfActive_OffThenOn(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := claudeconfig.InstallStopHook(dir, "/old/ntm", dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, claudeconfig.LocalSettingsPath)
+	before := mustReadFile(t, path)
+
+	off, on := config.Default(), config.Default()
+	disabled := false
+	off.AgentMail.StopHookEnabled = &disabled
+	installClaudeStopHookIfActive(off, dir, dir)
+	if after := mustReadFile(t, path); !bytes.Equal(after, before) {
+		t.Fatalf("switch off changed the file:\nbefore %s\nafter  %s", before, after)
+	}
+
+	installClaudeStopHookIfActive(on, dir, dir)
+	entry := onlyNtmStopEntry(t, readSettingsFile(t, dir))
+	if entry.Command != claudeconfig.StopHookCommand(helperBinary(t), dir) {
+		t.Fatalf("after switching on, command = %q", entry.Command)
+	}
+	installClaudeStopHookIfActive(on, dir, dir)
+	onlyNtmStopEntry(t, readSettingsFile(t, dir))
+}
+
+func TestClosure_StopHookSwitchOffIsSilent(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 42, From: "RedStone", Subject: "hi"})
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.writeConfig(t, stopHookOffConfig)
+	command := claudeconfig.StopHookCommand(helperBinary(t), env.workDir)
+
+	out := env.runShell(t, env.workDir, command, "{}", "AGENT_NAME=BlueLake", closureHelperModeEnv+"=argv", closureHelperArgsEnv+"=")
+	if out != "" {
+		t.Fatalf("switched-off hook printed %q", out)
+	}
+	if calls := mail.allCalls(); len(calls) != 0 {
+		t.Fatalf("switched-off hook called Agent Mail: %+v", calls)
+	}
+	if data, err := os.ReadFile(filepath.Join(env.dataDir(), "ntm", "logs", agentHookLogName)); err == nil && len(strings.TrimSpace(string(data))) != 0 {
+		t.Fatalf("switched-off hook logged: %s", data)
+	}
+}
+
 // helperBinary is the binary helpers run, which a spawn in a helper writes
 // into the hook command.
 func helperBinary(t *testing.T) string {

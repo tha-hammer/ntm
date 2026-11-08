@@ -4856,3 +4856,58 @@ func TestConfigReset_NoExistingFile(t *testing.T) {
 		t.Fatalf("config file should exist after reset: %v", err)
 	}
 }
+
+func TestAgentMailConfig_StopHookSwitch(t *testing.T) {
+	cases := []struct {
+		name        string
+		agentMail   string
+		wantEnabled bool
+		wantActive  bool
+	}{
+		{name: "default", agentMail: "enabled = true\n", wantEnabled: true, wantActive: true},
+		{name: "switch off", agentMail: "enabled = true\nstop_hook_enabled = false\n", wantEnabled: false, wantActive: false},
+		{name: "agent mail off", agentMail: "enabled = false\n", wantEnabled: true, wantActive: false},
+		{name: "agent mail off wins", agentMail: "enabled = false\nstop_hook_enabled = true\n", wantEnabled: true, wantActive: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(createTempConfig(t, "[agent_mail]\n"+tc.agentMail))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.AgentMail.StopHookEnabledOrDefault(); got != tc.wantEnabled {
+				t.Fatalf("StopHookEnabledOrDefault() = %v, want %v", got, tc.wantEnabled)
+			}
+			if got := cfg.AgentMail.StopHookActive(); got != tc.wantActive {
+				t.Fatalf("StopHookActive() = %v, want %v", got, tc.wantActive)
+			}
+		})
+	}
+	if !Default().AgentMail.StopHookActive() {
+		t.Fatal("the default config has the Stop hook inactive")
+	}
+}
+
+func TestPrint_ListsStopHookEnabled(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Print(Default(), &buf); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	section := buf.String()[strings.Index(buf.String(), "[agent_mail]"):]
+	section = section[:strings.Index(section, "\n\n")]
+	if !strings.Contains(section, "stop_hook_enabled = true") {
+		t.Fatalf("[agent_mail] section lacks stop_hook_enabled = true:\n%s", section)
+	}
+}
+
+func TestGetValue_StopHookEnabled(t *testing.T) {
+	cfg := Default()
+	if got, err := GetValue(cfg, "agent_mail.stop_hook_enabled"); err != nil || got != true {
+		t.Fatalf("default: GetValue = %v, %v", got, err)
+	}
+	off := false
+	cfg.AgentMail.StopHookEnabled = &off
+	if got, err := GetValue(cfg, "agent_mail.stop_hook_enabled"); err != nil || got != false {
+		t.Fatalf("off: GetValue = %v, %v", got, err)
+	}
+}

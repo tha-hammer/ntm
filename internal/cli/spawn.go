@@ -2346,8 +2346,8 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		// before the launch below, in the folder the agent runs in. The project
 		// key is the session folder even for a worktree agent, because that is
 		// the key the agent was registered under with Agent Mail.
-		if agent.Type == AgentTypeClaude && cfg.AgentMail.Enabled {
-			installClaudeStopHook(workingDir, dir)
+		if agent.Type == AgentTypeClaude {
+			installClaudeStopHookIfActive(cfg, workingDir, dir)
 		}
 
 		if err := tmux.SendKeys(pane.ID, cmd, true); err != nil {

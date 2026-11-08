@@ -748,8 +748,8 @@ func runAdd(opts AddOptions) error {
 		// Claude Code reads its settings at startup, so the Stop hook is
 		// written before the launch. The added pane runs in the session folder,
 		// which is also its Agent Mail project.
-		if agent.Type == AgentTypeClaude && cfg.AgentMail.Enabled {
-			installClaudeStopHook(dir, dir)
+		if agent.Type == AgentTypeClaude {
+			installClaudeStopHookIfActive(cfg, dir, dir)
 		}
 
 		if err := tmux.SendKeys(paneID, cmd, true); err != nil {

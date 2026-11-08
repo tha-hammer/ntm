@@ -1323,6 +1323,11 @@ type AgentMailConfig struct {
 	// `am` process on port 8765. Set to true only when you explicitly want
 	// ntm to own the Agent Mail daemon lifecycle for a session.
 	SupervisorEnabled *bool `toml:"supervisor_enabled,omitempty"`
+	// StopHookEnabled controls whether ntm writes and runs the Claude Stop
+	// hook that tells agents about new mail when their turn ends. Default
+	// true. Turning it off stops new entries and makes existing entries do
+	// nothing; it doesn't remove entries already written.
+	StopHookEnabled *bool `toml:"stop_hook_enabled,omitempty"`
 }
 
 // SupervisorEnabledOrDefault returns the effective value of
@@ -1332,6 +1337,17 @@ func (a AgentMailConfig) SupervisorEnabledOrDefault() bool {
 		return false
 	}
 	return *a.SupervisorEnabled
+}
+
+// StopHookEnabledOrDefault returns StopHookEnabled with its default-true rule.
+func (a AgentMailConfig) StopHookEnabledOrDefault() bool {
+	return a.StopHookEnabled == nil || *a.StopHookEnabled
+}
+
+// StopHookActive is true when Agent Mail is on and the Stop hook isn't
+// switched off. Every place that writes or runs the hook checks this.
+func (a AgentMailConfig) StopHookActive() bool {
+	return a.Enabled && a.StopHookEnabledOrDefault()
 }
 
 // IntegrationsConfig holds external tool integration settings.
@@ -3181,6 +3197,8 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# If true, ntm starts/stops `am serve-http` for session monitors.")
 	fmt.Fprintln(w, "# Default false prevents ntm from hijacking a user-owned Agent Mail server.")
 	fmt.Fprintf(w, "supervisor_enabled = %t\n", cfg.AgentMail.SupervisorEnabledOrDefault())
+	fmt.Fprintln(w, "# If true, Claude agents ntm creates are told about new mail when their turn ends.")
+	fmt.Fprintf(w, "stop_hook_enabled = %t\n", cfg.AgentMail.StopHookEnabledOrDefault())
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations]")
@@ -4315,6 +4333,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.AgentMail.ProgramName, nil
 		case "supervisor_enabled":
 			return cfg.AgentMail.SupervisorEnabledOrDefault(), nil
+		case "stop_hook_enabled":
+			return cfg.AgentMail.StopHookEnabledOrDefault(), nil
 		}
 	case "integrations":
 		if len(parts) < 2 {
@@ -5419,6 +5439,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agent_mail.auto_register", defaults.AgentMail.AutoRegister, cfg.AgentMail.AutoRegister)
 	addDiff("agent_mail.program_name", defaults.AgentMail.ProgramName, cfg.AgentMail.ProgramName)
 	addDiff("agent_mail.supervisor_enabled", defaults.AgentMail.SupervisorEnabledOrDefault(), cfg.AgentMail.SupervisorEnabledOrDefault())
+	addDiff("agent_mail.stop_hook_enabled", defaults.AgentMail.StopHookEnabledOrDefault(), cfg.AgentMail.StopHookEnabledOrDefault())
 
 	// Integrations (DCG)
 	addDiff("integrations.dcg.enabled", defaults.Integrations.DCG.Enabled, cfg.Integrations.DCG.Enabled)
