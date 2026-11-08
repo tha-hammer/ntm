@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,8 +25,10 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/serve"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard"
+	"github.com/gorilla/websocket"
 )
 
 // Closure tests in this file cross real process boundaries: they re-exec the
@@ -790,4 +795,298 @@ func TestProcessStateStore_ClosesAndReopens(t *testing.T) {
 
 	closeRobotPersistence()
 	closeRobotPersistence() // Closing with nothing open does nothing.
+}
+
+// closureServe is a running `ntm serve` helper process.
+type closureServe struct {
+	baseURL string
+}
+
+// freeLocalPort returns a port that was free on 127.0.0.1 a moment ago.
+func freeLocalPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find a free port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	return port
+}
+
+// startServe runs `ntm serve` on a free port as a helper process and waits until
+// it answers. Cleanup sends SIGINT, then kills the process after 5 seconds.
+func (e *closureEnv) startServe(t *testing.T) *closureServe {
+	t.Helper()
+	port := freeLocalPort(t)
+	cmd, _, stderr := e.helperCommand("execute", "", "serve", "--port", strconv.Itoa(port))
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start serve: %v", err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-exited
+		}
+	})
+
+	serve := &closureServe{baseURL: fmt.Sprintf("http://127.0.0.1:%d", port)}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		select {
+		case err := <-exited:
+			t.Fatalf("serve exited before answering: %v\nstderr: %s", err, stderr.String())
+		default:
+		}
+		resp, err := http.Get(serve.baseURL + "/api/v1/attention/events")
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return serve
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve didn't answer within 10s (last error %v)", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// eventReader collects attention events that a background reader receives.
+type eventReader struct {
+	events chan robot.AttentionEvent
+}
+
+// next returns the next event that matches, and fails the test at the deadline.
+// Events that don't match are dropped.
+func (r *eventReader) next(t *testing.T, match func(robot.AttentionEvent) bool, within time.Duration) robot.AttentionEvent {
+	t.Helper()
+	timeout := time.After(within)
+	for {
+		select {
+		case event, ok := <-r.events:
+			if !ok {
+				t.Fatal("stream ended while waiting for an event")
+			}
+			if match(event) {
+				return event
+			}
+		case <-timeout:
+			t.Fatalf("no matching event within %s", within)
+		}
+	}
+}
+
+// none fails the test if a matching event arrives within the wait.
+func (r *eventReader) none(t *testing.T, match func(robot.AttentionEvent) bool, wait time.Duration) {
+	t.Helper()
+	timeout := time.After(wait)
+	for {
+		select {
+		case event, ok := <-r.events:
+			if !ok {
+				t.Fatal("stream ended early")
+			}
+			if match(event) {
+				t.Fatalf("unexpected event: %+v", event)
+			}
+		case <-timeout:
+			return
+		}
+	}
+}
+
+// openAttentionStream reads the server's SSE attention stream in the background,
+// and returns once the server has sent its connected event, which it sends after
+// subscribing to the feed.
+func (s *closureServe) openAttentionStream(t *testing.T, sinceCursor int64) *eventReader {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	url := fmt.Sprintf("%s/api/v1/attention/stream?since_cursor=%d", s.baseURL, sinceCursor)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		t.Fatalf("open stream: status %d", resp.StatusCode)
+	}
+
+	reader := &eventReader{events: make(chan robot.AttentionEvent, 1000)}
+	connected := make(chan struct{})
+	go func() {
+		defer resp.Body.Close()
+		defer close(reader.events)
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		name := ""
+		for scanner.Scan() {
+			line := scanner.Text()
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				name = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: ") && name == "connected":
+				close(connected)
+			case strings.HasPrefix(line, "data: ") && name == "attention":
+				var event robot.AttentionEvent
+				if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event) == nil {
+					reader.events <- event
+				}
+			}
+		}
+	}()
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream sent no connected event within 5s")
+	}
+	return reader
+}
+
+// openAttentionSocket connects to the server's WebSocket, subscribes to the
+// attention topic from now, and returns once the server acknowledges it.
+func (s *closureServe) openAttentionSocket(t *testing.T) *eventReader {
+	t.Helper()
+	url := "ws" + strings.TrimPrefix(s.baseURL, "http") + "/api/v1/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial %s: %v", url, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	subscribe := serve.WSMessage{
+		Type:      serve.WSMsgSubscribe,
+		RequestID: "closure-sub",
+		Data:      map[string]interface{}{"topics": []string{"attention"}, "since_cursor": -1},
+	}
+	if err := conn.WriteJSON(subscribe); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	reader := &eventReader{events: make(chan robot.AttentionEvent, 1000)}
+	acked := make(chan struct{})
+	go func() {
+		defer close(reader.events)
+		for {
+			var frame struct {
+				Type serve.WSMessageType `json:"type"`
+				Data json.RawMessage     `json:"data"`
+			}
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			switch frame.Type {
+			case serve.WSMsgAck:
+				select {
+				case <-acked:
+				default:
+					close(acked)
+				}
+			case serve.WSMsgEvent:
+				var event robot.AttentionEvent
+				if json.Unmarshal(frame.Data, &event) == nil {
+					reader.events <- event
+				}
+			}
+		}
+	}()
+	select {
+	case <-acked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no subscribe acknowledgement within 5s")
+	}
+	return reader
+}
+
+func isMail42(event robot.AttentionEvent) bool {
+	return event.Type == robot.EventTypeMailReceived && event.MessageID == 42
+}
+
+// Behavior 1: a dashboard in another process writes a mail event, and the
+// `ntm serve` stream shows it once.
+func TestClosure_ServeStreamsOtherProcessMail(t *testing.T) {
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	serve := env.startServe(t)
+	stream := serve.openAttentionStream(t, -1)
+
+	env.run(t, "publish-dashboard-mail")
+
+	got := stream.next(t, isMail42, 5*time.Second)
+	stream.none(t, isMail42, 3*time.Second)
+
+	stored := parseRobotEvents(t, env.run(t, "execute", "--robot-events", "--events-category=mail"))
+	if len(stored) != 1 || stored[0].Cursor != got.Cursor {
+		t.Fatalf("streamed cursor %d, stored %+v", got.Cursor, stored)
+	}
+}
+
+// Behavior 2: a WebSocket client on the attention topic gets another
+// process's mail event once.
+func TestClosure_ServeWebSocketGetsOtherProcessMail(t *testing.T) {
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	serve := env.startServe(t)
+	socket := serve.openAttentionSocket(t)
+
+	env.run(t, "publish-dashboard-mail")
+
+	socket.next(t, isMail42, 5*time.Second)
+	socket.none(t, isMail42, 3*time.Second)
+}
+
+// Behavior 4: events from writers running at once reach the stream once each,
+// in cursor order, and match what was stored.
+func TestClosure_ServeStreamsParallelWritersInOrder(t *testing.T) {
+	const writers, each = 4, 20 // 80 stays under the SSE handler's 100-event buffer
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	serve := env.startServe(t)
+	stream := serve.openAttentionStream(t, -1)
+
+	env.runParallel(t, writers, "", "append-events", strconv.Itoa(each))
+
+	inSession := func(event robot.AttentionEvent) bool { return event.Session == closureContentionSession }
+	got := make([]int64, 0, writers*each)
+	for len(got) < writers*each {
+		got = append(got, stream.next(t, inSession, 10*time.Second).Cursor)
+	}
+	stream.none(t, inSession, 2*time.Second)
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Fatalf("streamed cursors out of order: %v", got)
+		}
+	}
+	if want := readAllCursors(t, env, closureContentionSession); !slices.Equal(got, want) {
+		t.Fatalf("streamed %v, stored %v", got, want)
+	}
+}
+
+// Behavior 7 support check: short commands on an existing state.db exit
+// promptly. No short command subscribes, so none starts the poll.
+func TestClosure_ShortCommandsExitPromptly(t *testing.T) {
+	env := newClosureEnv(t)
+	env.run(t, "publish-dashboard-mail") // creates state.db with an event in it
+	for _, args := range [][]string{
+		{"execute", "--robot-events"},
+		{"execute", "agent-hook", "stop", "--project", env.workDir},
+	} {
+		start := time.Now()
+		run := env.runHelper(args[0], "{}", args[1:]...)
+		if run.err != nil {
+			t.Fatalf("%v: %v", args[1:], run.err)
+		}
+		if took := time.Since(start); took > 2*time.Second {
+			t.Fatalf("%v took %s, want under 2s", args[1:], took)
+		}
+	}
 }

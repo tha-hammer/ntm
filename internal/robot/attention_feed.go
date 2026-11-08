@@ -155,6 +155,16 @@ func (c *CursorAllocator) Current() int64 {
 	return c.counter.Load()
 }
 
+// raiseTo makes cursor the most recent one unless a later one exists already.
+func (c *CursorAllocator) raiseTo(cursor int64) {
+	for {
+		current := c.counter.Load()
+		if cursor <= current || c.counter.CompareAndSwap(current, cursor) {
+			return
+		}
+	}
+}
+
 // =============================================================================
 // Journal Entry
 // =============================================================================
@@ -440,6 +450,21 @@ type AttentionFeed struct {
 	subNextID atomic.Uint64
 	subs      map[uint64]subscription
 
+	// A store-configured feed delivers through its poll, which reads the store
+	// and this process's memory-only events. See pollLoop.
+	pollMu        sync.Mutex
+	pollStarted   bool
+	pollStopped   bool   // set by Stop, so no poll starts after it
+	pollFrom      int64  // the last cursor delivered
+	pollGen       uint64 // bumped when a new first subscriber moves pollFrom to now
+	pollWake      chan struct{}
+	newPollTicker func(time.Duration) AttentionPollTicker
+	// deliveredFromMemory holds the keys of memory-only mail notices the poll
+	// delivered. Their stored copies, saved once the store recovers, aren't
+	// delivered again. Only the poll goroutine touches it.
+	deliveredFromMemory map[attentionAddressedKey]struct{}
+	pollFailing         bool // the last read failed; only the poll goroutine touches it
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	stopWg   sync.WaitGroup
@@ -517,6 +542,42 @@ const AttentionStoreRetryInterval = 30 * time.Second
 func WithAttentionClock(now func() time.Time) AttentionFeedOption {
 	return func(f *AttentionFeed) {
 		f.now = now
+	}
+}
+
+// AttentionPollInterval is how often a store-backed feed with subscribers reads
+// events that other processes wrote. It matches the --attention-poll default.
+const AttentionPollInterval = time.Second
+
+// attentionPollBatch is the most events one poll read returns.
+const attentionPollBatch = 500
+
+const (
+	attentionPollFailedLogMessage    = "attention feed poll failed"
+	attentionPollRecoveredLogMessage = "attention feed poll recovered"
+	attentionPollExpiredLogMessage   = "attention feed poll cursor expired"
+)
+
+// AttentionPollTicker is the timer a feed's poll waits on.
+type AttentionPollTicker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type timePollTicker struct{ ticker *time.Ticker }
+
+func (t timePollTicker) C() <-chan time.Time { return t.ticker.C }
+func (t timePollTicker) Stop()               { t.ticker.Stop() }
+
+func newTimePollTicker(interval time.Duration) AttentionPollTicker {
+	return timePollTicker{ticker: time.NewTicker(interval)}
+}
+
+// WithAttentionPollTicker sets how the feed makes its poll ticker. Tests pass a
+// ticker they tick by hand. The default is a time.Ticker.
+func WithAttentionPollTicker(newTicker func(time.Duration) AttentionPollTicker) AttentionFeedOption {
+	return func(f *AttentionFeed) {
+		f.newPollTicker = newTicker
 	}
 }
 
@@ -735,13 +796,15 @@ func NewAttentionFeed(config AttentionFeedConfig, opts ...AttentionFeedOption) *
 	}
 
 	feed := &AttentionFeed{
-		config:      config,
-		cursor:      NewCursorAllocator(),
-		journal:     NewAttentionJournal(config.JournalSize, config.RetentionPeriod),
-		recentDedup: make(map[string]attentionDedupEntry),
-		subs:        make(map[uint64]subscription),
-		stopCh:      make(chan struct{}),
-		now:         time.Now,
+		config:        config,
+		cursor:        NewCursorAllocator(),
+		journal:       NewAttentionJournal(config.JournalSize, config.RetentionPeriod),
+		recentDedup:   make(map[string]attentionDedupEntry),
+		subs:          make(map[uint64]subscription),
+		stopCh:        make(chan struct{}),
+		now:           time.Now,
+		pollWake:      make(chan struct{}, 1),
+		newPollTicker: newTimePollTicker,
 	}
 
 	// Apply options
@@ -816,9 +879,16 @@ func normalizeAppendedEvent(event AttentionEvent) AttentionEvent {
 }
 
 // publishLocked keeps the event in the journal, which is also the in-memory
-// cache, and queues it for subscribers. It releases appendMu before delivery.
+// cache, then delivers it. It releases appendMu before delivery. A
+// store-configured feed delivers through its poll, so this process's events and
+// other processes' events reach subscribers in one cursor order.
 func (f *AttentionFeed) publishLocked(event AttentionEvent) {
 	f.journal.Append(event)
+	if f.storeConfigured() {
+		f.appendMu.Unlock()
+		f.wakePoll()
+		return
+	}
 	startDrain := f.enqueuePendingEventLocked(event)
 	f.appendMu.Unlock()
 
@@ -915,7 +985,13 @@ func (f *AttentionFeed) PublishEphemeral(event AttentionEvent) AttentionEvent {
 	}
 
 	f.appendMu.Lock()
-	event.Cursor = f.cursor.Next()
+	if f.storeConfigured() {
+		// A store-backed feed's cursors come from the store. Taking the next one
+		// here would give a live-only event the cursor of the next stored event.
+		event.Cursor = f.cursor.Current()
+	} else {
+		event.Cursor = f.cursor.Next()
+	}
 	startDrain := f.enqueuePendingEventLocked(event)
 	f.appendMu.Unlock()
 
@@ -2616,12 +2692,19 @@ func (f *AttentionFeed) PublishActuation(record ActuationRecord) AttentionEvent 
 
 // Subscribe registers a handler to receive events.
 // Returns an unsubscribe function.
+// A store-configured feed's first subscriber starts the poll, which hands it
+// events written from then on, by this process or any other.
 func (f *AttentionFeed) Subscribe(handler AttentionHandler) func() {
 	f.subMu.Lock()
 	defer f.subMu.Unlock()
 
 	id := f.subNextID.Add(1)
 	f.subs[id] = subscription{id: id, handler: handler}
+	if len(f.subs) == 1 && f.storeConfigured() {
+		// Under subMu, so the start point is fixed before Subscribe returns, and
+		// a caller that reads Stats next can't miss an event in between.
+		f.startPollFromNow()
+	}
 
 	return func() {
 		f.subMu.Lock()
@@ -2632,6 +2715,9 @@ func (f *AttentionFeed) Subscribe(handler AttentionHandler) func() {
 
 // Stop shuts down the feed gracefully.
 func (f *AttentionFeed) Stop() {
+	f.pollMu.Lock()
+	f.pollStopped = true
+	f.pollMu.Unlock()
 	f.stopOnce.Do(func() {
 		close(f.stopCh)
 	})
@@ -2670,6 +2756,202 @@ func (f *AttentionFeed) subscriberCount() int {
 // SubscriberCount returns the number of active feed subscriptions.
 func (f *AttentionFeed) SubscriberCount() int {
 	return f.subscriberCount()
+}
+
+// startPollFromNow moves the poll's start point to the newest event, and starts
+// the poll goroutine the first time. Caller holds subMu.
+func (f *AttentionFeed) startPollFromNow() {
+	newest := f.newestCursor()
+	f.pollMu.Lock()
+	defer f.pollMu.Unlock()
+	f.pollFrom = newest
+	f.pollGen++
+	if f.pollStarted || f.pollStopped {
+		return
+	}
+	f.pollStarted = true
+	f.stopWg.Add(1)
+	go f.pollLoop(f.newPollTicker(AttentionPollInterval))
+}
+
+// newestCursor is the newest cursor in the store or this process, whichever is
+// higher.
+func (f *AttentionFeed) newestCursor() int64 {
+	newest := f.cursor.Current()
+	if store := f.currentStore(); store != nil {
+		if latest, err := store.GetLatestEventCursor(); err == nil && latest > newest {
+			newest = latest
+		}
+	}
+	return newest
+}
+
+// wakePoll asks the poll for a pass now, without waiting for its timer.
+func (f *AttentionFeed) wakePoll() {
+	select {
+	case f.pollWake <- struct{}{}:
+	default:
+	}
+}
+
+// pollLoop delivers a store-configured feed's events: the ones other processes
+// wrote and this process's own, in cursor order. It runs once a second and
+// whenever this process appends, and reads nothing while there are no
+// subscribers. It runs for the feed's life once the first subscriber starts it.
+func (f *AttentionFeed) pollLoop(ticker AttentionPollTicker) {
+	defer f.stopWg.Done()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-f.stopCh:
+			return
+		case <-ticker.C():
+		case <-f.pollWake:
+		}
+		f.pollOnce()
+	}
+}
+
+// pollOnce delivers every event after the poll's position, one batch at a time.
+// A failed read leaves the position where it is, so the next pass retries it.
+func (f *AttentionFeed) pollOnce() {
+	for f.subscriberCount() > 0 {
+		from, gen := f.pollPosition()
+		events, memoryKeys, err := f.pollRead(from)
+		var expired *CursorExpiredError
+		if errors.As(err, &expired) {
+			slog.Warn(attentionPollExpiredLogMessage, "since_cursor", from, "oldest_cursor", expired.EarliestCursor)
+			if !f.movePoll(expired.EarliestCursor-1, gen) {
+				return
+			}
+			continue
+		}
+		if !f.notePollRead(from, err) {
+			return
+		}
+		if len(events) > 0 {
+			// Other processes' cursors are taken. A memory-only event this process
+			// makes during a store outage must come after them, or the poll,
+			// already past them, would never deliver it.
+			f.cursor.raiseTo(events[len(events)-1].Cursor)
+		}
+		for _, event := range events {
+			if !f.movePoll(event.Cursor, gen) {
+				return
+			}
+			if f.storedCopyOfDelivered(event, memoryKeys) {
+				continue
+			}
+			f.notifySubscribers(event)
+		}
+		if len(events) < attentionPollBatch {
+			return
+		}
+	}
+}
+
+// notePollRead logs the first failed read and the first good read after it,
+// and reports whether the read worked. Only the poll goroutine calls it.
+func (f *AttentionFeed) notePollRead(from int64, err error) bool {
+	if err != nil {
+		if !f.pollFailing {
+			slog.Warn(attentionPollFailedLogMessage, "since_cursor", from, "error", err)
+			f.pollFailing = true
+		}
+		return false
+	}
+	if f.pollFailing {
+		slog.Info(attentionPollRecoveredLogMessage, "since_cursor", from)
+		f.pollFailing = false
+	}
+	return true
+}
+
+// attentionAddressedKey names one message for one recipient.
+type attentionAddressedKey struct {
+	project   string
+	agent     string // lower case: Agent Mail names match in any letter case
+	messageID int64
+}
+
+func addressedKeyOf(event AttentionEvent) (attentionAddressedKey, bool) {
+	if event.MessageID == 0 || strings.TrimSpace(event.RecipientAgent) == "" {
+		return attentionAddressedKey{}, false
+	}
+	return attentionAddressedKey{
+		project:   event.RecipientProject,
+		agent:     strings.ToLower(event.RecipientAgent),
+		messageID: event.MessageID,
+	}, true
+}
+
+// storedCopyOfDelivered reports whether event is the stored copy of a mail
+// notice the poll already delivered from memory, and forgets that notice. A
+// notice in memoryKeys is in memory now, so it is remembered as delivered.
+func (f *AttentionFeed) storedCopyOfDelivered(event AttentionEvent, memoryKeys map[attentionAddressedKey]struct{}) bool {
+	key, ok := addressedKeyOf(event)
+	if !ok {
+		return false
+	}
+	if _, inMemory := memoryKeys[key]; inMemory {
+		if f.deliveredFromMemory == nil {
+			f.deliveredFromMemory = map[attentionAddressedKey]struct{}{}
+		}
+		f.deliveredFromMemory[key] = struct{}{}
+		return false
+	}
+	if _, delivered := f.deliveredFromMemory[key]; delivered {
+		delete(f.deliveredFromMemory, key)
+		return true
+	}
+	return false
+}
+
+func (f *AttentionFeed) pollPosition() (int64, uint64) {
+	f.pollMu.Lock()
+	defer f.pollMu.Unlock()
+	return f.pollFrom, f.pollGen
+}
+
+// movePoll records cursor as delivered. It reports false when a new first
+// subscriber has moved the start point since the pass began, which ends the pass.
+func (f *AttentionFeed) movePoll(cursor int64, gen uint64) bool {
+	f.pollMu.Lock()
+	defer f.pollMu.Unlock()
+	if gen != f.pollGen {
+		return false
+	}
+	f.pollFrom = cursor
+	return true
+}
+
+// pollRead returns up to one batch of events after from: stored events and this
+// process's memory-only ones, merged in cursor order, as Replay merges them. It
+// also returns the keys of the memory-only mail notices among them.
+func (f *AttentionFeed) pollRead(from int64) ([]AttentionEvent, map[attentionAddressedKey]struct{}, error) {
+	var durable []AttentionEvent
+	if store := f.currentStore(); store != nil {
+		window, err := store.GetAttentionReplayWindow()
+		if err != nil {
+			return nil, nil, err
+		}
+		durable, err = f.storeEventsSince(store, window, from, attentionPollBatch, store.GetAttentionEventsSince, false)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	memory := f.memoryOnlySince(from)
+	memoryKeys := map[attentionAddressedKey]struct{}{}
+	for _, event := range memory {
+		if key, ok := addressedKeyOf(event); ok {
+			memoryKeys[key] = struct{}{}
+		}
+	}
+	events := mergeByCursor(durable, f.hydrateReplayEvents(memory))
+	if len(events) > attentionPollBatch {
+		events = events[:attentionPollBatch]
+	}
+	return events, memoryKeys, nil
 }
 
 // heartbeatLoop emits periodic heartbeat events.
@@ -4353,24 +4635,12 @@ func (f *AttentionFeed) replayFromStore(
 		limit = 100
 	}
 
-	// Check cursor expiration
-	if window.CursorExpired(sinceCursor) {
-		return nil, 0, &CursorExpiredError{
-			RequestedCursor: sinceCursor,
-			EarliestCursor:  window.OldestCursor,
-			RetentionPeriod: f.config.RetentionPeriod,
-		}
-	}
-
-	// GC expired events periodically
-	_, _ = store.GCExpiredEvents()
-
-	storedEvents, err := fetch(sinceCursor, limit)
+	durable, err := f.storeEventsSince(store, window, sinceCursor, limit, fetch, true)
 	if err != nil {
-		return nil, 0, fmt.Errorf("replay attention events from store: %w", err)
+		return nil, 0, err
 	}
 	events := mergeByCursor(
-		f.hydrateStoredAttentionEvents(storedEvents),
+		durable,
 		f.hydrateReplayEvents(filterAttentionEvents(f.memoryOnlySince(sinceCursor), match)),
 	)
 	if len(events) > limit {
@@ -4378,6 +4648,34 @@ func (f *AttentionFeed) replayFromStore(
 	}
 
 	return events, maxCursor(window.NewestCursor, f.cursor.Current()), nil
+}
+
+// storeEventsSince reads stored events after sinceCursor, with operator state,
+// once the cursor is known to be inside the replay window. Cleaning out expired
+// rows is a write, so the once-a-second poll leaves it to replays.
+func (f *AttentionFeed) storeEventsSince(
+	store AttentionStore,
+	window state.AttentionReplayWindow,
+	sinceCursor int64,
+	limit int,
+	fetch func(since int64, n int) ([]state.StoredAttentionEvent, error),
+	collectGarbage bool,
+) ([]AttentionEvent, error) {
+	if window.CursorExpired(sinceCursor) {
+		return nil, &CursorExpiredError{
+			RequestedCursor: sinceCursor,
+			EarliestCursor:  window.OldestCursor,
+			RetentionPeriod: f.config.RetentionPeriod,
+		}
+	}
+	if collectGarbage {
+		_, _ = store.GCExpiredEvents()
+	}
+	storedEvents, err := fetch(sinceCursor, limit)
+	if err != nil {
+		return nil, fmt.Errorf("replay attention events from store: %w", err)
+	}
+	return f.hydrateStoredAttentionEvents(storedEvents), nil
 }
 
 func (f *AttentionFeed) hydrateStoredAttentionEvents(storedEvents []state.StoredAttentionEvent) []AttentionEvent {

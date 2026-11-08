@@ -2386,6 +2386,8 @@ Note: when the config file has an error, ntm's startup prints "ntm: warning: con
 7. Remove the setting, kill the session and spawn again.
 8. Pass: `jq '.hooks.Stop | length' .claude/settings.local.json` prints `1`.
 
+**Result (2026-11-08):** passed on rocketman at `47cbe7b7`. With `[agent_mail] stop_hook_enabled = false` (`config show`: `enabled = true`, `stop_hook_enabled = false`), `spawn offtest` printed no "Stop hook written" line, made no `.claude` folder and added no exclude lines. Mail "switch off test" was sent to SilverSpring during its sleep. Its turn ended at 14:06:31 UTC with no reminder: 0 "Stop hook feedback" lines and 0 `told_records`. After the setting was removed (config restored exactly, `config show` says `true`), a kill and re-spawn gave `.hooks.Stop` length 1 and one exclude line. bd-57xdn still happens on spawn. Evidence: `/home/debian/Dev/ntm-test-evidence/loop3-sprint7-local-2026-11-08/`.
+
 ---
 
 ## Integration & E2E Testing

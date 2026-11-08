@@ -623,7 +623,13 @@ func (h *WSHub) broadcastEvent(event *WSEvent) {
 	h.clientsMu.RLock()
 	defer h.clientsMu.RUnlock()
 
+	attentionTopic := isAttentionTopic(event.Topic)
 	for client := range h.clients {
+		// A client with its own attention subscription gets attention events
+		// from it, with its cursor and filters, so the broadcast would repeat them.
+		if attentionTopic && client.hasActiveAttentionSub() {
+			continue
+		}
 		if client.isSubscribed(event.Topic) {
 			select {
 			case client.send <- data:
@@ -726,6 +732,14 @@ func (h *WSHub) ClientCount() int {
 }
 
 // isSubscribed checks if a client is subscribed to a topic.
+// hasActiveAttentionSub reports whether the client has its own attention feed
+// subscription.
+func (c *WSClient) hasActiveAttentionSub() bool {
+	c.attentionSubMu.Lock()
+	defer c.attentionSubMu.Unlock()
+	return c.attentionSub != nil && c.attentionSub.Active
+}
+
 func (c *WSClient) isSubscribed(topic string) bool {
 	c.topicsMu.RLock()
 	defer c.topicsMu.RUnlock()

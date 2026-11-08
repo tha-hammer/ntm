@@ -11,7 +11,7 @@
   },
   "cursor": {
     "step": "build",
-    "loop": "03-claude-turn-end-push.md"
+    "loop": "04-cross-process-delivery.md"
   },
   "steps": {
     "scope": {
@@ -57,20 +57,21 @@
     {
       "doc": "03-claude-turn-end-push.md",
       "tdd_plan": "03-claude-turn-end-push-tdd.md",
-      "status": "building",
+      "status": "built",
       "sprints_passed": [
         "Sprint 1: Hook command tells an agent once",
         "Sprint 2: Identity lookup",
         "Sprint 3: Hook written by `ntm spawn`",
         "Sprint 4: Hook written with `--worktrees`",
         "Sprint 5: Hook written by robot spawn",
-        "Sprint 6: Hook written by `ntm add`"
+        "Sprint 6: Hook written by `ntm add`",
+        "Sprint 7: Hook switch"
       ]
     },
     {
       "doc": "04-cross-process-delivery.md",
-      "tdd_plan": null,
-      "status": "pending",
+      "tdd_plan": "04-cross-process-delivery-tdd.md",
+      "status": "building",
       "sprints_passed": []
     },
     {
@@ -373,8 +374,50 @@
       "step": "build",
       "event": "sprint",
       "detail": "Sprint 6: Hook written by `ntm add`"
+    },
+    {
+      "at": "2026-11-08T14:08:25.918Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 7: Hook switch"
+    },
+    {
+      "at": "2026-11-08T14:08:25.931Z",
+      "step": "build",
+      "event": "done",
+      "detail": "03-claude-turn-end-push-tdd.md"
+    },
+    {
+      "at": "2026-11-08T14:28:28.460Z",
+      "step": "tdd",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-08T14:28:44.138Z",
+      "step": "tdd",
+      "event": "started",
+      "detail": "04-cross-process-delivery.md"
+    },
+    {
+      "at": "2026-11-08T16:41:33.563Z",
+      "step": "tdd",
+      "event": "done",
+      "detail": "04-cross-process-delivery.md"
+    },
+    {
+      "at": "2026-11-08T17:11:11.901Z",
+      "step": "build",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-08T17:11:23.942Z",
+      "step": "build",
+      "event": "started",
+      "detail": "04-cross-process-delivery-tdd.md"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-08T13:42:40.307Z"
+  "updated_at": "2026-11-08T17:11:23.942Z"
 }

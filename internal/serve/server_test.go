@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"bufio"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -6705,6 +6707,192 @@ func TestIsAttentionTopic(t *testing.T) {
 			got := isAttentionTopic(tc.topic)
 			if got != tc.want {
 				t.Errorf("isAttentionTopic(%q) = %v, want %v", tc.topic, got, tc.want)
+			}
+		})
+	}
+}
+
+// Behavior 2: a client with its own attention subscription gets each feed
+// event once, although Server.Start also broadcasts feed events to the hub's
+// attention topics, which that client joined.
+func TestWSAttentionSubscriptionNoHubDuplicate(t *testing.T) {
+	feed, _ := installServeTestAttentionFeed(t)
+	srv := New(Config{})
+	srv.ensureWSHubRunning()
+	defer srv.wsHub.Stop()
+	// What Server.Start does for every feed event.
+	unsubscribe := feed.Subscribe(func(e robot.AttentionEvent) {
+		srv.wsHub.Publish("attention", string(e.Type), e)
+	})
+	defer unsubscribe()
+
+	client := &WSClient{
+		id:     "attention-dup-client",
+		hub:    srv.wsHub,
+		send:   make(chan []byte, 256),
+		topics: make(map[string]struct{}),
+	}
+	requireRegisterWSClient(t, srv.wsHub, client)
+	result := client.handleAttentionSubscribe(WSMessage{
+		Type: WSMsgSubscribe,
+		Data: map[string]interface{}{"topics": []interface{}{"attention"}, "since_cursor": float64(-1)},
+	}, []string{"attention"})
+	if result["subscribed"] != true {
+		t.Fatalf("subscribe result = %v", result)
+	}
+	defer client.cancelAttentionSubscription()
+
+	appended := feed.Append(robot.AttentionEvent{
+		Category:      robot.EventCategoryAgent,
+		Type:          robot.EventTypeAgentStateChange,
+		Actionability: robot.ActionabilityInteresting,
+		Severity:      robot.SeverityInfo,
+		Summary:       "once",
+	})
+
+	frames := 0
+	timeout := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case raw := <-client.send:
+			var frame struct {
+				Type WSMessageType        `json:"type"`
+				Data robot.AttentionEvent `json:"data"`
+			}
+			if json.Unmarshal(raw, &frame) == nil && frame.Type == WSMsgEvent && frame.Data.Cursor == appended.Cursor {
+				frames++
+			}
+			continue
+		case <-timeout:
+		}
+		break
+	}
+	if frames != 1 {
+		t.Fatalf("event cursor %d sent %d times, want 1", appended.Cursor, frames)
+	}
+}
+
+// openAttentionStoreFile opens and migrates its own connection to a store file,
+// so two feeds on one path behave like two processes.
+func openAttentionStoreFile(t *testing.T, path string) *state.Store {
+	t.Helper()
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open store %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("migrate store %s: %v", path, err)
+	}
+	return store
+}
+
+func appendResumeEvents(t *testing.T, feed *robot.AttentionFeed, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		feed.Append(robot.AttentionEvent{
+			Session:       "resume",
+			Category:      robot.EventCategorySystem,
+			Type:          robot.EventTypeSystemHealthChange,
+			Source:        "test",
+			Actionability: robot.ActionabilityBackground,
+			Severity:      robot.SeverityInfo,
+			Summary:       fmt.Sprintf("event %d", i),
+		})
+	}
+}
+
+// Behavior 5: a stream resumed from a cursor gets every later event once, in
+// order, whether the other process writes before, during or after the switch
+// from replay to live delivery.
+func TestAttentionStream_ResumeAcrossHandoverMissesNothing(t *testing.T) {
+	for _, schedule := range []string{"before", "during", "after"} {
+		t.Run(schedule, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			config := robot.AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour}
+			feed := robot.NewAttentionFeed(config, robot.WithAttentionStore(openAttentionStoreFile(t, path)))
+			previous := robot.PeekAttentionFeed()
+			robot.SetAttentionFeed(feed)
+			t.Cleanup(func() {
+				robot.SetAttentionFeed(previous)
+				feed.Stop()
+			})
+			writer := robot.NewAttentionFeed(config, robot.WithAttentionStore(openAttentionStoreFile(t, path)))
+			t.Cleanup(writer.Stop)
+			// The writer seeds the first 10 too. An append by the stream's own feed
+			// would leave its poll a wake-up, which would hide a late start point.
+			appendResumeEvents(t, writer, 10)
+
+			srv, _ := setupTestServer(t)
+			ts := httptest.NewServer(http.HandlerFunc(srv.handleAttentionStreamV1))
+			t.Cleanup(ts.Close)
+
+			if schedule == "before" {
+				appendResumeEvents(t, writer, 30)
+			}
+			written := make(chan struct{})
+			if schedule == "during" {
+				go func() {
+					defer close(written)
+					appendResumeEvents(t, writer, 30)
+				}()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"?since_cursor=5", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if schedule == "after" {
+				appendResumeEvents(t, writer, 30)
+			}
+
+			cursors := make(chan int64, 100)
+			go func() {
+				defer close(cursors)
+				scanner := bufio.NewScanner(resp.Body)
+				scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+				name := ""
+				for scanner.Scan() {
+					line := scanner.Text()
+					if strings.HasPrefix(line, "event: ") {
+						name = strings.TrimPrefix(line, "event: ")
+						continue
+					}
+					if name != "attention" || !strings.HasPrefix(line, "data: ") {
+						continue
+					}
+					var event robot.AttentionEvent
+					if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event) == nil && event.Session == "resume" {
+						cursors <- event.Cursor
+					}
+				}
+			}()
+
+			var got []int64
+			timeout := time.After(5 * time.Second)
+			for len(got) == 0 || got[len(got)-1] < 40 {
+				select {
+				case cursor, ok := <-cursors:
+					if !ok {
+						t.Fatalf("stream ended after %v", got)
+					}
+					got = append(got, cursor)
+				case <-timeout:
+					t.Fatalf("got %v within 5s, want 6 to 40", got)
+				}
+			}
+			want := make([]int64, 0, 35)
+			for cursor := int64(6); cursor <= 40; cursor++ {
+				want = append(want, cursor)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("got %v, want 6 to 40 once each", got)
+			}
+			if schedule == "during" {
+				<-written
 			}
 		})
 	}

@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -5361,11 +5362,19 @@ func (c *testClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-// faultInjectingStore is a real store whose appends fail on demand.
+// faultInjectingStore is a real store whose appends, or event reads, fail on demand.
 type faultInjectingStore struct {
 	*state.Store
 	fail              atomic.Bool
+	failReads         atomic.Bool
 	addressedAttempts atomic.Int32
+}
+
+func (s *faultInjectingStore) GetAttentionEventsSince(since int64, limit int) ([]state.StoredAttentionEvent, error) {
+	if s.failReads.Load() {
+		return nil, errors.New("injected read failure")
+	}
+	return s.Store.GetAttentionEventsSince(since, limit)
 }
 
 func (s *faultInjectingStore) AppendAttentionEvent(event *state.StoredAttentionEvent) (int64, error) {
@@ -5424,6 +5433,12 @@ func (c *slogCapture) count(message string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return strings.Count(c.buf.String(), message)
+}
+
+func (c *slogCapture) text() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
 }
 
 func captureSlog(t *testing.T) *slogCapture {
@@ -6007,7 +6022,10 @@ func TestRobotEventsCapabilities_ListRecipientFlag(t *testing.T) {
 }
 
 func TestAppendAddressed_RepeatDoesNothing(t *testing.T) {
-	feed := newRecipientFeed(t)
+	// A store-backed feed delivers through its poll, so the test ticks it by
+	// hand before counting deliveries.
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, openStoreFile(t, filepath.Join(t.TempDir(), "state.db")), ticker)
 	var delivered atomic.Int32
 	unsubscribe := feed.Subscribe(func(AttentionEvent) { delivered.Add(1) })
 	defer unsubscribe()
@@ -6019,6 +6037,7 @@ func TestAppendAddressed_RepeatDoesNothing(t *testing.T) {
 	if second.Cursor != first.Cursor || second.Type != EventTypeMailReceived {
 		t.Fatalf("second = %+v, want the first event", second)
 	}
+	ticker.pass(t)
 	if got := delivered.Load(); got != 1 {
 		t.Fatalf("delivered %d times, want 1", got)
 	}
@@ -6078,8 +6097,10 @@ func TestAppendAddressed_FoundDuringOutageKeepsOutage(t *testing.T) {
 
 func TestAppendAddressed_ManyGoroutines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(openStoreFile(t, path)))
-	t.Cleanup(feed.Stop)
+	// A store-backed feed delivers through its poll, so the test ticks it by
+	// hand before counting deliveries.
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, openStoreFile(t, path), ticker)
 	var delivered atomic.Int32
 	unsubscribe := feed.Subscribe(func(AttentionEvent) { delivered.Add(1) })
 	defer unsubscribe()
@@ -6097,6 +6118,7 @@ func TestAppendAddressed_ManyGoroutines(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	ticker.pass(t)
 
 	if created.Load() != 1 || delivered.Load() != 1 {
 		t.Fatalf("created %d, delivered %d, want 1 and 1", created.Load(), delivered.Load())
@@ -6117,8 +6139,10 @@ func TestAppendAddressed_OutageThenRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	store := &faultInjectingStore{Store: openStoreFile(t, path)}
 	clock := newTestClock()
-	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(store), WithAttentionClock(clock.Now))
-	t.Cleanup(feed.Stop)
+	// A store-backed feed delivers through its poll, so the test ticks it by
+	// hand before counting deliveries.
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, store, ticker, WithAttentionClock(clock.Now))
 	var delivered atomic.Int32
 	unsubscribe := feed.Subscribe(func(AttentionEvent) { delivered.Add(1) })
 	defer unsubscribe()
@@ -6151,6 +6175,7 @@ func TestAppendAddressed_OutageThenRecovery(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("after recovery: %+v", events)
 	}
+	ticker.pass(t)
 	if got := delivered.Load(); got != 2 {
 		t.Fatalf("delivered %d times, want 2, one per message", got)
 	}
@@ -6228,4 +6253,712 @@ func TestSetAttentionFeed_ReplacesOpenerFeed(t *testing.T) {
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("opener ran %d times, want 0 once a feed is set", got)
 	}
+}
+
+// fakePollTicker is a poll ticker the test ticks by hand. It records how many
+// tickers were made, their interval, and how many were stopped.
+type fakePollTicker struct {
+	ch       chan time.Time
+	interval atomic.Int64
+	made     atomic.Int32
+	stopped  atomic.Int32
+}
+
+func newFakePollTicker() *fakePollTicker {
+	return &fakePollTicker{ch: make(chan time.Time)}
+}
+
+func (f *fakePollTicker) factory() func(time.Duration) AttentionPollTicker {
+	return func(d time.Duration) AttentionPollTicker {
+		f.made.Add(1)
+		f.interval.Store(int64(d))
+		return f
+	}
+}
+
+func (f *fakePollTicker) C() <-chan time.Time { return f.ch }
+func (f *fakePollTicker) Stop()               { f.stopped.Add(1) }
+
+// tick hands the poll loop one tick, and fails the test if the loop doesn't take
+// it within 2 seconds.
+func (f *fakePollTicker) tick(t *testing.T) {
+	t.Helper()
+	select {
+	case f.ch <- time.Now():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the poll loop didn't take a tick within 2s")
+	}
+}
+
+// tryTick hands the poll loop a tick only if it is waiting for one.
+func (f *fakePollTicker) tryTick() {
+	select {
+	case f.ch <- time.Now():
+	default:
+	}
+}
+
+// pass ticks twice. The loop takes the second tick only after the pass the first
+// one started has finished, so every event written before the call has been read
+// and delivered when pass returns.
+func (f *fakePollTicker) pass(t *testing.T) {
+	t.Helper()
+	f.tick(t)
+	f.tick(t)
+}
+
+// newPollTestFeed builds a store-backed feed with heartbeats off and a fake ticker.
+func newPollTestFeed(t *testing.T, store AttentionStore, ticker *fakePollTicker, opts ...AttentionFeedOption) *AttentionFeed {
+	t.Helper()
+	opts = append([]AttentionFeedOption{WithAttentionStore(store), WithAttentionPollTicker(ticker.factory())}, opts...)
+	feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour}, opts...)
+	t.Cleanup(feed.Stop)
+	return feed
+}
+
+// newWriterFeed is a feed on its own connection to path, standing in for
+// another process.
+func newWriterFeed(t *testing.T, path string) *AttentionFeed {
+	t.Helper()
+	writer := NewAttentionFeed(AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour},
+		WithAttentionStore(openStoreFile(t, path)))
+	t.Cleanup(writer.Stop)
+	return writer
+}
+
+// eventSink collects the events one subscription receives.
+type eventSink struct {
+	ch          chan AttentionEvent
+	unsubscribe func()
+}
+
+func collect(feed *AttentionFeed) *eventSink {
+	sink := &eventSink{ch: make(chan AttentionEvent, 2000)}
+	sink.unsubscribe = feed.Subscribe(sink.handler)
+	return sink
+}
+
+func (s *eventSink) handler(event AttentionEvent) { s.ch <- event }
+
+// waitFor returns the next n events, and fails the test at the deadline.
+func (s *eventSink) waitFor(t *testing.T, n int, within time.Duration) []AttentionEvent {
+	t.Helper()
+	got := make([]AttentionEvent, 0, n)
+	timeout := time.After(within)
+	for len(got) < n {
+		select {
+		case event := <-s.ch:
+			got = append(got, event)
+		case <-timeout:
+			t.Fatalf("got %d events within %s, want %d: %+v", len(got), within, n, got)
+		}
+	}
+	return got
+}
+
+// drain returns the events already received.
+func (s *eventSink) drain() []AttentionEvent {
+	got := []AttentionEvent{}
+	for {
+		select {
+		case event := <-s.ch:
+			got = append(got, event)
+		default:
+			return got
+		}
+	}
+}
+
+// countingReadStore is a real store that counts the reads a poll makes.
+type countingReadStore struct {
+	*state.Store
+	windowReads atomic.Int32
+	sinceReads  atomic.Int32
+}
+
+func (s *countingReadStore) GetAttentionReplayWindow() (state.AttentionReplayWindow, error) {
+	s.windowReads.Add(1)
+	return s.Store.GetAttentionReplayWindow()
+}
+
+func (s *countingReadStore) GetAttentionEventsSince(since int64, limit int) ([]state.StoredAttentionEvent, error) {
+	s.sinceReads.Add(1)
+	return s.Store.GetAttentionEventsSince(since, limit)
+}
+
+func (s *countingReadStore) reads() int32 {
+	return s.windowReads.Load() + s.sinceReads.Load()
+}
+
+func assertIncreasing(t *testing.T, events []AttentionEvent) {
+	t.Helper()
+	for i := 1; i < len(events); i++ {
+		if events[i].Cursor <= events[i-1].Cursor {
+			t.Fatalf("cursors not increasing: %v", cursorsOf(events))
+		}
+	}
+}
+
+// Behavior 6: a store-backed feed reads the store only while it has subscribers.
+func TestAttentionFeed_PollsOnlyWithSubscribers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &countingReadStore{Store: openStoreFile(t, path)}
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, store, ticker)
+	writer := newWriterFeed(t, path)
+
+	writer.Append(testAttentionEvent("before anyone listens"))
+	if made, reads := ticker.made.Load(), store.reads(); made != 0 || reads != 0 {
+		t.Fatalf("polled with no subscribers: tickers %d, reads %d", made, reads)
+	}
+
+	sink := collect(feed)
+	second := collect(feed)
+	if AttentionPollInterval != time.Second {
+		t.Fatalf("AttentionPollInterval = %s, want 1s, the --attention-poll default", AttentionPollInterval)
+	}
+	if got := time.Duration(ticker.interval.Load()); got != AttentionPollInterval {
+		t.Fatalf("ticker interval = %s, want %s", got, AttentionPollInterval)
+	}
+	writer.Append(testAttentionEvent("after"))
+	ticker.pass(t)
+	got := sink.waitFor(t, 1, 2*time.Second)
+	assertSummaries(t, got, "after")
+	if extra := sink.drain(); len(extra) != 0 {
+		t.Fatalf("extra events: %+v", extra)
+	}
+
+	// One subscriber leaving keeps the poll going for the other.
+	second.unsubscribe()
+	writer.Append(testAttentionEvent("one left"))
+	ticker.pass(t)
+	assertSummaries(t, sink.waitFor(t, 1, 2*time.Second), "one left")
+
+	sink.unsubscribe()
+	ticker.pass(t)
+	before := store.reads()
+	ticker.pass(t)
+	if store.reads() != before {
+		t.Fatal("read the store with no subscribers")
+	}
+
+	// A new subscriber starts at "now" and doesn't get what was written meanwhile.
+	writer.Append(testAttentionEvent("while nobody listened"))
+	late := collect(feed)
+	writer.Append(testAttentionEvent("for the late subscriber"))
+	ticker.pass(t)
+	assertSummaries(t, late.waitFor(t, 1, 2*time.Second), "for the late subscriber")
+	if ticker.made.Load() != 1 {
+		t.Fatalf("tickers made = %d, want 1", ticker.made.Load())
+	}
+}
+
+// Behavior 3: the feed's own appends reach its subscriber once, woken by the
+// append itself, with no tick.
+func TestAttentionFeed_OwnAppendDeliveredOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, openStoreFile(t, path), ticker)
+	sink := collect(feed)
+
+	for i := 0; i < 3; i++ {
+		feed.Append(testAttentionEvent(fmt.Sprintf("own %d", i)))
+	}
+	feed.PublishMailPending("/proj", "RedStone", "BlueLake", "hello", 42, "")
+	feed.PublishMailPending("/proj", "RedStone", "BlueLake", "hello", 42, "")
+
+	got := sink.waitFor(t, 4, 2*time.Second)
+	ticker.pass(t)
+	if extra := sink.drain(); len(extra) != 0 {
+		t.Fatalf("extra deliveries: %+v", extra)
+	}
+	assertIncreasing(t, got)
+
+	reader := newWriterFeed(t, path)
+	replayed, _, err := reader.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cursorsOf(got), cursorsOf(replayed)) {
+		t.Fatalf("delivered %v, replayed %v", cursorsOf(got), cursorsOf(replayed))
+	}
+}
+
+// Behavior 3 edge case: a handler's follow-on append arrives after the event
+// that caused it.
+func TestAttentionFeed_StoreBackedFollowOnKeepsOrder(t *testing.T) {
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, openStoreFile(t, filepath.Join(t.TempDir(), "state.db")), ticker)
+	got := make(chan AttentionEvent, 10)
+	feed.Subscribe(func(event AttentionEvent) {
+		got <- event
+		if event.Summary == "first" {
+			feed.Append(testAttentionEvent("follow-on"))
+		}
+	})
+	feed.Append(testAttentionEvent("first"))
+	feed.Append(testAttentionEvent("second"))
+	var summaries []string
+	for len(summaries) < 3 {
+		select {
+		case event := <-got:
+			summaries = append(summaries, event.Summary)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("got %v, want 3 events", summaries)
+		}
+	}
+	if !slices.Equal(summaries, []string{"first", "second", "follow-on"}) {
+		t.Fatalf("order = %v, want first, second, follow-on (cursor order)", summaries)
+	}
+}
+
+// Behavior 14: a feed with no store delivers before Append returns, and never polls.
+func TestAttentionFeed_MemoryFeedDeliversDirectly(t *testing.T) {
+	ticker := newFakePollTicker()
+	feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 10, RetentionPeriod: time.Hour},
+		WithAttentionPollTicker(ticker.factory()))
+	t.Cleanup(feed.Stop)
+	var got atomic.Int32
+	feed.Subscribe(func(AttentionEvent) { got.Add(1) })
+	feed.Append(testAttentionEvent("direct"))
+	if got.Load() != 1 || ticker.made.Load() != 0 {
+		t.Fatalf("delivered %d, tickers %d; want 1 and 0", got.Load(), ticker.made.Load())
+	}
+}
+
+// Behavior 13: in a store-backed feed, a heartbeat carries the newest cursor
+// instead of taking the one the next stored event will get.
+func TestAttentionFeed_HeartbeatKeepsStoredCursorFree(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	ticker := newFakePollTicker()
+	writer := newWriterFeed(t, path)
+	for i := 0; i < 3; i++ {
+		writer.Append(testAttentionEvent("seed"))
+	}
+	feed := newPollTestFeed(t, openStoreFile(t, path), ticker)
+	sink := collect(feed)
+
+	heartbeat := feed.PublishEphemeral(AttentionEvent{
+		Category: EventCategorySystem,
+		Type:     EventType(DefaultTransportLiveness.HeartbeatType),
+	})
+	if newest := feed.Stats().NewestCursor; heartbeat.Cursor != 3 || newest != 3 {
+		t.Fatalf("heartbeat cursor %d, newest %d; want 3 and 3", heartbeat.Cursor, newest)
+	}
+	stored := writer.Append(testAttentionEvent("after heartbeat"))
+	if stored.Cursor != 4 {
+		t.Fatalf("stored cursor = %d, want 4", stored.Cursor)
+	}
+	ticker.pass(t)
+	var delivered []AttentionEvent
+	for _, event := range sink.drain() {
+		if event.Type == EventTypeSystemHealthChange {
+			delivered = append(delivered, event)
+		}
+	}
+	if len(delivered) != 1 || delivered[0].Cursor != stored.Cursor {
+		t.Fatalf("delivered %+v, want cursor %d once", delivered, stored.Cursor)
+	}
+}
+
+// Behavior 12: during a store write outage, this process's events reach the
+// subscriber in replay order, and their stored copies aren't delivered again
+// after the store recovers.
+func TestAttentionFeed_OutageEventsDeliveredOnce(t *testing.T) {
+	captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	clock := newTestClock()
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, store, ticker, WithAttentionClock(clock.Now))
+	sink := collect(feed)
+	writer := newWriterFeed(t, path)
+
+	store.fail.Store(true)
+	feed.Append(testAttentionEvent("held 1"))
+	feed.PublishMailPending("/proj", "S", "RedStone", "m42", 42, "")
+	writer.Append(testAttentionEvent("other process"))
+	feed.Append(testAttentionEvent("held 2"))
+	feed.PublishMailPending("/proj", "S", "RedStone", "m43", 43, "")
+	ticker.pass(t)
+	got := sink.waitFor(t, 5, 2*time.Second)
+	want, _, err := feed.Replay(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cursorsOf(got), cursorsOf(want)) {
+		t.Fatalf("delivered %v, replay order %v", cursorsOf(got), cursorsOf(want))
+	}
+
+	store.fail.Store(false)
+	clock.Advance(AttentionStoreRetryInterval)
+	feed.PublishMailPending("/proj", "S", "RedStone", "m42", 42, "")
+	feed.PublishMailPending("/proj", "S", "RedStone", "m43", 43, "")
+	ticker.pass(t)
+	if extra := sink.drain(); len(extra) != 0 {
+		t.Fatalf("redelivered after recovery: %+v", extra)
+	}
+}
+
+// Behavior 12 edge case: after the poll has delivered other processes' events,
+// an event this process keeps in memory during an outage gets a cursor above
+// them, so the poll still delivers it.
+func TestAttentionFeed_OutageEventAfterOtherWritersDelivered(t *testing.T) {
+	captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, store, ticker)
+	sink := collect(feed)
+	writer := newWriterFeed(t, path)
+	for i := 0; i < 5; i++ {
+		writer.Append(testAttentionEvent("other process"))
+	}
+	ticker.pass(t)
+	sink.waitFor(t, 5, 2*time.Second)
+
+	store.fail.Store(true)
+	held := feed.Append(testAttentionEvent("held"))
+	ticker.pass(t)
+	if held.Cursor <= 5 {
+		t.Fatalf("held cursor = %d, want above the delivered 5", held.Cursor)
+	}
+	assertSummaries(t, sink.waitFor(t, 1, 2*time.Second), "held")
+}
+
+// Behavior 12 edge case: a memory-only notice the poll never delivered before
+// the store recovered is delivered once, from its stored copy.
+func TestAttentionFeed_OutageNoticeNotYetDeliveredArrivesOnce(t *testing.T) {
+	captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	clock := newTestClock()
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, store, ticker, WithAttentionClock(clock.Now))
+	got := make(chan AttentionEvent, 10)
+	release := make(chan struct{})
+	var once sync.Once
+	feed.Subscribe(func(event AttentionEvent) {
+		once.Do(func() { <-release }) // hold the poll so it can't see the memory copy
+		got <- event
+	})
+
+	feed.Append(testAttentionEvent("blocks the poll")) // stored; the poll blocks delivering it
+	time.Sleep(50 * time.Millisecond)
+	store.fail.Store(true)
+	feed.PublishMailPending("/proj", "S", "RedStone", "m42", 42, "")
+	store.fail.Store(false)
+	clock.Advance(AttentionStoreRetryInterval)
+	feed.PublishMailPending("/proj", "S", "RedStone", "m42", 42, "") // saves the stored copy
+	close(release)
+	ticker.pass(t)
+
+	var mail []AttentionEvent
+	for len(got) > 0 {
+		if event := <-got; event.MessageID == 42 {
+			mail = append(mail, event)
+		}
+	}
+	if len(mail) != 1 {
+		t.Fatalf("message 42 delivered %d times, want 1: %+v", len(mail), mail)
+	}
+}
+
+// Behavior 9: a failed read is logged once, and the next good read delivers
+// from where the poll stopped.
+func TestAttentionFeed_PollReadFailureRetries(t *testing.T) {
+	logs := captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := &faultInjectingStore{Store: openStoreFile(t, path)}
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, store, ticker)
+	sink := collect(feed)
+	writer := newWriterFeed(t, path)
+
+	store.failReads.Store(true)
+	writer.Append(testAttentionEvent("written during the failure"))
+	ticker.pass(t)
+	ticker.pass(t)
+	if got := sink.drain(); len(got) != 0 {
+		t.Fatalf("delivered during the failure: %+v", got)
+	}
+	if n := logs.count(attentionPollFailedLogMessage); n != 1 {
+		t.Fatalf("failure logged %d times, want 1\n%s", n, logs.text())
+	}
+
+	store.failReads.Store(false)
+	ticker.pass(t)
+	assertSummaries(t, sink.waitFor(t, 1, 2*time.Second), "written during the failure")
+	if n := logs.count(attentionPollRecoveredLogMessage); n != 1 {
+		t.Fatalf("recovery logged %d times, want 1", n)
+	}
+}
+
+// Behavior 10: when the poll's cursor has left retention, it goes on from the
+// oldest kept event and logs both cursors.
+func TestAttentionFeed_PollContinuesAfterExpiredCursor(t *testing.T) {
+	logs := captureSlog(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	ticker := newFakePollTicker()
+	writer := newWriterFeed(t, path)
+	// The window starts at the oldest event that hasn't expired, so the poll's
+	// start event must expire too for its cursor to leave the window.
+	appendAged(writer, "start", 2*time.Hour)
+	feed := newPollTestFeed(t, openStoreFile(t, path), ticker)
+	sink := collect(feed)
+
+	for i := 0; i < 3; i++ {
+		appendAged(writer, fmt.Sprintf("old %d", i), 2*time.Hour)
+	}
+	if _, err := openStoreFile(t, path).GCExpiredEvents(); err != nil {
+		t.Fatal(err)
+	}
+	writer.Append(testAttentionEvent("new 1"))
+	writer.Append(testAttentionEvent("new 2"))
+
+	ticker.pass(t)
+	got := sink.waitFor(t, 2, 2*time.Second)
+	if got[0].Cursor != 5 || got[1].Cursor != 6 {
+		t.Fatalf("got cursors %v, want 5 and 6", cursorsOf(got))
+	}
+	line := logs.text()
+	if logs.count(attentionPollExpiredLogMessage) != 1 ||
+		!strings.Contains(line, "since_cursor=1") || !strings.Contains(line, "oldest_cursor=5") {
+		t.Fatalf("expiry not reported with both cursors:\n%s", line)
+	}
+}
+
+// Behavior 11: a handler that blocks loses nothing, and more than one batch
+// arrives in full.
+func TestAttentionFeed_SlowHandlerLosesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	ticker := newFakePollTicker()
+	feed := newPollTestFeed(t, openStoreFile(t, path), ticker)
+	writer := newWriterFeed(t, path)
+	release := make(chan struct{})
+	var once sync.Once
+	got := make(chan AttentionEvent, 1000)
+	feed.Subscribe(func(event AttentionEvent) {
+		once.Do(func() { <-release })
+		got <- event
+	})
+
+	writer.Append(testAttentionEvent("first"))
+	ticker.tick(t)
+	for i := 0; i < 5; i++ {
+		writer.Append(testAttentionEvent(fmt.Sprintf("while blocked %d", i)))
+		ticker.tryTick()
+	}
+	close(release)
+	ticker.pass(t)
+	if len(got) != 6 {
+		t.Fatalf("got %d events, want 6", len(got))
+	}
+
+	for i := 0; i < attentionPollBatch+100; i++ {
+		writer.Append(testAttentionEvent("bulk"))
+	}
+	ticker.pass(t)
+	all := make([]AttentionEvent, 0, 6+attentionPollBatch+100)
+	for len(got) > 0 {
+		all = append(all, <-got)
+	}
+	if len(all) != 6+attentionPollBatch+100 {
+		t.Fatalf("got %d events, want %d", len(all), 6+attentionPollBatch+100)
+	}
+	assertIncreasing(t, all)
+}
+
+// Behavior 8: Stop ends the poll, stops its ticker and leaves no goroutine.
+func TestAttentionFeed_StopEndsPoll(t *testing.T) {
+	store := openStoreFile(t, filepath.Join(t.TempDir(), "state.db"))
+	baseline := runtime.NumGoroutine() // after the store, which has goroutines of its own
+	ticker := newFakePollTicker()
+	feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 100, RetentionPeriod: time.Hour},
+		WithAttentionStore(store), WithAttentionPollTicker(ticker.factory()))
+	collect(feed)
+
+	assertReturnsWithin(t, time.Second, feed.Stop)
+	feed.Stop() // A second Stop is safe.
+	if n := ticker.stopped.Load(); n != 1 {
+		t.Fatalf("ticker stopped %d times, want 1", n)
+	}
+	waitForGoroutines(t, baseline, time.Second)
+	collect(feed)
+	if ticker.made.Load() != 1 {
+		t.Fatal("Subscribe after Stop started a poll")
+	}
+}
+
+// Behavior 7: a short command's calls never start the poll, whether the store
+// opens or not, and Stop returns at once.
+func TestAttentionFeed_ShortCommandNeverPolls(t *testing.T) {
+	for _, openerFails := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("state-%v.db", openerFails))
+		ticker := newFakePollTicker()
+		feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 100, RetentionPeriod: time.Hour},
+			WithAttentionStoreOpener(func() (AttentionStore, error) {
+				if openerFails {
+					return nil, errors.New("injected open failure")
+				}
+				return openStoreFile(t, path), nil
+			}),
+			WithAttentionPollTicker(ticker.factory()))
+
+		feed.Append(testAttentionEvent("short"))
+		feed.PublishMailPending("/proj", "RedStone", "BlueLake", "hi", 7, "")
+		_, _, _ = feed.Replay(0, 10)
+		_, _, _ = feed.ReplayForRecipient("BlueLake", 0, 10)
+		_ = feed.Stats()
+
+		if ticker.made.Load() != 0 {
+			t.Fatalf("opener fails %v: the poll started without a subscriber", openerFails)
+		}
+		assertReturnsWithin(t, 100*time.Millisecond, feed.Stop)
+	}
+}
+
+// Behavior 4 property: while two other writers append at once, the subscriber
+// gets every stored cursor once, in increasing order, however the poll's passes
+// fall between commits. This is also the check that SQLite commits cursors in
+// order: a cursor seen after a higher one would break the order.
+func TestAttentionFeed_ParallelWritersDeliveredInOrder(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("state-%d.db", time.Now().UnixNano()))
+		ticker := newFakePollTicker()
+		feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour},
+			WithAttentionStore(openStoreFile(t, path)), WithAttentionPollTicker(ticker.factory()))
+		defer feed.Stop()
+		sink := collect(feed)
+		counts := []int{rapid.IntRange(1, 50).Draw(rt, "a"), rapid.IntRange(1, 50).Draw(rt, "b")}
+		pauses := rapid.SliceOfN(rapid.IntRange(0, 2000), 1, 20).Draw(rt, "pauses_us")
+
+		var wg sync.WaitGroup
+		for w, count := range counts {
+			writer := NewAttentionFeed(AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour},
+				WithAttentionStore(openStoreFile(t, path)))
+			defer writer.Stop()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < count; i++ {
+					writer.Append(testAttentionEvent(fmt.Sprintf("writer %d event %d", w, i)))
+				}
+			}()
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+			default:
+				ticker.tryTick()
+				time.Sleep(time.Duration(pauses[i%len(pauses)]) * time.Microsecond)
+				continue
+			}
+			break
+		}
+		ticker.pass(t)
+
+		got := sink.drain()
+		stored, _, err := feed.Replay(0, 1000)
+		if err != nil {
+			rt.Fatal(err)
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i].Cursor <= got[i-1].Cursor {
+				rt.Fatalf("delivered out of order: %v", cursorsOf(got))
+			}
+		}
+		if !slices.Equal(cursorsOf(got), cursorsOf(stored)) {
+			rt.Fatalf("delivered %v, stored %v", cursorsOf(got), cursorsOf(stored))
+		}
+	})
+}
+
+func assertReturnsWithin(t *testing.T, limit time.Duration, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		t.Fatalf("didn't return within %s", limit)
+	}
+}
+
+// waitForGoroutines waits for the goroutine count to fall back to baseline.
+func waitForGoroutines(t *testing.T, baseline int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for runtime.NumGoroutine() > baseline {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines = %d, want at most %d", runtime.NumGoroutine(), baseline)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// appendStep is one generated append: by the subscribed feed or the other
+// writer, a plain event or a mail notice.
+type appendStep struct {
+	other     bool
+	addressed bool
+	messageID int
+}
+
+// Behavior 3 property: whatever mix of own and other appends, the subscriber
+// gets every stored event after it subscribed, once, in cursor order.
+func TestAttentionFeed_OwnAppendProperty(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("state-%d.db", time.Now().UnixNano()))
+		ticker := newFakePollTicker()
+		feed := NewAttentionFeed(AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour},
+			WithAttentionStore(openStoreFile(t, path)), WithAttentionPollTicker(ticker.factory()))
+		defer feed.Stop()
+		other := NewAttentionFeed(AttentionFeedConfig{JournalSize: 1000, RetentionPeriod: time.Hour},
+			WithAttentionStore(openStoreFile(t, path)))
+		defer other.Stop()
+		other.Append(testAttentionEvent("before subscribe"))
+		sink := collect(feed)
+
+		steps := rapid.SliceOfN(rapid.Custom(func(rt *rapid.T) appendStep {
+			return appendStep{
+				other:     rapid.Bool().Draw(rt, "other"),
+				addressed: rapid.Bool().Draw(rt, "addressed"),
+				messageID: rapid.IntRange(1, 5).Draw(rt, "message"),
+			}
+		}), 1, 40).Draw(rt, "steps")
+		for i, step := range steps {
+			writer := feed
+			if step.other {
+				writer = other
+			}
+			if step.addressed {
+				writer.PublishMailPending("/proj", "S", "BlueLake", "m", step.messageID, "")
+			} else {
+				writer.Append(testAttentionEvent(fmt.Sprintf("step %d", i)))
+			}
+		}
+		ticker.pass(t)
+
+		stored, _, err := other.Replay(1, 1000)
+		if err != nil {
+			rt.Fatal(err)
+		}
+		got := sink.drain()
+		if !slices.Equal(cursorsOf(got), cursorsOf(stored)) {
+			rt.Fatalf("delivered %v, stored after subscribe %v", cursorsOf(got), cursorsOf(stored))
+		}
+		seen := map[int64]bool{}
+		for _, event := range got {
+			if event.MessageID != 0 && seen[event.MessageID] {
+				rt.Fatalf("message %d delivered twice", event.MessageID)
+			}
+			seen[event.MessageID] = event.MessageID != 0
+		}
+	})
 }

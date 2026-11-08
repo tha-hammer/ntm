@@ -19,7 +19,7 @@ Human tests run on this VPS, except Loop 8, Sprint 3, which runs on your local m
 |---|---|---|---|---|
 | 1 | [01-durable-feed.md](01-durable-feed.md) | Durable feed | 3 | Done: Sprints 1, 2 and 3 passed |
 | 2 | [02-addressed-mail-notices.md](02-addressed-mail-notices.md) | Addressed mail notices | 2 | Done: Sprints 1 and 2 passed |
-| 3 | [03-claude-turn-end-push.md](03-claude-turn-end-push.md) | Claude turn-end push | 7 | In progress: Sprints 1 to 6 passed |
+| 3 | [03-claude-turn-end-push.md](03-claude-turn-end-push.md) | Claude turn-end push | 7 | Done: Sprints 1 to 7 passed |
 | 4 | [04-cross-process-delivery.md](04-cross-process-delivery.md) | Cross-process delivery | 1 | Not started |
 | 5 | [05-idle-nudge.md](05-idle-nudge.md) | Idle nudge | 5 | Not started |
 | 6 | [06-agent-snooze.md](06-agent-snooze.md) | Agent snooze | 2 | Not started |
