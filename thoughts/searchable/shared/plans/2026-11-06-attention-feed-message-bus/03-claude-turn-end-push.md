@@ -297,7 +297,7 @@ Two gaps found while writing this document:
 
 ### Human test script
 
-1. Create a session with one agent: `/tmp/ntm-loop3 spawn addtest --cc=1`.
+1. Spawn uses `<projects_base>/addtest`, so make that folder a git repo (for example `git init ~/ntm_Dev/addtest`) and `cd` into it. Then create a session with one agent: `/tmp/ntm-loop3 spawn addtest --cc=1`.
 2. Add another: `/tmp/ntm-loop3 add addtest --cc=1`.
 3. Run `tmux list-panes -a -F '#{pane_id} #{pane_title}'`, and note the new agent's name and pane. `--robot-status` shows only an agent count.
 4. Pass: the new pane has its own Agent Mail name.

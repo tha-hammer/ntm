@@ -263,6 +263,12 @@ const (
 // isn't the JSON shape the writer can merge into.
 var ErrUnparseableSettings = errors.New("settings file can't be parsed")
 
+// ErrHomeFolder means the Stop hook wasn't written because the work folder is
+// the user's home folder. There the local settings file sits inside ~/.claude,
+// next to the user's own settings, and a home folder is never an agent's
+// project: getting it means the project lookup went wrong.
+var ErrHomeFolder = errors.New("refusing to write the Claude Stop hook into the home folder")
+
 // StopHookCommand is the command Claude Code runs at turn end. Hooks don't
 // get an interactive PATH, so the binary is absolute. Both paths are shell
 // quoted, because Claude Code runs the command with sh -c.
@@ -362,6 +368,9 @@ type StopHookResult struct {
 // which differs from workDir in a worktree. The command holds paths only,
 // never a token.
 func InstallStopHook(workDir, ntmPath, projectKey string) (StopHookResult, error) {
+	if home, err := os.UserHomeDir(); err == nil && home != "" && filepath.Clean(workDir) == filepath.Clean(home) {
+		return StopHookResult{}, fmt.Errorf("%w: %s", ErrHomeFolder, workDir)
+	}
 	path, changed, err := WriteStopHook(workDir, StopHookCommand(ntmPath, projectKey))
 	result := StopHookResult{SettingsPath: path, Changed: changed}
 	if err != nil {

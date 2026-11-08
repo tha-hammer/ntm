@@ -205,6 +205,55 @@ func TestResolveProjectDir_FallsBackToGitRoot(t *testing.T) {
 	}
 }
 
+// TestResolveProjectDir_NeverPicksHomeFolder covers bd-nftwx: a home folder
+// holding the global beads store or a user .ntm/config.toml isn't a project,
+// so a folder under it resolves to its own git root, or to itself.
+func TestResolveProjectDir_NeverPicksHomeFolder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, marker := range []string{".beads", ".ntm"} {
+		if err := os.MkdirAll(filepath.Join(home, marker), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(home, ".ntm", "config.toml"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := filepath.Join(home, "ntm_Dev", "addtest")
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	plain := filepath.Join(home, "scratch", "plain")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct{ start, want string }{
+		{repo, repo},
+		{filepath.Join(repo, "pkg"), repo},
+		{plain, plain},
+	} {
+		gotReal, _ := filepath.EvalSymlinks(ResolveProjectDir(tc.start))
+		wantReal, _ := filepath.EvalSymlinks(tc.want)
+		if gotReal != wantReal {
+			t.Errorf("ResolveProjectDir(%q) = %q, want %q", tc.start, gotReal, wantReal)
+		}
+		if got := BestProjectDir(tc.start); got == home {
+			t.Errorf("BestProjectDir(%q) picked the home folder", tc.start)
+		}
+	}
+	if root, err := FindBeadsRoot(plain); err == nil {
+		t.Errorf("FindBeadsRoot(%q) = %q, want not found", plain, root)
+	}
+	if root, err := FindProjectConfigRoot(plain); err == nil {
+		t.Errorf("FindProjectConfigRoot(%q) = %q, want not found", plain, root)
+	}
+}
+
 func TestBestProjectDir_PrefersCandidateWithProjectSignals(t *testing.T) {
 	t.Parallel()
 

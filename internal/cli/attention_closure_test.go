@@ -263,6 +263,8 @@ func runClosureHelper(mode string) int {
 		return closureHelperPublishInbox(args)
 	case "seed-registry":
 		return closureHelperSeedRegistry(args)
+	case "load-registry":
+		return closureHelperLoadRegistry(args)
 	case "argv":
 		// A hook command names this binary, so its own arguments are the
 		// ntm command line, as they are for the real binary.

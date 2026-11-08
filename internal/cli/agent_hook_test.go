@@ -221,6 +221,35 @@ func closureHelperSeedRegistry(args []string) int {
 	return 0
 }
 
+// closureHelperLoadRegistry prints the session registry that ntm's own lookup
+// finds, as JSON. Args: session, project.
+func closureHelperLoadRegistry(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "load-registry needs a session and a project")
+		return 2
+	}
+	registry, err := agentmail.LoadBestSessionAgentRegistry(args[0], args[1])
+	if err != nil || registry == nil {
+		fmt.Fprintf(os.Stderr, "no registry for %s: %v\n", args[0], err)
+		return 1
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(registry); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
+}
+
+// loadSessionRegistry reads a session's registry in a helper process.
+func (e *closureEnv) loadSessionRegistry(t *testing.T, session, project string) agentmail.SessionAgentRegistry {
+	t.Helper()
+	var registry agentmail.SessionAgentRegistry
+	if err := json.Unmarshal([]byte(e.run(t, "load-registry", session, project)), &registry); err != nil {
+		t.Fatalf("parse registry: %v", err)
+	}
+	return registry
+}
+
 type stopDecisionOutput struct {
 	Decision string `json:"decision"`
 	Reason   string `json:"reason"`
@@ -771,9 +800,22 @@ func (e *closureEnv) privateTmux(t *testing.T) {
 	socket := filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()), "default")
 	t.Cleanup(func() {
 		// -S names this server's socket, so only the private server is stopped.
-		kill := exec.Command("tmux", "-S", socket, "kill-server")
-		kill.Env = append(os.Environ(), "TMUX=")
-		_ = kill.Run()
+		privateTmuxCommand := func(args ...string) *exec.Cmd {
+			cmd := exec.Command("tmux", append([]string{"-S", socket}, args...)...)
+			cmd.Env = append(os.Environ(), "TMUX=")
+			return cmd
+		}
+		pidOut, _ := privateTmuxCommand("display-message", "-p", "#{pid}").Output()
+		_ = privateTmuxCommand("kill-server").Run()
+		// kill-server returns before the server and its panes have exited, and
+		// they can still write into the test's temp home, so wait for the server.
+		if pid := strings.TrimSpace(string(pidOut)); pid != "" {
+			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+				if _, err := os.Stat(filepath.Join("/proc", pid)); os.IsNotExist(err) {
+					break
+				}
+			}
+		}
 		_ = os.RemoveAll(dir)
 	})
 }
@@ -815,6 +857,7 @@ func (e *closureEnv) runShell(t *testing.T, cwd, command, stdin string, extra ..
 
 // launchedAgent is what a stand-in agent saw when it started.
 type launchedAgent struct {
+	ID          string // the stand-in's process id, which names its capture folder
 	Type        string // "claude" or "codex"
 	Dir         string
 	Env         map[string]string
@@ -935,7 +978,7 @@ func (c *agentCapture) waitForType(t *testing.T, agentType string, count int, ti
 
 func readLaunchedAgent(t *testing.T, dir string) launchedAgent {
 	t.Helper()
-	agent := launchedAgent{Env: map[string]string{}}
+	agent := launchedAgent{ID: filepath.Base(dir), Env: map[string]string{}}
 	agent.Type = strings.TrimSpace(string(mustReadFile(t, filepath.Join(dir, "type"))))
 	agent.Dir = strings.TrimSpace(string(mustReadFile(t, filepath.Join(dir, "pwd"))))
 	for _, line := range strings.Split(string(mustReadFile(t, filepath.Join(dir, "env"))), "\n") {
@@ -1275,6 +1318,170 @@ func TestClosure_RobotSpawnWritesClaudeStopHook(t *testing.T) {
 	capture.waitForType(t, "codex", 2, 20*time.Second)
 	if _, err := os.Stat(filepath.Join(repo2, ".claude", "settings.local.json")); !os.IsNotExist(err) {
 		t.Fatalf("codex-only spawn wrote a Claude file: %v", err)
+	}
+}
+
+// addedAgentSession is a session spawned with one Claude agent, plus one added
+// with ntm add.
+type addedAgentSession struct {
+	env          *closureEnv
+	mail         *fakeAgentMail
+	repo         string
+	first, added launchedAgent
+	addOutput    string
+}
+
+func setupAddedAgentSession(t *testing.T) addedAgentSession {
+	t.Helper()
+	s := addedAgentSession{mail: newFakeAgentMail(t), env: newClosureEnv(t)}
+	s.env.useAgentMail(s.mail)
+	s.env.privateTmux(t)
+	capture := s.env.standInAgentConfig(t, "")
+	s.repo = gitInitForTest(t, s.env.projectDir("addtest"))
+
+	s.env.run(t, "execute", "spawn", "addtest", "--cc=1")
+	s.first = capture.waitForAgents(t, 1, 20*time.Second)[0]
+	s.addOutput = s.env.run(t, "execute", "add", "addtest", "--cc=1")
+	for _, agent := range capture.waitForAgents(t, 2, 20*time.Second) {
+		if agent.ID != s.first.ID {
+			s.added = agent
+		}
+	}
+	return s
+}
+
+func TestClosure_AddedAgentGetsIdentityAndHook(t *testing.T) {
+	s := setupAddedAgentSession(t)
+
+	name := s.added.Env["AGENT_NAME"]
+	if name == "" || name == s.first.Env["AGENT_NAME"] {
+		t.Fatalf("added AGENT_NAME = %q, first = %q", name, s.first.Env["AGENT_NAME"])
+	}
+	registry := s.env.loadSessionRegistry(t, "addtest", s.repo)
+	if token := registry.RegistrationTokens[name]; token == "" || token != s.mail.token(name) {
+		t.Fatalf("registry token for %s = %q, server issued %q", name, token, s.mail.token(name))
+	}
+	if registry.RegistrationTokens[s.first.Env["AGENT_NAME"]] == "" {
+		t.Fatalf("registry lost the first agent: %+v", registry)
+	}
+	onlyNtmStopEntry(t, readSettingsFile(t, s.repo))
+	onlyNtmStopEntry(t, s.added.Settings) // written before the added agent launched
+	if !strings.Contains(s.addOutput, "Claude Stop hook written") {
+		t.Fatalf("add output = %q", s.addOutput)
+	}
+}
+
+func TestClosure_AddedAgentToldAlone(t *testing.T) {
+	s := setupAddedAgentSession(t)
+	firstName, addedName := s.first.Env["AGENT_NAME"], s.added.Env["AGENT_NAME"]
+	if addedName == "" {
+		t.Fatalf("added agent has no AGENT_NAME")
+	}
+	s.mail.addMessage(addedName, agentmail.InboxMessage{ID: 8, From: "HumanOverseer", Subject: "added agent test"})
+	command := onlyNtmStopEntry(t, readSettingsFile(t, s.repo)).Command
+	run := func(name string) string {
+		return s.env.runShell(t, s.repo, command, "{}", "AGENT_NAME="+name, closureHelperModeEnv+"=argv", closureHelperArgsEnv+"=")
+	}
+
+	if out := run(firstName); out != "" {
+		t.Fatalf("first agent was told: %q", out)
+	}
+	if d := parseStopDecision(t, run(addedName)); !strings.Contains(d.Reason, "from HumanOverseer: added agent test") ||
+		!strings.Contains(d.Reason, fmt.Sprintf("agent_name %q", addedName)) {
+		t.Fatalf("added agent reason = %q", d.Reason)
+	}
+	if out := run(addedName); out != "" {
+		t.Fatalf("added agent told twice: %q", out)
+	}
+	for _, call := range s.mail.callsFor("fetch_inbox") {
+		if call.Token != s.mail.token(call.Agent) {
+			t.Fatalf("fetch for %s used token %q, want %q", call.Agent, call.Token, s.mail.token(call.Agent))
+		}
+	}
+}
+
+// TestClosure_AddUnderHomeWithBeadsUsesSessionFolder reproduces Sprint 6's
+// first human test run (bd-nftwx): with the global beads store in the home
+// folder and the project below it, ntm add launched in the home folder and
+// wrote the Stop hook into ~/.claude.
+func TestClosure_AddUnderHomeWithBeadsUsesSessionFolder(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	home := filepath.Dir(env.workDir) // projects_base is below it
+	env.set("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("hometest"))
+
+	env.run(t, "execute", "spawn", "hometest", "--cc=1")
+	first := capture.waitForAgents(t, 1, 20*time.Second)[0]
+	out := env.runWithStdinIn(t, repo, "", "execute", "add", "hometest", "--cc=1")
+	var added launchedAgent
+	for _, agent := range capture.waitForAgents(t, 2, 20*time.Second) {
+		if agent.ID != first.ID {
+			added = agent
+		}
+	}
+	if added.Dir != repo {
+		t.Fatalf("added agent ran in %q, want the session folder %q", added.Dir, repo)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude")); !os.IsNotExist(err) {
+		t.Fatalf("add wrote into the home folder's .claude: %v", err)
+	}
+	if want := "Claude Stop hook written: " + filepath.Join(repo, claudeconfig.LocalSettingsPath); !strings.Contains(out, want) {
+		t.Fatalf("add output %q lacks %q", out, want)
+	}
+	if entry := onlyNtmStopEntry(t, readSettingsFile(t, repo)); entry.Command != claudeconfig.StopHookCommand(helperBinary(t), repo) {
+		t.Fatalf("entry = %q", entry.Command)
+	}
+}
+
+func TestAdd_AgentMailDownStillAdds(t *testing.T) {
+	env := newClosureEnv(t) // AGENT_MAIL_URL is a closed port by default
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("downtest"))
+
+	env.run(t, "execute", "spawn", "downtest", "--cc=1")
+	first := capture.waitForAgents(t, 1, 20*time.Second)[0]
+	out := env.run(t, "execute", "add", "downtest", "--cc=1")
+	var added launchedAgent
+	for _, agent := range capture.waitForAgents(t, 2, 20*time.Second) {
+		if agent.ID != first.ID {
+			added = agent
+		}
+	}
+	if added.ID == "" || added.Env["AGENT_NAME"] != "" {
+		t.Fatalf("added agent = %+v, want one launched with no AGENT_NAME", added)
+	}
+	if n := strings.Count(out, "Agent Mail unavailable; cc agent 2 added without a name"); n != 1 {
+		t.Fatalf("warning count = %d in add output %q", n, out)
+	}
+	// The hook stays silent with no name, so it is still written.
+	onlyNtmStopEntry(t, readSettingsFile(t, repo))
+}
+
+func TestAdd_CodexWritesNoClaudeFile(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("codtest"))
+
+	env.run(t, "execute", "spawn", "codtest", "--cod=1")
+	capture.waitForType(t, "codex", 1, 20*time.Second)
+	out := env.run(t, "execute", "add", "codtest", "--cod=1")
+	capture.waitForType(t, "codex", 2, 20*time.Second)
+	if _, err := os.Stat(filepath.Join(repo, ".claude", "settings.local.json")); !os.IsNotExist(err) {
+		t.Fatalf("a Codex add wrote a Claude settings file: %v", err)
+	}
+	if strings.Contains(out, "Agent Mail unavailable") {
+		t.Fatalf("add warned with a live server: %q", out)
 	}
 }
 

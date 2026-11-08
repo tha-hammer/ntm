@@ -309,6 +309,28 @@ func TestWriteStopHook_NoChangeNoWrite(t *testing.T) {
 	}
 }
 
+// TestInstallStopHook_RefusesHomeFolder: in the home folder, the local
+// settings file sits inside ~/.claude, next to the user's own settings, so a
+// wrong project lookup must never put the hook there.
+func TestInstallStopHook_RefusesHomeFolder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, dir := range []string{home, home + "/", filepath.Join(home, "sub", "..")} {
+		_, err := InstallStopHook(dir, "/bin/ntm", dir)
+		if !errors.Is(err, ErrHomeFolder) {
+			t.Fatalf("InstallStopHook(%q) err = %v, want ErrHomeFolder", dir, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude")); !os.IsNotExist(err) {
+		t.Fatalf("a .claude folder was created in the home folder: %v", err)
+	}
+
+	below := filepath.Join(home, "proj")
+	if _, err := InstallStopHook(below, "/bin/ntm", below); err != nil {
+		t.Fatalf("a folder below the home folder was refused: %v", err)
+	}
+}
+
 func TestStopHookCommand_QuotesPaths(t *testing.T) {
 	for _, tc := range []struct{ bin, project string }{
 		{"/usr/local/bin/ntm", "/home/x/proj"},

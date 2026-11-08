@@ -67,36 +67,26 @@ func FindGitRoot(startDir string) (string, error) {
 // FindProjectConfigRoot walks up from startDir looking for a local .ntm/config.toml.
 // It returns the directory that owns the project config.
 func FindProjectConfigRoot(startDir string) (string, error) {
-	if strings.TrimSpace(startDir) == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return "", err
-		}
-		startDir = cwd
-	}
-
-	dir, err := filepath.Abs(startDir)
-	if err != nil {
-		return "", err
-	}
-
-	for {
-		configPath := filepath.Join(dir, ".ntm", "config.toml")
-		if info, err := os.Stat(configPath); err == nil && !info.IsDir() {
-			return dir, nil
-		}
-
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("project config not found from %s", startDir)
-		}
-		dir = parent
-	}
+	return walkUpForMarker(startDir, func(dir string) bool {
+		info, err := os.Stat(filepath.Join(dir, ".ntm", "config.toml"))
+		return err == nil && !info.IsDir()
+	}, "project config")
 }
 
 // FindBeadsRoot walks up from startDir looking for a local .beads directory.
 // It returns the directory that owns the beads state.
 func FindBeadsRoot(startDir string) (string, error) {
+	return walkUpForMarker(startDir, func(dir string) bool {
+		info, err := os.Stat(filepath.Join(dir, ".beads"))
+		return err == nil && info.IsDir()
+	}, "beads root")
+}
+
+// walkUpForMarker returns the nearest folder at or above startDir for which
+// hasMarker is true. The walk stops at the user's home folder without checking
+// it: a .beads or .ntm/config.toml there is the user's global store, not a
+// project, and a folder under home must not resolve to home (bd-nftwx).
+func walkUpForMarker(startDir string, hasMarker func(dir string) bool, what string) (string, error) {
 	if strings.TrimSpace(startDir) == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -110,18 +100,27 @@ func FindBeadsRoot(startDir string) (string, error) {
 		return "", err
 	}
 
-	for {
-		beadsPath := filepath.Join(dir, ".beads")
-		if info, err := os.Stat(beadsPath); err == nil && info.IsDir() {
+	home := userHomeDir()
+	for dir != home {
+		if hasMarker(dir) {
 			return dir, nil
 		}
-
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("beads root not found from %s", startDir)
+			break
 		}
 		dir = parent
 	}
+	return "", fmt.Errorf("%s not found from %s", what, startDir)
+}
+
+// userHomeDir is the cleaned home folder, or "" when there is none.
+func userHomeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Clean(home)
 }
 
 // ResolveProjectDir prefers an explicit project config root, then a beads root,

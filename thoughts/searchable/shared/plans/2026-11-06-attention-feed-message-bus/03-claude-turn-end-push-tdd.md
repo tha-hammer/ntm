@@ -1944,6 +1944,8 @@ Where the build differs from the plan:
 5. Run steps 7 to 10 of the Sprint 3 script against `robottest`.
 6. Pass: the agent is told at turn end.
 
+**Result (2026-11-08):** passed on rocketman at `a9be5d83`. The user reported "Passed" with no further detail: robot spawn returned `success: true`, the settings file had one Stop entry, and the agent was told at turn end and called `fetch_inbox`.
+
 ---
 
 ## Sprint 6: Hook written by `ntm add`
@@ -2125,9 +2127,22 @@ No new code beyond Behavior 21.
 
 **Automated:** `go test -short -run 'TestAdd_AgentMailDownStillAdds|TestAdd_CodexWritesNoClaudeFile' ./internal/cli/` fails first, then passes.
 
+### Build record (2026-11-08)
+
+Red, then green, for each behavior:
+- **21:** red was `added AGENT_NAME = "", first = "Agent1"`. **Red-at-seam:** that same run: with no registration and no `AGENT_NAME` in `runAdd`, the added agent had no name. The test also checks that the registry keeps the first agent's token and holds the added agent's, and that the added stand-in's settings copy already had the entry at launch.
+- **22:** red was "added agent has no AGENT_NAME", the same seam. Green, it checks the first agent's run is silent, the added agent is told with its own name in the reason, a second run is silent, and every fetch used its own agent's token.
+- **23:** red was "warning count = 0". `TestAdd_CodexWritesNoClaudeFile` passed at once, because add writes the hook only for Claude agents.
+
+Where the build differs from the plan:
+- `resolvePaneAgentMailName` takes the session registry as a parameter (it may be nil), so spawn keeps its single registry load. Add passes nil, because a new pane is never in the registry yet.
+- `addedPaneIndex` looks up the new pane's tmux index by its ID, because registration keys its result by pane index.
+- The warning uses the agent type as ntm writes it: `Agent Mail unavailable; cc agent 2 added without a name`.
+- The private tmux cleanup now waits for the server process to exit after `kill-server`. Without the wait, `TestClosure_AddedAgentToldAlone` sometimes failed in `t.TempDir` cleanup ("home: directory not empty"), because the server and its panes were still writing ntm's audit and session files into the temp home.
+
 ### Human test script
 
-1. Create a session with one agent: `/tmp/ntm-loop3 spawn addtest --cc=1`.
+1. Spawn uses `<projects_base>/addtest`, so make that folder a git repo (for example `git init ~/ntm_Dev/addtest`) and `cd` into it. Then create a session with one agent: `/tmp/ntm-loop3 spawn addtest --cc=1`.
 2. Add another: `/tmp/ntm-loop3 add addtest --cc=1`.
 3. Run `tmux list-panes -a -F '#{pane_id} #{pane_title}'`, and note the new agent's name and pane. `--robot-status` shows only an agent count.
 4. Pass: the new pane has its own Agent Mail name.
@@ -2135,6 +2150,15 @@ No new code beyond Behavior 21.
 6. Pass: it prints `1`, since both agents share the folder.
 7. Give the new agent slow work with `/tmp/ntm-loop3 send addtest --panes=<pane> "Run sleep 60, then reply done."`, then send it mail with `/tmp/ntm-loop3 mail send addtest --to <new agent> "added agent test"`.
 8. Pass: only the new agent is told at its turn end, and the first agent is not.
+
+**First run (2026-11-08), failed:** on rocketman, built from `a9be5d83` plus the uncommitted Sprint 6 diff. `ntm add addtest --cc=1`, run from `~/ntm_Dev/addtest` with no `.ntm/config.toml`, wrote the Stop hook into `/home/maceo/.claude/settings.local.json` with `--project '/home/maceo'`, launched the new agent HazyWolf with its folder set to `/home/maceo`, and saved its registry under project key `/home/maceo`. The user removed that entry. Spawn from the same folder used `~/ntm_Dev/addtest` correctly. A second run, with `.ntm/config.toml` created first, passed every step: StormyDune got its own name, title and `AGENT_NAME`, the Stop list had length 1, mail 12497 produced `Run fetch_inbox with agent_name "StormyDune" and project_key "/home/maceo/ntm_Dev/addtest"` at turn end, StormyDune called `fetch_inbox`, and the first agent, WindyMarsh, wasn't told. Spawn and add both still hit bd-57xdn. Evidence: `/home/debian/Dev/ntm-test-evidence/loop3-sprint6-local-2026-11-08/`.
+
+**Cause and fix (bd-nftwx, chosen by the user):** add takes its folder from `resolveWorkspaceProjectDirForExplicitSession`, which scores the session's saved folder through `util.BestProjectDir`. That runs each candidate through `ResolveProjectDir`, whose `.beads` walk found `~/.beads` before the folder's own git root. Spawn uses `resolveCreationProjectDirForSession`, which doesn't do that step. Test-first:
+- `TestResolveProjectDir_NeverPicksHomeFolder` failed with every case resolving to the temp home.
+- `TestInstallStopHook_RefusesHomeFolder` failed on `undefined: ErrHomeFolder`.
+- `TestClosure_AddUnderHomeWithBeadsUsesSessionFolder` reproduced the run in a closure test: with `HOME` holding `.beads` and the project below it, the added agent ran in `HOME`.
+
+Now the config and beads walks share `walkUpForMarker`, which stops at the home folder without checking it. As a second guard, `InstallStopHook` refuses the home folder with `ErrHomeFolder`, which spawn and add print as a warning and robot spawn returns in `warnings`. All three tests pass.
 
 ---
 

@@ -2248,31 +2248,16 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 
 		// Resolve the Agent Mail identity for this pane *before* launch so the
 		// name can be shown in the pane title and threaded into the startup
-		// command via AGENT_NAME. Reuse an existing identity when present,
-		// otherwise pre-register just this pane to mint one. The post-launch
-		// registration below reuses whatever we persist here (registry is saved
-		// on each call), so no second identity is minted.
-		agentMailName := ""
-		if registry := loadSpawnRegistry(); registry != nil {
-			if existingName, ok := registry.GetAgent(title, pane.ID); ok {
-				agentMailName = strings.TrimSpace(existingName)
-			}
-		}
-		if agentMailName == "" {
-			preRegisterStatus := registerSpawnedAgents(dir, opts.Session, []spawnedAgentInfo{
-				{
-					paneIndex:     pane.Index,
-					paneID:        pane.ID,
-					paneTitle:     title,
-					agentType:     string(agent.Type),
-					model:         agent.Model,
-					resolvedModel: resolvedModel,
-				},
-			})
-			if preRegisterStatus != nil {
-				agentMailName = strings.TrimSpace(preRegisterStatus.AgentMap[fmt.Sprintf("%d", pane.Index)])
-			}
-		}
+		// command via AGENT_NAME. The post-launch registration below reuses
+		// whatever is persisted here, so no second identity is minted.
+		agentMailName := resolvePaneAgentMailName(dir, opts.Session, loadSpawnRegistry(), spawnedAgentInfo{
+			paneIndex:     pane.Index,
+			paneID:        pane.ID,
+			paneTitle:     title,
+			agentType:     string(agent.Type),
+			model:         agent.Model,
+			resolvedModel: resolvedModel,
+		})
 		// Record ntm's canonical identity (type/index/variant) in tmux pane
 		// options so pane addressing (grep/output/scale/is-working) resolves by
 		// type/index independently of the pane title. This lets the pane title
@@ -3216,6 +3201,23 @@ type spawnedAgentInfo struct {
 	agentType     string
 	model         string
 	resolvedModel string
+}
+
+// resolvePaneAgentMailName returns the Agent Mail name for a pane about to
+// launch: the name the session registry already holds for it, or a new one
+// minted by registering just this pane (which saves the registry). It returns
+// "" when Agent Mail is off or unavailable. registry may be nil.
+func resolvePaneAgentMailName(projectDir, session string, registry *agentmail.SessionAgentRegistry, pane spawnedAgentInfo) string {
+	if registry != nil {
+		if existingName, ok := registry.GetAgent(pane.paneTitle, pane.paneID); ok && strings.TrimSpace(existingName) != "" {
+			return strings.TrimSpace(existingName)
+		}
+	}
+	status := registerSpawnedAgents(projectDir, session, []spawnedAgentInfo{pane})
+	if status == nil {
+		return ""
+	}
+	return strings.TrimSpace(status.AgentMap[fmt.Sprintf("%d", pane.paneIndex)])
 }
 
 // registerSpawnedAgents registers each spawned agent with Agent Mail and returns status.

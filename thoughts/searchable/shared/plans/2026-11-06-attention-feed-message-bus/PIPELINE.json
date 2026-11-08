@@ -62,7 +62,8 @@
         "Sprint 1: Hook command tells an agent once",
         "Sprint 2: Identity lookup",
         "Sprint 3: Hook written by `ntm spawn`",
-        "Sprint 4: Hook written with `--worktrees`"
+        "Sprint 4: Hook written with `--worktrees`",
+        "Sprint 5: Hook written by robot spawn"
       ]
     },
     {
@@ -359,8 +360,14 @@
       "step": "build",
       "event": "sprint",
       "detail": "Sprint 4: Hook written with `--worktrees`"
+    },
+    {
+      "at": "2026-11-08T00:54:29.456Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 5: Hook written by robot spawn"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-08T00:36:24.860Z"
+  "updated_at": "2026-11-08T00:54:29.456Z"
 }

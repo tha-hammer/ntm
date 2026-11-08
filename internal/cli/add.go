@@ -63,6 +63,22 @@ func paneIdentityArgs(agent FlatAgent, num int) (string, int, string) {
 
 // writeAddPaneIdentity writes one added pane's tmux identity vars through
 // the seam, mirroring spawn's identity-before-launch order.
+// addedPaneIndex returns the tmux pane index of a pane split by ntm add, which
+// Agent Mail registration keys its result by. It returns 0 if the pane can't
+// be found, which still works as that key for a single pane.
+func addedPaneIndex(session, paneID string) int {
+	panes, err := tmux.GetPanes(session)
+	if err != nil {
+		return 0
+	}
+	for _, pane := range panes {
+		if pane.ID == paneID {
+			return pane.Index
+		}
+	}
+	return 0
+}
+
 func writeAddPaneIdentity(paneID string, agent FlatAgent, num int) {
 	typ, idx, variant := paneIdentityArgs(agent, num)
 	setPaneIdentityHook(paneID, typ, idx, variant)
@@ -688,6 +704,26 @@ func runAdd(opts AddOptions) error {
 			finalCmd = envPrefix + finalCmd
 		}
 
+		// Give the added pane an Agent Mail identity before launch, as spawn
+		// does, so the agent sees its name in $AGENT_NAME and its turn-end hook
+		// can fetch its mail.
+		agentMailName := resolvePaneAgentMailName(dir, session, nil, spawnedAgentInfo{
+			paneIndex:     addedPaneIndex(session, paneID),
+			paneID:        paneID,
+			paneTitle:     title,
+			agentType:     agentTypeStr,
+			model:         agent.Model,
+			resolvedModel: resolvedModel,
+		})
+		if agentMailName != "" {
+			if err := tmux.SetPaneTitle(paneID, agentMailName); err != nil && !IsJSONOutput() {
+				output.PrintWarningf("Could not set Agent Mail pane title for %s agent %d: %v", agentTypeStr, num, err)
+			}
+			finalCmd = fmt.Sprintf("AGENT_NAME=%s %s", tmux.ShellQuote(agentMailName), finalCmd)
+		} else if cfg.AgentMail.Enabled && !IsJSONOutput() {
+			output.PrintWarningf("Agent Mail unavailable; %s agent %d added without a name", agentTypeStr, num)
+		}
+
 		safeCmd, err := tmux.SanitizePaneCommand(finalCmd)
 		if err != nil {
 			return outputError(fmt.Errorf("invalid agent command: %w", err))
@@ -707,6 +743,13 @@ func runAdd(opts AddOptions) error {
 		cmd, err := tmux.BuildPaneCommand(dir, safeCmd)
 		if err != nil {
 			return outputError(fmt.Errorf("building agent command: %w", err))
+		}
+
+		// Claude Code reads its settings at startup, so the Stop hook is
+		// written before the launch. The added pane runs in the session folder,
+		// which is also its Agent Mail project.
+		if agent.Type == AgentTypeClaude && cfg.AgentMail.Enabled {
+			installClaudeStopHook(dir, dir)
 		}
 
 		if err := tmux.SendKeys(paneID, cmd, true); err != nil {
