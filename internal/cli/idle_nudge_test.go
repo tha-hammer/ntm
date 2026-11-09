@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -568,6 +569,35 @@ func TestClosure_TypingHoldsNudge(t *testing.T) {
 	}
 }
 
+// Loop 5, Behavior 23: a real Claude screen with unsent typed text holds the
+// nudge however quiet the keys are, and a real screen with only preview text
+// doesn't. The stand-in draws the captures with their styles, so the monitor's
+// capture-pane -e sees what it would see on a real pane.
+func TestClosure_TypedTextHoldsNudge(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	agents := env.screenAgentConfig(t, mail, "")
+	pid, agent := spawnNudgeAgent(t, env, agents, "drafthold")
+	agents.setScreen(t, pid, "cc_input_typed.ansi")
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 97, From: "RedStone", Subject: "draft test"})
+	env.startMonitor(t, "drafthold")
+
+	time.Sleep(3 * time.Second)
+	if held := agents.typed(t, pid); strings.Contains(held, "draft test") || strings.Contains(held, "new message") {
+		t.Fatalf("reminder typed over a person's unsent text: %q", held)
+	}
+	if rec := env.told(t, env.projectDir("drafthold"), agent, 97); rec != nil {
+		t.Fatalf("claimed while unsent text was on the input line: %+v", rec)
+	}
+
+	agents.setScreen(t, pid, "cc_input_preview.ansi")
+	got := agents.waitTyped(t, pid, "draft test", 10*time.Second)
+	if strings.Contains(got, "add a second line") {
+		t.Fatalf("the preview text was submitted with the reminder: %q", got)
+	}
+}
+
 func testRegistry(paneAgents map[string]string) *agentmail.SessionAgentRegistry {
 	return &agentmail.SessionAgentRegistry{PaneIDMap: paneAgents, Agents: map[string]string{}}
 }
@@ -781,6 +811,63 @@ func TestIdleNudgePoll_HeldThenSent(t *testing.T) {
 	if fake.count("send") != 1 {
 		t.Fatalf("sent while held again: %v", fake.calls)
 	}
+}
+
+// Loop 5, Behavior 22: the Human Typing Guard holds for unsent typed text or
+// recent keystrokes, and a failed pane read holds too.
+func TestIdleNudgePoll_TypedTextGuard(t *testing.T) {
+	cases := []struct {
+		name      string
+		typed     agent.TypedText
+		recent    bool
+		readFails bool
+		wantSend  bool
+	}{
+		{"typed text, keys quiet for hours", agent.TypedTextPresent, false, false, false},
+		{"no typed text", agent.TypedTextAbsent, false, false, true},
+		{"unknown, keys quiet", agent.TypedTextUnknown, false, false, true},
+		{"unknown, recent keys", agent.TypedTextUnknown, true, false, false},
+		{"no typed text, recent keys", agent.TypedTextAbsent, true, false, false},
+		{"pane read fails", agent.TypedTextAbsent, false, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := typedTextGuardSends(t, tc.typed, tc.recent, tc.readFails); got != tc.wantSend {
+				t.Fatalf("sent = %v, want %v", got, tc.wantSend)
+			}
+		})
+	}
+}
+
+// Behavior 22 property: a reminder is sent only when the pane read worked, no
+// typed text is present, and no keys are recent. The input space is 12
+// combinations, so every one is checked rather than a random sample.
+func TestIdleNudgePoll_TypedTextGuardProperty(t *testing.T) {
+	for _, typed := range []agent.TypedText{agent.TypedTextUnknown, agent.TypedTextAbsent, agent.TypedTextPresent} {
+		for _, recent := range []bool{false, true} {
+			for _, readFails := range []bool{false, true} {
+				want := !readFails && typed != agent.TypedTextPresent && !recent
+				if got := typedTextGuardSends(t, typed, recent, readFails); got != want {
+					t.Errorf("typed %v, recent %v, read fails %v: sent = %v, want %v", typed, recent, readFails, got, want)
+				}
+			}
+		}
+	}
+}
+
+// typedTextGuardSends runs one poll for an idle, live agent with one message
+// and the given pane state, and reports whether a reminder was sent.
+func typedTextGuardSends(t *testing.T, typed agent.TypedText, recent, readFails bool) bool {
+	t.Helper()
+	fake := newFakeNudge(t)
+	fake.addUnread("BlueLake", 71, "first")
+	fake.state.TypedText = typed
+	fake.state.RecentHumanActivity = recent
+	if readFails {
+		fake.failStep["state"] = errors.New("capture-pane failed")
+	}
+	fake.nudger().poll(context.Background())
+	return fake.count("send") == 1
 }
 
 // fakeNudge is an idle nudger over fakes, with a real state store on a temp

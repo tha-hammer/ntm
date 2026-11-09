@@ -8,6 +8,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
@@ -40,6 +41,8 @@ type paneNudgeState struct {
 	// RecentHumanActivity: a person may be typing in the pane (see
 	// recentHumanActivity).
 	RecentHumanActivity bool
+	// TypedText: whether a person's unsent text is on the agent's input line.
+	TypedText agent.TypedText
 }
 
 // idleNudgeStore is the part of the state store the nudge uses.
@@ -150,12 +153,13 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 	if !pane.Idle {
 		return // the Stop hook tells a busy agent when its turn ends
 	}
-	if pane.RecentHumanActivity {
+	if humanTypingGuardHolds(pane) {
 		// Typing into the input line a person is using would garble both. Hold
 		// without claiming, so a later poll, or the Stop hook, tells them.
 		if batch := messageBatchKey(msgs); n.heldBatches[target.PaneID] != batch {
 			n.heldBatches[target.PaneID] = batch
-			slog.Info("idle nudge: held, person typing", "pane", target.PaneID, "agent", target.Agent, "messages", batch)
+			slog.Info("idle nudge: held, person typing", "pane", target.PaneID, "agent", target.Agent,
+				"messages", batch, "recent_keys", pane.RecentHumanActivity, "typed_text", pane.TypedText.String())
 		}
 		return
 	}
@@ -246,6 +250,14 @@ func (n *idleNudger) warn(step string, target nudgeTarget, err error) {
 	slog.Warn("idle nudge: "+step+" failed", "pane", target.PaneID, "agent", target.Agent, "error", err)
 }
 
+// humanTypingGuardHolds applies the Human Typing Guard: hold while a person's
+// keystrokes are recent, or while their unsent text is on the input line,
+// however long ago they typed it. Unknown typed text leaves the keystroke
+// check to decide alone.
+func humanTypingGuardHolds(s paneNudgeState) bool {
+	return s.RecentHumanActivity || s.TypedText == agent.TypedTextPresent
+}
+
 // recentHumanActivity reports whether a person may be typing in paneID: some
 // attached client showing that pane sent keystrokes less than quiet ago. A
 // time in the future, from clock skew, counts as recent. When the clients
@@ -306,6 +318,11 @@ func productionIdleNudgeDeps(session string, manifest *resilience.SpawnManifest)
 			if err != nil {
 				return paneNudgeState{}, err
 			}
+			// Styled, to tell a person's typed text from preview text.
+			styled, err := tmux.CapturePaneOutputANSIContext(ctx, target.PaneID, tmux.LinesStatusDetection)
+			if err != nil {
+				return paneNudgeState{}, err
+			}
 			clients, clientsErr := tmux.ListClientActivityContext(ctx)
 			if clientsErr != nil {
 				slog.Warn("idle nudge: list tmux clients failed, holding", "pane", target.PaneID, "agent", target.Agent, "error", clientsErr)
@@ -314,6 +331,7 @@ func productionIdleNudgeDeps(session string, manifest *resilience.SpawnManifest)
 				Live:                tmux.PaneAgentProcess(target.Pane).Canonical() == target.AgentType.Canonical(),
 				Idle:                determineAgentState(screen, string(target.AgentType)) == "idle",
 				RecentHumanActivity: recentHumanActivity(clients, target.PaneID, time.Now(), typingQuiet, clientsErr),
+				TypedText:           agent.TypedTextState(styled, agent.AgentType(target.AgentType)),
 			}, nil
 		},
 		Store: func() (idleNudgeStore, error) {

@@ -1623,6 +1623,13 @@ Notes for the run:
 - Attach with a plain `tmux attach -t typetest` in a normal terminal. iTerm2's `tmux -CC` mode sends keys as commands, which tmux doesn't count as typing (see the evidence results above).
 - The monitor log, `~/.local/share/ntm/logs/typetest-monitor.log`, should show one "idle nudge: held, person typing" line and then one "idle nudge: reminder sent" line.
 
+**Result (2026-11-09), passed:** run on rocketman at `32443603`, with agent SilentBridge in pane `%58`.
+- A real tmux client attached through a pty (`tmux attach -t typetest`) typed "abc" and 3 backspaces about every 19 seconds for 2 minutes. The script is `typer.py` in the evidence folder.
+- Mail 12515 was sent at 11:31:14. At 11:31:20 the log said `idle nudge: held, person typing pane=%58 agent=SilentBridge messages=[12515]`, and no reminder was typed while the typing went on.
+- The last keystroke was at about 11:33:08. The reminder appeared at 11:34:22, 74 seconds later, which is the 60-second quiet period plus part of one 30-second poll. The log has one `reminder sent` line, and `told_records` has `12515|idle_nudge` once.
+- **Side issue:** the agent exited at the trust prompt on spawn again (`bd-57xdn`) and was relaunched from the manifest.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop5-sprint3-local-2026-11-09/`.
+
 ---
 
 ## Sprint 4: Hold back for unsent text
@@ -1632,6 +1639,13 @@ Notes for the run:
 **Testable function:** "Leave real text unsent in an idle pane, and see no nudge. Then leave only preview text showing, and see the nudge arrive."
 
 **Evidence check at sprint start (scope Evidence Needed item 3, preview text style):** on your local machine, capture real panes with `tmux capture-pane -e -p` on Claude Code and on Codex. Capture each agent three ways: preview text showing, typed text, and an empty input line. Save them as `internal/agent/testdata/cc_input_typed.ansi`, `cc_input_preview.ansi`, `cc_input_empty.ansi`, and the same with `cod_`. Record the exact SGR codes that tell typed text from preview text for each agent. If an agent shows no reliable difference, that agent returns unknown, and Behavior 21's table for it changes to unknown, as the scope says.
+
+**Evidence results (2026-11-09, rocketman, Claude Code v2.1.319 and Codex GPT-6.1-Sol):** the raw captures and a README are in `/home/debian/Dev/ntm-test-evidence/loop5-sprint4-captures-2026-11-09/`.
+- **Both agents draw preview text dim** (SGR 2, `ESC[2m … ESC[0m`), and a person's typed text with no SGR around it. Claude's post-turn suggestion and its startup placeholder (`Try "fix lint errors"`, each word dimmed separately) are both dim. So is Codex's placeholder, "Ask Codex to do anything".
+- **Claude's input line** is `ESC[39m❯` followed by a no-break space (U+00A0). The prompts echoed in the history above it use `❯` and an ordinary space, on a grey background, so they never look like the input line.
+- **Codex's input line** is `ESC[1m›ESC[0m` and a space. The history's prompts use `ESC[1;2m› ESC[0m`. The input line is the last `›` line on the screen.
+- **Codex has no empty capture.** It shows its placeholder in an empty box at all times, even after text is typed and cleared, and it showed no post-turn suggestion. "Empty" for Codex is the placeholder capture.
+- **Fixtures:** `cc_input_typed`, `cc_input_preview`, `cc_input_empty`, `cc_startup_placeholder`, `cod_input_typed`, `cod_input_preview` and `cod_startup_placeholder` (`.ansi`) are in `internal/agent/testdata`. In those copies the home folder and the project slug have the username replaced with `user`. The tester had already replaced the Agent Mail registration token in the Codex captures with `[REDACTED]`.
 
 **Order of work:** 21 first (on the saved captures), then 23 as the outer test, then 22.
 
@@ -1798,6 +1812,31 @@ As Behavior 22.
 
 **Automated:** `go test -short -run TestClosure_TypedTextHoldsNudge ./internal/cli/` fails first, then passes.
 
+### Build record (2026-11-09)
+
+Base commit `32443603`. Red, then green, for each behavior:
+- **21:** red was "undefined: TypedText". It passed on all 7 captures and 13 synthetic cases. The scrollback property passed with 1,000 checks.
+- **23:** red was "reminder typed over a person's unsent text". The stand-in drew the real typed-text capture, the screen still read as idle, and the reminder was typed onto it. So the test is red at the typed-text guard, not at idle detection.
+- **22:** red was "typed present … sent = true, want false".
+
+Verification:
+- The seven closure tests (Sprints 1 to 3's six plus `TestClosure_TypedTextHoldsNudge`) passed 5 times in a row: `ok internal/cli 368s`. `TestTypedTextState` passed with 100 rapid checks.
+- **The full suite found one new failure, now fixed.** `TestNoNewPlaceholders` flagged the word "placeholder" in a comment in `input_line.go`, because the repo's stub scanner bans it. The comment now says "hint text in an empty box", and the test passes. No allowlist entry was added.
+- Apart from that, `go test -short ./...` shows only the 7 known failures from bd-5zbcm.
+- The build, `go vet` and the tamper check against `32443603` are clean. `gofmt -l` flags only the 3 files that were already flagged.
+- golangci-lint, goimports, ubs and rch aren't installed here, so they weren't run.
+
+Where the build differs from the plan:
+- **`TypedTextState` takes an `agent.AgentType`,** not a string, and canonicalizes it, so `claude` and `cc` both work.
+- **No existing SGR parser fit.** `internal/agent` only strips ANSI codes. `input_line.go` has a small reader that keeps one thing, whether each character is dim. It:
+  - carries the dim state across lines, because tmux may not repeat a style at the start of the next line;
+  - skips color parameters whole (`38;2;r;g;b`, `38;5;n`), because the Codex status line uses 24-bit colors whose `2` isn't dim;
+  - treats `22` as the end of dim.
+- **A Codex "empty" row is the placeholder capture,** because Codex has no empty box without one. The evidence results above give the reason.
+- **Behavior 22's property checks all 12 input combinations** instead of a random sample. A rapid run built a database per check and took 25 seconds, and the full set is stronger.
+- **The poll captures the pane twice,** plain for idle detection, as before, and styled for typed text. Idle detection is left unchanged, and both captures run after the fetch, just before the claim.
+- **The "held" log line names its reason,** with `recent_keys` and `typed_text` fields. It's still logged once per batch.
+
 ### Human test script
 
 1. Create a session with one of each: `/tmp/ntm-loop5 spawn drafttest --cc=1 --cod=1`, and wait for both to be idle.
@@ -1810,6 +1849,10 @@ As Behavior 22.
 8. Detach and wait about a minute.
 9. Pass: the reminder arrives, and the preview text wasn't sent as part of it.
 10. Repeat steps 2 to 9 on the Codex pane. If evidence showed Codex has no style difference, step 6 is expected to fail on that pane, and you should record that instead.
+
+Notes for the run:
+- The evidence showed both agents have a style difference, so step 6 should pass on Codex too. On Codex, step 7's "preview text" is its "Ask Codex to do anything" placeholder, which shows as soon as the box is cleared.
+- The monitor log, `~/.local/share/ntm/logs/drafttest-monitor.log`, should show "idle nudge: held, person typing" with `typed_text=present recent_keys=false` while your text waits, and then "idle nudge: reminder sent".
 
 ---
 
