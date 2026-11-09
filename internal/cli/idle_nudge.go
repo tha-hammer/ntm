@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -55,11 +56,13 @@ type idleNudgeDeps struct {
 	Now        func() time.Time
 }
 
-// idleNudger runs the poll and remembers, between polls, which panes it has
-// already logged as having no agent running, so each is logged once.
+// idleNudger runs the poll and remembers what it has already logged between
+// polls, so a state that lasts, such as a pane with no agent or a session with
+// no registry yet, is logged once rather than every poll.
 type idleNudger struct {
-	deps    idleNudgeDeps
-	notLive map[string]bool
+	deps           idleNudgeDeps
+	notLive        map[string]bool
+	lastTargetsErr string
 }
 
 func newIdleNudger(deps idleNudgeDeps) *idleNudger {
@@ -93,9 +96,13 @@ func runIdleNudgeLoop(ctx context.Context, interval time.Duration, newTicker idl
 func (n *idleNudger) poll(ctx context.Context) {
 	targets, err := n.deps.Targets(ctx)
 	if err != nil {
-		slog.Warn("idle nudge: list agents failed", "error", err)
+		if err.Error() != n.lastTargetsErr {
+			n.lastTargetsErr = err.Error()
+			slog.Warn("idle nudge: list agents failed", "error", err)
+		}
 		return
 	}
+	n.lastTargetsErr = ""
 	for _, target := range targets {
 		if ctx.Err() != nil {
 			return
@@ -232,11 +239,15 @@ func productionIdleNudgeDeps(session string, manifest *resilience.SpawnManifest)
 			if err != nil {
 				return nil, fmt.Errorf("list panes: %w", err)
 			}
+			// Read on every poll, so agents added while the monitor runs are found.
 			registry, err := agentmail.LoadBestSessionAgentRegistry(session, projectKey)
 			if err != nil {
 				return nil, fmt.Errorf("load agent registry: %w", err)
 			}
-			return manifestNudgeTargets(manifest, registry, panes), nil
+			if registry == nil {
+				return nil, errNoAgentRegistry
+			}
+			return nudgeTargets(registry, panes), nil
 		},
 		Fetch: func(ctx context.Context, agent string) ([]agentmail.InboxMessage, error) {
 			ctx, cancel := context.WithTimeout(ctx, idleNudgeFetchTimeout)
@@ -270,18 +281,24 @@ func productionIdleNudgeDeps(session string, manifest *resilience.SpawnManifest)
 	}
 }
 
-// manifestNudgeTargets lists the manifest's agents that still have a pane and
-// a name in the session's agent registry.
-func manifestNudgeTargets(manifest *resilience.SpawnManifest, registry *agentmail.SessionAgentRegistry, panes []tmux.Pane) []nudgeTarget {
-	byID := make(map[string]tmux.Pane, len(panes))
-	for _, pane := range panes {
-		byID[pane.ID] = pane
-	}
+// errNoAgentRegistry means the session has no agent registry yet, so no agent
+// has a name to fetch mail for.
+var errNoAgentRegistry = errors.New("session has no agent registry yet")
+
+// nudgeableAgentTypes are the agents whose input line takes a pasted prompt and
+// whose idle screen ntm recognizes.
+var nudgeableAgentTypes = map[tmux.AgentType]bool{tmux.AgentClaude: true, tmux.AgentCodex: true}
+
+// nudgeTargets joins the registry's pane IDs with the session's live panes.
+// The registry, not the spawn manifest, is the source, because ntm add records
+// added agents there and not in the manifest. Matching by pane ID means a
+// reminder reaches exactly the agent it names. A pane's type is the one ntm set
+// on it (@ntm_type, or its title).
+func nudgeTargets(registry *agentmail.SessionAgentRegistry, panes []tmux.Pane) []nudgeTarget {
 	var targets []nudgeTarget
-	for _, agentCfg := range manifest.Agents {
-		pane, ok := byID[agentCfg.PaneID]
-		name := registry.PaneIDMap[agentCfg.PaneID]
-		if !ok || name == "" {
+	for _, pane := range panes {
+		name := registry.PaneIDMap[pane.ID]
+		if name == "" || !nudgeableAgentTypes[pane.Type.Canonical()] {
 			continue
 		}
 		targets = append(targets, nudgeTarget{PaneID: pane.ID, AgentType: pane.Type, Agent: name, Pane: pane})

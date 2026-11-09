@@ -437,6 +437,138 @@ func TestClosure_ShellPaneNeverTyped(t *testing.T) {
 	}
 }
 
+// Loop 5, Behavior 13: an agent added with ntm add while the monitor runs is
+// nudged, with no monitor restart, and the first agent gets nothing.
+func TestClosure_AddedAgentNudged(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	agents := env.screenAgentConfig(t, mail, "")
+	firstPID, _ := spawnNudgeAgent(t, env, agents, "addnudge")
+	env.startMonitor(t, "addnudge")
+
+	env.run(t, "execute", "add", "addnudge", "--cc=1")
+	started := agents.waitStarted(t, 2, 20*time.Second)
+	addedPID := started[1]
+	agents.setScreen(t, addedPID, "cc_idle.txt")
+	added := agents.agentEnv(t, addedPID, "AGENT_NAME")
+	mail.addMessage(added, agentmail.InboxMessage{ID: 91, From: "RedStone", Subject: "added nudge"})
+
+	if got := agents.waitTyped(t, addedPID, "added nudge", 15*time.Second); !strings.Contains(got, fmt.Sprintf("agent_name %q", added)) {
+		t.Fatalf("added agent typed = %q", got)
+	}
+	if got := agents.typed(t, firstPID); strings.Contains(got, "new message") {
+		t.Fatalf("the first agent got a reminder: %q", got)
+	}
+}
+
+func testRegistry(paneAgents map[string]string) *agentmail.SessionAgentRegistry {
+	return &agentmail.SessionAgentRegistry{PaneIDMap: paneAgents, Agents: map[string]string{}}
+}
+
+// Loop 5, Behavior 14: targets come from the registry, each agent matched to
+// its own pane by pane ID.
+func TestNudgeTargets(t *testing.T) {
+	registry := testRegistry(map[string]string{"%1": "BlueLake", "%2": "GreenCastle"})
+	panes := []tmux.Pane{
+		{ID: "%2", Type: tmux.AgentCodex, Command: "codex"},
+		{ID: "%1", Type: tmux.AgentClaude, Command: "claude"},
+	}
+	got := nudgeTargets(registry, panes)
+	if len(got) != 2 {
+		t.Fatalf("targets = %+v", got)
+	}
+	for _, target := range got {
+		if registry.PaneIDMap[target.PaneID] != target.Agent || target.Pane.ID != target.PaneID {
+			t.Fatalf("target %+v matched the wrong pane", target)
+		}
+	}
+	// A title-keyed entry with no pane ID entry isn't used: titles can repeat.
+	registry.Agents["proj__cc_3"] = "RedStone"
+	if got := nudgeTargets(registry, append(panes, tmux.Pane{ID: "%3", Title: "proj__cc_3", Type: tmux.AgentClaude})); len(got) != 2 {
+		t.Fatalf("a title-only entry became a target: %+v", got)
+	}
+}
+
+// Behavior 14 property: however the pane list is ordered, each target's name
+// is the registry's name for its pane.
+func TestNudgeTargets_ShuffleProperty(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		count := rapid.IntRange(1, 6).Draw(rt, "agents")
+		registry := testRegistry(map[string]string{})
+		var panes []tmux.Pane
+		for i := 0; i < count; i++ {
+			id := fmt.Sprintf("%%%d", i)
+			registry.PaneIDMap[id] = fmt.Sprintf("Agent%d", i)
+			panes = append(panes, tmux.Pane{ID: id, Type: tmux.AgentClaude})
+		}
+		shuffled := rapid.Permutation(panes).Draw(rt, "order")
+		got := nudgeTargets(registry, shuffled)
+		if len(got) != count {
+			rt.Fatalf("targets = %d, want %d", len(got), count)
+		}
+		for _, target := range got {
+			if registry.PaneIDMap[target.PaneID] != target.Agent {
+				rt.Fatalf("target %+v has another pane's name", target)
+			}
+		}
+	})
+}
+
+// Loop 5, Behavior 15: a registry entry whose pane is gone is skipped.
+func TestNudgeTargets_MissingPaneSkipped(t *testing.T) {
+	registry := testRegistry(map[string]string{"%1": "BlueLake", "%9": "Gone"})
+	got := nudgeTargets(registry, []tmux.Pane{{ID: "%1", Type: tmux.AgentClaude}})
+	if len(got) != 1 || got[0].Agent != "BlueLake" {
+		t.Fatalf("targets = %+v", got)
+	}
+}
+
+// Behavior 15: a session with no registry yet gives no targets and an error
+// the poll logs once, not on every poll, until the registry appears.
+func TestIdleNudgePoll_MissingRegistryLogsOnce(t *testing.T) {
+	logs := captureNudgeLogs(t)
+	fake := newFakeNudge(t)
+	fake.addUnread("BlueLake", 71, "first")
+	fake.failStep["targets"] = errNoAgentRegistry
+	nudger := fake.nudger()
+	for i := 0; i < 3; i++ {
+		nudger.poll(context.Background())
+	}
+	if n := strings.Count(logs.String(), errNoAgentRegistry.Error()); n != 1 {
+		t.Fatalf("logged %d times, want 1:\n%s", n, logs.String())
+	}
+	if fake.count("fetch") != 0 {
+		t.Fatalf("fetched without targets: %v", fake.calls)
+	}
+	delete(fake.failStep, "targets")
+	nudger.poll(context.Background())
+	if fake.count("send") != 1 {
+		t.Fatalf("after the registry appeared: %v", fake.calls)
+	}
+}
+
+// Loop 5, Behavior 16: only Claude and Codex panes are nudged, by the type
+// ntm set on the pane.
+func TestNudgeTargets_AgentTypes(t *testing.T) {
+	registry := testRegistry(map[string]string{"%1": "A", "%2": "B", "%3": "C", "%4": "D", "%5": "E"})
+	panes := []tmux.Pane{
+		{ID: "%1", Type: tmux.AgentClaude},
+		{ID: "%2", Type: tmux.AgentCodex},
+		{ID: "%3", Type: tmux.AgentGemini},
+		{ID: "%4", Type: tmux.AgentOllama},
+		{ID: "%5", Type: tmux.AgentUser},
+	}
+	var names []string
+	for _, target := range nudgeTargets(registry, panes) {
+		names = append(names, target.Agent)
+	}
+	sort.Strings(names)
+	if !slices.Equal(names, []string{"A", "B"}) {
+		t.Fatalf("targets = %v, want only the Claude and Codex panes", names)
+	}
+}
+
 // fakeNudge is an idle nudger over fakes, with a real state store on a temp
 // file. It records each dependency call in order, such as "fetch BlueLake",
 // "state %1", "claim 71", "record 71", "send %1" and "release 71".

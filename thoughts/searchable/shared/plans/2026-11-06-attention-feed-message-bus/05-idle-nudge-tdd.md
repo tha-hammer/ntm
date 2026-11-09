@@ -1328,6 +1328,24 @@ var nudgeableAgentTypes = map[tmux.AgentType]bool{tmux.AgentClaude: true, tmux.A
 
 **Automated:** `go test -short -run TestNudgeTargets_AgentTypes ./internal/cli/` fails first, then passes.
 
+### Build record (2026-11-09)
+
+Base commit `f12747a9`. Red, then green, for each behavior:
+- **13:** red was "no "added nudge" typed within 15s", because Sprint 1 listed agents from the manifest, which `ntm add` doesn't update. That run is also the red-at-seam proof.
+- **14, 15, 16:** red was "undefined: nudgeTargets" and "undefined: errNoAgentRegistry". The shuffle property passed.
+
+Where the build differs from the plan:
+- **A Sprint 1 bug, fixed here.** `manifestNudgeTargets` read `registry.PaneIDMap` without checking for a nil registry. `LoadBestSessionAgentRegistry` returns no registry and no error when the file is missing, so a monitor polling a session with no registry yet would have panicked. The `Targets` dependency now returns `errNoAgentRegistry` in that case. `manifestNudgeTargets` is replaced by `nudgeTargets`.
+- **Failures listing agents are logged once per distinct error, until listing works again.** This covers a missing registry and an unreadable one with one rule, `idleNudger.lastTargetsErr`, not a separate sentinel check.
+- **`nudgeTargets` walks the live panes, not the registry map,** so its order follows tmux and a registry entry with no pane is simply never reached.
+
+Verification:
+- The five closure tests (Sprint 1's four plus `TestClosure_AddedAgentNudged`) passed 5 times in a row: `ok internal/cli 253s`.
+- `go test -short ./...` shows only the 7 known failures from bd-5zbcm, and no new ones.
+- `go build ./cmd/ntm` and `go vet ./internal/cli/` pass. `gofmt -l` flags only the 3 files that were already flagged before this loop.
+- The tamper check against `f12747a9` is clean.
+- golangci-lint, goimports, ubs and rch aren't installed here, so they weren't run.
+
 ### Human test script
 
 1. Create a session: `/tmp/ntm-loop5 spawn addnudge --cc=1`.
