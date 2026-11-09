@@ -2069,6 +2069,17 @@ Verification:
 8. Remove the setting, kill the session and spawn again, then repeat steps 2 to 4.
 9. Pass: the reminder appears.
 
+**Result (2026-11-09), passed:** run on rocketman at `d89bb6a8`.
+- **Off:**
+  - The manifest had `"idle_nudge_disabled": true`. Mail 12518 was sent to RoseFinch at 16:53:19.
+  - Two minutes later the pane had no reminder, the monitor log had no "idle nudge:" lines, and there was no told record.
+  - After "say hi", the turn ended with Stop hook feedback "You have 1 new message … no nudge", and `told_records` has `12518|stop_hook`.
+- **On:**
+  - The config was restored (same checksum) and the session respawned. The manifest has no `idle_nudge` key, which reads as on.
+  - Mail 12519 to DarkBay at 16:57:14 gave `16:57:33 INFO idle nudge: reminder sent pane=%68 agent=DarkBay messages=[12519]`.
+- **Bug found, filed as `bd-w26rs` (P1, related to `bd-57xdn`) by your choice to bead it and close Loop 5:** spawn's first prompt, "register with agent mail. use <name> for your name", is often left typed but unsent in Claude's input box. It was seen in addnudge, both nonudge spawns, and earlier sessions. It was probably typed while Claude was still starting, or during the trust prompt, so the Enter was lost. With Sprint 4's typed-text hold, that leftover text holds the idle nudge for that agent forever. The tester cleared it by hand before the last step.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop5-sprint5-local-2026-11-09/`.
+
 ---
 
 ## Sprint verification (every sprint)
