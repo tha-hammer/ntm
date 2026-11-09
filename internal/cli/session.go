@@ -1778,14 +1778,16 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// isMonitorAlive checks whether the resilience monitor process is running
-// for the given session by looking for the "internal-monitor <session>" process.
+// monitorProcessPatternForExecutable matches the "<binary> internal-monitor
+// <session>" command line. It is an extended regular expression for pgrep -f
+// and pkill -f, which reject Go's (?:...) groups (bd-ndisv). QuoteMeta's
+// escapes are valid there too.
 func monitorProcessPatternForExecutable(executablePath, session string) string {
 	execName := strings.TrimSpace(filepath.Base(executablePath))
 	if execName == "" {
 		execName = "ntm"
 	}
-	return `(?:^|[[:space:]])(?:[^[:space:]]*/)?` + regexp.QuoteMeta(execName) + `[[:space:]]+internal-monitor[[:space:]]+` + regexp.QuoteMeta(session) + `(?:[[:space:]]|$)`
+	return `(^|[[:space:]])([^[:space:]]*/)?` + regexp.QuoteMeta(execName) + `[[:space:]]+internal-monitor[[:space:]]+` + regexp.QuoteMeta(session) + `([[:space:]]|$)`
 }
 
 func monitorProcessPattern(session string) string {
@@ -1796,6 +1798,8 @@ func monitorProcessPattern(session string) string {
 	return monitorProcessPatternForExecutable(executablePath, session)
 }
 
+// isMonitorAlive checks whether the resilience monitor process is running
+// for the given session by looking for the "internal-monitor <session>" process.
 func isMonitorAlive(session string) bool {
 	// Use an anchored regex pattern to avoid false positives from processes
 	// whose paths or arguments happen to contain "ntm". The pattern matches

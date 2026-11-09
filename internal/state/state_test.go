@@ -2711,6 +2711,112 @@ func TestClaimToldRecord_DistinctKeysAndBadInput(t *testing.T) {
 	}
 }
 
+// Loop 5, Behavior 10: a release removes only the same writer's claim from the
+// same moment, so a failed nudge can be retried without undoing the hook's
+// claim or an earlier one.
+func TestReleaseToldRecord_OnlyOwnClaim(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	t0 := time.Now().UTC().Truncate(time.Second)
+	hook := toldRecord("/p", "BlueLake", 1, t0)
+	hook.ToldBy = ToldByStopHook
+	nudge := toldRecord("/p", "BlueLake", 2, t0)
+	nudge.ToldBy = ToldByIdleNudge
+	for _, rec := range []ToldRecord{hook, nudge} {
+		if won, err := store.ClaimToldRecord(rec); err != nil || !won {
+			t.Fatalf("claim %+v: won %v, err %v", rec, won, err)
+		}
+	}
+
+	notMine := hook
+	notMine.ToldBy = ToldByIdleNudge
+	if err := store.ReleaseToldRecord(notMine); err != nil {
+		t.Fatal(err)
+	}
+	if won, _ := store.ClaimToldRecord(hook); won {
+		t.Fatal("released the hook's claim")
+	}
+
+	earlier := nudge
+	earlier.ToldAt = t0.Add(-time.Minute)
+	if err := store.ReleaseToldRecord(earlier); err != nil {
+		t.Fatal(err)
+	}
+	if won, _ := store.ClaimToldRecord(nudge); won {
+		t.Fatal("a release from another moment removed the claim")
+	}
+
+	if err := store.ReleaseToldRecord(nudge); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.ClaimToldRecord(nudge); err != nil || !won {
+		t.Fatalf("own claim not released: won %v, err %v", won, err)
+	}
+	missing := toldRecord("/p", "BlueLake", 99, t0)
+	if err := store.ReleaseToldRecord(missing); err != nil {
+		t.Fatalf("releasing a record that doesn't exist: %v", err)
+	}
+}
+
+// Behavior 10 property: after any sequence of claims and releases by the two
+// writers, a message is held exactly when its last winning claim wasn't
+// released by the same writer at the same moment.
+func TestReleaseToldRecord_Property(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		store := testRuntimeAttentionStore(t)
+		t0 := time.Now().UTC().Truncate(time.Second)
+		type held struct {
+			by string
+			at time.Time
+		}
+		model := map[int64]*held{}
+		steps := rapid.IntRange(1, 20).Draw(rt, "steps")
+		for i := 0; i < steps; i++ {
+			rec := toldRecord("/p", "BlueLake", int64(rapid.IntRange(1, 3).Draw(rt, "message")), t0.Add(time.Duration(rapid.IntRange(0, 2).Draw(rt, "minute"))*time.Minute))
+			rec.ToldBy = rapid.SampledFrom([]string{ToldByStopHook, ToldByIdleNudge}).Draw(rt, "by")
+			if rapid.Bool().Draw(rt, "release") {
+				if err := store.ReleaseToldRecord(rec); err != nil {
+					rt.Fatal(err)
+				}
+				if h := model[rec.MessageID]; h != nil && h.by == rec.ToldBy && h.at.Equal(rec.ToldAt) {
+					model[rec.MessageID] = nil
+				}
+				continue
+			}
+			won, err := store.ClaimToldRecord(rec)
+			if err != nil {
+				rt.Fatal(err)
+			}
+			if wantWin := model[rec.MessageID] == nil; won != wantWin {
+				rt.Fatalf("claim %+v won %v, model says %v", rec, won, wantWin)
+			}
+			if won {
+				model[rec.MessageID] = &held{by: rec.ToldBy, at: rec.ToldAt}
+			}
+		}
+	})
+}
+
+func TestGetToldRecord(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	rec := toldRecord("/one", "BlueLake", 42, now)
+	rec.ToldBy = ToldByIdleNudge
+	if won, err := store.ClaimToldRecord(rec); err != nil || !won {
+		t.Fatalf("claim: won %v, err %v", won, err)
+	}
+
+	got, err := store.GetToldRecord("/one", "bluelake", 42) // names compare without case
+	if err != nil || got == nil {
+		t.Fatalf("get: %+v, %v", got, err)
+	}
+	if got.ToldBy != ToldByIdleNudge || !got.ToldAt.Equal(now) || got.AgentName != "BlueLake" {
+		t.Fatalf("got %+v, want told_by %q at %s", got, ToldByIdleNudge, now)
+	}
+	if missing, err := store.GetToldRecord("/one", "BlueLake", 43); err != nil || missing != nil {
+		t.Fatalf("untold message: %+v, %v", missing, err)
+	}
+}
+
 func TestRunGC_RemovesOldToldRecords(t *testing.T) {
 	store := testRuntimeAttentionStore(t)
 	now := time.Now().UTC()

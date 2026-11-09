@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestManifestDir_WithXDGDataHome(t *testing.T) {
@@ -43,6 +44,35 @@ func TestLogDir_WithoutXDGDataHome(t *testing.T) {
 	dir := LogDir()
 	if !strings.HasSuffix(dir, filepath.Join("ntm", "logs")) {
 		t.Errorf("LogDir() = %q, want suffix ntm/logs", dir)
+	}
+}
+
+// Loop 5, Behavior 12: the idle nudge's interval is frozen at spawn. A manifest
+// saved before the field existed, or with 0 or less, means 30 seconds.
+func TestSpawnManifest_IdleNudgeInterval(t *testing.T) {
+	cases := map[int]time.Duration{0: 30 * time.Second, 1: time.Second, -5: 30 * time.Second, 45: 45 * time.Second}
+	for seconds, want := range cases {
+		m := &SpawnManifest{IdleNudgeIntervalSeconds: seconds}
+		if got := m.IdleNudgeInterval(); got != want {
+			t.Errorf("IdleNudgeInterval() with %d = %s, want %s", seconds, got, want)
+		}
+	}
+
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	if err := SaveManifest(&SpawnManifest{Session: "nudge-interval", IdleNudgeIntervalSeconds: 2}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadManifest("nudge-interval")
+	if err != nil || loaded.IdleNudgeInterval() != 2*time.Second {
+		t.Fatalf("round trip: %+v, %v", loaded, err)
+	}
+
+	old := filepath.Join(ManifestDir(), "old-manifest.json")
+	if err := os.WriteFile(old, []byte(`{"session":"old-manifest","project_dir":"/p","agents":[],"auto_restart":false,"reap_orphans_on_exit":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := LoadManifest("old-manifest"); err != nil || loaded.IdleNudgeInterval() != 30*time.Second {
+		t.Fatalf("old manifest: %+v, %v", loaded, err)
 	}
 }
 

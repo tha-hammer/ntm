@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
@@ -41,6 +43,16 @@ type SpawnManifest struct {
 	// deliberate fail-safe default for a destructive policy rather than a
 	// compatibility shim.
 	ReapOrphansOnExit bool `json:"reap_orphans_on_exit"`
+	// IdleNudgeIntervalSeconds is the idle nudge's poll interval, frozen at
+	// spawn for the same reason. Zero, as in a manifest saved before the field
+	// existed, means the default.
+	IdleNudgeIntervalSeconds int `json:"idle_nudge_interval_seconds,omitempty"`
+}
+
+// IdleNudgeInterval returns the frozen idle nudge interval, or the default
+// when it isn't positive.
+func (m *SpawnManifest) IdleNudgeInterval() time.Duration {
+	return config.AgentMailConfig{IdleNudgeIntervalSeconds: m.IdleNudgeIntervalSeconds}.IdleNudgeInterval()
 }
 
 // AgentConfig represents the configuration for a single agent

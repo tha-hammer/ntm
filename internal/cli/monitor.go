@@ -153,6 +153,13 @@ func runMonitor(session string) error {
 
 	monitor.Start(ctx)
 
+	// Remind idle agents about new mail. It stops with ctx and doesn't touch
+	// the resilience monitor's crash handling.
+	if cfg != nil && cfg.AgentMail.Enabled {
+		nudger := newIdleNudger(productionIdleNudgeDeps(session, manifest))
+		go runIdleNudgeLoop(ctx, manifest.IdleNudgeInterval(), timeIdleNudgeTicker, nudger)
+	}
+
 	// Initialize archiver for background CASS capture
 	archiverOpts := archive.DefaultArchiverOptions(session)
 	archiver, err := archive.NewArchiver(archiverOpts)

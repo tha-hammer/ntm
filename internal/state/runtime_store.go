@@ -2259,6 +2259,15 @@ const ToldRecordRetention = 7 * 24 * time.Hour
 // ToldByStopHook is the told_by value for the turn-end Stop hook.
 const ToldByStopHook = "stop_hook"
 
+// ToldByIdleNudge is the told_by value for the monitor's idle nudge.
+const ToldByIdleNudge = "idle_nudge"
+
+// toldAtText is how told_at is stored. Claims and releases must agree on it,
+// because a release matches the claim's moment exactly.
+func toldAtText(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
+}
+
 // ToldRecord says an agent was told about one Agent Mail message.
 type ToldRecord struct {
 	ProjectKey string
@@ -2292,9 +2301,52 @@ func (s *Store) ClaimToldRecord(rec ToldRecord) (bool, error) {
 			told_by = excluded.told_by,
 			told_at = excluded.told_at
 		WHERE told_records.told_at < ?`,
-		rec.ProjectKey, agent, rec.MessageID, rec.ToldBy, toldAt.Format(time.RFC3339), cutoff.Format(time.RFC3339))
+		rec.ProjectKey, agent, rec.MessageID, rec.ToldBy, toldAtText(toldAt), toldAtText(cutoff))
 	won, err := rowsAffected(result, err, "claim told record")
 	return won == 1, err
+}
+
+// ReleaseToldRecord deletes a claim made by the same writer at the same moment,
+// so a reminder that failed to reach the agent can be tried again. Another
+// writer's claim, or one from another moment, stays. A missing record is not
+// an error.
+func (s *Store) ReleaseToldRecord(rec ToldRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		DELETE FROM told_records
+		WHERE project_key = ? AND agent_name = ? AND message_id = ? AND told_by = ? AND told_at = ?`,
+		rec.ProjectKey, strings.TrimSpace(rec.AgentName), rec.MessageID, rec.ToldBy, toldAtText(rec.ToldAt))
+	if err != nil {
+		return fmt.Errorf("release told record: %w", err)
+	}
+	return nil
+}
+
+// GetToldRecord returns the told record for one message, with the agent
+// compared without case, or nil when the agent wasn't told about it.
+func (s *Store) GetToldRecord(projectKey, agentName string, messageID int64) (*ToldRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rec := ToldRecord{}
+	var toldAt string
+	err := s.db.QueryRow(`
+		SELECT project_key, agent_name, message_id, told_by, told_at FROM told_records
+		WHERE project_key = ? AND agent_name = ? AND message_id = ?`,
+		projectKey, strings.TrimSpace(agentName), messageID,
+	).Scan(&rec.ProjectKey, &rec.AgentName, &rec.MessageID, &rec.ToldBy, &toldAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get told record: %w", err)
+	}
+	if rec.ToldAt, err = time.Parse(time.RFC3339, toldAt); err != nil {
+		return nil, fmt.Errorf("get told record: parse told_at %q: %w", toldAt, err)
+	}
+	return &rec, nil
 }
 
 // GCExpiredToldRecords deletes told records past retention and returns how many.

@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -2238,12 +2237,8 @@ func runKill(w io.Writer, session string, force bool, tags []string, noHooks boo
 	}
 	orphanCandidates := collectPaneDescendants(panePIDs)
 
-	// Kill the monitor process before destroying the session
-	if output, err := exec.Command("pkill", "-f", monitorProcessPattern(session)).CombinedOutput(); err != nil {
-		// Monitor may not be running — that's fine
-		_ = output
-	}
-
+	// The monitor isn't killed here. It sees the session end, deletes the
+	// manifest, finalizes memory samples and exits by itself (bd-ndisv).
 	if err := tmux.KillSession(session); err != nil {
 		return err
 	}
@@ -2769,11 +2764,8 @@ func buildKillResponse(session string, force bool, tags []string, noHooks bool, 
 		// Finalize timeline persistence before killing the session
 		_ = state.EndSessionTimeline(session) // Ignore error - not critical
 
-		// Kill the monitor process before destroying the session (same as runKill)
-		if output, err := exec.Command("pkill", "-f", monitorProcessPattern(session)).CombinedOutput(); err != nil {
-			_ = output // Monitor may not be running — that's fine
-		}
-
+		// As in runKill, the monitor is left to see the session end and clean
+		// up by itself (bd-ndisv).
 		if err := tmux.KillSession(session); err != nil {
 			return nil, err
 		}

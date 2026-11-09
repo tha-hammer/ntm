@@ -29,6 +29,13 @@ func ShouldStartInternalMonitor() bool {
 	return true
 }
 
+// ShouldSaveSpawnManifest reports whether spawn writes the session manifest.
+// Unlike ShouldStartInternalMonitor, it holds under go test, so tests can run
+// the monitor themselves on the manifest spawn wrote.
+func ShouldSaveSpawnManifest() bool {
+	return os.Getenv("NTM_DISABLE_INTERNAL_MONITOR") == ""
+}
+
 // CurrentExecutablePath resolves and validates the absolute path to the
 // currently running ntm binary, so a detached child (the internal-monitor
 // process) can be launched via the same executable regardless of how ntm

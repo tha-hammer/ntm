@@ -6,9 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +24,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/worktrees"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
+	"pgregory.net/rapid"
 )
 
 // TestSpawnMemoryEstimateCounts_FromAgentsSlice covers Behavior 7 of the
@@ -195,6 +199,156 @@ func TestMonitorProcessPattern_MatchesExactSessionOnly(t *testing.T) {
 	}
 	if pattern.MatchString("/usr/local/bin/ntm-dev2 internal-monitor proj") {
 		t.Fatal("expected prefix-sharing executable name not to match")
+	}
+}
+
+// Loop 5, Behavior 12: buildSpawnManifest freezes the idle nudge's interval.
+func TestBuildSpawnManifest_FreezesIdleNudgeInterval(t *testing.T) {
+	cfg := config.Default()
+	cfg.AgentMail.IdleNudgeIntervalSeconds = 7
+	manifest := buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil)
+	if manifest.IdleNudgeIntervalSeconds != 7 || manifest.IdleNudgeInterval() != 7*time.Second {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+	cfg.AgentMail.IdleNudgeIntervalSeconds = 0
+	if got := buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).IdleNudgeInterval(); got != 30*time.Second {
+		t.Fatalf("default interval = %s, want 30s", got)
+	}
+}
+
+// Loop 5, Behavior 12: spawn saves the manifest even when it doesn't launch the
+// monitor, so a monitor started later, as in these tests, reads it.
+func TestClosure_SpawnSavesManifestWithoutLaunchingMonitor(t *testing.T) {
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "\n[agent_mail]\nidle_nudge_interval_seconds = 3\n")
+	gitInitForTest(t, env.projectDir("manifesttest"))
+	env.run(t, "execute", "spawn", "manifesttest", "--cc=1")
+	capture.waitForAgents(t, 1, 20*time.Second)
+
+	t.Setenv("XDG_DATA_HOME", env.dataDir())
+	manifest, err := resilience.LoadManifest("manifesttest")
+	if err != nil {
+		t.Fatalf("no manifest after spawn: %v", err)
+	}
+	if len(manifest.Agents) != 1 || manifest.IdleNudgeInterval() != 3*time.Second || manifest.ProjectDir != env.projectDir("manifesttest") {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+	if isMonitorAlive("manifesttest") {
+		t.Fatal("spawn launched a monitor from a test binary")
+	}
+}
+
+// startFakeMonitor starts this test binary with the command line
+// "<binary> internal-monitor <session>". It only sleeps, so pgrep and pkill
+// see exactly what they see for a real monitor.
+func startFakeMonitor(t *testing.T, session string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "internal-monitor", session)
+	cmd.Env = append(os.Environ(), closureHelperModeEnv+"=sleep")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fake monitor: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	fakeMonitorExits.Store(cmd, exited)
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-exited
+	})
+	return cmd
+}
+
+// fakeMonitorExits maps a fake monitor to the channel closed when it exits.
+var fakeMonitorExits sync.Map
+
+func fakeMonitorExited(cmd *exec.Cmd, within time.Duration) bool {
+	value, _ := fakeMonitorExits.Load(cmd)
+	select {
+	case <-value.(chan struct{}):
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
+
+// Behavior 1 (bd-ndisv): the monitor's pattern works with the real pgrep and
+// pkill, which reject the (?:...) groups Go's regexp accepts.
+func TestMonitorPattern_RealPgrep(t *testing.T) {
+	for _, tool := range []string{"pgrep", "pkill"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Fatalf("%s is required: %v", tool, err)
+		}
+	}
+	session := fmt.Sprintf("mon-test-%d", os.Getpid())
+	proc := startFakeMonitor(t, session)
+	deadline := time.Now().Add(2 * time.Second)
+	for !isMonitorAlive(session) {
+		if time.Now().After(deadline) {
+			t.Fatal("isMonitorAlive = false with the monitor running")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, other := range []string{session + "-2", "mon-test-" + strconv.Itoa(os.Getpid()+1), "mon"} {
+		if isMonitorAlive(other) {
+			t.Fatalf("isMonitorAlive(%q) matched the monitor for %q", other, session)
+		}
+	}
+	if err := killExistingMonitorProcess(session); err != nil {
+		t.Fatalf("killExistingMonitorProcess: %v", err)
+	}
+	if !fakeMonitorExited(proc, 2*time.Second) {
+		t.Fatal("the monitor is still running after killExistingMonitorProcess")
+	}
+}
+
+// Behavior 1 property: for any valid session names s and t, the real pgrep
+// finds a monitor for s with s's pattern and not with t's.
+func TestMonitorPattern_RealPgrepProperty(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		name := rapid.StringMatching(`[a-zA-Z0-9][a-zA-Z0-9_-]{0,19}`)
+		s := name.Draw(rt, "s")
+		other := name.Filter(func(v string) bool { return v != s }).Draw(rt, "t")
+		proc := startFakeMonitor(t, s)
+		defer func() { _ = proc.Process.Kill() }()
+		pattern := monitorProcessPattern(s)
+		found := false
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if out, _ := exec.Command("pgrep", "-f", pattern).Output(); strings.Contains(string(out), strconv.Itoa(proc.Process.Pid)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			rt.Fatalf("pgrep with the pattern for %q didn't find its monitor", s)
+		}
+		if out, _ := exec.Command("pgrep", "-f", monitorProcessPattern(other)).Output(); strings.Contains(string(out), strconv.Itoa(proc.Process.Pid)) {
+			rt.Fatalf("the pattern for %q found the monitor for %q", other, s)
+		}
+	})
+}
+
+// Behavior 1 (bd-ndisv): ntm kill leaves the monitor alone. The monitor sees
+// the session end, cleans up and exits by itself.
+func TestClosure_KillLeavesMonitorToItself(t *testing.T) {
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	gitInitForTest(t, env.projectDir("killtest"))
+	env.run(t, "execute", "spawn", "killtest", "--cc=1")
+	capture.waitForAgents(t, 1, 20*time.Second)
+	proc := startFakeMonitor(t, "killtest")
+	for deadline := time.Now().Add(2 * time.Second); !isMonitorAlive("killtest"); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("isMonitorAlive = false with the monitor running")
+		}
+	}
+	env.run(t, "execute", "kill", "killtest", "--force")
+	if fakeMonitorExited(proc, time.Second) {
+		t.Fatal("ntm kill stopped the monitor; it should leave the monitor to clean up itself")
 	}
 }
 

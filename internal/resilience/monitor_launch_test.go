@@ -28,6 +28,19 @@ func TestShouldStartInternalMonitor_IsDisabledUnderGoTest(t *testing.T) {
 	}
 }
 
+// Loop 5, Behavior 12: spawn saves the manifest even where it doesn't launch
+// the monitor, such as under go test, unless the monitor is switched off.
+func TestShouldSaveSpawnManifest(t *testing.T) {
+	t.Setenv("NTM_DISABLE_INTERNAL_MONITOR", "")
+	if !ShouldSaveSpawnManifest() {
+		t.Fatal("expected the manifest to be saved under go test")
+	}
+	t.Setenv("NTM_DISABLE_INTERNAL_MONITOR", "1")
+	if ShouldSaveSpawnManifest() {
+		t.Fatal("expected NTM_DISABLE_INTERNAL_MONITOR to stop the manifest save")
+	}
+}
+
 func TestCurrentExecutablePath_ReturnsAbsoluteExistingFile(t *testing.T) {
 	exe, err := CurrentExecutablePath()
 	if err != nil {

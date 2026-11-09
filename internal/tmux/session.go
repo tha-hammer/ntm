@@ -1746,17 +1746,34 @@ func parsePaneFromParts(parts1, parts2 []string) (*Pane, error) {
 	//  3. Process tree walk — required when the agent runs under a
 	//     wrapper that shows up in tmux's `pane_current_command` (e.g.
 	//     Bun-launched Codex shows `bun`, not `codex`). See acfs#267.
-	if pane.Type == AgentUser && pane.Command != "" {
-		if detected := detectAgentFromCommand(pane.Command); detected != AgentUser {
-			pane.Type = detected
-		} else if isAgentWrapperCommand(pane.Command) && pane.PID > 0 {
-			if detected := detectAgentFromProcessTree(pane.PID, 4); detected != AgentUser {
-				pane.Type = detected
-			}
-		}
+	if pane.Type == AgentUser {
+		pane.Type = PaneAgentProcess(*pane)
 	}
 
 	return pane, nil
+}
+
+// PaneAgentProcess returns the agent running in the pane, from its current
+// command, or from its process tree when the command is a wrapper such as a
+// shell or node. AgentUser means no agent is running, as in a bare shell after
+// an agent exits. Unlike Pane.Type, it ignores the title and @ntm_type, which
+// outlive the agent.
+func PaneAgentProcess(pane Pane) AgentType {
+	return paneAgentProcessWith(pane, detectAgentFromProcessTree)
+}
+
+// paneAgentProcessWith is PaneAgentProcess with the process-tree walk passed in.
+func paneAgentProcessWith(pane Pane, tree func(pid, maxDepth int) AgentType) AgentType {
+	if pane.Command == "" {
+		return AgentUser
+	}
+	if detected := detectAgentFromCommand(pane.Command); detected != AgentUser {
+		return detected
+	}
+	if isAgentWrapperCommand(pane.Command) && pane.PID > 0 {
+		return tree(pane.PID, 4)
+	}
+	return AgentUser
 }
 
 func parsePaneActivityTimestamp(raw string, now time.Time) (time.Time, error) {

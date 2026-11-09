@@ -4900,6 +4900,42 @@ func TestPrint_ListsStopHookEnabled(t *testing.T) {
 	}
 }
 
+// Loop 5, Behavior 12: the idle nudge's poll interval, in whole seconds.
+func TestAgentMailConfig_IdleNudgeInterval(t *testing.T) {
+	cases := []struct {
+		name      string
+		agentMail string
+		want      time.Duration
+	}{
+		{name: "default", agentMail: "enabled = true\n", want: 30 * time.Second},
+		{name: "set", agentMail: "enabled = true\nidle_nudge_interval_seconds = 5\n", want: 5 * time.Second},
+		{name: "zero is the default", agentMail: "idle_nudge_interval_seconds = 0\n", want: 30 * time.Second},
+		{name: "negative is the default", agentMail: "idle_nudge_interval_seconds = -4\n", want: 30 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(createTempConfig(t, "[agent_mail]\n"+tc.agentMail))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.AgentMail.IdleNudgeInterval(); got != tc.want {
+				t.Fatalf("IdleNudgeInterval() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+
+	var buf bytes.Buffer
+	if err := Print(Default(), &buf); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	if !strings.Contains(buf.String(), "idle_nudge_interval_seconds = 30") {
+		t.Fatal("printed config lacks idle_nudge_interval_seconds = 30")
+	}
+	if got, err := GetValue(Default(), "agent_mail.idle_nudge_interval_seconds"); err != nil || got != 30 {
+		t.Fatalf("GetValue = %v, %v, want 30", got, err)
+	}
+}
+
 func TestGetValue_StopHookEnabled(t *testing.T) {
 	cfg := Default()
 	if got, err := GetValue(cfg, "agent_mail.stop_hook_enabled"); err != nil || got != true {

@@ -52,6 +52,14 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.Setenv("XDG_CONFIG_HOME", configDir)
 	_ = os.Unsetenv("NTM_CONFIG")
+	// Spawn saves session manifests even under go test (Loop 5), so in-process
+	// tests get their own data folder rather than the real one.
+	dataDir, err := os.MkdirTemp("", "ntm-cli-test-data-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create test data folder: %v\n", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("XDG_DATA_HOME", dataDir)
 
 	// Clean up any orphan test sessions from previous runs before starting.
 	// This catches sessions left behind when tests are interrupted (Ctrl+C, timeout, etc.)
@@ -64,6 +72,7 @@ func TestMain(m *testing.M) {
 
 	closeRobotPersistence()
 	_ = os.RemoveAll(configDir)
+	_ = os.RemoveAll(dataDir)
 
 	os.Exit(code)
 }

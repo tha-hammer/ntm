@@ -274,6 +274,11 @@ func runClosureHelper(mode string) int {
 		// A hook command names this binary, so its own arguments are the
 		// ntm command line, as they are for the real binary.
 		return closureHelperExecute(os.Args[1:])
+	case "sleep":
+		// Stands in for a process by its command line only, such as a monitor
+		// started as "<binary> internal-monitor <session>".
+		time.Sleep(60 * time.Second)
+		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "unknown closure helper mode %q\n", mode)
 		return 2

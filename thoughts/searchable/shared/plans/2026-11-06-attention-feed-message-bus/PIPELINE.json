@@ -5,9 +5,12 @@
   "output_folder": "/home/debian/Dev/ntm/thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus",
   "repository": "/home/debian/Dev/ntm",
   "scope_input": "Scope this project.\nRequest: We started research on my local machine. You are running on a VPS. We need to modify the existing \"attention feed\" to be better suited for a message bus. by default the \"attention feed\" is an in-memory list inside one ntm process (GetAttentionFeed, internal/robot/attention_feed.go:2956). It can be backed by SQLite so events survive restarts (attention_feed.go:399-402) and we need to make it so. We need to create a stop hook that is saved to the settings.local.json file in the ntm session creation process for the /.claude/ folder. The stop hook is what fires when the agent turn is complete and can serve as the \"push\" and/or \"check messages\" reminder.\nType: code\nSources: thoughts/searchable/shared/research/2026-11-06-09-56-agent-messaging-push-stop-hooks-agent-mail.md; repository /home/debian/Dev/ntm\nOutput folder: /home/debian/Dev/ntm/thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus",
-  "run": null,
+  "run": {
+    "session": "ca971f3a-bdb1-4b10-9208-206026adcd94",
+    "pipeline": "planning-build"
+  },
   "cursor": {
-    "step": "tdd",
+    "step": "build",
     "loop": "05-idle-nudge.md"
   },
   "steps": {
@@ -75,8 +78,8 @@
     },
     {
       "doc": "05-idle-nudge.md",
-      "tdd_plan": null,
-      "status": "pending",
+      "tdd_plan": "05-idle-nudge-tdd.md",
+      "status": "building",
       "sprints_passed": []
     },
     {
@@ -427,8 +430,38 @@
       "step": "build",
       "event": "done",
       "detail": "04-cross-process-delivery-tdd.md"
+    },
+    {
+      "at": "2026-11-08T19:16:08.104Z",
+      "step": "tdd",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-08T19:58:09.204Z",
+      "step": "tdd",
+      "event": "started",
+      "detail": "05-idle-nudge.md"
+    },
+    {
+      "at": "2026-11-09T11:57:29.396Z",
+      "step": "tdd",
+      "event": "done",
+      "detail": "05-idle-nudge.md"
+    },
+    {
+      "at": "2026-11-09T12:19:02.112Z",
+      "step": "build",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-09T12:20:00.754Z",
+      "step": "build",
+      "event": "started",
+      "detail": "05-idle-nudge-tdd.md"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-08T19:11:57.471Z"
+  "updated_at": "2026-11-09T12:20:00.754Z"
 }

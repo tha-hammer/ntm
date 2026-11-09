@@ -1328,6 +1328,22 @@ type AgentMailConfig struct {
 	// true. Turning it off stops new entries and makes existing entries do
 	// nothing; it doesn't remove entries already written.
 	StopHookEnabled *bool `toml:"stop_hook_enabled,omitempty"`
+	// IdleNudgeIntervalSeconds is how often a session's monitor checks idle
+	// agents for new mail to remind them about. Zero or less means 30. Spawn
+	// freezes it into the session manifest.
+	IdleNudgeIntervalSeconds int `toml:"idle_nudge_interval_seconds,omitempty"`
+}
+
+// DefaultIdleNudgeInterval is the idle nudge's poll interval when none is set.
+const DefaultIdleNudgeInterval = 30 * time.Second
+
+// IdleNudgeInterval returns IdleNudgeIntervalSeconds as a duration, or the
+// default when it isn't positive.
+func (a AgentMailConfig) IdleNudgeInterval() time.Duration {
+	if a.IdleNudgeIntervalSeconds <= 0 {
+		return DefaultIdleNudgeInterval
+	}
+	return time.Duration(a.IdleNudgeIntervalSeconds) * time.Second
 }
 
 // SupervisorEnabledOrDefault returns the effective value of
@@ -3199,6 +3215,8 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "supervisor_enabled = %t\n", cfg.AgentMail.SupervisorEnabledOrDefault())
 	fmt.Fprintln(w, "# If true, Claude agents ntm creates are told about new mail when their turn ends.")
 	fmt.Fprintf(w, "stop_hook_enabled = %t\n", cfg.AgentMail.StopHookEnabledOrDefault())
+	fmt.Fprintln(w, "# Seconds between the session monitor's checks of idle agents for new mail.")
+	fmt.Fprintf(w, "idle_nudge_interval_seconds = %d\n", int(cfg.AgentMail.IdleNudgeInterval()/time.Second))
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations]")
@@ -4335,6 +4353,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.AgentMail.SupervisorEnabledOrDefault(), nil
 		case "stop_hook_enabled":
 			return cfg.AgentMail.StopHookEnabledOrDefault(), nil
+		case "idle_nudge_interval_seconds":
+			return int(cfg.AgentMail.IdleNudgeInterval() / time.Second), nil
 		}
 	case "integrations":
 		if len(parts) < 2 {
@@ -5440,6 +5460,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agent_mail.program_name", defaults.AgentMail.ProgramName, cfg.AgentMail.ProgramName)
 	addDiff("agent_mail.supervisor_enabled", defaults.AgentMail.SupervisorEnabledOrDefault(), cfg.AgentMail.SupervisorEnabledOrDefault())
 	addDiff("agent_mail.stop_hook_enabled", defaults.AgentMail.StopHookEnabledOrDefault(), cfg.AgentMail.StopHookEnabledOrDefault())
+	addDiff("agent_mail.idle_nudge_interval_seconds", int(defaults.AgentMail.IdleNudgeInterval()/time.Second), int(cfg.AgentMail.IdleNudgeInterval()/time.Second))
 
 	// Integrations (DCG)
 	addDiff("integrations.dcg.enabled", defaults.Integrations.DCG.Enabled, cfg.Integrations.DCG.Enabled)
