@@ -1355,6 +1355,13 @@ Verification:
 5. Wait about 30 seconds, and run `/tmp/ntm-loop5 --robot-tail=addnudge --lines=30`.
 6. Pass: the reminder is in the new agent's pane only.
 
+**Result (2026-11-09), passed:** run on rocketman at `7616d29b`.
+- Spawn started WindyHawk. `ntm add addnudge --cc=1` added BronzeBear in pane `%56`.
+- Mail 12514 was sent to BronzeBear only at 10:58:30 local time. At 10:58:35, "You have 1 new message. 1) from HumanOverseer: added nudge" appeared in BronzeBear's pane, and the agent ran `fetch_inbox`. WindyHawk's pane got nothing.
+- The monitor log has `INFO idle nudge: reminder sent pane=%56 agent=BronzeBear messages=[12514]`, and `told_records` has `12514|idle_nudge`.
+- **Side issue:** in WindyHawk's pane, spawn's first prompt ("register with agent mail. use WindyHawk for your name") stayed unsent in the input box after the trust prompt was accepted. This is the same spawn-versus-trust-prompt timing as `bd-57xdn`, and is noted there.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop5-sprint2-local-2026-11-09/`.
+
 ---
 
 ## Sprint 3: Hold back for recent keystrokes
@@ -1369,6 +1376,18 @@ Verification:
 - a client attached but idle.
 
 For each, record `#{client_name} #{client_activity} #{client_session} #{pane_id}` from `list-clients`, where `pane_id` resolves in the client's context to its active pane. Also check whether a control-mode client (`tmux -C attach`) updates `client_activity` the same way. Record the results here. If `pane_id` doesn't resolve per client, use `#{window_active}` with `display -c <client> -p '#{pane_id}'`, and say so.
+
+**Evidence results (2026-11-09, tmux 3.5a, private server, clients attached through `script -qfc` with `TERM=xterm-256color`):**
+- **Typing counts.** A client's `client_activity` is set when it attaches and moves forward when it sends keys: "hello" typed at 1794240119 changed it from 114 to 119.
+- **Pane output doesn't count.** Server-side `send-keys` into the pane, and a burst of pane output, left every client's `client_activity` unchanged. A busy agent's own output can't hold the nudge back.
+- **`#{pane_id}` in `list-clients` resolves per client** to the active pane of that client's current window. A client on a grouped session (`new-session -t x`) viewing another window reported its own pane `%3`, while the client on `x` reported `%1`. The fallback isn't needed. `display -c <client> -p '#{pane_id}'` is wrong: it gave `%3` for both clients.
+- **Two clients on one session always show the same pane.** The active pane belongs to the window, so `select-pane` moves it for every client of that session. "A client on a different pane" means a different window, or a grouped session.
+- **A detached session:** `list-clients` prints nothing and exits 0.
+- **Control-mode clients don't count typing.** A `tmux -C attach` client's `client_activity` was set at attach (1794240130) and stayed there after it sent `send-keys` and `refresh-client`. So:
+  - The guard can't see typing through iTerm2's `tmux -CC` integration, which sends keys as commands. Only the 60 seconds after such a client attaches are held. This is a limitation of `client_activity`, recorded for the loop document.
+  - Behaviors 17 and 20 use a `script` client, not a control client, to type.
+- Raw output and the script that made it: `/home/debian/Dev/ntm-test-evidence/loop5-sprint3-evidence-check-2026-11-09/`.
+- **Build choice from this:** `ListClientActivity` lists every client on the server (`list-clients` with no `-t`) and the guard matches by pane ID. Pane IDs are unique across the server, so a client on a grouped session that shows this pane also counts.
 
 **Order of work:** 17 first (it rests on the evidence), then 20 as the outer test, then 18 and 19.
 
@@ -1564,6 +1583,32 @@ As Behaviors 17 and 18.
 
 **Automated:** `go test -short -run TestClosure_TypingHoldsNudge ./internal/cli/` fails first, then passes.
 
+### Build record (2026-11-09)
+
+Base commit `7616d29b`. Red, then green, for each behavior:
+- **Setting first.** The closure test needs `human_typing_quiet_seconds`, and the strict config loader rejects unknown keys, so the setting was built first, as in Sprint 1.
+  - `TestAgentMailConfig_HumanTypingQuiet`: red was "HumanTypingQuiet undefined".
+  - The manifest and spawn tests: red was "quiet period = 1m0s, want 2s".
+- **17:** red was "undefined: ListClientActivityContext".
+- **20:** red was "reminder typed while a person was typing", with the reminder in the stand-in's typed file. The idle screen was still recognized while keys went in, so the test is red at the guard and not at idle detection.
+- **18:** red was "undefined: recentHumanActivity". The property passed with 100 checks.
+- **19:** red was "claimed or sent while held", with the claims in the call list.
+
+Verification:
+- The six closure tests (Sprints 1 and 2's five plus `TestClosure_TypingHoldsNudge`) passed 5 times in a row: `ok internal/cli 315s`. `TestListClientActivity_RealClient` passed 5 times in a row.
+- `go test -short ./...` shows only the 7 known failures from bd-5zbcm, and no new ones.
+- `go build ./cmd/ntm` and `go vet` pass on the four changed packages. `gofmt -l` flags only the 3 files that were already flagged before this loop.
+- The tamper check against `7616d29b` is clean.
+- golangci-lint, goimports, ubs and rch aren't installed here, so they weren't run.
+
+Where the build differs from the plan:
+- **`ListClientActivityContext` lists every client on the server,** not one session's, and the guard matches by pane ID. A client on a grouped session that shows this pane counts too. It has no `session` argument.
+- **Behaviors 17 and 20 type through a `script` client,** not a control client, because the evidence showed a control client's commands don't move `client_activity`. The closure test types a key and its erase (`x`, DEL) every half second, so the agent's input line stays empty.
+- **No `humanTypingQuiet` constant in `cli`.** The default lives once, as `config.DefaultHumanTypingQuiet`, and reaches the poll through the manifest (`SpawnManifest.HumanTypingQuiet`). `IdleNudgeInterval` and `HumanTypingQuiet` share one helper, `positiveSecondsOr`.
+- **The held batch is forgotten once a reminder is sent** (`delete(n.heldBatches, pane)`), so the next held batch logs, even if a person goes busy and comes back in between.
+- **A failure listing clients is logged at warn on each poll** that hits it, as fetch failures are, and holds the nudge.
+- **The `script` check fails, not skips,** in both tests. The tamper check flagged the skip in the first draft.
+
 ### Human test script
 
 1. Create a session: `/tmp/ntm-loop5 spawn typetest --cc=1`, and wait for the agent to be idle.
@@ -1573,6 +1618,10 @@ As Behaviors 17 and 18.
 5. Pass: no reminder appears while you keep typing.
 6. Clear the input line and stop typing.
 7. Pass: within about 90 seconds, the reminder appears.
+
+Notes for the run:
+- Attach with a plain `tmux attach -t typetest` in a normal terminal. iTerm2's `tmux -CC` mode sends keys as commands, which tmux doesn't count as typing (see the evidence results above).
+- The monitor log, `~/.local/share/ntm/logs/typetest-monitor.log`, should show one "idle nudge: held, person typing" line and then one "idle nudge: reminder sent" line.
 
 ---
 

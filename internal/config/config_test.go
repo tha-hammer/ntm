@@ -4936,6 +4936,41 @@ func TestAgentMailConfig_IdleNudgeInterval(t *testing.T) {
 	}
 }
 
+func TestAgentMailConfig_HumanTypingQuiet(t *testing.T) {
+	cases := []struct {
+		name      string
+		agentMail string
+		want      time.Duration
+	}{
+		{name: "default", agentMail: "enabled = true\n", want: 60 * time.Second},
+		{name: "set", agentMail: "human_typing_quiet_seconds = 2\n", want: 2 * time.Second},
+		{name: "zero is the default", agentMail: "human_typing_quiet_seconds = 0\n", want: 60 * time.Second},
+		{name: "negative is the default", agentMail: "human_typing_quiet_seconds = -1\n", want: 60 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(createTempConfig(t, "[agent_mail]\n"+tc.agentMail))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.AgentMail.HumanTypingQuiet(); got != tc.want {
+				t.Fatalf("HumanTypingQuiet() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+
+	var buf bytes.Buffer
+	if err := Print(Default(), &buf); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	if !strings.Contains(buf.String(), "human_typing_quiet_seconds = 60") {
+		t.Fatal("printed config lacks human_typing_quiet_seconds = 60")
+	}
+	if got, err := GetValue(Default(), "agent_mail.human_typing_quiet_seconds"); err != nil || got != 60 {
+		t.Fatalf("GetValue = %v, %v, want 60", got, err)
+	}
+}
+
 func TestGetValue_StopHookEnabled(t *testing.T) {
 	cfg := Default()
 	if got, err := GetValue(cfg, "agent_mail.stop_hook_enabled"); err != nil || got != true {

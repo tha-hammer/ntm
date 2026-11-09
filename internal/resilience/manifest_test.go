@@ -57,6 +57,13 @@ func TestSpawnManifest_IdleNudgeInterval(t *testing.T) {
 			t.Errorf("IdleNudgeInterval() with %d = %s, want %s", seconds, got, want)
 		}
 	}
+	quietCases := map[int]time.Duration{0: 60 * time.Second, 2: 2 * time.Second, -1: 60 * time.Second}
+	for seconds, want := range quietCases {
+		m := &SpawnManifest{HumanTypingQuietSeconds: seconds}
+		if got := m.HumanTypingQuiet(); got != want {
+			t.Errorf("HumanTypingQuiet() with %d = %s, want %s", seconds, got, want)
+		}
+	}
 
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	if err := SaveManifest(&SpawnManifest{Session: "nudge-interval", IdleNudgeIntervalSeconds: 2}); err != nil {

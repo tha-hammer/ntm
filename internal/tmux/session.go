@@ -1859,3 +1859,48 @@ func (c *Client) IsAttached(session string) bool {
 func IsAttached(session string) bool {
 	return DefaultClient.IsAttached(session)
 }
+
+// ClientActivity is one attached tmux client: the pane it shows and when it
+// last sent input.
+type ClientActivity struct {
+	Name     string
+	PaneID   string
+	Activity time.Time
+}
+
+// ListClientActivityContext lists every client attached to the tmux server,
+// with the pane each one shows and its last input time. tmux moves a client's
+// activity only on that client's own keystrokes: pane output, server-side
+// send-keys and a control-mode client's commands leave it alone. Pane IDs are
+// unique across the server, so callers match clients by pane ID, which also
+// counts a client on a grouped session.
+func (c *Client) ListClientActivityContext(ctx context.Context) ([]ClientActivity, error) {
+	format := fmt.Sprintf("#{client_name}%[1]s#{pane_id}%[1]s#{client_activity}", FieldSeparator)
+	output, err := c.RunContext(ctx, "list-clients", "-F", format)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	var clients []ClientActivity
+	for line := range strings.SplitSeq(output, "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, FieldSeparator)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("list-clients: unexpected line %q", line)
+		}
+		activity, err := parsePaneActivityTimestamp(parts[2], now)
+		if err != nil {
+			return nil, fmt.Errorf("list-clients: client %s activity: %w", parts[0], err)
+		}
+		clients = append(clients, ClientActivity{Name: parts[0], PaneID: parts[1], Activity: activity})
+	}
+	return clients, nil
+}
+
+// ListClientActivityContext lists every attached client's pane and last input
+// time (default client).
+func ListClientActivityContext(ctx context.Context) ([]ClientActivity, error) {
+	return DefaultClient.ListClientActivityContext(ctx)
+}

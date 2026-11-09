@@ -1543,6 +1543,7 @@ func buildSpawnManifest(opts SpawnOptions, cfg *config.Config, projectDir string
 		AutoRestart:              opts.AutoRestart || cfg.Resilience.AutoRestart,
 		ReapOrphansOnExit:        cfg.Resilience.ReapOrphansOnExit,
 		IdleNudgeIntervalSeconds: cfg.AgentMail.IdleNudgeIntervalSeconds,
+		HumanTypingQuietSeconds:  cfg.AgentMail.HumanTypingQuietSeconds,
 	}
 }
 

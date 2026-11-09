@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
@@ -36,6 +37,9 @@ type nudgeTarget struct {
 type paneNudgeState struct {
 	Live bool // an agent process, not a bare shell, is in the pane
 	Idle bool
+	// RecentHumanActivity: a person may be typing in the pane (see
+	// recentHumanActivity).
+	RecentHumanActivity bool
 }
 
 // idleNudgeStore is the part of the state store the nudge uses.
@@ -63,10 +67,13 @@ type idleNudger struct {
 	deps           idleNudgeDeps
 	notLive        map[string]bool
 	lastTargetsErr string
+	// heldBatches is, per pane, the batch key of the messages last held back
+	// because a person was typing, so each batch is logged once.
+	heldBatches map[string]string
 }
 
 func newIdleNudger(deps idleNudgeDeps) *idleNudger {
-	return &idleNudger{deps: deps, notLive: map[string]bool{}}
+	return &idleNudger{deps: deps, notLive: map[string]bool{}, heldBatches: map[string]string{}}
 }
 
 // idleNudgeTicker makes the loop's ticker: its channel and its stop function.
@@ -143,6 +150,15 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 	if !pane.Idle {
 		return // the Stop hook tells a busy agent when its turn ends
 	}
+	if pane.RecentHumanActivity {
+		// Typing into the input line a person is using would garble both. Hold
+		// without claiming, so a later poll, or the Stop hook, tells them.
+		if batch := messageBatchKey(msgs); n.heldBatches[target.PaneID] != batch {
+			n.heldBatches[target.PaneID] = batch
+			slog.Info("idle nudge: held, person typing", "pane", target.PaneID, "agent", target.Agent, "messages", batch)
+		}
+		return
+	}
 
 	store, err := n.deps.Store()
 	if err != nil {
@@ -173,7 +189,19 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 		n.release(store, target, claims) // the next poll tries again
 		return
 	}
+	delete(n.heldBatches, target.PaneID)
 	slog.Info("idle nudge: reminder sent", "pane", target.PaneID, "agent", target.Agent, "messages", fmt.Sprint(ids))
+}
+
+// messageBatchKey names a set of messages by their sorted IDs, so the same
+// messages give the same key in any order.
+func messageBatchKey(msgs []agentmail.InboxMessage) string {
+	ids := make([]int, 0, len(msgs))
+	for _, msg := range msgs {
+		ids = append(ids, msg.ID)
+	}
+	slices.Sort(ids)
+	return fmt.Sprint(ids)
 }
 
 // nudgeClaim is one message this poll won the right to tell.
@@ -218,6 +246,20 @@ func (n *idleNudger) warn(step string, target nudgeTarget, err error) {
 	slog.Warn("idle nudge: "+step+" failed", "pane", target.PaneID, "agent", target.Agent, "error", err)
 }
 
+// recentHumanActivity reports whether a person may be typing in paneID: some
+// attached client showing that pane sent keystrokes less than quiet ago. A
+// time in the future, from clock skew, counts as recent. When the clients
+// couldn't be read, it holds too: the nudge waits for the next poll rather
+// than risk typing over a person.
+func recentHumanActivity(clients []tmux.ClientActivity, paneID string, now time.Time, quiet time.Duration, readErr error) bool {
+	if readErr != nil {
+		return true
+	}
+	return slices.ContainsFunc(clients, func(c tmux.ClientActivity) bool {
+		return c.PaneID == paneID && now.Sub(c.Activity) < quiet
+	})
+}
+
 func unreadMessages(msgs []agentmail.InboxMessage) []agentmail.InboxMessage {
 	unread := make([]agentmail.InboxMessage, 0, len(msgs))
 	for _, msg := range msgs {
@@ -232,6 +274,7 @@ func unreadMessages(msgs []agentmail.InboxMessage) []agentmail.InboxMessage {
 // registry, Agent Mail, tmux and the state store.
 func productionIdleNudgeDeps(session string, manifest *resilience.SpawnManifest) idleNudgeDeps {
 	projectKey := manifest.ProjectDir
+	typingQuiet := manifest.HumanTypingQuiet()
 	return idleNudgeDeps{
 		ProjectKey: projectKey,
 		Targets: func(ctx context.Context) ([]nudgeTarget, error) {
@@ -263,9 +306,14 @@ func productionIdleNudgeDeps(session string, manifest *resilience.SpawnManifest)
 			if err != nil {
 				return paneNudgeState{}, err
 			}
+			clients, clientsErr := tmux.ListClientActivityContext(ctx)
+			if clientsErr != nil {
+				slog.Warn("idle nudge: list tmux clients failed, holding", "pane", target.PaneID, "agent", target.Agent, "error", clientsErr)
+			}
 			return paneNudgeState{
-				Live: tmux.PaneAgentProcess(target.Pane).Canonical() == target.AgentType.Canonical(),
-				Idle: determineAgentState(screen, string(target.AgentType)) == "idle",
+				Live:                tmux.PaneAgentProcess(target.Pane).Canonical() == target.AgentType.Canonical(),
+				Idle:                determineAgentState(screen, string(target.AgentType)) == "idle",
+				RecentHumanActivity: recentHumanActivity(clients, target.PaneID, time.Now(), typingQuiet, clientsErr),
 			}, nil
 		},
 		Store: func() (idleNudgeStore, error) {

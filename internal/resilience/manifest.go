@@ -47,12 +47,22 @@ type SpawnManifest struct {
 	// spawn for the same reason. Zero, as in a manifest saved before the field
 	// existed, means the default.
 	IdleNudgeIntervalSeconds int `json:"idle_nudge_interval_seconds,omitempty"`
+	// HumanTypingQuietSeconds is how long a person's keystrokes in a pane must
+	// be quiet before the idle nudge types there, frozen the same way. Zero
+	// means the default.
+	HumanTypingQuietSeconds int `json:"human_typing_quiet_seconds,omitempty"`
 }
 
 // IdleNudgeInterval returns the frozen idle nudge interval, or the default
 // when it isn't positive.
 func (m *SpawnManifest) IdleNudgeInterval() time.Duration {
 	return config.AgentMailConfig{IdleNudgeIntervalSeconds: m.IdleNudgeIntervalSeconds}.IdleNudgeInterval()
+}
+
+// HumanTypingQuiet returns the frozen keystroke quiet period, or the default
+// when it isn't positive.
+func (m *SpawnManifest) HumanTypingQuiet() time.Duration {
+	return config.AgentMailConfig{HumanTypingQuietSeconds: m.HumanTypingQuietSeconds}.HumanTypingQuiet()
 }
 
 // AgentConfig represents the configuration for a single agent

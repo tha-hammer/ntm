@@ -214,6 +214,11 @@ func TestBuildSpawnManifest_FreezesIdleNudgeInterval(t *testing.T) {
 	if got := buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).IdleNudgeInterval(); got != 30*time.Second {
 		t.Fatalf("default interval = %s, want 30s", got)
 	}
+	// Loop 5 Sprint 3: the keystroke quiet period is frozen the same way.
+	cfg.AgentMail.HumanTypingQuietSeconds = 2
+	if got := buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).HumanTypingQuiet(); got != 2*time.Second {
+		t.Fatalf("quiet period = %s, want 2s", got)
+	}
 }
 
 // Loop 5, Behavior 12: spawn saves the manifest even when it doesn't launch the

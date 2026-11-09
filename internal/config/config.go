@@ -1332,18 +1332,37 @@ type AgentMailConfig struct {
 	// agents for new mail to remind them about. Zero or less means 30. Spawn
 	// freezes it into the session manifest.
 	IdleNudgeIntervalSeconds int `toml:"idle_nudge_interval_seconds,omitempty"`
+	// HumanTypingQuietSeconds is how long an attached tmux client showing an
+	// agent's pane must have sent no keystrokes before the idle nudge types
+	// there. Zero or less means 60. Spawn freezes it into the session
+	// manifest.
+	HumanTypingQuietSeconds int `toml:"human_typing_quiet_seconds,omitempty"`
 }
 
 // DefaultIdleNudgeInterval is the idle nudge's poll interval when none is set.
 const DefaultIdleNudgeInterval = 30 * time.Second
 
+// DefaultHumanTypingQuiet is the idle nudge's keystroke quiet period when none
+// is set.
+const DefaultHumanTypingQuiet = 60 * time.Second
+
 // IdleNudgeInterval returns IdleNudgeIntervalSeconds as a duration, or the
 // default when it isn't positive.
 func (a AgentMailConfig) IdleNudgeInterval() time.Duration {
-	if a.IdleNudgeIntervalSeconds <= 0 {
-		return DefaultIdleNudgeInterval
+	return positiveSecondsOr(a.IdleNudgeIntervalSeconds, DefaultIdleNudgeInterval)
+}
+
+// HumanTypingQuiet returns HumanTypingQuietSeconds as a duration, or the
+// default when it isn't positive.
+func (a AgentMailConfig) HumanTypingQuiet() time.Duration {
+	return positiveSecondsOr(a.HumanTypingQuietSeconds, DefaultHumanTypingQuiet)
+}
+
+func positiveSecondsOr(seconds int, fallback time.Duration) time.Duration {
+	if seconds <= 0 {
+		return fallback
 	}
-	return time.Duration(a.IdleNudgeIntervalSeconds) * time.Second
+	return time.Duration(seconds) * time.Second
 }
 
 // SupervisorEnabledOrDefault returns the effective value of
@@ -3217,6 +3236,8 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "stop_hook_enabled = %t\n", cfg.AgentMail.StopHookEnabledOrDefault())
 	fmt.Fprintln(w, "# Seconds between the session monitor's checks of idle agents for new mail.")
 	fmt.Fprintf(w, "idle_nudge_interval_seconds = %d\n", int(cfg.AgentMail.IdleNudgeInterval()/time.Second))
+	fmt.Fprintln(w, "# Seconds a person's keystrokes in an agent's pane must be quiet before the idle nudge types there.")
+	fmt.Fprintf(w, "human_typing_quiet_seconds = %d\n", int(cfg.AgentMail.HumanTypingQuiet()/time.Second))
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations]")
@@ -4355,6 +4376,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.AgentMail.StopHookEnabledOrDefault(), nil
 		case "idle_nudge_interval_seconds":
 			return int(cfg.AgentMail.IdleNudgeInterval() / time.Second), nil
+		case "human_typing_quiet_seconds":
+			return int(cfg.AgentMail.HumanTypingQuiet() / time.Second), nil
 		}
 	case "integrations":
 		if len(parts) < 2 {
@@ -5461,6 +5484,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agent_mail.supervisor_enabled", defaults.AgentMail.SupervisorEnabledOrDefault(), cfg.AgentMail.SupervisorEnabledOrDefault())
 	addDiff("agent_mail.stop_hook_enabled", defaults.AgentMail.StopHookEnabledOrDefault(), cfg.AgentMail.StopHookEnabledOrDefault())
 	addDiff("agent_mail.idle_nudge_interval_seconds", int(defaults.AgentMail.IdleNudgeInterval()/time.Second), int(cfg.AgentMail.IdleNudgeInterval()/time.Second))
+	addDiff("agent_mail.human_typing_quiet_seconds", int(defaults.AgentMail.HumanTypingQuiet()/time.Second), int(cfg.AgentMail.HumanTypingQuiet()/time.Second))
 
 	// Integrations (DCG)
 	addDiff("integrations.dcg.enabled", defaults.Integrations.DCG.Enabled, cfg.Integrations.DCG.Enabled)

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -59,7 +61,7 @@ done
 
 // screenAgentConfig writes claude and codex stand-ins into <root>/bin, and the
 // helpers' config.toml with them as the agent commands, Agent Mail on at the
-// fake server, and a 1 second nudge poll.
+// fake server, a 1 second nudge poll, and a 2 second keystroke quiet period.
 func (e *closureEnv) screenAgentConfig(t *testing.T, mail *fakeAgentMail, extra string) *screenAgents {
 	t.Helper()
 	root := filepath.Dir(e.workDir)
@@ -88,6 +90,7 @@ codex = %q
 [agent_mail]
 enabled = true
 idle_nudge_interval_seconds = 1
+human_typing_quiet_seconds = 2
 
 [cass.context]
 enabled = false
@@ -462,6 +465,109 @@ func TestClosure_AddedAgentNudged(t *testing.T) {
 	}
 }
 
+// attachTypingClient attaches a terminal client to session through script, as
+// a person's terminal would be, shows the agent's pane in it, and returns a
+// function that types keys into it. A control-mode client won't do: its
+// commands don't move client_activity (Loop 5 Sprint 3 evidence).
+func (e *closureEnv) attachTypingClient(t *testing.T, session string) (typeKeys func(keys string) error) {
+	t.Helper()
+	paneID := ""
+	panes := e.runShell(t, e.workDir, "tmux list-panes -t "+session+" -F '#{pane_id} #{@ntm_type}'", "")
+	for line := range strings.SplitSeq(panes, "\n") {
+		if id, agentType, _ := strings.Cut(strings.TrimSpace(line), " "); agentType == "cc" {
+			paneID = id
+		}
+	}
+	if paneID == "" {
+		t.Fatalf("no agent pane in session %s:\n%s", session, panes)
+	}
+	e.runShell(t, e.workDir, "tmux select-pane -t "+paneID, "")
+
+	cmd := exec.Command("script", "-qfc", "tmux attach -t "+session, "/dev/null")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	for key, value := range e.vars {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start script client: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(e.runShell(t, e.workDir, "tmux list-clients -F '#{pane_id}'", ""), paneID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("client didn't attach to %s within 5s", paneID)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return func(keys string) error {
+		_, err := io.WriteString(stdin, keys)
+		return err
+	}
+}
+
+// Loop 5, Behavior 20: a person typing in the agent's pane holds the nudge
+// back, with no told record, until their keystrokes have been quiet for the
+// quiet period (2 seconds here).
+func TestClosure_TypingHoldsNudge(t *testing.T) {
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Fatalf("script is required for this closure test: %v", err)
+	}
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	agents := env.screenAgentConfig(t, mail, "")
+	pid, agent := spawnNudgeAgent(t, env, agents, "typehold")
+	typeKeys := env.attachTypingClient(t, "typehold")
+
+	stopTyping := make(chan struct{})
+	typingErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopTyping:
+				typingErr <- nil
+				return
+			case <-ticker.C:
+				// A key and its erase, so the agent's input line stays empty.
+				if err := typeKeys("x\x7f"); err != nil {
+					typingErr <- err
+					return
+				}
+			}
+		}
+	}()
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 95, From: "RedStone", Subject: "typing test"})
+	env.startMonitor(t, "typehold")
+
+	time.Sleep(4 * time.Second)
+	held := agents.typed(t, pid)
+	close(stopTyping)
+	if err := <-typingErr; err != nil {
+		t.Fatalf("typing into the client: %v", err)
+	}
+	if strings.Contains(held, "typing test") || strings.Contains(held, "new message") {
+		t.Fatalf("reminder typed while a person was typing: %q", held)
+	}
+	if rec := env.told(t, env.projectDir("typehold"), agent, 95); rec != nil {
+		t.Fatalf("claimed while a person was typing: %+v", rec)
+	}
+
+	agents.waitTyped(t, pid, "typing test", 10*time.Second)
+	if n := strings.Count(env.monitorLog(t, "typehold"), "idle nudge: held, person typing"); n != 1 {
+		t.Fatalf("held logged %d times, want 1:\n%s", n, env.monitorLog(t, "typehold"))
+	}
+}
+
 func testRegistry(paneAgents map[string]string) *agentmail.SessionAgentRegistry {
 	return &agentmail.SessionAgentRegistry{PaneIDMap: paneAgents, Agents: map[string]string{}}
 }
@@ -566,6 +672,114 @@ func TestNudgeTargets_AgentTypes(t *testing.T) {
 	sort.Strings(names)
 	if !slices.Equal(names, []string{"A", "B"}) {
 		t.Fatalf("targets = %v, want only the Claude and Codex panes", names)
+	}
+}
+
+// Loop 5, Behavior 18: the keystroke guard holds a pane that an attached
+// client showing it has typed into within the quiet period, and holds on a
+// read error.
+func TestRecentHumanActivity(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	quiet := 60 * time.Second
+	client := func(pane string, ago time.Duration) tmux.ClientActivity {
+		return tmux.ClientActivity{Name: "/dev/pts/1", PaneID: pane, Activity: now.Add(-ago)}
+	}
+	cases := []struct {
+		name    string
+		clients []tmux.ClientActivity
+		readErr error
+		want    bool
+	}{
+		{"active 20s ago on the pane", []tmux.ClientActivity{client("%a", 20*time.Second)}, nil, true},
+		{"quiet 90s on the pane", []tmux.ClientActivity{client("%a", 90*time.Second)}, nil, false},
+		{"exactly the quiet period", []tmux.ClientActivity{client("%a", quiet)}, nil, false},
+		{"active on another pane", []tmux.ClientActivity{client("%b", 5*time.Second)}, nil, false},
+		{"one quiet and one active", []tmux.ClientActivity{client("%a", 5*time.Minute), client("%a", 10*time.Second)}, nil, true},
+		{"detached", nil, nil, false},
+		{"read error", nil, errors.New("list-clients failed"), true},
+		{"read error with a quiet client", []tmux.ClientActivity{client("%a", time.Hour)}, errors.New("boom"), true},
+		{"activity in the future", []tmux.ClientActivity{client("%a", -5*time.Second)}, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recentHumanActivity(tc.clients, "%a", now, quiet, tc.readErr); got != tc.want {
+				t.Fatalf("recentHumanActivity = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Behavior 18 property: the guard holds exactly when the read failed, or some
+// client on the pane typed less than the quiet period ago.
+func TestRecentHumanActivity_Property(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	quiet := 60 * time.Second
+	rapid.Check(t, func(rt *rapid.T) {
+		count := rapid.IntRange(0, 4).Draw(rt, "clients")
+		clients := make([]tmux.ClientActivity, 0, count)
+		for i := range count {
+			clients = append(clients, tmux.ClientActivity{
+				Name:     fmt.Sprintf("/dev/pts/%d", i),
+				PaneID:   rapid.SampledFrom([]string{"%a", "%b"}).Draw(rt, "pane"),
+				Activity: now.Add(-time.Duration(rapid.IntRange(0, 200).Draw(rt, "age")) * time.Second),
+			})
+		}
+		var readErr error
+		if rapid.Bool().Draw(rt, "read fails") {
+			readErr = errors.New("list-clients failed")
+		}
+		want := readErr != nil || slices.ContainsFunc(clients, func(c tmux.ClientActivity) bool {
+			return c.PaneID == "%a" && now.Sub(c.Activity) < quiet
+		})
+		if got := recentHumanActivity(clients, "%a", now, quiet, readErr); got != want {
+			rt.Fatalf("got %v, want %v for %+v, error %v", got, want, clients, readErr)
+		}
+	})
+}
+
+// Loop 5, Behavior 19: while a person is typing, the poll claims and sends
+// nothing and logs once for each batch of messages; once they're quiet, the
+// next poll sends.
+func TestIdleNudgePoll_HeldThenSent(t *testing.T) {
+	logs := captureNudgeLogs(t)
+	fake := newFakeNudge(t)
+	fake.addUnread("BlueLake", 71, "first")
+	fake.addUnread("BlueLake", 72, "second")
+	fake.state.RecentHumanActivity = true
+	nudger := fake.nudger()
+	held := func() int { return strings.Count(logs.String(), "idle nudge: held, person typing") }
+
+	for range 3 {
+		nudger.poll(context.Background())
+	}
+	if fake.count("claim") != 0 || fake.count("send") != 0 {
+		t.Fatalf("claimed or sent while held: %v", fake.calls)
+	}
+	if held() != 1 {
+		t.Fatalf("held logged %d times over 3 polls, want 1:\n%s", held(), logs.String())
+	}
+
+	fake.addUnread("BlueLake", 73, "third") // the batch changes while held
+	nudger.poll(context.Background())
+	if held() != 2 {
+		t.Fatalf("held logged %d times after the batch changed, want 2:\n%s", held(), logs.String())
+	}
+
+	fake.state.RecentHumanActivity = false
+	nudger.poll(context.Background())
+	if fake.count("send") != 1 || !strings.Contains(fake.lastSent(), "third") {
+		t.Fatalf("after the person went quiet: %v", fake.calls)
+	}
+
+	fake.addUnread("BlueLake", 74, "fourth")
+	fake.state.RecentHumanActivity = true
+	nudger.poll(context.Background())
+	nudger.poll(context.Background())
+	if held() != 3 {
+		t.Fatalf("held logged %d times for the new batch, want 3:\n%s", held(), logs.String())
+	}
+	if fake.count("send") != 1 {
+		t.Fatalf("sent while held again: %v", fake.calls)
 	}
 }
 

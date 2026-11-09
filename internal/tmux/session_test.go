@@ -3,7 +3,9 @@ package tmux
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -1958,5 +1960,111 @@ func TestCollapseInteriorBlankLines(t *testing.T) {
 	}
 	if agentAutoSubmitsOnBlankLine(AgentUser) {
 		t.Error("agentAutoSubmitsOnBlankLine(user) = true, want false")
+	}
+}
+
+// Behavior 17: client activity is read from real tmux clients. Clients are
+// attached through script, as a terminal would be, because a control-mode
+// client's commands don't move client_activity (Loop 5 Sprint 3 evidence).
+func TestListClientActivity_RealClient(t *testing.T) {
+	skipIfNoTmux(t)
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Fatalf("script is required to attach a terminal client: %v", err)
+	}
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX", "")
+	run := func(args ...string) string {
+		t.Helper()
+		out, err := DefaultClient.Run(args...)
+		if err != nil {
+			t.Fatalf("tmux %v: %v", args, err)
+		}
+		return strings.TrimSpace(out)
+	}
+	run("new-session", "-d", "-s", "act", "-x", "100", "-y", "30", "cat")
+	t.Cleanup(func() { _, _ = DefaultClient.Run("kill-server") })
+	paneA := run("display", "-t", "act", "-p", "#{pane_id}")
+	paneB := run("split-window", "-t", "act", "-P", "-F", "#{pane_id}", "cat")
+
+	ctx := context.Background()
+	clients, err := ListClientActivityContext(ctx)
+	if err != nil || len(clients) != 0 {
+		t.Fatalf("detached: got %+v, %v; want no clients, no error", clients, err)
+	}
+
+	typeKey := attachScriptClient(t, "act")
+	first := waitForClients(t, 1)[0]
+	if first.PaneID != paneB {
+		t.Fatalf("client shows %s, want the active pane %s", first.PaneID, paneB)
+	}
+	if age := time.Since(first.Activity); age < -time.Second || age > 5*time.Second {
+		t.Fatalf("client activity %v is %v old, want within a few seconds", first.Activity, age)
+	}
+
+	run("select-pane", "-t", paneA)
+	time.Sleep(1500 * time.Millisecond) // client_activity has one-second steps
+	typeKey("k")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		clients, err = ListClientActivityContext(ctx)
+		if err == nil && len(clients) == 1 && clients[0].PaneID == paneA && clients[0].Activity.After(first.Activity) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after select-pane and a key: got %+v, %v; want pane %s, activity after %v", clients, err, paneA, first.Activity)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// A second client, on a grouped session's own window, shows another pane.
+	run("new-session", "-d", "-t", "act", "-s", "actg")
+	paneC := run("new-window", "-t", "actg", "-P", "-F", "#{pane_id}", "cat")
+	attachScriptClient(t, "actg")
+	panes := map[string]bool{}
+	for _, c := range waitForClients(t, 2) {
+		panes[c.PaneID] = true
+	}
+	if !panes[paneA] || !panes[paneC] {
+		t.Fatalf("two clients show %v, want %s and %s", panes, paneA, paneC)
+	}
+}
+
+// attachScriptClient attaches a terminal client to session through script and
+// returns a function that types into it.
+func attachScriptClient(t *testing.T, session string) func(keys string) {
+	t.Helper()
+	cmd := exec.Command("script", "-qfc", "tmux attach -t "+session, "/dev/null")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start script client: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return func(keys string) {
+		if _, err := io.WriteString(stdin, keys); err != nil {
+			t.Fatalf("type %q: %v", keys, err)
+		}
+	}
+}
+
+func waitForClients(t *testing.T, n int) []ClientActivity {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		clients, err := ListClientActivityContext(context.Background())
+		if err == nil && len(clients) == n {
+			return clients
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiting for %d clients: got %+v, %v", n, clients, err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
