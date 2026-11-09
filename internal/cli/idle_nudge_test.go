@@ -759,6 +759,27 @@ func TestIdleNudgePoll_TargetsFailure(t *testing.T) {
 	}
 }
 
+// A reminder that was sent is logged once, with its pane, agent and messages,
+// so the monitor's log shows what it did, not only what it skipped.
+func TestIdleNudgePoll_SentIsLogged(t *testing.T) {
+	logs := captureNudgeLogs(t)
+	fake := newFakeNudge(t)
+	fake.addUnread("BlueLake", 71, "first")
+	fake.addUnread("BlueLake", 72, "second")
+	nudger := fake.nudger()
+	nudger.poll(context.Background())
+	nudger.poll(context.Background())
+	out := logs.String()
+	if n := strings.Count(out, "idle nudge: reminder sent"); n != 1 {
+		t.Fatalf("logged %d sends, want 1:\n%s", n, out)
+	}
+	for _, want := range []string{"pane=%1", "agent=BlueLake", "messages=\"[71 72]\""} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("send log lacks %s:\n%s", want, out)
+		}
+	}
+}
+
 // Behavior 5 (unit): a pane with no running agent gets nothing, and is logged
 // once, not on every poll.
 func TestIdleNudgePoll_NotLiveLoggedOnce(t *testing.T) {

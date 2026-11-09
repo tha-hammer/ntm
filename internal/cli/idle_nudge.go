@@ -155,14 +155,18 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 	}
 
 	told := make([]agentmail.InboxMessage, 0, len(claims))
+	ids := make([]int, 0, len(claims))
 	for _, c := range claims {
 		n.deps.Record(target.Agent, c.msg)
 		told = append(told, c.msg)
+		ids = append(ids, c.msg.ID)
 	}
 	if err := n.deps.Send(target, buildReminderText(told, target.Agent, n.deps.ProjectKey)); err != nil {
 		n.warn("send reminder", target, err)
 		n.release(store, target, claims) // the next poll tries again
+		return
 	}
+	slog.Info("idle nudge: reminder sent", "pane", target.PaneID, "agent", target.Agent, "messages", fmt.Sprint(ids))
 }
 
 // nudgeClaim is one message this poll won the right to tell.

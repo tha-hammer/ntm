@@ -80,7 +80,9 @@
       "doc": "05-idle-nudge.md",
       "tdd_plan": "05-idle-nudge-tdd.md",
       "status": "building",
-      "sprints_passed": []
+      "sprints_passed": [
+        "Sprint 1: Nudge an idle spawned agent"
+      ]
     },
     {
       "doc": "06-agent-snooze.md",
@@ -460,8 +462,14 @@
       "step": "build",
       "event": "started",
       "detail": "05-idle-nudge-tdd.md"
+    },
+    {
+      "at": "2026-11-09T15:01:22.555Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 1: Nudge an idle spawned agent"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-09T12:20:00.754Z"
+  "updated_at": "2026-11-09T15:01:22.555Z"
 }

@@ -1134,6 +1134,24 @@ Notes for the run:
 - The monitor's log is `~/.local/share/ntm/logs/nudgetest-monitor.log`.
 - Step 9 needs you to attach briefly. Detach again before sending the message.
 
+**Result (2026-11-09):** run on rocketman at `8a0f1cf0`, with agent DarkHollow.
+- **Reminder:** "first" and "second" were sent at 14:17:31 UTC. At 14:17:48, `told_records` held messages 12509 and 12510 with `told_by` `idle_nudge`. At 14:17:49, one prompt naming both, with the `fetch_inbox` line, was typed into the pane.
+- **`fetch_inbox`:** untested. Claude answered "You've hit your weekly limit · resets Nov 11, 11am", an account limit, not ntm.
+- **No repeat:** two minutes later there was still one reminder, and no Stop hook feedback.
+- **Shell case:** after Ctrl+C to zsh, "third" (12511) was never typed, no told record was written, and the log said "idle nudge: no agent running in pane, not typing".
+- **`bd-ndisv`:** the monitor exited by itself 25 seconds after `ntm kill`.
+- **Issues found:**
+  1. A sent reminder wrote no `idle nudge:` log line, although the run notes said those lines show what the monitor did. Fixed after the test: `TestIdleNudgePoll_SentIsLogged` went red with "logged 0 sends", and now the poll logs "idle nudge: reminder sent" with the pane, agent and message IDs.
+  2. Spawn's trust-prompt keystrokes (`bd-57xdn`).
+- **Evidence:** `/home/debian/Dev/ntm-test-evidence/loop5-sprint1-local-2026-11-09/`.
+
+**Rerun (2026-11-09), passed:** on a fresh account, still at `8a0f1cf0`, with agent LilacDune.
+- At 14:53:46, the nudge told "first", and the agent called `fetch_inbox`.
+- At 14:53:56, the Stop hook told "second", which was sent after the nudge poll, and the agent called `fetch_inbox` again.
+- Each message was told once, through the shared told record, and nothing repeated after 2 minutes.
+- The "reminder sent" log line wasn't in this build. It ships in the commit after `8a0f1cf0`.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop5-sprint1-rerun-local-2026-11-09/`.
+
 ---
 
 ## Sprint 2: Nudge an added agent
