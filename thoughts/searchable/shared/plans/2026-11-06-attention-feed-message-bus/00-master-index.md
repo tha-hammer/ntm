@@ -21,7 +21,7 @@ Human tests run on this VPS, except Loop 8, Sprint 3, which runs on your local m
 | 2 | [02-addressed-mail-notices.md](02-addressed-mail-notices.md) | Addressed mail notices | 2 | Done: Sprints 1 and 2 passed |
 | 3 | [03-claude-turn-end-push.md](03-claude-turn-end-push.md) | Claude turn-end push | 7 | Done: Sprints 1 to 7 passed |
 | 4 | [04-cross-process-delivery.md](04-cross-process-delivery.md) | Cross-process delivery | 1 | Done: Sprint 1 passed |
-| 5 | [05-idle-nudge.md](05-idle-nudge.md) | Idle nudge | 5 | In progress: Sprints 1, 2 and 3 passed |
+| 5 | [05-idle-nudge.md](05-idle-nudge.md) | Idle nudge | 5 | In progress: Sprints 1 to 4 passed |
 | 6 | [06-agent-snooze.md](06-agent-snooze.md) | Agent snooze | 2 | Not started |
 | 7 | [07-codex-turn-end-push.md](07-codex-turn-end-push.md) | Codex turn-end push | 2 | Not started |
 | 8 | [08-hook-migration.md](08-hook-migration.md) | Hook migration | 3 | Not started |

@@ -1337,6 +1337,10 @@ type AgentMailConfig struct {
 	// there. Zero or less means 60. Spawn freezes it into the session
 	// manifest.
 	HumanTypingQuietSeconds int `toml:"human_typing_quiet_seconds,omitempty"`
+	// IdleNudgeEnabled controls whether a session's monitor types reminders
+	// about new mail into idle agents. Nil means on. Spawn freezes it into the
+	// session manifest. It is independent of StopHookEnabled.
+	IdleNudgeEnabled *bool `toml:"idle_nudge_enabled,omitempty"`
 }
 
 // DefaultIdleNudgeInterval is the idle nudge's poll interval when none is set.
@@ -1383,6 +1387,17 @@ func (a AgentMailConfig) StopHookEnabledOrDefault() bool {
 // switched off. Every place that writes or runs the hook checks this.
 func (a AgentMailConfig) StopHookActive() bool {
 	return a.Enabled && a.StopHookEnabledOrDefault()
+}
+
+// IdleNudgeEnabledOrDefault returns IdleNudgeEnabled with its default-true rule.
+func (a AgentMailConfig) IdleNudgeEnabledOrDefault() bool {
+	return a.IdleNudgeEnabled == nil || *a.IdleNudgeEnabled
+}
+
+// IdleNudgeActive is true when Agent Mail is on and the idle nudge isn't
+// switched off.
+func (a AgentMailConfig) IdleNudgeActive() bool {
+	return a.Enabled && a.IdleNudgeEnabledOrDefault()
 }
 
 // IntegrationsConfig holds external tool integration settings.
@@ -3234,6 +3249,8 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "supervisor_enabled = %t\n", cfg.AgentMail.SupervisorEnabledOrDefault())
 	fmt.Fprintln(w, "# If true, Claude agents ntm creates are told about new mail when their turn ends.")
 	fmt.Fprintf(w, "stop_hook_enabled = %t\n", cfg.AgentMail.StopHookEnabledOrDefault())
+	fmt.Fprintln(w, "# If true, the session monitor reminds idle agents about new mail they haven't been told about.")
+	fmt.Fprintf(w, "idle_nudge_enabled = %t\n", cfg.AgentMail.IdleNudgeEnabledOrDefault())
 	fmt.Fprintln(w, "# Seconds between the session monitor's checks of idle agents for new mail.")
 	fmt.Fprintf(w, "idle_nudge_interval_seconds = %d\n", int(cfg.AgentMail.IdleNudgeInterval()/time.Second))
 	fmt.Fprintln(w, "# Seconds a person's keystrokes in an agent's pane must be quiet before the idle nudge types there.")
@@ -4374,6 +4391,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.AgentMail.SupervisorEnabledOrDefault(), nil
 		case "stop_hook_enabled":
 			return cfg.AgentMail.StopHookEnabledOrDefault(), nil
+		case "idle_nudge_enabled":
+			return cfg.AgentMail.IdleNudgeEnabledOrDefault(), nil
 		case "idle_nudge_interval_seconds":
 			return int(cfg.AgentMail.IdleNudgeInterval() / time.Second), nil
 		case "human_typing_quiet_seconds":
@@ -5483,6 +5502,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agent_mail.program_name", defaults.AgentMail.ProgramName, cfg.AgentMail.ProgramName)
 	addDiff("agent_mail.supervisor_enabled", defaults.AgentMail.SupervisorEnabledOrDefault(), cfg.AgentMail.SupervisorEnabledOrDefault())
 	addDiff("agent_mail.stop_hook_enabled", defaults.AgentMail.StopHookEnabledOrDefault(), cfg.AgentMail.StopHookEnabledOrDefault())
+	addDiff("agent_mail.idle_nudge_enabled", defaults.AgentMail.IdleNudgeEnabledOrDefault(), cfg.AgentMail.IdleNudgeEnabledOrDefault())
 	addDiff("agent_mail.idle_nudge_interval_seconds", int(defaults.AgentMail.IdleNudgeInterval()/time.Second), int(cfg.AgentMail.IdleNudgeInterval()/time.Second))
 	addDiff("agent_mail.human_typing_quiet_seconds", int(defaults.AgentMail.HumanTypingQuiet()/time.Second), int(cfg.AgentMail.HumanTypingQuiet()/time.Second))
 

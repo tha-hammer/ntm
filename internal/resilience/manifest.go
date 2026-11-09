@@ -51,6 +51,10 @@ type SpawnManifest struct {
 	// be quiet before the idle nudge types there, frozen the same way. Zero
 	// means the default.
 	HumanTypingQuietSeconds int `json:"human_typing_quiet_seconds,omitempty"`
+	// IdleNudgeDisabled is the idle nudge switch, frozen at spawn for the same
+	// reason as ReapOrphansOnExit. It is stored as "disabled" so a manifest
+	// saved before the switch existed reads as on, the default.
+	IdleNudgeDisabled bool `json:"idle_nudge_disabled,omitempty"`
 }
 
 // IdleNudgeInterval returns the frozen idle nudge interval, or the default

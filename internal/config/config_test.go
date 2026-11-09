@@ -4982,3 +4982,82 @@ func TestGetValue_StopHookEnabled(t *testing.T) {
 		t.Fatalf("off: GetValue = %v, %v", got, err)
 	}
 }
+
+// Loop 5, Behavior 24: the idle nudge switch defaults to on, and is active
+// only while Agent Mail is on.
+func TestAgentMailConfig_IdleNudgeSwitch(t *testing.T) {
+	cases := []struct {
+		name        string
+		agentMail   string
+		wantEnabled bool
+		wantActive  bool
+	}{
+		{name: "default", agentMail: "enabled = true\n", wantEnabled: true, wantActive: true},
+		{name: "switch off", agentMail: "enabled = true\nidle_nudge_enabled = false\n", wantEnabled: false, wantActive: false},
+		{name: "agent mail off", agentMail: "enabled = false\n", wantEnabled: true, wantActive: false},
+		{name: "agent mail off wins", agentMail: "enabled = false\nidle_nudge_enabled = true\n", wantEnabled: true, wantActive: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(createTempConfig(t, "[agent_mail]\n"+tc.agentMail))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.AgentMail.IdleNudgeEnabledOrDefault(); got != tc.wantEnabled {
+				t.Fatalf("IdleNudgeEnabledOrDefault() = %v, want %v", got, tc.wantEnabled)
+			}
+			if got := cfg.AgentMail.IdleNudgeActive(); got != tc.wantActive {
+				t.Fatalf("IdleNudgeActive() = %v, want %v", got, tc.wantActive)
+			}
+		})
+	}
+	if !Default().AgentMail.IdleNudgeActive() {
+		t.Fatal("the default config has the idle nudge inactive")
+	}
+}
+
+// Behavior 24 property: IdleNudgeActive is Enabled and the switch's
+// default-true rule, for all three pointer states and both Enabled values.
+func TestAgentMailConfig_IdleNudgeActiveProperty(t *testing.T) {
+	on, off := true, false
+	for _, enabled := range []bool{false, true} {
+		for _, sw := range []*bool{nil, &on, &off} {
+			a := AgentMailConfig{Enabled: enabled, IdleNudgeEnabled: sw}
+			want := enabled && (sw == nil || *sw)
+			if got := a.IdleNudgeActive(); got != want {
+				t.Errorf("Enabled %v, switch %v: IdleNudgeActive() = %v, want %v", enabled, sw, got, want)
+			}
+		}
+	}
+}
+
+func TestIdleNudgeEnabled_PrintGetValueDiff(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Print(Default(), &buf); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	section := buf.String()[strings.Index(buf.String(), "[agent_mail]"):]
+	section = section[:strings.Index(section, "\n\n")]
+	if !strings.Contains(section, "idle_nudge_enabled = true") {
+		t.Fatalf("[agent_mail] section lacks idle_nudge_enabled = true:\n%s", section)
+	}
+
+	cfg := Default()
+	if got, err := GetValue(cfg, "agent_mail.idle_nudge_enabled"); err != nil || got != true {
+		t.Fatalf("default: GetValue = %v, %v", got, err)
+	}
+	off := false
+	cfg.AgentMail.IdleNudgeEnabled = &off
+	if got, err := GetValue(cfg, "agent_mail.idle_nudge_enabled"); err != nil || got != false {
+		t.Fatalf("off: GetValue = %v, %v", got, err)
+	}
+	found := false
+	for _, d := range Diff(cfg) {
+		if d.Path == "agent_mail.idle_nudge_enabled" {
+			found = d.Default == true && d.Current == false
+		}
+	}
+	if !found {
+		t.Fatalf("Diff lacks agent_mail.idle_nudge_enabled true -> false: %+v", Diff(cfg))
+	}
+}

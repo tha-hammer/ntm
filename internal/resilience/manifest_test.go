@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"pgregory.net/rapid"
 )
 
 func TestManifestDir_WithXDGDataHome(t *testing.T) {
@@ -81,6 +83,45 @@ func TestSpawnManifest_IdleNudgeInterval(t *testing.T) {
 	if loaded, err := LoadManifest("old-manifest"); err != nil || loaded.IdleNudgeInterval() != 30*time.Second {
 		t.Fatalf("old manifest: %+v, %v", loaded, err)
 	}
+}
+
+// Loop 5, Behavior 25: a manifest saved before the nudge switch existed reads
+// as on.
+func TestLoadManifest_OldManifestNudgeOn(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	if err := os.MkdirAll(ManifestDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(ManifestDir(), "old-nudge.json")
+	if err := os.WriteFile(old, []byte(`{"session":"old-nudge","project_dir":"/p","agents":[],"auto_restart":false,"reap_orphans_on_exit":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadManifest("old-nudge")
+	if err != nil || loaded.IdleNudgeDisabled {
+		t.Fatalf("old manifest: %+v, %v; want the nudge on", loaded, err)
+	}
+}
+
+// Behavior 25 property: save then load keeps the nudge switch and interval.
+func TestSaveLoadManifest_NudgeSettingsRoundTrip(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	rapid.Check(t, func(rt *rapid.T) {
+		want := &SpawnManifest{
+			Session:                  "nudge-roundtrip",
+			IdleNudgeDisabled:        rapid.Bool().Draw(rt, "disabled"),
+			IdleNudgeIntervalSeconds: rapid.IntRange(-5, 600).Draw(rt, "interval"),
+		}
+		if err := SaveManifest(want); err != nil {
+			rt.Fatal(err)
+		}
+		got, err := LoadManifest("nudge-roundtrip")
+		if err != nil {
+			rt.Fatal(err)
+		}
+		if got.IdleNudgeDisabled != want.IdleNudgeDisabled || got.IdleNudgeIntervalSeconds != want.IdleNudgeIntervalSeconds {
+			rt.Fatalf("round trip: got %+v, want %+v", got, want)
+		}
+	})
 }
 
 func TestSaveLoadDeleteManifest_RoundTrip(t *testing.T) {

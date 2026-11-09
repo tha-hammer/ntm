@@ -214,6 +214,22 @@ func TestBuildSpawnManifest_FreezesIdleNudgeInterval(t *testing.T) {
 	if got := buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).IdleNudgeInterval(); got != 30*time.Second {
 		t.Fatalf("default interval = %s, want 30s", got)
 	}
+	// Loop 5, Behavior 25: the nudge switch is frozen as "disabled", so an
+	// old manifest reads as on. Agent Mail off turns the nudge off too.
+	cfg.AgentMail.Enabled = true
+	if buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).IdleNudgeDisabled {
+		t.Fatal("nudge disabled in the manifest with the switch on")
+	}
+	off := false
+	cfg.AgentMail.IdleNudgeEnabled = &off
+	if !buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).IdleNudgeDisabled {
+		t.Fatal("nudge not disabled in the manifest with the switch off")
+	}
+	cfg.AgentMail.IdleNudgeEnabled = nil
+	cfg.AgentMail.Enabled = false
+	if !buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).IdleNudgeDisabled {
+		t.Fatal("nudge not disabled in the manifest with Agent Mail off")
+	}
 	// Loop 5 Sprint 3: the keystroke quiet period is frozen the same way.
 	cfg.AgentMail.HumanTypingQuietSeconds = 2
 	if got := buildSpawnManifest(SpawnOptions{Session: "nudge"}, cfg, "/tmp/project", nil).HumanTypingQuiet(); got != 2*time.Second {

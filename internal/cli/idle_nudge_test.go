@@ -63,7 +63,8 @@ done
 // screenAgentConfig writes claude and codex stand-ins into <root>/bin, and the
 // helpers' config.toml with them as the agent commands, Agent Mail on at the
 // fake server, a 1 second nudge poll, and a 2 second keystroke quiet period.
-func (e *closureEnv) screenAgentConfig(t *testing.T, mail *fakeAgentMail, extra string) *screenAgents {
+// agentMail holds more lines for the [agent_mail] table.
+func (e *closureEnv) screenAgentConfig(t *testing.T, mail *fakeAgentMail, agentMail string) *screenAgents {
 	t.Helper()
 	root := filepath.Dir(e.workDir)
 	agents := &screenAgents{dir: filepath.Join(root, "agents")}
@@ -92,7 +93,7 @@ codex = %q
 enabled = true
 idle_nudge_interval_seconds = 1
 human_typing_quiet_seconds = 2
-
+%s
 [cass.context]
 enabled = false
 
@@ -114,8 +115,12 @@ enabled = false
 
 [integrations.rch]
 enabled = false
-%s`, e.projectsBase(), commands["claude"], commands["codex"], extra))
+`, e.projectsBase(), commands["claude"], commands["codex"], agentMail))
 	return agents
+}
+
+func (e *closureEnv) configPath() string {
+	return filepath.Join(e.configDir, "ntm", "config.toml")
 }
 
 // waitStarted waits for count stand-ins to start and returns their pid folders
@@ -299,11 +304,12 @@ func (e *closureEnv) told(t *testing.T, project, agent string, messageID int64) 
 }
 
 // spawnNudgeAgent spawns one stand-in Claude agent in a git repo, shows the
-// idle screen, and returns its pid folder and Agent Mail name.
-func spawnNudgeAgent(t *testing.T, env *closureEnv, agents *screenAgents, session string) (pid, agent string) {
+// idle screen, and returns its pid folder and Agent Mail name. spawnArgs are
+// added to the spawn command.
+func spawnNudgeAgent(t *testing.T, env *closureEnv, agents *screenAgents, session string, spawnArgs ...string) (pid, agent string) {
 	t.Helper()
 	gitInitForTest(t, env.projectDir(session))
-	env.run(t, "execute", "spawn", session, "--cc=1")
+	env.run(t, "execute", append([]string{"spawn", session, "--cc=1"}, spawnArgs...)...)
 	pid = agents.waitStarted(t, 1, 20*time.Second)[0]
 	agents.setScreen(t, pid, "cc_idle.txt")
 	return pid, agents.agentEnv(t, pid, "AGENT_NAME")
@@ -596,6 +602,117 @@ func TestClosure_TypedTextHoldsNudge(t *testing.T) {
 	if strings.Contains(got, "add a second line") {
 		t.Fatalf("the preview text was submitted with the reminder: %q", got)
 	}
+}
+
+// assertNoNudge runs the session's monitor for 3 seconds and checks it made no
+// fetch_inbox call and typed no reminder, while its other work still started.
+func assertNoNudge(t *testing.T, env *closureEnv, mail *fakeAgentMail, agents *screenAgents, pid, session string) {
+	t.Helper()
+	fetchesBefore := len(mail.callsFor("fetch_inbox"))
+	env.startMonitor(t, session)
+	time.Sleep(3 * time.Second)
+	if fetches := mail.callsFor("fetch_inbox"); len(fetches) != fetchesBefore {
+		t.Fatalf("the monitor asked Agent Mail for the inbox: %+v", fetches[fetchesBefore:])
+	}
+	if typed := agents.typed(t, pid); strings.Contains(typed, "new message") {
+		t.Fatalf("the monitor typed a reminder: %q", typed)
+	}
+	if log := env.monitorLog(t, session); !strings.Contains(log, "Monitoring session '"+session+"'") {
+		t.Fatalf("the monitor didn't start its other work:\n%s", log)
+	}
+}
+
+// Loop 5, Behavior 26: with the nudge switch off, whether in the default
+// config, in a config passed to spawn with --config, or by Agent Mail being
+// off, the monitor neither asks Agent Mail nor types. The monitor's own
+// command line carries no --config, so it must read the switch spawn froze.
+func TestClosure_NudgeSwitchOff(t *testing.T) {
+	t.Run("default config", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		env := newClosureEnv(t)
+		env.privateTmux(t)
+		agents := env.screenAgentConfig(t, mail, "idle_nudge_enabled = false\n")
+		pid, agent := spawnNudgeAgent(t, env, agents, "nonudge")
+		mail.addMessage(agent, agentmail.InboxMessage{ID: 101, From: "RedStone", Subject: "no nudge"})
+		assertNoNudge(t, env, mail, agents, pid, "nonudge")
+	})
+	t.Run("spawn --config", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		env := newClosureEnv(t)
+		env.privateTmux(t)
+		agents := env.screenAgentConfig(t, mail, "")
+		content, err := os.ReadFile(env.configPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		offConfig := filepath.Join(filepath.Dir(env.workDir), "nudge-off.toml")
+		writeFile(t, offConfig, strings.Replace(string(content), "[agent_mail]\n", "[agent_mail]\nidle_nudge_enabled = false\n", 1))
+		pid, agent := spawnNudgeAgent(t, env, agents, "nonudgecfg", "--config", offConfig)
+		mail.addMessage(agent, agentmail.InboxMessage{ID: 102, From: "RedStone", Subject: "no nudge"})
+		assertNoNudge(t, env, mail, agents, pid, "nonudgecfg")
+	})
+	t.Run("agent mail off", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		env := newClosureEnv(t)
+		env.privateTmux(t)
+		agents := env.screenAgentConfig(t, mail, "")
+		content, err := os.ReadFile(env.configPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.writeConfig(t, strings.Replace(string(content), "[agent_mail]\nenabled = true\n", "[agent_mail]\nenabled = false\n", 1))
+		gitInitForTest(t, env.projectDir("nomail"))
+		env.run(t, "execute", "spawn", "nomail", "--cc=1")
+		pid := agents.waitStarted(t, 1, 20*time.Second)[0]
+		agents.setScreen(t, pid, "cc_idle.txt")
+		assertNoNudge(t, env, mail, agents, pid, "nomail")
+	})
+}
+
+// Loop 5, Behavior 27: the Stop hook's switch and the nudge's switch are
+// independent. Each feature reads only its own.
+func TestClosure_HookAndNudgeSwitchesIndependent(t *testing.T) {
+	settingsFile := func(env *closureEnv, session string) string {
+		return filepath.Join(env.projectDir(session), ".claude", "settings.local.json")
+	}
+	t.Run("hook off, nudge on", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		env := newClosureEnv(t)
+		env.privateTmux(t)
+		agents := env.screenAgentConfig(t, mail, "stop_hook_enabled = false\n")
+		pid, agent := spawnNudgeAgent(t, env, agents, "hookoff")
+		if _, err := os.Stat(settingsFile(env, "hookoff")); !os.IsNotExist(err) {
+			t.Fatalf("hook file written with the hook off: %v", err)
+		}
+		mail.addMessage(agent, agentmail.InboxMessage{ID: 111, From: "RedStone", Subject: "nudged anyway"})
+		env.startMonitor(t, "hookoff")
+		agents.waitTyped(t, pid, "nudged anyway", 15*time.Second)
+	})
+	t.Run("nudge off, hook on", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		env := newClosureEnv(t)
+		env.privateTmux(t)
+		agents := env.screenAgentConfig(t, mail, "idle_nudge_enabled = false\n")
+		pid, agent := spawnNudgeAgent(t, env, agents, "nudgeoff")
+		mail.addMessage(agent, agentmail.InboxMessage{ID: 112, From: "RedStone", Subject: "hook tells it"})
+		assertNoNudge(t, env, mail, agents, pid, "nudgeoff")
+		decision := parseStopDecision(t, runStopHook(t, env, "nudgeoff", agent))
+		if !strings.Contains(decision.Reason, "from RedStone: hook tells it") {
+			t.Fatalf("hook reason = %q", decision.Reason)
+		}
+	})
+	t.Run("both off", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		env := newClosureEnv(t)
+		env.privateTmux(t)
+		agents := env.screenAgentConfig(t, mail, "stop_hook_enabled = false\nidle_nudge_enabled = false\n")
+		pid, agent := spawnNudgeAgent(t, env, agents, "bothoff")
+		if _, err := os.Stat(settingsFile(env, "bothoff")); !os.IsNotExist(err) {
+			t.Fatalf("hook file written with the hook off: %v", err)
+		}
+		mail.addMessage(agent, agentmail.InboxMessage{ID: 113, From: "RedStone", Subject: "nobody tells it"})
+		assertNoNudge(t, env, mail, agents, pid, "bothoff")
+	})
 }
 
 func testRegistry(paneAgents map[string]string) *agentmail.SessionAgentRegistry {

@@ -154,8 +154,10 @@ func runMonitor(session string) error {
 	monitor.Start(ctx)
 
 	// Remind idle agents about new mail. It stops with ctx and doesn't touch
-	// the resilience monitor's crash handling.
-	if cfg != nil && cfg.AgentMail.Enabled {
+	// the resilience monitor's crash handling. The switch comes from the
+	// manifest, frozen at spawn, because this process's command line carries
+	// no --config. It is the nudge's own switch, not the Stop hook's.
+	if !manifest.IdleNudgeDisabled {
 		nudger := newIdleNudger(productionIdleNudgeDeps(session, manifest))
 		go runIdleNudgeLoop(ctx, manifest.IdleNudgeInterval(), timeIdleNudgeTicker, nudger)
 	}

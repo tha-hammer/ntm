@@ -1854,6 +1854,19 @@ Notes for the run:
 - The evidence showed both agents have a style difference, so step 6 should pass on Codex too. On Codex, step 7's "preview text" is its "Ask Codex to do anything" placeholder, which shows as soon as the box is cleared.
 - The monitor log, `~/.local/share/ntm/logs/drafttest-monitor.log`, should show "idle nudge: held, person typing" with `typed_text=present recent_keys=false` while your text waits, and then "idle nudge: reminder sent".
 
+**Result (2026-11-09), passed on both agents:** run on rocketman at `7fa91f82`. Typing went through a real tmux client attached through a pty, which then detached. The script is `client.py` in the evidence folder.
+- **Claude** (MagentaBeaver, `%63`):
+  - "please look at the" was left unsent and idle for 70 seconds. Mail 12516 was sent at 12:53:08.
+  - At 12:53:16 the log said `held, person typing … recent_keys=false typed_text=present`. The draft was intact after 2 minutes.
+  - The text was cleared at about 12:55:38, and the dim `Try "fix lint errors"` hint came back. At 12:55:48 the reminder was sent for [12516], and the hint wasn't sent with it.
+- **Codex** (FoggyGrove, `%64`):
+  - Mail 12517 was sent at 12:57:22. At 12:57:46 the log said `held … typed_text=present`. The draft was intact after 2 minutes.
+  - The text was cleared at about 12:59:43, and the "Ask Codex to do anything" hint came back. At 12:59:48 the reminder was sent for [12517], and the agent ran `fetch_inbox`.
+- `told_records` has one `idle_nudge` row for each message.
+- **The tester's question:** after clearing, the reminder came 5 to 10 seconds later, not 60, because the client had detached. That's intended. Sprint 3's criteria say a detached session is nudged as normal, so the keystroke check only covers attached clients. Once nobody is attached, only text left on the input line holds the nudge.
+- **Side issue:** Claude exited at the trust prompt on spawn again (`bd-57xdn`) and was relaunched.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop5-sprint4-local-2026-11-09/`.
+
 ---
 
 ## Sprint 5: Nudge switch
@@ -2016,6 +2029,33 @@ As Behavior 24.
 #### Success Criteria
 
 **Automated:** `go test -short -run TestClosure_HookAndNudgeSwitchesIndependent ./internal/cli/` passes, with red-at-seam recorded.
+
+### Build record (2026-11-09)
+
+Base commit `7fa91f82`. Red, then green, for each behavior:
+- **24:** red was "IdleNudgeActive undefined" and "unknown field IdleNudgeEnabled". The invariant is checked for all 6 combinations, the 3 pointer states times both `Enabled` values.
+- **25:** red was "IdleNudgeDisabled undefined", in the old-manifest test, the round-trip property and the spawn test. Spawn and the manifest went green before the monitor changed, so Behavior 26 could be red against the old monitor.
+- **26:** red was "the monitor asked Agent Mail for the inbox" in the default-config run and the `spawn --config` run. The monitor still read its own config's `AgentMail.Enabled`. The "Agent Mail off" run passed before and after.
+- **27:**
+  - **Before the fix:** "nudge off, hook on" and "both off" were red, for the same reason as 26. "Hook off, nudge on" was green.
+  - **Seam check:** with the monitor temporarily gated on `StopHookActive()`, "hook off, nudge on" went red: "no "nudged anyway" typed within 15s".
+  - **After:** with the monitor on `!manifest.IdleNudgeDisabled`, all three runs pass.
+
+Where the build differs from the plan:
+- **`screenAgentConfig`'s last argument is now lines for the `[agent_mail]` table,** not text appended after the last table. Every earlier caller passed "", and the switch must sit inside `[agent_mail]`.
+- **`spawnNudgeAgent` takes extra spawn arguments,** for `--config`.
+- **The "Agent Mail off" run reads no agent name,** because spawn registers none, so it checks only for no `fetch_inbox` calls and no reminder.
+- **Behavior 24's invariant is checked exhaustively** over its 6 inputs rather than with rapid. Behavior 25's round trip uses rapid.
+- **No config docs page was changed.** No doc outside `thoughts/` mentions `stop_hook_enabled`, and the printed config (`ntm config show`) carries the new key with its comment.
+- **Sprint verification follows this plan's list** (`-race` on 5 packages, closure tests ×10). Sprints 1 to 4 ran the closure tests ×5.
+
+Verification:
+- `go vet` on the 6 listed packages is clean.
+- `-race` on state, tmux, resilience, config and agent: all pass with no data race. The one failure is the known `TestClaudeActivelyWorking_RealCaptures` (bd-5zbcm).
+- The nudge closure tests, Behaviors 2 to 5, 13, 20, 23, 26 and 27, passed 10 times in a row: `ok internal/cli 1063s`.
+- `go test -short ./...` shows only the 7 known failures from bd-5zbcm.
+- The build and the tamper check against `7fa91f82` are clean. `gofmt -l` flags only the 3 files that were already flagged.
+- golangci-lint, goimports, ubs and rch aren't installed here, so they weren't run.
 
 ### Human test script
 

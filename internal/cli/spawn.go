@@ -1544,6 +1544,7 @@ func buildSpawnManifest(opts SpawnOptions, cfg *config.Config, projectDir string
 		ReapOrphansOnExit:        cfg.Resilience.ReapOrphansOnExit,
 		IdleNudgeIntervalSeconds: cfg.AgentMail.IdleNudgeIntervalSeconds,
 		HumanTypingQuietSeconds:  cfg.AgentMail.HumanTypingQuietSeconds,
+		IdleNudgeDisabled:        !cfg.AgentMail.IdleNudgeActive(),
 	}
 }
 
