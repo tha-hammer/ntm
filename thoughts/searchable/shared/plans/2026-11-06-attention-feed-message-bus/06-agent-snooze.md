@@ -91,7 +91,7 @@ Covers deliverable 14. Needs Loop 5.
 
 **API:** The hook and nudge query for snoozes that have ended for this agent, then treat those messages as new. Agent Mail's read state isn't checked, because the server doesn't report it. **Assumption:** a snooze longer than the 7 day retention, or past its event's expiry, is rejected, because the event would be gone by then.
 
-**UI:** A snoozed message returns in the normal `ReminderText`. **Assumption:** it isn't marked differently.
+**UI:** A snoozed message returns in the normal `ReminderText`. **Assumption:** it isn't marked differently. The text `ntm mail inbox` shows each message's `[#id]`, so its id can be found without `--json` (added after Sprint 1's human test, 2026-11-10).
 
 ### Test scenarios
 

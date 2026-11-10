@@ -2023,14 +2023,28 @@ func upsertAttentionItemStateExec(exec sqlExecer, item *AttentionItemState, now 
 	return nil
 }
 
-// ErrSnoozeNotInFuture is returned for a snooze time at or before now.
-var ErrSnoozeNotInFuture = errors.New("snooze time must be in the future")
+// SnoozeLimit is the longest snooze. Attention events last as long as told
+// records, so a longer snooze would end after its notice was gone.
+const SnoozeLimit = ToldRecordRetention
+
+var (
+	// ErrSnoozeNotInFuture is returned for a snooze time at or before now.
+	ErrSnoozeNotInFuture = errors.New("snooze time must be in the future")
+	// ErrSnoozeTooLong is returned for a snooze time more than SnoozeLimit ahead.
+	ErrSnoozeTooLong = errors.New("snooze time can be at most 7 days ahead")
+	// ErrSnoozePastNotice is returned for a snooze that would end after its
+	// notice expires.
+	ErrSnoozePastNotice = errors.New("snooze would end after its notice expires")
+)
 
 // ValidateSnoozeUntil is the snooze time rule for every caller: the operator
 // API and an agent's ntm mail snooze.
 func ValidateSnoozeUntil(until, now time.Time) error {
 	if !until.After(now) {
 		return ErrSnoozeNotInFuture
+	}
+	if latest := now.Add(SnoozeLimit); until.After(latest) {
+		return fmt.Errorf("%w (until %s)", ErrSnoozeTooLong, latest.UTC().Format(time.RFC3339))
 	}
 	return nil
 }
@@ -2076,6 +2090,10 @@ func (s *Store) SnoozeAddressedMessage(req SnoozeRequest) (time.Time, error) {
 	}
 	if event == nil {
 		return time.Time{}, ErrNoAddressedEvent
+	}
+	if event.ExpiresAt != nil && req.Until.After(*event.ExpiresAt) {
+		return time.Time{}, fmt.Errorf("%w: message %d's notice expires at %s; snooze until then at the latest",
+			ErrSnoozePastNotice, req.MessageID, event.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	itemKey := attentionItemKeyForEvent(event.DedupKey, event.Cursor)
 	prior, err := s.GetAttentionItemState(itemKey)
@@ -2129,6 +2147,7 @@ func (s *Store) SnoozeAddressedMessage(req SnoozeRequest) (time.Time, error) {
 // SnoozedMessage is one snoozed Agent Mail message on an agent's notice.
 type SnoozedMessage struct {
 	Cursor    int64
+	ItemKey   string
 	MessageID int64
 	From      string
 	Subject   string
@@ -2144,7 +2163,7 @@ func (s *Store) SnoozedMessages(project, agent string, now time.Time) (active, e
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT e.cursor, e.message_id, COALESCE(e.details, ''), s.snoozed_until
+		SELECT e.cursor, s.item_key, e.message_id, COALESCE(e.details, ''), s.snoozed_until
 		FROM attention_events e
 		JOIN attention_item_states s ON s.item_key = CASE
 			WHEN TRIM(COALESCE(e.dedup_key, '')) != '' THEN 'dedup:' || TRIM(e.dedup_key)
@@ -2166,7 +2185,7 @@ func (s *Store) SnoozedMessages(project, agent string, now time.Time) (active, e
 			details string
 			until   sql.NullTime
 		)
-		if err := rows.Scan(&m.Cursor, &m.MessageID, &details, &until); err != nil {
+		if err := rows.Scan(&m.Cursor, &m.ItemKey, &m.MessageID, &details, &until); err != nil {
 			return nil, nil, fmt.Errorf("snoozed messages: %w", err)
 		}
 		var fields struct {
@@ -2490,10 +2509,18 @@ func (s *Store) ReleaseToldRecord(rec ToldRecord) error {
 func (s *Store) GetToldRecord(projectKey, agentName string, messageID int64) (*ToldRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return getToldRecord(s.db, projectKey, agentName, messageID)
+}
 
+// rowQuerier is a database or a transaction, for reads both need.
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func getToldRecord(db rowQuerier, projectKey, agentName string, messageID int64) (*ToldRecord, error) {
 	rec := ToldRecord{}
 	var toldAt string
-	err := s.db.QueryRow(`
+	err := db.QueryRow(`
 		SELECT project_key, agent_name, message_id, told_by, told_at FROM told_records
 		WHERE project_key = ? AND agent_name = ? AND message_id = ?`,
 		projectKey, strings.TrimSpace(agentName), messageID,
@@ -2508,6 +2535,85 @@ func (s *Store) GetToldRecord(projectKey, agentName string, messageID int64) (*T
 		return nil, fmt.Errorf("get told record: parse told_at %q: %w", toldAt, err)
 	}
 	return &rec, nil
+}
+
+// EndedSnoozeClaim is a won claim on an ended snooze. A caller whose reminder
+// doesn't reach the agent gives it to ReleaseEndedSnoozeClaim.
+type EndedSnoozeClaim struct {
+	Snooze   SnoozedMessage
+	Told     ToldRecord
+	Previous *ToldRecord // the told record this claim replaced, if any
+}
+
+// ClaimEndedSnooze takes an ended snooze for one reminder. In one transaction
+// it clears the snooze and replaces the message's told record with rec. One
+// caller wins. The others, and a caller whose snooze isn't over or was snoozed
+// again, get nil. The transaction starts with the conditional update, so it
+// holds the write lock before it reads anything, and a caller in another
+// process waits for it rather than failing on a stale read.
+func (s *Store) ClaimEndedSnooze(snooze SnoozedMessage, rec ToldRecord) (*EndedSnoozeClaim, error) {
+	rec.AgentName = strings.TrimSpace(rec.AgentName)
+	rec.ToldAt = rec.ToldAt.UTC()
+	var claim *EndedSnoozeClaim
+	err := s.Transaction(func(tx *Tx) error {
+		result, err := tx.tx.Exec(`
+			UPDATE attention_item_states SET state = ?, snoozed_until = NULL, updated_at = ?
+			WHERE item_key = ? AND state = ? AND snoozed_until IS NOT NULL AND snoozed_until <= ?`,
+			AttentionStateNew, rec.ToldAt, snooze.ItemKey, AttentionStateSnoozed, rec.ToldAt)
+		changed, err := rowsAffected(result, err, "claim ended snooze")
+		if err != nil || changed != 1 {
+			return err
+		}
+		previous, err := getToldRecord(tx.tx, rec.ProjectKey, rec.AgentName, rec.MessageID)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.tx.Exec(`
+			INSERT INTO told_records (project_key, agent_name, message_id, told_by, told_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (project_key, agent_name, message_id) DO UPDATE SET
+				told_by = excluded.told_by,
+				told_at = excluded.told_at`,
+			rec.ProjectKey, rec.AgentName, rec.MessageID, rec.ToldBy, toldAtText(rec.ToldAt)); err != nil {
+			return fmt.Errorf("claim ended snooze: replace told record: %w", err)
+		}
+		claim = &EndedSnoozeClaim{Snooze: snooze, Told: rec, Previous: previous}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claim, nil
+}
+
+// ReleaseEndedSnoozeClaim puts back what a won claim changed: the snooze, and
+// the told record it replaced (or none). Each part is put back only if it is
+// still as the claim left it, so a later snooze or claim stays.
+func (s *Store) ReleaseEndedSnoozeClaim(c *EndedSnoozeClaim) error {
+	return s.Transaction(func(tx *Tx) error {
+		if _, err := tx.tx.Exec(`
+			UPDATE attention_item_states SET state = ?, snoozed_until = ?, updated_at = ?
+			WHERE item_key = ? AND state = ? AND snoozed_until IS NULL`,
+			AttentionStateSnoozed, c.Snooze.Until.UTC(), time.Now().UTC(), c.Snooze.ItemKey, AttentionStateNew); err != nil {
+			return fmt.Errorf("release ended snooze: restore snooze: %w", err)
+		}
+		mine := []any{c.Told.ProjectKey, c.Told.AgentName, c.Told.MessageID, c.Told.ToldBy, toldAtText(c.Told.ToldAt)}
+		var err error
+		if p := c.Previous; p != nil {
+			_, err = tx.tx.Exec(`
+				UPDATE told_records SET told_by = ?, told_at = ?
+				WHERE project_key = ? AND agent_name = ? AND message_id = ? AND told_by = ? AND told_at = ?`,
+				append([]any{p.ToldBy, toldAtText(p.ToldAt)}, mine...)...)
+		} else {
+			_, err = tx.tx.Exec(`
+				DELETE FROM told_records
+				WHERE project_key = ? AND agent_name = ? AND message_id = ? AND told_by = ? AND told_at = ?`, mine...)
+		}
+		if err != nil {
+			return fmt.Errorf("release ended snooze: restore told record: %w", err)
+		}
+		return nil
+	})
 }
 
 // GCExpiredToldRecords deletes told records past retention and returns how many.

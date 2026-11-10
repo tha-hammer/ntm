@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -103,6 +105,7 @@ func TestClosure_MailSnoozeCommand(t *testing.T) {
 		{"BlueLake", []string{"999", "--until", "30m"}, "message 999 isn't in BlueLake's Agent Mail inbox"},
 		{"BlueLake", []string{"81", "--until", "2020-01-01T00:00:00Z"}, "snooze time must be in the future"},
 		{"BlueLake", []string{"81", "--until", "soon"}, "--until must be an RFC3339 time"},
+		{"BlueLake", []string{"81", "--until", "8d"}, "snooze time can be at most 7 days ahead"}, // Loop 6, Behavior 9
 		{"BlueLake", []string{"0", "--until", "30m"}, "message id must be a positive number"},
 		{"", []string{"81", "--until", "30m"}, "no Agent Mail name found"},
 		{"SomeoneElse", []string{"81", "--until", "30m"}, "message 81 isn't in SomeoneElse's Agent Mail inbox"},
@@ -167,6 +170,263 @@ func TestParseSnoozeUntil_RoundTripProperty(t *testing.T) {
 			rt.Fatalf("time %s: got %v, %v", at, got, err)
 		}
 	})
+}
+
+// seedEndedSnooze stores a mail notice for agent whose snooze ended a minute
+// before now, as a snooze that ran out leaves it.
+func seedEndedSnooze(t *testing.T, store *state.Store, project, agent string, id int64, from, subject string, now time.Time) {
+	t.Helper()
+	ts := now.Add(-time.Hour)
+	expires := ts.Add(7 * 24 * time.Hour)
+	cursor, _, err := store.AppendAddressedAttentionEvent(&state.StoredAttentionEvent{
+		Ts: ts, Category: "mail", EventType: "mail.received", Source: "agent_mail",
+		Actionability: "interesting", Severity: "info", Summary: "mail for " + agent,
+		Details:   fmt.Sprintf(`{"from":%q,"subject":%q,"message_id":%d}`, from, subject, id),
+		ExpiresAt: &expires, RecipientProject: project, RecipientAgent: agent, MessageID: &id,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := now.Add(-time.Minute)
+	if err := store.UpsertAttentionItemState(&state.AttentionItemState{ItemKey: fmt.Sprintf("cursor:%d", cursor), State: state.AttentionStateSnoozed, SnoozedUntil: &until}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fakeSnoozes is a snoozeReader with fixed lists.
+type fakeSnoozes struct {
+	active, ended []state.SnoozedMessage
+	err           error
+}
+
+func (f fakeSnoozes) SnoozedMessages(string, string, time.Time) ([]state.SnoozedMessage, []state.SnoozedMessage, error) {
+	return f.active, f.ended, f.err
+}
+
+func announcedIDs(items []announceItem) (ids []int, ended []int) {
+	for _, it := range items {
+		ids = append(ids, it.msg.ID)
+		if it.ended != nil {
+			ended = append(ended, it.msg.ID)
+		}
+	}
+	return ids, ended
+}
+
+// Loop 6, Behavior 11: the shared step drops active snoozes and adds ended
+// ones from the store, with their sender and subject, once each.
+func TestMailToAnnounce(t *testing.T) {
+	now := time.Now().UTC()
+	snoozes := fakeSnoozes{
+		active: []state.SnoozedMessage{{MessageID: 52}},
+		ended:  []state.SnoozedMessage{{MessageID: 53, From: "GreenCastle", Subject: "come back", ItemKey: "cursor:9"}},
+	}
+	msgs := []agentmail.InboxMessage{{ID: 51, From: "RedStone", Subject: "new"}, {ID: 52, Subject: "held"}}
+	items := mailToAnnounce(snoozes, "/p", "BlueLake", msgs, now)
+	ids, ended := announcedIDs(items)
+	if fmt.Sprint(ids) != "[51 53]" || fmt.Sprint(ended) != "[53]" {
+		t.Fatalf("ids %v, ended %v; want [51 53] and [53]", ids, ended)
+	}
+	if back := items[1]; back.msg.From != "GreenCastle" || back.msg.Subject != "come back" || back.ended.ItemKey != "cursor:9" {
+		t.Fatalf("returned item = %+v", back)
+	}
+
+	// Fetched as well: listed once, as the ended snooze.
+	items = mailToAnnounce(snoozes, "/p", "BlueLake", append(msgs, agentmail.InboxMessage{ID: 53, From: "GreenCastle", Subject: "come back"}), now)
+	if ids, ended := announcedIDs(items); fmt.Sprint(ids) != "[51 53]" || fmt.Sprint(ended) != "[53]" {
+		t.Fatalf("with 53 fetched: ids %v, ended %v", ids, ended)
+	}
+
+	// A store read error leaves the fetched mail as it is (Fail Open).
+	items = mailToAnnounce(fakeSnoozes{err: errors.New("busy")}, "/p", "BlueLake", msgs, now)
+	if ids, ended := announcedIDs(items); fmt.Sprint(ids) != "[51 52]" || len(ended) != 0 {
+		t.Fatalf("on a read error: ids %v, ended %v", ids, ended)
+	}
+}
+
+// Behavior 11 property: the result is the fetched mail minus active snoozes,
+// plus ended snoozes, each id once.
+func TestMailToAnnounce_Property(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		ids := rapid.SliceOfNDistinct(rapid.IntRange(1, 20), 0, 20, rapid.ID).Draw(rt, "fetched")
+		var msgs []agentmail.InboxMessage
+		for _, id := range ids {
+			msgs = append(msgs, agentmail.InboxMessage{ID: id})
+		}
+		var snoozes fakeSnoozes
+		kind := map[int]string{}
+		for id := 1; id <= 20; id++ {
+			switch rapid.IntRange(0, 2).Draw(rt, fmt.Sprintf("snooze-%d", id)) {
+			case 1:
+				snoozes.active = append(snoozes.active, state.SnoozedMessage{MessageID: int64(id)})
+				kind[id] = "active"
+			case 2:
+				snoozes.ended = append(snoozes.ended, state.SnoozedMessage{MessageID: int64(id)})
+				kind[id] = "ended"
+			}
+		}
+		want := map[int]bool{}
+		for _, id := range ids {
+			if kind[id] != "active" {
+				want[id] = true
+			}
+		}
+		for id, k := range kind {
+			if k == "ended" {
+				want[id] = true
+			}
+		}
+		got, _ := announcedIDs(mailToAnnounce(snoozes, "/p", "BlueLake", msgs, time.Now()))
+		seen := map[int]bool{}
+		for _, id := range got {
+			if seen[id] || !want[id] {
+				rt.Fatalf("got %v, want the set %v", got, want)
+			}
+			seen[id] = true
+		}
+		if len(seen) != len(want) {
+			rt.Fatalf("got %v, want the set %v", got, want)
+		}
+	})
+}
+
+// Behavior 11: the hook claims an ended snooze through the store and names it
+// in the reminder, even with no new mail.
+func TestClaimUnread_EndedSnooze(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	withHookTestEnv(t, mail, "BlueLake")
+	store, err := openProcessStateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	seedEndedSnooze(t, store, "/proj", "BlueLake", 53, "GreenCastle", "come back", now)
+	mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 51, From: "RedStone", Subject: "new"})
+
+	var out bytes.Buffer
+	runAgentHookStop(strings.NewReader("{}"), &out, "/proj")
+	reason := parseStopDecision(t, out.String()).Reason
+	if !strings.Contains(reason, "[#51] from RedStone: new") || !strings.Contains(reason, "[#53] from GreenCastle: come back") {
+		t.Fatalf("reason = %q; want both", reason)
+	}
+	if rec, _ := store.GetToldRecord("/proj", "BlueLake", 53); rec == nil || rec.ToldBy != state.ToldByStopHook {
+		t.Fatalf("told record for 53 = %+v", rec)
+	}
+	if _, ended, _ := store.SnoozedMessages("/proj", "BlueLake", time.Now()); len(ended) != 0 {
+		t.Fatalf("the snooze wasn't cleared: %+v", ended)
+	}
+	out.Reset()
+	runAgentHookStop(strings.NewReader("{}"), &out, "/proj")
+	if out.Len() != 0 {
+		t.Fatalf("second run printed %q", out.String())
+	}
+}
+
+// waitTypedCount waits until want appears n times in the stand-in's typed
+// file, and returns the file.
+func waitTypedCount(t *testing.T, agents *screenAgents, pid, want string, n int, within time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		got := agents.typed(t, pid)
+		if strings.Count(got, want) >= n {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stand-in %s: %q typed %d times within %s, want %d (typed %q)", pid, want, strings.Count(got, want), within, n, got)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// Loop 6, Behavior 12: a snooze that ends while the agent is idle returns in
+// one reminder, and nothing more follows, from the nudge or the hook.
+func TestClosure_SnoozeReturnsOnce(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	agents := env.screenAgentConfig(t, mail, "")
+	pid, agent := spawnNudgeAgent(t, env, agents, "returnonce")
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 95, From: "RedStone", Subject: "come back"})
+	env.startMonitor(t, "returnonce")
+	const entry = "[#95] from RedStone: come back"
+	waitTypedCount(t, agents, pid, entry, 1, 15*time.Second)
+	agents.setScreen(t, pid, "cc_idle.txt")
+	first := env.told(t, env.projectDir("returnonce"), agent, 95)
+
+	snoozeInSession(t, env, "returnonce", agent, 95, "4s")
+	time.Sleep(2 * time.Second)
+	if n := strings.Count(agents.typed(t, pid), entry); n != 1 {
+		t.Fatalf("reminded %d times while the snooze was active, want 1", n)
+	}
+	waitTypedCount(t, agents, pid, entry, 2, 12*time.Second)
+	agents.setScreen(t, pid, "cc_idle.txt")
+	if rec := env.told(t, env.projectDir("returnonce"), agent, 95); rec == nil || rec.ToldBy != state.ToldByIdleNudge || !rec.ToldAt.After(first.ToldAt) {
+		t.Fatalf("told record after the return = %+v, first %+v", rec, first)
+	}
+	time.Sleep(3 * time.Second)
+	if n := strings.Count(agents.typed(t, pid), entry); n != 2 {
+		t.Fatalf("reminded %d times after the return, want 2", n)
+	}
+	if out := runStopHook(t, env, "returnonce", agent); out != "" {
+		t.Fatalf("the hook repeated the returned message: %q", out)
+	}
+}
+
+// Loop 6, Behavior 13: a snooze that ends during a turn is told at the turn
+// end, and the nudge doesn't repeat it once the agent is idle.
+func TestClosure_SnoozeEndsMidTurn(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	agents := env.screenAgentConfig(t, mail, "")
+	pid, agent := spawnNudgeAgent(t, env, agents, "midturn")
+	agents.setScreen(t, pid, "cc_working.txt")
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 96, From: "RedStone", Subject: "after your turn"})
+	if d := parseStopDecision(t, runStopHook(t, env, "midturn", agent)); !strings.Contains(d.Reason, "[#96]") {
+		t.Fatalf("first hook reason = %q", d.Reason)
+	}
+	snoozeInSession(t, env, "midturn", agent, 96, "2s")
+	env.startMonitor(t, "midturn")
+
+	time.Sleep(4 * time.Second)
+	if typed := agents.typed(t, pid); strings.Contains(typed, "[#96]") {
+		t.Fatalf("typed into a working agent: %q", typed)
+	}
+	if d := parseStopDecision(t, runStopHook(t, env, "midturn", agent)); !strings.Contains(d.Reason, "[#96] from RedStone: after your turn") {
+		t.Fatalf("turn-end reason = %q; want the returned message", d.Reason)
+	}
+	agents.setScreen(t, pid, "cc_idle.txt")
+	time.Sleep(3 * time.Second)
+	if typed := agents.typed(t, pid); strings.Contains(typed, "[#96]") {
+		t.Fatalf("the nudge repeated what the hook told: %q", typed)
+	}
+}
+
+// Loop 6, Behavior 14: a monitor restart keeps the snooze, which lives in
+// state.db, and the message returns on time.
+func TestClosure_SnoozeSurvivesMonitorRestart(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	agents := env.screenAgentConfig(t, mail, "")
+	pid, agent := spawnNudgeAgent(t, env, agents, "restartsnooze")
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 97, From: "RedStone", Subject: "still here"})
+	if d := parseStopDecision(t, runStopHook(t, env, "restartsnooze", agent)); !strings.Contains(d.Reason, "[#97]") {
+		t.Fatalf("first hook reason = %q", d.Reason)
+	}
+	snoozeInSession(t, env, "restartsnooze", agent, 97, "6s")
+	until := time.Now().Add(6 * time.Second)
+
+	stop := env.startMonitor(t, "restartsnooze")
+	time.Sleep(time.Second)
+	stop()
+	env.startMonitor(t, "restartsnooze")
+	time.Sleep(1500 * time.Millisecond)
+	if time.Now().Before(until) && strings.Contains(agents.typed(t, pid), "[#97]") {
+		t.Fatalf("the new monitor typed the message before its snooze ended: %q", agents.typed(t, pid))
+	}
+	agents.waitTyped(t, pid, "[#97] from RedStone: still here", 15*time.Second)
 }
 
 // snoozeInSession runs ntm mail snooze as the session's agent, for the

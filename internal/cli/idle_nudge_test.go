@@ -1074,6 +1074,22 @@ func (s fakeNudgeStore) SnoozedMessages(project, agent string, now time.Time) (a
 	return s.f.store.SnoozedMessages(project, agent, now)
 }
 
+func (s fakeNudgeStore) ClaimEndedSnooze(snooze state.SnoozedMessage, rec state.ToldRecord) (*state.EndedSnoozeClaim, error) {
+	s.f.note(fmt.Sprintf("claim %d", rec.MessageID))
+	if err := s.f.fail("claim", rec.AgentName); err != nil {
+		return nil, err
+	}
+	return s.f.store.ClaimEndedSnooze(snooze, rec)
+}
+
+func (s fakeNudgeStore) ReleaseEndedSnoozeClaim(c *state.EndedSnoozeClaim) error {
+	s.f.note(fmt.Sprintf("release %d", c.Told.MessageID))
+	s.f.mu.Lock()
+	s.f.releases++
+	s.f.mu.Unlock()
+	return s.f.store.ReleaseEndedSnoozeClaim(c)
+}
+
 func (f *fakeNudge) nudger() *idleNudger {
 	return newIdleNudger(idleNudgeDeps{
 		ProjectKey: "/proj",
@@ -1315,6 +1331,70 @@ func TestIdleNudgePoll_TargetsFailure(t *testing.T) {
 
 // A reminder that was sent is logged once, with its pane, agent and messages,
 // so the monitor's log shows what it did, not only what it skipped.
+// Loop 6, Behavior 11: the nudge claims new mail with a told record and an
+// ended snooze with ClaimEndedSnooze, in one reminder, and a failed send puts
+// both back.
+func TestIdleNudgePoll_EndedSnoozeClaimAndRelease(t *testing.T) {
+	fake := newFakeNudge(t)
+	fake.addUnread("BlueLake", 51, "new")
+	seedEndedSnooze(t, fake.store, "/proj", "BlueLake", 53, "GreenCastle", "come back", fake.now)
+	fake.failStep["send"] = errors.New("tmux gone")
+	nudger := fake.nudger()
+
+	nudger.poll(context.Background())
+	if rec, _ := fake.store.GetToldRecord("/proj", "BlueLake", 51); rec != nil {
+		t.Fatalf("a failed send left the told record for 51: %+v", rec)
+	}
+	if _, ended, _ := fake.store.SnoozedMessages("/proj", "BlueLake", fake.now); len(ended) != 1 || ended[0].MessageID != 53 {
+		t.Fatalf("a failed send didn't restore the snooze: %+v", ended)
+	}
+
+	delete(fake.failStep, "send")
+	nudger.poll(context.Background())
+	sent := fake.lastSent()
+	if !strings.Contains(sent, "[#51] from RedStone: new") || !strings.Contains(sent, "[#53] from GreenCastle: come back") ||
+		!strings.Contains(sent, "You have 2 new messages") {
+		t.Fatalf("sent = %q; want one reminder with both", sent)
+	}
+	if rec, _ := fake.store.GetToldRecord("/proj", "BlueLake", 53); rec == nil || rec.ToldBy != state.ToldByIdleNudge {
+		t.Fatalf("told record for 53 = %+v", rec)
+	}
+	nudger.poll(context.Background())
+	if fake.count("send") != 2 {
+		t.Fatalf("the next poll sent again: %v", fake.calls)
+	}
+}
+
+// Loop 6, Behavior 15: an ended snooze returns even if Agent Mail lists the
+// message as read, or no longer lists it.
+func TestMailToAnnounce_EndedSnoozeIgnoresReadState(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		fetched bool
+	}{{"listed as read", true}, {"no longer listed", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeNudge(t)
+			seedEndedSnooze(t, fake.store, "/proj", "BlueLake", 53, "GreenCastle", "come back", fake.now)
+			if tc.fetched {
+				read := agentmail.FlexTime{Time: fake.now.Add(-time.Minute)}
+				fake.unread["BlueLake"] = []agentmail.InboxMessage{{ID: 53, From: "GreenCastle", Subject: "come back", ReadAt: &read}}
+			}
+			fake.nudger().poll(context.Background())
+			if sent := fake.lastSent(); !strings.Contains(sent, "[#53] from GreenCastle: come back") {
+				t.Fatalf("sent = %q; want the returned message", sent)
+			}
+		})
+	}
+	// A read message with no snooze stays out, as before.
+	fake := newFakeNudge(t)
+	read := agentmail.FlexTime{Time: fake.now}
+	fake.unread["BlueLake"] = []agentmail.InboxMessage{{ID: 54, Subject: "already read", ReadAt: &read}}
+	fake.nudger().poll(context.Background())
+	if fake.count("send") != 0 {
+		t.Fatalf("sent a read, unsnoozed message: %v", fake.calls)
+	}
+}
+
 func TestIdleNudgePoll_SentIsLogged(t *testing.T) {
 	logs := captureNudgeLogs(t)
 	fake := newFakeNudge(t)

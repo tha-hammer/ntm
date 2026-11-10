@@ -477,7 +477,8 @@ func runMailInbox(cmd *cobra.Command, client mailInboxClient, session string, se
 			recipients = append(recipients, sanitizeMailDisplayField(r))
 		}
 
-		fmt.Fprintf(cmd.OutOrStdout(), "%s%s\n", prefix, subject)
+		// The id, in the reminder's [#id] form, is what ntm mail snooze takes.
+		fmt.Fprintf(cmd.OutOrStdout(), "[#%d] %s%s\n", m.ID, prefix, subject)
 		if from != "" || len(recipients) > 0 {
 			fmt.Fprintf(cmd.OutOrStdout(), "%s → %s\n", from, strings.Join(recipients, ", "))
 		}

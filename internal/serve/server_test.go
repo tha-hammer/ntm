@@ -3367,6 +3367,16 @@ func TestApplyAttentionItemAction_SnoozeUsesSharedRule(t *testing.T) {
 	}
 }
 
+// Loop 6, Behavior 9: the operator API rejects a snooze past 7 days too.
+func TestApplyAttentionItemAction_SnoozeSevenDayLimit(t *testing.T) {
+	now := time.Now().UTC()
+	item := state.AttentionItemState{ItemKey: "cursor:1", State: state.AttentionStateNew}
+	err := applyAttentionItemAction(&item, "snooze", AttentionItemStateRequest{Until: now.Add(8 * 24 * time.Hour).Format(time.RFC3339)}, "op", now)
+	if !errors.Is(err, state.ErrSnoozeTooLong) || item.SnoozedUntil != nil {
+		t.Fatalf("8 day snooze: %v, item %+v", err, item)
+	}
+}
+
 func TestAttentionItemStateSnoozeRestoreClearsState(t *testing.T) {
 	srv, store := setupTestServer(t)
 	cursor := appendServeTestAttentionEvent(t, store, "operator attention snooze")

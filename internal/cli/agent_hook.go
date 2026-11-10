@@ -231,33 +231,34 @@ func claimUnread(projectKey, agent string, msgs []agentmail.InboxMessage) []agen
 		slog.Warn("agent hook: store unavailable", "agent", agent, "error", storeErr)
 	}
 	now := time.Now().UTC()
+	unread := unreadMessages(msgs)
+	items := plainAnnounceItems(unread)
 	if storeErr == nil {
-		msgs = mailToAnnounce(store, projectKey, agent, msgs, now)
+		items = mailToAnnounce(store, projectKey, agent, unread, now)
 	}
 	var won []agentmail.InboxMessage
-	for _, msg := range msgs {
-		if msg.ReadAt != nil {
-			continue
+	for _, item := range items {
+		if item.ended == nil {
+			feed.RecordMailNotice(projectKey, agent, item.msg) // a returning snooze has its notice
 		}
-		feed.RecordMailNotice(projectKey, agent, msg)
 		if storeErr != nil {
-			won = append(won, msg)
+			won = append(won, item.msg)
 			continue
 		}
-		claimed, err := store.ClaimToldRecord(state.ToldRecord{
+		claimed, _, err := claimAnnounce(store, item, state.ToldRecord{
 			ProjectKey: projectKey,
 			AgentName:  agent,
-			MessageID:  int64(msg.ID),
+			MessageID:  int64(item.msg.ID),
 			ToldBy:     state.ToldByStopHook,
 			ToldAt:     now,
 		})
 		if err != nil {
-			slog.Warn("agent hook: store unavailable", "agent", agent, "message_id", msg.ID, "error", err)
+			slog.Warn("agent hook: store unavailable", "agent", agent, "message_id", item.msg.ID, "error", err)
 			storeErr = err
 			claimed = true
 		}
 		if claimed {
-			won = append(won, msg)
+			won = append(won, item.msg)
 		}
 	}
 	return won

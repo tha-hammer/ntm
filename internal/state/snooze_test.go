@@ -3,6 +3,10 @@ package state
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -223,6 +227,191 @@ func TestSnoozedMessages_PartitionProperty(t *testing.T) {
 		}
 		check("active", active, wantActive)
 		check("ended", ended, wantEnded)
+	})
+}
+
+// Loop 6, Behavior 9: a snooze can't outlast the 7 day retention.
+func TestValidateSnoozeUntil_SevenDayLimit(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	if err := ValidateSnoozeUntil(now.Add(7*24*time.Hour), now); err != nil {
+		t.Fatalf("exactly 7 days: %v", err)
+	}
+	err := ValidateSnoozeUntil(now.Add(7*24*time.Hour+time.Second), now)
+	if !errors.Is(err, ErrSnoozeTooLong) || !strings.Contains(err.Error(), "at most 7 days ahead (until 2026-11-16T12:00:00Z)") {
+		t.Fatalf("7 days and 1 second: %v", err)
+	}
+}
+
+// Behavior 9 property: a snooze time is accepted exactly when it is after now
+// and no more than 7 days ahead.
+func TestValidateSnoozeUntil_LimitProperty(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	rapid.Check(t, func(rt *rapid.T) {
+		until := now.Add(time.Duration(rapid.Int64Range(-24*3600, 9*24*3600).Draw(rt, "offset")) * time.Second)
+		want := until.After(now) && !until.After(now.Add(7*24*time.Hour))
+		if got := ValidateSnoozeUntil(until, now) == nil; got != want {
+			rt.Fatalf("until %v: accepted %v, want %v", until, got, want)
+		}
+	})
+}
+
+// Behavior 9: a snooze can't end after its own notice expires, or the notice,
+// and the snooze with it, would be gone when it ends.
+func TestSnoozeAddressedMessage_EventExpiry(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	cursor := mailEvent(t, store, now.Add(-5*24*time.Hour), "/p", "BlueLake", 42, "RedStone", "old")
+	expires := now.Add(2 * 24 * time.Hour)
+
+	_, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", 42, now.Add(3*24*time.Hour), now))
+	if !errors.Is(err, ErrSnoozePastNotice) || !strings.Contains(err.Error(), "message 42's notice expires at "+expires.Format(time.RFC3339)) {
+		t.Fatalf("past the notice: %v", err)
+	}
+	if item, _ := store.GetAttentionItemStateByCursor(cursor); item != nil {
+		t.Fatalf("a rejected snooze wrote state: %+v", item)
+	}
+	if _, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", 42, now.Add(24*time.Hour), now)); err != nil {
+		t.Fatalf("within the notice: %v", err)
+	}
+}
+
+// endedSnoozeOf returns the agent's one ended snooze, failing otherwise.
+func endedSnoozeOf(t testing.TB, store *Store, agent string, now time.Time) SnoozedMessage {
+	t.Helper()
+	_, ended, err := store.SnoozedMessages("/p", agent, now)
+	if err != nil || len(ended) != 1 {
+		t.Fatalf("ended snoozes = %+v, %v; want one", ended, err)
+	}
+	return ended[0]
+}
+
+func nudgeTold(agent string, id int64, at time.Time) ToldRecord {
+	return ToldRecord{ProjectKey: "/p", AgentName: agent, MessageID: id, ToldBy: ToldByIdleNudge, ToldAt: at}
+}
+
+// Loop 6, Behavior 10: an ended snooze is claimed by exactly one caller,
+// which clears the snooze and replaces the told record together, and a release
+// puts both back.
+func TestClaimEndedSnooze(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	earlier, later := now.Add(-time.Minute), now.Add(time.Hour)
+	cursor := mailEvent(t, store, now.Add(-time.Hour), "/p", "BlueLake", 42, "RedStone", "come back")
+	setSnooze(t, store, cursor, AttentionStateSnoozed, &earlier)
+	toldEarlier := toldRecord("/p", "BlueLake", 42, now.Add(-time.Hour))
+	if won, err := store.ClaimToldRecord(toldEarlier); err != nil || !won {
+		t.Fatalf("seed told record: %v %v", won, err)
+	}
+
+	snooze := endedSnoozeOf(t, store, "BlueLake", now)
+	claim, err := store.ClaimEndedSnooze(snooze, nudgeTold("BlueLake", 42, now))
+	if err != nil || claim == nil {
+		t.Fatalf("claim = %+v, %v; want a win", claim, err)
+	}
+	if item, _ := store.GetAttentionItemStateByCursor(cursor); item.State != AttentionStateNew || item.SnoozedUntil != nil {
+		t.Fatalf("item after claim = %+v", item)
+	}
+	if rec, _ := store.GetToldRecord("/p", "BlueLake", 42); rec == nil || rec.ToldBy != ToldByIdleNudge || !rec.ToldAt.Equal(now) {
+		t.Fatalf("told record after claim = %+v", rec)
+	}
+	if again, err := store.ClaimEndedSnooze(snooze, nudgeTold("BlueLake", 42, now)); err != nil || again != nil {
+		t.Fatalf("second claim = %+v, %v; want none", again, err)
+	}
+
+	if err := store.ReleaseEndedSnoozeClaim(claim); err != nil {
+		t.Fatal(err)
+	}
+	if item, _ := store.GetAttentionItemStateByCursor(cursor); item.State != AttentionStateSnoozed || !item.SnoozedUntil.Equal(earlier) {
+		t.Fatalf("item after release = %+v", item)
+	}
+	if rec, _ := store.GetToldRecord("/p", "BlueLake", 42); rec == nil || rec.ToldBy != ToldByStopHook || !rec.ToldAt.Equal(toldEarlier.ToldAt) {
+		t.Fatalf("told record after release = %+v", rec)
+	}
+
+	// An active snooze can't be claimed, and stays as it is.
+	active := mailEvent(t, store, now, "/p", "BlueLake", 43, "RedStone", "not yet")
+	setSnooze(t, store, active, AttentionStateSnoozed, &later)
+	held, _, _ := store.SnoozedMessages("/p", "BlueLake", now)
+	for _, s := range held {
+		if s.MessageID != 43 {
+			continue
+		}
+		if c, err := store.ClaimEndedSnooze(s, nudgeTold("BlueLake", 43, now)); err != nil || c != nil {
+			t.Fatalf("active claim = %+v, %v", c, err)
+		}
+	}
+	if item, _ := store.GetAttentionItemStateByCursor(active); item.State != AttentionStateSnoozed || !item.SnoozedUntil.Equal(later) {
+		t.Fatalf("active item changed: %+v", item)
+	}
+
+	// With no earlier told record, a release removes the claim's record.
+	fresh := mailEvent(t, store, now, "/p", "BlueLake", 44, "RedStone", "never told")
+	setSnooze(t, store, fresh, AttentionStateSnoozed, &earlier)
+	var freshSnooze SnoozedMessage
+	_, ended, _ := store.SnoozedMessages("/p", "BlueLake", now)
+	for _, s := range ended {
+		if s.MessageID == 44 {
+			freshSnooze = s
+		}
+	}
+	c, err := store.ClaimEndedSnooze(freshSnooze, nudgeTold("BlueLake", 44, now))
+	if err != nil || c == nil || c.Previous != nil {
+		t.Fatalf("fresh claim = %+v, %v", c, err)
+	}
+	if err := store.ReleaseEndedSnoozeClaim(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := store.GetToldRecord("/p", "BlueLake", 44); rec != nil {
+		t.Fatalf("release left a told record: %+v", rec)
+	}
+}
+
+// Behavior 10 property: callers in separate store connections, as the hook and
+// the monitor are, race to claim one ended snooze, and exactly one wins.
+func TestClaimEndedSnooze_OneWinnerProperty(t *testing.T) {
+	dir := t.TempDir()
+	var run int
+	rapid.Check(t, func(rt *rapid.T) {
+		run++
+		path := filepath.Join(dir, fmt.Sprintf("state-%d.db", run))
+		seed, err := Open(path)
+		if err != nil {
+			rt.Fatal(err)
+		}
+		defer seed.Close()
+		if err := seed.Migrate(); err != nil {
+			rt.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Second)
+		earlier := now.Add(-time.Minute)
+		setSnooze(t, seed, mailEvent(t, seed, now, "/p", "BlueLake", 42, "RedStone", "race"), AttentionStateSnoozed, &earlier)
+		snooze := endedSnoozeOf(t, seed, "BlueLake", now)
+
+		n := rapid.IntRange(2, 6).Draw(rt, "callers")
+		stores := make([]*Store, n)
+		for i := range stores {
+			if stores[i], err = Open(path); err != nil {
+				rt.Fatal(err)
+			}
+			defer stores[i].Close()
+		}
+		var wins atomic.Int32
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() {
+				claim, err := stores[i].ClaimEndedSnooze(snooze, nudgeTold("BlueLake", 42, now))
+				if err != nil {
+					t.Errorf("caller %d: %v", i, err)
+				}
+				if claim != nil {
+					wins.Add(1)
+				}
+			})
+		}
+		wg.Wait()
+		if wins.Load() != 1 {
+			rt.Fatalf("%d winners of %d callers", wins.Load(), n)
+		}
 	})
 }
 

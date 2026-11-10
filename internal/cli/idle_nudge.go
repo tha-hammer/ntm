@@ -47,9 +47,9 @@ type paneNudgeState struct {
 
 // idleNudgeStore is the part of the state store the nudge uses.
 type idleNudgeStore interface {
-	ClaimToldRecord(state.ToldRecord) (bool, error)
+	announceClaimer
 	ReleaseToldRecord(state.ToldRecord) error
-	snoozeReader
+	ReleaseEndedSnoozeClaim(*state.EndedSnoozeClaim) error
 }
 
 // snoozeReader is the part of the state store the snooze filter reads.
@@ -57,27 +57,78 @@ type snoozeReader interface {
 	SnoozedMessages(project, agent string, now time.Time) (active, ended []state.SnoozedMessage, err error)
 }
 
+// announceClaimer is the part of the state store that the hook and the nudge
+// both use to find and claim what to announce.
+type announceClaimer interface {
+	snoozeReader
+	ClaimToldRecord(state.ToldRecord) (bool, error)
+	ClaimEndedSnooze(state.SnoozedMessage, state.ToldRecord) (*state.EndedSnoozeClaim, error)
+}
+
+// announceItem is one message to tell an agent about. ended is set when it is
+// back from a snooze, and then it is claimed with ClaimEndedSnooze.
+type announceItem struct {
+	msg   agentmail.InboxMessage
+	ended *state.SnoozedMessage
+}
+
+func plainAnnounceItems(msgs []agentmail.InboxMessage) []announceItem {
+	items := make([]announceItem, 0, len(msgs))
+	for _, msg := range msgs {
+		items = append(items, announceItem{msg: msg})
+	}
+	return items
+}
+
 // mailToAnnounce is the step the hook and the nudge share between fetching an
-// agent's mail and claiming it: it leaves out messages the agent snoozed until
-// later. If the snoozes can't be read, msgs are returned as they are, because
-// a repeat is better than a missed message (Fail Open).
-func mailToAnnounce(store snoozeReader, project, agent string, msgs []agentmail.InboxMessage, now time.Time) []agentmail.InboxMessage {
-	active, _, err := store.SnoozedMessages(project, agent, now)
+// agent's unread mail and claiming it. It leaves out messages whose snooze is
+// still active, and adds those whose snooze has ended, from the store, with the
+// sender and subject their notice saved. So a returning message doesn't depend
+// on the fetch window, or on Agent Mail's read state, which it doesn't report.
+// If the snoozes can't be read, the mail is announced as it is, because a
+// repeat is better than a missed message (Fail Open).
+func mailToAnnounce(store snoozeReader, project, agent string, msgs []agentmail.InboxMessage, now time.Time) []announceItem {
+	active, ended, err := store.SnoozedMessages(project, agent, now)
 	if err != nil {
 		slog.Warn("snoozes not checked", "agent", agent, "project", project, "error", err)
-		return msgs
+		return plainAnnounceItems(msgs)
 	}
-	snoozed := make(map[int64]bool, len(active))
+	held := make(map[int64]bool, len(active))
 	for _, s := range active {
-		snoozed[s.MessageID] = true
+		held[s.MessageID] = true
 	}
-	kept := make([]agentmail.InboxMessage, 0, len(msgs))
+	back := make(map[int64]*state.SnoozedMessage, len(ended))
+	for i := range ended {
+		back[ended[i].MessageID] = &ended[i]
+	}
+	items := make([]announceItem, 0, len(msgs)+len(ended))
 	for _, msg := range msgs {
-		if !snoozed[int64(msg.ID)] {
-			kept = append(kept, msg)
+		id := int64(msg.ID)
+		if held[id] {
+			continue
+		}
+		items = append(items, announceItem{msg: msg, ended: back[id]})
+		delete(back, id)
+	}
+	for i := range ended {
+		if s, ok := back[ended[i].MessageID]; ok {
+			items = append(items, announceItem{msg: agentmail.InboxMessage{ID: int(s.MessageID), From: s.From, Subject: s.Subject}, ended: s})
 		}
 	}
-	return kept
+	return items
+}
+
+// claimAnnounce claims one item as rec: a returning snooze through
+// ClaimEndedSnooze, anything else through ClaimToldRecord. It reports whether
+// this caller won, with the ended-snooze claim to release if the reminder
+// fails.
+func claimAnnounce(store announceClaimer, item announceItem, rec state.ToldRecord) (bool, *state.EndedSnoozeClaim, error) {
+	if item.ended == nil {
+		won, err := store.ClaimToldRecord(rec)
+		return won, nil, err
+	}
+	claim, err := store.ClaimEndedSnooze(*item.ended, rec)
+	return claim != nil, claim, err
 }
 
 // idleNudgeDeps are the nudge's ways of reaching the outside world.
@@ -160,19 +211,18 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 		return
 	}
 	msgs = unreadMessages(msgs)
-	if len(msgs) == 0 {
-		return
-	}
 	store, err := n.deps.Store()
 	if err != nil {
 		// Without a claim, every poll would type the same reminder again. The
 		// Stop hook still tells the agent at its next turn end.
-		n.warn("open state store", target, err)
+		if len(msgs) > 0 {
+			n.warn("open state store", target, err)
+		}
 		return
 	}
-	msgs = mailToAnnounce(store, n.deps.ProjectKey, target.Agent, msgs, n.deps.Now().UTC())
-	if len(msgs) == 0 {
-		return // all snoozed
+	items := mailToAnnounce(store, n.deps.ProjectKey, target.Agent, msgs, n.deps.Now().UTC())
+	if len(items) == 0 {
+		return // no new mail, and nothing back from a snooze
 	}
 
 	pane, err := n.deps.PaneState(ctx, target)
@@ -196,7 +246,7 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 	if humanTypingGuardHolds(pane) {
 		// Typing into the input line a person is using would garble both. Hold
 		// without claiming, so a later poll, or the Stop hook, tells them.
-		if batch := messageBatchKey(msgs); n.heldBatches[target.PaneID] != batch {
+		if batch := messageBatchKey(announcedMessages(items)); n.heldBatches[target.PaneID] != batch {
 			n.heldBatches[target.PaneID] = batch
 			slog.Info("idle nudge: held, person typing", "pane", target.PaneID, "agent", target.Agent,
 				"messages", batch, "recent_keys", pane.RecentHumanActivity, "typed_text", pane.TypedText.String())
@@ -204,7 +254,7 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 		return
 	}
 
-	claims, err := n.claim(store, target, msgs)
+	claims, err := n.claim(store, target, items)
 	if err != nil {
 		n.warn("claim", target, err)
 		n.release(store, target, claims)
@@ -243,40 +293,57 @@ func messageBatchKey(msgs []agentmail.InboxMessage) string {
 
 // nudgeClaim is one message this poll won the right to tell.
 type nudgeClaim struct {
-	msg agentmail.InboxMessage
-	rec state.ToldRecord
+	msg   agentmail.InboxMessage
+	rec   state.ToldRecord
+	ended *state.EndedSnoozeClaim // set for a message back from a snooze
 }
 
-// claim claims each message for the nudge and returns the ones it won. On an
+// claim claims each item for the nudge and returns the ones it won. On an
 // error it returns the claims made so far, for release.
-func (n *idleNudger) claim(store idleNudgeStore, target nudgeTarget, msgs []agentmail.InboxMessage) ([]nudgeClaim, error) {
+func (n *idleNudger) claim(store idleNudgeStore, target nudgeTarget, items []announceItem) ([]nudgeClaim, error) {
 	now := n.deps.Now().UTC()
 	var won []nudgeClaim
-	for _, msg := range msgs {
+	for _, item := range items {
 		rec := state.ToldRecord{
 			ProjectKey: n.deps.ProjectKey,
 			AgentName:  target.Agent,
-			MessageID:  int64(msg.ID),
+			MessageID:  int64(item.msg.ID),
 			ToldBy:     state.ToldByIdleNudge,
 			ToldAt:     now,
 		}
-		ok, err := store.ClaimToldRecord(rec)
+		ok, ended, err := claimAnnounce(store, item, rec)
 		if err != nil {
-			return won, fmt.Errorf("message %d: %w", msg.ID, err)
+			return won, fmt.Errorf("message %d: %w", item.msg.ID, err)
 		}
 		if ok {
-			won = append(won, nudgeClaim{msg: msg, rec: rec})
+			won = append(won, nudgeClaim{msg: item.msg, rec: rec, ended: ended})
 		}
 	}
 	return won, nil
 }
 
+// release puts back claims whose reminder didn't reach the agent: a told
+// record is removed, and a returning snooze is snoozed again.
 func (n *idleNudger) release(store idleNudgeStore, target nudgeTarget, claims []nudgeClaim) {
 	for _, c := range claims {
-		if err := store.ReleaseToldRecord(c.rec); err != nil {
+		var err error
+		if c.ended != nil {
+			err = store.ReleaseEndedSnoozeClaim(c.ended)
+		} else {
+			err = store.ReleaseToldRecord(c.rec)
+		}
+		if err != nil {
 			n.warn("release claim", target, err)
 		}
 	}
+}
+
+func announcedMessages(items []announceItem) []agentmail.InboxMessage {
+	msgs := make([]agentmail.InboxMessage, 0, len(items))
+	for _, item := range items {
+		msgs = append(msgs, item.msg)
+	}
+	return msgs
 }
 
 func (n *idleNudger) warn(step string, target nudgeTarget, err error) {

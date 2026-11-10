@@ -636,7 +636,22 @@ Notes for the run:
 - Step 2: set `idle_nudge_enabled = false` under `[agent_mail]` before `spawn`, because spawn freezes it.
 - Step 4: run it from the session's folder (`<projects_base>/snoozetest`), or add `--project <that folder>`.
 - Step 7: run the command from `.claude/settings.local.json` in that folder, with `AGENT_NAME=<agent>` and `echo '{}' |` piped in.
-- Steps 10 and 12: to see that the snooze still stands without changing it, run step 7's hook command again and check that it still doesn't name `snooze me`.
+- Steps 10 and 12: to see that the snooze still stands without changing it, send one fresh message first, then run step 7's hook command again. Check that the reminder lists only the fresh message, not `snooze me`. Without fresh mail, the hook prints nothing because `second` was already told, and the check passes trivially (found in the first run).
+- Step 3: `ntm mail inbox` shows IDs only with `--json`.
+
+**Result (2026-11-09), passed:** run on rocketman at `1790b2b5`, with agent FoggyGorge and the nudge off (`"idle_nudge_disabled": true` in the manifest).
+- **Step 4:** "Snoozed message 12520 until 2026-11-10T02:44:56Z (in 30m)", at 21:14:56 EST.
+- **Steps 7 and 8:** the hook gave "1) [#12521] from HumanOverseer: second" and the snooze command line, with no "snooze me".
+- **Steps 9 and 10:** "Error: snooze time must be in the future".
+- **Steps 11 and 12:**
+  - `AGENT_NAME=SomeoneElse` failed with Agent Mail's own "Agent 'SomeoneElse' not found in project …", because that name isn't registered. The command wraps it as "can't check message … with Agent Mail".
+  - With a registered other agent, BlueForest, it gave "Error: message 12520 isn't in BlueForest's Agent Mail inbox".
+- **The snooze held through every rerun.** The tester sent fresh mail before each rerun (#12522 to #12524), and each reminder listed only the new mail, never #12520.
+- **Notes from the run:**
+  1. The script's reruns needed fresh mail, which is now added to the notes above.
+  2. The text `ntm mail inbox` shows no message IDs.
+  3. The snooze running out wasn't tested, because that's Sprint 2. #12520 has no told record.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop6-sprint1-local-2026-11-09/`.
 
 ---
 
@@ -646,7 +661,7 @@ Notes for the run:
 
 **Testable function:** "Leave the agent idle past the snooze time, and see one reminder that includes the message."
 
-**Order of work:** 9, 10, 11, then 12 as the outer test, then 13, 14 and 15.
+**Order of work:** 9, 10, 11, then 12 as the outer test, then 13, 14, 15 and 16.
 
 | Acceptance criterion | Behaviors |
 |---|---|
@@ -659,6 +674,7 @@ Notes for the run:
 | Re-announcing replaces the told record and clears the snooze in one transaction, so two callers can't both announce it (requirement, test scenario "Race") | 10 |
 | A snooze longer than the 7 day retention is rejected (test scenario "Over the limit") | 9 |
 | Snooze ends and new mail arrives: one reminder listing both (test scenario "With new mail") | 11 |
+| The text `ntm mail inbox` shows each message's id, so a person or agent can snooze it (added after Sprint 1's human test, 2026-11-10) | 16 |
 
 ### Behavior 9: A snooze can't outlast the 7 day retention or its event [LEAF: pure function plus one store check]
 
@@ -924,6 +940,76 @@ As Behavior 11.
 #### Success Criteria
 
 **Automated:** `go test -short -run TestMailToAnnounce_EndedSnoozeIgnoresReadState ./internal/cli/` fails first, then passes.
+
+### Behavior 16: The text inbox shows message IDs [LEAF: one command's text output, with the existing mock client]
+
+Added after Sprint 1's human test, where finding an id needed `--json` (your choice, 2026-11-10).
+
+#### Test Specification
+
+**Given** BlueLake's inbox with message 1 "Test Message" (normal) and 2 "Urgent Msg" (urgent). **When** `ntm mail inbox` runs without `--json`. **Then** the subject lines read `[#1] Test Message` and `[#2] [URGENT] Urgent Msg`, and the sender line is unchanged.
+
+**Edge Cases:** the JSON output doesn't change.
+
+**Property:** no property: fixed rendering, nothing to generate over.
+
+**Files touched:** `internal/cli/mail.go` (`runMailInbox`), `internal/cli/mail_inbox_test.go`.
+
+#### TDD Cycle
+
+##### 🔴 Red
+
+Extend `TestRunMailInbox`'s "successful list with messages" and "urgent filter" cases. Expected failure: no `[#1]` in the output.
+
+##### 🟢 Green
+
+`fmt.Fprintf(out, "[#%d] %s%s\n", m.ID, prefix, subject)`.
+
+##### 🔵 Refactor
+
+- [ ] **No duplication:** the `[#id]` form matches the reminder's.
+- [ ] **Reveals intent:** n/a, one format string.
+- [ ] **Complexity went down:** n/a.
+- [ ] **No shallow wrappers:** none.
+- [ ] **Fits existing patterns:** `runMailInbox`'s rendering.
+
+#### Success Criteria
+
+**Automated:** `go test -short -run TestRunMailInbox ./internal/cli/` fails first, then passes.
+
+### Build record (2026-11-10)
+
+Base commit `1790b2b5`. Red, then green, for each behavior:
+- **9:** red was "undefined: ErrSnoozeTooLong" and "ErrSnoozePastNotice" in `state` and serve, and the command accepted `8d` ("Snoozed message 81 until … (in 192h0m)"). Green in all three. The limit property passed.
+- **10:** red was "store.ClaimEndedSnooze undefined". The one-winner property opens a separate `Store` per caller on one file, as the hook and the monitor are separate processes. It passed 100 checks under `-race`.
+- **11 and 15:** red was "undefined: announceItem" (compile).
+- **12, 13, 14 (red-at-seam):** with `mailToAnnounce` ignoring ended snoozes (`ended = nil`), five tests went red:
+  - `TestClosure_SnoozeReturnsOnce`: "typed 1 times within 12s, want 2".
+  - `TestClosure_SnoozeEndsMidTurn`: the hook printed nothing.
+  - `TestClosure_SnoozeSurvivesMonitorRestart`: nothing typed in 15s.
+  - `TestClaimUnread_EndedSnooze` and `TestMailToAnnounce_EndedSnoozeIgnoresReadState`.
+
+  All went green again once the seam check was undone.
+- **The first seam check proved nothing, and shows what the closure tests miss.** Turning off only the store-only path (an ended snooze that the fetch doesn't list) left the closure tests green. The fake server keeps listing a message as unread, so the closure tests always get it through the fetch. That path is covered by the unit tests instead: Behavior 15's "no longer listed" case, `TestClaimUnread_EndedSnooze` and `TestMailToAnnounce`.
+- **16:** red was the two inbox cases missing `[#1] Test Message` and `[#2] [URGENT] Urgent Msg`.
+
+Where the build differs from the plan:
+- **`ClaimEndedSnooze` takes the ended `SnoozedMessage` as well as the told record,** and returns a `*EndedSnoozeClaim` (nil when another caller won) instead of a bool. The claim keeps the told record it replaced, so `ReleaseEndedSnoozeClaim` can put back exactly that. `SnoozedMessage` gained `ItemKey`.
+- **The claim's transaction starts with the conditional `UPDATE`,** so it holds SQLite's write lock before it reads. A plain deferred transaction that reads first can fail in a second process with a stale-snapshot busy error, which the hook would treat as Fail Open and tell twice. The release puts each part back only if it's still as the claim left it.
+- **`GetToldRecord`'s query is shared** with the claim's in-transaction read, through a small `rowQuerier` interface.
+- **The nudge opens the store on every poll,** because an ended snooze can return with no new mail. A store that won't open is logged only when there is new mail, so a broken store doesn't log on every poll for every agent.
+- **The hook's read filter now uses `unreadMessages`,** the nudge's helper, and runs before the snooze step, so ended snoozes are added after it (Behavior 15).
+- **`claimAnnounce` is the one claim helper.** The hook and the nudge each keep their own `told_by` and failure rule. The nudge's `release` restores an ended snooze through `ReleaseEndedSnoozeClaim`.
+
+Verification:
+- `go test -short -race ./internal/state/`: ok, no data race. `go test -short ./internal/serve/`: ok. `internal/cli` alone shows only its 2 known failures.
+- The closure tests (Behaviors 5, 6, 7, 12, 13 and 14, Loop 5's nudge closure tests, and Loop 3's Stop hook closure tests) passed 10 times in a row: `ok internal/cli 1646s`.
+- `go test -short ./...` shows the 7 known failures from bd-5zbcm, plus 2 palette tests that failed only in that parallel run: `TestPaletteConfigContextDirPrefersExplicitSessionProject` and `TestLoadPaletteRuntimeConfigPrefersExplicitSessionProject`.
+  - They passed 3 times in a row alone, and in the same verification's separate `internal/cli` run. Sprint 2 didn't touch palette code.
+  - Their isolation doesn't cover the default tmux server, which they ask for a session named `ntm`, so a live session of that name on this shared VPS can fail them. They're beaded as `bd-cxa1s` (P3).
+  - Sprint 1's flaky `TestAttentionFeed_OutageEventsDeliveredOnce` (`bd-dwpes`) passed this time.
+- The build, `go vet` on cli, state and serve, and the tamper check against `1790b2b5` are clean. `gofmt -l` flags only the 3 files that were already flagged. No rapid failure files were left.
+- golangci-lint, goimports, ubs and rch aren't installed here, so they weren't run.
 
 ### Human test script
 

@@ -129,7 +129,7 @@ func TestRunMailInbox(t *testing.T) {
 			wantErr: false,
 			wantOutput: []string{
 				"Project Inbox: " + filepath.Base(GetProjectRoot()),
-				"Test Message",
+				"[#1] Test Message", // Loop 6, Behavior 16
 				"GreenCastle → BlueLake",
 			},
 		},
@@ -153,6 +153,7 @@ func TestRunMailInbox(t *testing.T) {
 			wantOutput: []string{
 				"Urgent Msg",
 				"[URGENT]",
+				"[#2] [URGENT] Urgent Msg", // Loop 6, Behavior 16
 			},
 		},
 		{
