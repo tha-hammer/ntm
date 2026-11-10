@@ -3347,6 +3347,26 @@ func TestAttentionItemStateAcknowledgePersistsAudit(t *testing.T) {
 	}
 }
 
+// Loop 6, Behavior 2: the operator API's snooze uses the shared time rule.
+func TestApplyAttentionItemAction_SnoozeUsesSharedRule(t *testing.T) {
+	now := time.Now().UTC()
+	item := state.AttentionItemState{ItemKey: "cursor:1", State: state.AttentionStateNew}
+	err := applyAttentionItemAction(&item, "snooze", AttentionItemStateRequest{Until: now.Add(-time.Minute).Format(time.RFC3339)}, "op", now)
+	if !errors.Is(err, state.ErrSnoozeNotInFuture) {
+		t.Fatalf("past snooze error = %v, want state.ErrSnoozeNotInFuture", err)
+	}
+	if item.State != state.AttentionStateNew || item.SnoozedUntil != nil {
+		t.Fatalf("a rejected snooze changed the item: %+v", item)
+	}
+	until := now.Add(time.Hour).Truncate(time.Second)
+	if err := applyAttentionItemAction(&item, "snooze", AttentionItemStateRequest{Until: until.Format(time.RFC3339)}, "op", now); err != nil {
+		t.Fatal(err)
+	}
+	if item.State != state.AttentionStateSnoozed || item.SnoozedUntil == nil || !item.SnoozedUntil.Equal(until) {
+		t.Fatalf("item after snooze = %+v", item)
+	}
+}
+
 func TestAttentionItemStateSnoozeRestoreClearsState(t *testing.T) {
 	srv, store := setupTestServer(t)
 	cursor := appendServeTestAttentionEvent(t, store, "operator attention snooze")

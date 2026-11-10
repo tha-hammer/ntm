@@ -2023,6 +2023,167 @@ func upsertAttentionItemStateExec(exec sqlExecer, item *AttentionItemState, now 
 	return nil
 }
 
+// ErrSnoozeNotInFuture is returned for a snooze time at or before now.
+var ErrSnoozeNotInFuture = errors.New("snooze time must be in the future")
+
+// ValidateSnoozeUntil is the snooze time rule for every caller: the operator
+// API and an agent's ntm mail snooze.
+func ValidateSnoozeUntil(until, now time.Time) error {
+	if !until.After(now) {
+		return ErrSnoozeNotInFuture
+	}
+	return nil
+}
+
+// SnoozeAttentionItem sets an item to snoozed until the given time, which is
+// stored in UTC. A rejected time leaves the item unchanged.
+func SnoozeAttentionItem(item *AttentionItemState, until, now time.Time) error {
+	if err := ValidateSnoozeUntil(until, now); err != nil {
+		return err
+	}
+	until = until.UTC()
+	item.State = AttentionStateSnoozed
+	item.SnoozedUntil = &until
+	item.DismissedAt = nil
+	item.DismissedBy = ""
+	return nil
+}
+
+// ErrNoAddressedEvent means there is no mail notice for this project, agent
+// and message.
+var ErrNoAddressedEvent = errors.New("no mail notice for this agent and message")
+
+// SnoozeRequest is one agent's snooze of one Agent Mail message.
+type SnoozeRequest struct {
+	ProjectKey string
+	AgentName  string
+	MessageID  int64
+	Until      time.Time
+	Now        time.Time
+}
+
+// SnoozeAddressedMessage saves a snooze on the agent's own notice for a
+// message: its item state and an audit record, in one transaction. A rejected
+// time, or a message with no notice for this agent, writes nothing. It returns
+// the saved time.
+func (s *Store) SnoozeAddressedMessage(req SnoozeRequest) (time.Time, error) {
+	if err := ValidateSnoozeUntil(req.Until, req.Now); err != nil {
+		return time.Time{}, err
+	}
+	event, err := s.GetAddressedAttentionEvent(req.ProjectKey, req.AgentName, req.MessageID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if event == nil {
+		return time.Time{}, ErrNoAddressedEvent
+	}
+	itemKey := attentionItemKeyForEvent(event.DedupKey, event.Cursor)
+	prior, err := s.GetAttentionItemState(itemKey)
+	if err != nil {
+		return time.Time{}, err
+	}
+	item := AttentionItemState{ItemKey: itemKey, DedupKey: event.DedupKey}
+	if prior != nil {
+		item = *prior
+	}
+	previous, err := json.Marshal(item)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("snooze: encode previous state: %w", err)
+	}
+	if err := SnoozeAttentionItem(&item, req.Until, req.Now); err != nil {
+		return time.Time{}, err
+	}
+	next, err := json.Marshal(item)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("snooze: encode new state: %w", err)
+	}
+	agent := strings.TrimSpace(req.AgentName)
+	err = s.Transaction(func(tx *Tx) error {
+		if err := tx.UpsertAttentionItemState(&item); err != nil {
+			return err
+		}
+		_, err := tx.RecordAuditEvent(&AuditEvent{
+			Ts:              req.Now.UTC(),
+			ActorType:       "agent",
+			ActorID:         agent,
+			ActorOrigin:     "ntm mail snooze",
+			Category:        "attention",
+			EventType:       "snooze",
+			Severity:        event.Severity,
+			EntityType:      "attention_item",
+			EntityID:        itemKey,
+			PreviousState:   string(previous),
+			NewState:        string(next),
+			ChangeSummary:   fmt.Sprintf("snooze attention item %s until %s", itemKey, item.SnoozedUntil.Format(time.RFC3339)),
+			DisclosureState: "visible",
+			RetentionClass:  RetentionClassStandard,
+		})
+		return err
+	})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("save snooze: %w", err)
+	}
+	return *item.SnoozedUntil, nil
+}
+
+// SnoozedMessage is one snoozed Agent Mail message on an agent's notice.
+type SnoozedMessage struct {
+	Cursor    int64
+	MessageID int64
+	From      string
+	Subject   string
+	Until     time.Time
+}
+
+// SnoozedMessages lists an agent's snoozed messages in a project, split at
+// now into active snoozes and ended ones, in cursor order. Matching follows
+// GetAddressedAttentionEvent: the agent without case, and only notices that
+// haven't expired. The join key is attentionItemKeyForEvent's.
+func (s *Store) SnoozedMessages(project, agent string, now time.Time) (active, ended []SnoozedMessage, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT e.cursor, e.message_id, COALESCE(e.details, ''), s.snoozed_until
+		FROM attention_events e
+		JOIN attention_item_states s ON s.item_key = CASE
+			WHEN TRIM(COALESCE(e.dedup_key, '')) != '' THEN 'dedup:' || TRIM(e.dedup_key)
+			ELSE 'cursor:' || e.cursor END
+		WHERE e.recipient_project = ?
+		  AND e.recipient_agent = ? COLLATE NOCASE
+		  AND e.message_id IS NOT NULL
+		  AND (e.expires_at IS NULL OR e.expires_at >= datetime('now'))
+		  AND s.state = ?
+		  AND s.snoozed_until IS NOT NULL
+		ORDER BY e.cursor ASC`, project, strings.TrimSpace(agent), AttentionStateSnoozed)
+	if err != nil {
+		return nil, nil, fmt.Errorf("snoozed messages: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			m       SnoozedMessage
+			details string
+			until   sql.NullTime
+		)
+		if err := rows.Scan(&m.Cursor, &m.MessageID, &details, &until); err != nil {
+			return nil, nil, fmt.Errorf("snoozed messages: %w", err)
+		}
+		var fields struct {
+			From    string `json:"from"`
+			Subject string `json:"subject"`
+		}
+		_ = json.Unmarshal([]byte(details), &fields) // a notice without details still counts
+		m.From, m.Subject, m.Until = fields.From, fields.Subject, until.Time.UTC()
+		if m.Until.After(now) {
+			active = append(active, m)
+		} else {
+			ended = append(ended, m)
+		}
+	}
+	return active, ended, rows.Err()
+}
+
 // ResolveAttentionItemKey returns the stable operator-state key for an attention cursor.
 // Recurring items use their durable dedup key; one-off items fall back to a cursor key.
 func (s *Store) ResolveAttentionItemKey(cursor int64) (string, error) {

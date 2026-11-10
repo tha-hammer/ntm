@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,8 +18,11 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 func newMailCmd() *cobra.Command {
@@ -45,6 +49,7 @@ Examples:
 	cmd.AddCommand(newMailInboxCmdReal())
 	cmd.AddCommand(newMailReadCmd())
 	cmd.AddCommand(newMailAckCmd())
+	cmd.AddCommand(newMailSnoozeCmd())
 
 	return cmd
 }
@@ -674,12 +679,7 @@ func runMailMark(cmd *cobra.Command, session, agent string, action mailAction, i
 		return fmt.Errorf("provide message IDs or use --all/--urgent/--from to select messages")
 	}
 
-	jsonEnabled := IsJSONOutput()
-	if !jsonEnabled {
-		if f := cmd.Root().PersistentFlags().Lookup("json"); f != nil && f.Changed {
-			jsonEnabled = true
-		}
-	}
+	jsonEnabled := mailJSONEnabled(cmd)
 
 	if len(ids) == 0 {
 		inbox, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
@@ -1107,4 +1107,141 @@ type aggregatedMessage struct {
 	Kind        string    `json:"kind"`
 	BodyMD      string    `json:"body_md,omitempty"` // truncated for display
 	Recipients  []string  `json:"recipients"`
+}
+
+// errSnoozeUntilForm names the --until forms snooze accepts.
+var errSnoozeUntilForm = errors.New("--until must be an RFC3339 time (2026-11-09T15:30:00Z) or a duration (30m, 2h, 1d)")
+
+// parseSnoozeUntil reads --until as an RFC3339 time or a duration from now,
+// and returns it in UTC.
+func parseSnoozeUntil(raw string, now time.Time) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC(), nil
+	}
+	if d, err := util.ParseDuration(raw); err == nil {
+		return now.Add(d).UTC(), nil
+	}
+	return time.Time{}, errSnoozeUntilForm
+}
+
+// snoozeInboxLimit is how far back the inbox check looks for a message that
+// has no notice yet: the most Agent Mail's fetch_inbox returns.
+const snoozeInboxLimit = 1000
+
+// newMailSnoozeCmd lets an agent defer one of its messages. Reminders leave
+// the message out until the time, then include it once.
+func newMailSnoozeCmd() *cobra.Command {
+	var until, project string
+	cmd := &cobra.Command{
+		Use:   "snooze <message-id> --until <time>",
+		Short: "Defer one of your Agent Mail messages until a time",
+		Long: `Snooze one of your Agent Mail messages. The Stop hook and the idle nudge leave it
+out of reminders until the time, then remind you about it once.
+
+You are the agent named by AGENT_NAME, MCP_AGENT_MAIL_AGENT_NAME or the Agent Mail
+breadcrumb, and only your own messages can be snoozed. Snoozing again replaces
+the time.
+
+Examples:
+  ntm mail snooze 42 --until 30m
+  ntm mail snooze 42 --until 2026-11-09T15:30:00Z --project /path/to/project`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runMailSnooze(cmd, args[0], until, project)
+		},
+	}
+	cmd.Flags().StringVar(&until, "until", "", "RFC3339 time or duration (30m, 2h, 1d) to snooze until")
+	cmd.Flags().StringVar(&project, "project", "", "Agent Mail project key (defaults to $MCP_AGENT_MAIL_PROJECT, then this folder)")
+	_ = cmd.MarkFlagRequired("until")
+	return cmd
+}
+
+// mailSnoozeResult is ntm mail snooze's JSON output.
+type mailSnoozeResult struct {
+	Success      bool      `json:"success"`
+	MessageID    int64     `json:"message_id"`
+	Agent        string    `json:"agent"`
+	Project      string    `json:"project"`
+	SnoozedUntil time.Time `json:"snoozed_until"`
+}
+
+func runMailSnooze(cmd *cobra.Command, rawID, rawUntil, projectFlag string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(rawID), 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("message id must be a positive number, got %q", rawID)
+	}
+	now := time.Now().UTC()
+	until, err := parseSnoozeUntil(rawUntil, now)
+	if err != nil {
+		return err
+	}
+	if err := state.ValidateSnoozeUntil(until, now); err != nil {
+		return err
+	}
+	cwd, _ := os.Getwd()
+	identity := agentHookIdentity(cwd)
+	agent := identity.Name
+	if agent == "" {
+		return fmt.Errorf("no Agent Mail name found: set AGENT_NAME, or run this inside an ntm-spawned agent")
+	}
+	project := stopHookProject(projectFlag, os.Getenv, cwd)
+
+	store, err := openProcessStateStore()
+	if err != nil {
+		return fmt.Errorf("open state store: %w", err)
+	}
+	notice, err := store.GetAddressedAttentionEvent(project, agent, id)
+	if err != nil {
+		return err
+	}
+	if notice == nil {
+		if err := recordOwnMailNotice(project, agent, identity, id); err != nil {
+			return err
+		}
+	}
+	saved, err := store.SnoozeAddressedMessage(state.SnoozeRequest{ProjectKey: project, AgentName: agent, MessageID: id, Until: until, Now: now})
+	if errors.Is(err, state.ErrNoAddressedEvent) {
+		return fmt.Errorf("message %d's notice for %s couldn't be saved, so it can't be snoozed; try again", id, agent)
+	}
+	if err != nil {
+		return err
+	}
+
+	if mailJSONEnabled(cmd) {
+		return encodeJSONResult(mailJSONWriter(cmd), mailSnoozeResult{Success: true, MessageID: id, Agent: agent, Project: project, SnoozedUntil: saved})
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Snoozed message %d until %s (in %s).\n", id, saved.Format(time.RFC3339), formatDuration(saved.Sub(now)))
+	return nil
+}
+
+// recordOwnMailNotice records the notice for a message nothing has announced
+// yet, after checking with Agent Mail that it is in this agent's own inbox.
+func recordOwnMailNotice(project, agent string, identity agentmail.HookIdentity, id int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	msgs, err := agentMailClientFor(project, identity).FetchInbox(ctx, agentmail.FetchInboxOptions{
+		ProjectKey: project,
+		AgentName:  agent,
+		Limit:      snoozeInboxLimit,
+	})
+	if err != nil {
+		return fmt.Errorf("can't check message %d with Agent Mail: %w", id, err)
+	}
+	for _, msg := range msgs {
+		if int64(msg.ID) == id {
+			robot.GetAttentionFeed().RecordMailNotice(project, agent, msg)
+			return nil
+		}
+	}
+	return fmt.Errorf("message %d isn't in %s's Agent Mail inbox", id, agent)
+}
+
+// mailJSONEnabled reports whether a mail command should print JSON.
+func mailJSONEnabled(cmd *cobra.Command) bool {
+	if IsJSONOutput() {
+		return true
+	}
+	f := cmd.Root().PersistentFlags().Lookup("json")
+	return f != nil && f.Changed
 }

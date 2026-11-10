@@ -82,14 +82,14 @@ Covers deliverable 14. Needs Loop 5.
 - [ ] The first poll after the snooze ends that finds the agent idle and safe to type into sends one reminder with that message.
 - [ ] The reminder covers it once, then **One Telling** applies again, including at the next turn end.
 - [ ] If the agent is working when the snooze ends, its next turn end includes the message (**One Telling**).
-- [ ] A message read or acknowledged during the snooze isn't announced.
+- [ ] A snoozed message returns when its snooze ends, whether or not it was read. Agent Mail reports no read state, so the earlier rule "a message read or acknowledged during the snooze isn't announced" was dropped (your choice at the TDD step, 2026-11-09).
 - [ ] A snooze still ending within retention survives restarts of the monitor and the agent.
 
 ### Requirements
 
 **Data:** Re-announcing replaces the `ToldRecord`, and clears the snooze in `attention_item_states`, in one transaction, so two callers can't both announce it.
 
-**API:** The hook and nudge query for snoozes that have ended for this agent, then treat those messages as new. The message's Agent Mail read state is checked before it's announced. **Assumption:** a snooze longer than the 7 day retention is rejected, because its event would be gone by then.
+**API:** The hook and nudge query for snoozes that have ended for this agent, then treat those messages as new. Agent Mail's read state isn't checked, because the server doesn't report it. **Assumption:** a snooze longer than the 7 day retention, or past its event's expiry, is rejected, because the event would be gone by then.
 
 **UI:** A snoozed message returns in the normal `ReminderText`. **Assumption:** it isn't marked differently.
 
@@ -101,7 +101,7 @@ Covers deliverable 14. Needs Loop 5.
 | Next poll | After that reminder | Nothing more |
 | Ends while working | Snooze passes during a turn | Told at turn end, and no second nudge |
 | Race | Hook and nudge at the same moment | One announcement |
-| Read during snooze | Message read before the time | No reminder |
+| Read during snooze | Message read before the time | Still one reminder when the snooze ends (read state isn't reported) |
 | With new mail | Snooze ends, and new mail arrives | One reminder listing both |
 | Monitor restart | Restart while snoozed | Still honored, and returns on time |
 | Over the limit | `--until 8d` | Error stating the 7 day limit |

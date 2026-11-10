@@ -5665,14 +5665,9 @@ func applyAttentionItemAction(item *state.AttentionItemState, action string, req
 		if err != nil {
 			return fmt.Errorf("invalid until: %w", err)
 		}
-		parsed = parsed.UTC()
-		if !parsed.After(now) {
-			return fmt.Errorf("until must be in the future")
+		if err := state.SnoozeAttentionItem(item, parsed, now); err != nil {
+			return err
 		}
-		item.State = state.AttentionStateSnoozed
-		item.SnoozedUntil = &parsed
-		item.DismissedAt = nil
-		item.DismissedBy = ""
 	case "dismiss":
 		item.State = state.AttentionStateDismissed
 		item.DismissedAt = &now

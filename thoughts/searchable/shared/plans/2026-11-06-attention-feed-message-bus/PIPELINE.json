@@ -5,9 +5,12 @@
   "output_folder": "/home/debian/Dev/ntm/thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus",
   "repository": "/home/debian/Dev/ntm",
   "scope_input": "Scope this project.\nRequest: We started research on my local machine. You are running on a VPS. We need to modify the existing \"attention feed\" to be better suited for a message bus. by default the \"attention feed\" is an in-memory list inside one ntm process (GetAttentionFeed, internal/robot/attention_feed.go:2956). It can be backed by SQLite so events survive restarts (attention_feed.go:399-402) and we need to make it so. We need to create a stop hook that is saved to the settings.local.json file in the ntm session creation process for the /.claude/ folder. The stop hook is what fires when the agent turn is complete and can serve as the \"push\" and/or \"check messages\" reminder.\nType: code\nSources: thoughts/searchable/shared/research/2026-11-06-09-56-agent-messaging-push-stop-hooks-agent-mail.md; repository /home/debian/Dev/ntm\nOutput folder: /home/debian/Dev/ntm/thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus",
-  "run": null,
+  "run": {
+    "session": "ca971f3a-bdb1-4b10-9208-206026adcd94",
+    "pipeline": "planning-build"
+  },
   "cursor": {
-    "step": "tdd",
+    "step": "build",
     "loop": "06-agent-snooze.md"
   },
   "steps": {
@@ -87,8 +90,8 @@
     },
     {
       "doc": "06-agent-snooze.md",
-      "tdd_plan": null,
-      "status": "pending",
+      "tdd_plan": "06-agent-snooze-tdd.md",
+      "status": "building",
       "sprints_passed": []
     },
     {
@@ -499,8 +502,38 @@
       "step": "build",
       "event": "done",
       "detail": "05-idle-nudge-tdd.md"
+    },
+    {
+      "at": "2026-11-09T22:15:59.291Z",
+      "step": "tdd",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-09T22:17:13.598Z",
+      "step": "tdd",
+      "event": "started",
+      "detail": "06-agent-snooze.md"
+    },
+    {
+      "at": "2026-11-09T22:41:00.936Z",
+      "step": "tdd",
+      "event": "done",
+      "detail": "06-agent-snooze.md"
+    },
+    {
+      "at": "2026-11-09T22:42:23.037Z",
+      "step": "build",
+      "event": "armed (fresh)",
+      "detail": "ca971f3a-bdb1-4b10-9208-206026adcd94"
+    },
+    {
+      "at": "2026-11-09T22:42:43.993Z",
+      "step": "build",
+      "event": "started",
+      "detail": "06-agent-snooze-tdd.md"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-09T22:10:46.152Z"
+  "updated_at": "2026-11-09T22:42:43.993Z"
 }

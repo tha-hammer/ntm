@@ -1070,6 +1070,10 @@ func (s fakeNudgeStore) ReleaseToldRecord(rec state.ToldRecord) error {
 	return s.f.store.ReleaseToldRecord(rec)
 }
 
+func (s fakeNudgeStore) SnoozedMessages(project, agent string, now time.Time) (active, ended []state.SnoozedMessage, err error) {
+	return s.f.store.SnoozedMessages(project, agent, now)
+}
+
 func (f *fakeNudge) nudger() *idleNudger {
 	return newIdleNudger(idleNudgeDeps{
 		ProjectKey: "/proj",

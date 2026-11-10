@@ -49,6 +49,35 @@ type paneNudgeState struct {
 type idleNudgeStore interface {
 	ClaimToldRecord(state.ToldRecord) (bool, error)
 	ReleaseToldRecord(state.ToldRecord) error
+	snoozeReader
+}
+
+// snoozeReader is the part of the state store the snooze filter reads.
+type snoozeReader interface {
+	SnoozedMessages(project, agent string, now time.Time) (active, ended []state.SnoozedMessage, err error)
+}
+
+// mailToAnnounce is the step the hook and the nudge share between fetching an
+// agent's mail and claiming it: it leaves out messages the agent snoozed until
+// later. If the snoozes can't be read, msgs are returned as they are, because
+// a repeat is better than a missed message (Fail Open).
+func mailToAnnounce(store snoozeReader, project, agent string, msgs []agentmail.InboxMessage, now time.Time) []agentmail.InboxMessage {
+	active, _, err := store.SnoozedMessages(project, agent, now)
+	if err != nil {
+		slog.Warn("snoozes not checked", "agent", agent, "project", project, "error", err)
+		return msgs
+	}
+	snoozed := make(map[int64]bool, len(active))
+	for _, s := range active {
+		snoozed[s.MessageID] = true
+	}
+	kept := make([]agentmail.InboxMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		if !snoozed[int64(msg.ID)] {
+			kept = append(kept, msg)
+		}
+	}
+	return kept
 }
 
 // idleNudgeDeps are the nudge's ways of reaching the outside world.
@@ -134,6 +163,17 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 	if len(msgs) == 0 {
 		return
 	}
+	store, err := n.deps.Store()
+	if err != nil {
+		// Without a claim, every poll would type the same reminder again. The
+		// Stop hook still tells the agent at its next turn end.
+		n.warn("open state store", target, err)
+		return
+	}
+	msgs = mailToAnnounce(store, n.deps.ProjectKey, target.Agent, msgs, n.deps.Now().UTC())
+	if len(msgs) == 0 {
+		return // all snoozed
+	}
 
 	pane, err := n.deps.PaneState(ctx, target)
 	if err != nil {
@@ -164,13 +204,6 @@ func (n *idleNudger) nudge(ctx context.Context, target nudgeTarget) {
 		return
 	}
 
-	store, err := n.deps.Store()
-	if err != nil {
-		// Without a claim, every poll would type the same reminder again. The
-		// Stop hook still tells the agent at its next turn end.
-		n.warn("open state store", target, err)
-		return
-	}
 	claims, err := n.claim(store, target, msgs)
 	if err != nil {
 		n.warn("claim", target, err)
