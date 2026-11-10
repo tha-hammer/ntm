@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -68,33 +67,24 @@ func InstallCodexStopHook(workDir, ntmPath, projectKey string) (CodexStopHookRes
 
 // InstallAndApproveCodexStopHook writes ntm's Codex Stop entry into workDir,
 // then saves Codex's approval for it in codexHome, so a Codex agent launched
-// there doesn't stop at Codex's "Hooks need review" screen. launchCommand is
-// the Codex command about to run in workDir. notice is "" when the hook will
-// run, and otherwise one line telling you what to do. err is a failure to
-// write the hook file; the approval's own failure is in notice.
-func InstallAndApproveCodexStopHook(workDir, ntmPath, projectKey, codexHome, launchCommand string) (result CodexStopHookResult, notice string, err error) {
+// there doesn't stop at Codex's "Hooks need review" screen. notice is "" when
+// the hook will run, and otherwise one line telling you what to do. err is a
+// failure to write the hook file; the approval's own failure is in notice.
+func InstallAndApproveCodexStopHook(workDir, ntmPath, projectKey, codexHome string) (result CodexStopHookResult, notice string, err error) {
 	result, err = InstallCodexStopHook(workDir, ntmPath, projectKey)
 	if err != nil {
 		return result, "", err
 	}
 	approval, approveErr := ApproveCodexStopHook(codexHome, result.HooksPath, StopHookCommand(ntmPath, projectKey))
-	return result, codexHookNotice(workDir, approval, approveErr, launchCommand), nil
-}
-
-// codexBypassFlag makes Codex trust the folder it starts in, and save that
-// trust, without asking (seen in Loop 7 Sprint 1's human test, Codex 0.167).
-const codexBypassFlag = "--dangerously-bypass-approvals-and-sandbox"
-
-// codexLaunchTrustsFolder reports whether a Codex command has codexBypassFlag
-// as a word of its own.
-func codexLaunchTrustsFolder(command string) bool {
-	return slices.Contains(strings.Fields(command), codexBypassFlag)
+	return result, codexHookNotice(workDir, approval, approveErr), nil
 }
 
 // codexHookNotice is what you need to know about ntm's Codex hook in folder,
-// or "" when Codex will run it. launchCommand is the Codex command about to
-// run there.
-func codexHookNotice(folder string, approval CodexApproval, err error, launchCommand string) string {
+// or "" when Codex will run it. Codex asks to trust a new folder on its first
+// launch there even with --dangerously-bypass-approvals-and-sandbox (Codex
+// 0.164 on rocketman, Loop 7 Sprint 2's human test), so an untrusted folder
+// always gets the trust notice.
+func codexHookNotice(folder string, approval CodexApproval, err error) string {
 	switch {
 	case approval.State == ApprovalDisabled:
 		return fmt.Sprintf("ntm's Codex hook is turned off in /hooks for %s; turn it on there to get turn-end reminders.", folder)
@@ -104,8 +94,8 @@ func codexHookNotice(folder string, approval CodexApproval, err error, launchCom
 			reason = err.Error()
 		}
 		return fmt.Sprintf("Codex hook not approved in %s: %s. Codex will show its \"Hooks need review\" screen; choose \"Trust all and continue\".", folder, reason)
-	case !approval.FolderTrusted && !codexLaunchTrustsFolder(launchCommand):
-		return fmt.Sprintf("Codex will ask you to trust %s before ntm's turn-end hook can run there. Accept it when you attach.", folder)
+	case !approval.FolderTrusted:
+		return fmt.Sprintf("Codex will ask you to trust %s on first launch; press Enter to accept. ntm's turn-end hook runs after that.", folder)
 	}
 	return ""
 }

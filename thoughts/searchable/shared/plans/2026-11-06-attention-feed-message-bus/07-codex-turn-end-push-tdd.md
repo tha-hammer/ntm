@@ -55,7 +55,7 @@ These come from strings in the Codex 0.167 binary on this VPS (`~/.codex/package
 17. Given Agent Mail is down or the store fails, when the Codex hook runs, then nothing is printed, it exits 0 and the log has the reason.
 18. Given a Codex pane, when the hook tells first and the nudge polls next (or the reverse), then the message is announced once.
 19. Given a Codex agent whose hook can't run (no approval saved), when mail arrives while it's idle, then the Idle Nudge still types the reminder.
-20. Given a folder Codex hasn't trusted, when spawn launches Codex with `--dangerously-bypass-approvals-and-sandbox`, then no folder trust notice is shown, because Codex trusts the folder itself. A Codex command without that flag still gets the notice.
+20. Given a folder Codex hasn't trusted, when spawn launches Codex, with or without `--dangerously-bypass-approvals-and-sandbox`, then one notice says Codex will ask to trust the folder on first launch and to press Enter. (Corrected after Sprint 2's human test: the first version left the notice out with that flag.)
 
 ## What We're NOT Doing
 
@@ -204,15 +204,15 @@ Behavior 19.
 - **DRIVABILITY**: as in Loop 5.
 - **EXECUTION (must run)**: as above.
 
-### Closure Test: No folder trust notice when ntm's Codex command trusts the folder itself [BLOCKING]
+### Closure Test: Spawn tells you Codex will ask to trust a new folder, even with ntm's bypass flag [BLOCKING]
 
-Behavior 20.
-- **SOURCE (seed only)**: an untrusted repo, no `config.toml`, and the stand-in Codex command with and without `--dangerously-bypass-approvals-and-sandbox` in the env config.
-- **TRIGGER (start)**: `Execute` with `spawn`, `--robot-spawn` and `add` (boundary = highest_new_connector, the spawn paths passing the launch command).
+Behavior 20 (corrected after Sprint 2's human test).
+- **SOURCE (seed only)**: an untrusted repo, no `config.toml`, and the stand-in Codex command with `--dangerously-bypass-approvals-and-sandbox` in the env config. Later, the same folder marked trusted.
+- **TRIGGER (start)**: `Execute` with `spawn`, `add` and `--robot-spawn` (boundary = highest_new_connector).
 - **DRIVERS (async edges)**: `capture.waitForType`.
-- **OBSERVE (assert via)**: spawn stdout and robot `warnings`, plus `CodexHookApproval` to confirm the hook was still approved.
-- **FORBIDDEN SPAN**: `codexLaunchTrustsFolder`, `codexHookNotice`.
-- **RED-AT-SEAM proof**: pass "" as the launch command. Expected: "spawn output has a trust notice although the Codex command trusts the folder".
+- **OBSERVE (assert via)**: spawn and add stdout, robot `warnings`, and `CodexHookApproval`.
+- **FORBIDDEN SPAN**: `codexHookNotice`, `codexHookNotices`.
+- **RED-AT-SEAM proof**: turn the folder trust case off. Expected: "spawn output has no trust notice with the bypass flag".
 - **DRIVABILITY**: the Codex command comes from the env's `[agents] codex`.
 - **EXECUTION (must run)**: as above.
 
@@ -941,7 +941,7 @@ Base commit `66662aa7`. All 13 behaviors are built.
 - There was no "Hooks need review" screen. `/hooks` showed Stop installed 1 / active 1, with Trust Trusted.
 - The bypass-flag count was 0.
 - `~/.codex/config.toml` gained only ntm's `hooks.state` table and the folder's `trust_level`.
-- **Issue found:** the folder trust notice was wrong. With ntm's `--dangerously-bypass-approvals-and-sandbox` flag, Codex trusts the folder itself, writes `trust_level`, and shows no prompt.
+- **Issue reported:** the folder trust notice looked wrong, because no trust prompt appeared. **Corrected by Sprint 2's test:** Codex 0.164.0 does ask "Trust this folder?" in a new folder even with `--dangerously-bypass-approvals-and-sandbox` (empty repo and one-commit repo). The notice was right, and Behavior 20 now keeps it, with clearer wording.
 - Evidence: `/home/debian/Dev/ntm-test-evidence/loop7-codex-hook-sprint1-local-2026-11-10/`.
 
 **Deleted with permission:** `internal/config/testdata/rapid/TestCodexCommandNoHookTrustBypass/TestCodexCommandNoHookTrustBypass-20261110140759-2649541.fail`, from the Behavior 13 red check, and its empty folders. Your answer was "Delete it (Recommended)" (2026-11-10). Commands: `rm` on that file, then `rmdir` on `internal/config/testdata/rapid/TestCodexCommandNoHookTrustBypass`, `internal/config/testdata/rapid` and `internal/config/testdata`, at 15:32:03Z.
@@ -975,57 +975,47 @@ Base commit `66662aa7`. All 13 behaviors are built.
 | One message is announced once across the hook and nudge (**One Telling**) | 18 |
 | When the hook can't run (approval not saved, or the folder not trusted), the Codex agent still gets the Idle Nudge | 19 |
 | Fail-open behavior matches Claude's: a problem never blocks a Codex agent (**Fail Open**) | 17 |
-| Spawn's folder trust notice shows only when Codex will really ask: not when the Codex launch command has `--dangerously-bypass-approvals-and-sandbox` (added after Sprint 1's human test) | 20 |
+| Spawn's folder trust notice shows whenever Codex hasn't trusted the folder, including with `--dangerously-bypass-approvals-and-sandbox`, and says to press Enter (added after Sprint 1's test, corrected after Sprint 2's) | 20 |
 | Scenarios: Codex format, Claude format unchanged, loop guard, nothing new, told by nudge, hook can't run | 15, 16, 14, 15, 18, 19 |
 
-### Behavior 20: No folder trust notice when ntm's Codex command trusts the folder itself [BLOCKING]
+### Behavior 20: Spawn tells you Codex will ask to trust a new folder, and what to press [BLOCKING]
 
-Added after Sprint 1's human test (rocketman, 2026-11-10). ntm's default Codex command has `--dangerously-bypass-approvals-and-sandbox`, and with it Codex trusted the folder and wrote `trust_level` itself, with no prompt. So the notice "Codex will ask you to trust …" was wrong.
+Added after Sprint 1's human test, which reported that the trust notice was wrong, and corrected after Sprint 2's human test. The first version (in 9efdee0f) left the notice out when the Codex command had `--dangerously-bypass-approvals-and-sandbox`. But Codex 0.164.0 on rocketman still showed "Trust this folder?" in a new folder with that flag, in an empty repo and in a repo with one commit. After you accept, ntm's first prompt arrives normally. So the notice stays, with the wording you suggested.
 
 #### Test Specification
 
-**Given** a folder Codex hasn't trusted, and no other Codex hook problem. **When** each run below happens. **Then**:
+**Given** a folder Codex hasn't trusted. **When** spawn, add or robot spawn launches Codex with ntm's bypass flag. **Then** one notice says: "Codex will ask you to trust `<folder>` on first launch; press Enter to accept. ntm's turn-end hook runs after that." Robot spawn puts it in `warnings`. Once the folder is trusted, there's no notice.
 
-| Run | Codex command | Output |
-|---|---|---|
-| `spawn s --cod=1` | the stand-in plus `--dangerously-bypass-approvals-and-sandbox` | no trust notice; the hook is written and approved |
-| `--robot-spawn=s --spawn-cod=1` | the same | `warnings` empty |
-| `add s --cod=1` | the same | no trust notice |
-| `spawn s --cod=1` | the stand-in without the flag | the trust notice, once |
+**Edge Cases:** the "not approved" and "turned off in /hooks" notices come first, as before.
 
-The "approval not saved" and "turned off in /hooks" notices still show with the flag.
-
-**Edge Cases:** the flag must be a whole word in the command (`--dangerously-bypass-approvals-and-sandboxX` doesn't count).
-
-**Property:** no property: fixed commands. A unit table covers `codexLaunchTrustsFolder`.
+**Property:** no property: fixed runs. `TestCodexHookNotice` covers each notice.
 
 **Files touched:**
-- `internal/claudeconfig/codex_hooks.go`: `InstallAndApproveCodexStopHook` takes the launch command, `codexLaunchTrustsFolder`, and `codexHookNotice`.
-- `internal/cli/agent_hook.go`, `spawn.go` and `add.go`: pass the built Codex command.
-- `internal/robot/spawn.go`: passes `agentCommands["codex"]`.
-- Tests: `internal/claudeconfig/codex_hooks_test.go` and `internal/cli/agent_hook_test.go` (`TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder`).
+- `internal/claudeconfig/codex_hooks.go`: the notice wording. The launch-command check and its plumbing from the first version are removed.
+- `internal/cli/agent_hook.go`, `spawn.go`, `add.go` and `internal/robot/spawn.go`: back to Sprint 1's signatures.
+- Tests: `internal/claudeconfig/codex_hooks_test.go` (`TestCodexHookNotice`) and `internal/cli/agent_hook_test.go` (`TestClosure_SpawnTrustNoticeWithCodexBypassFlag`).
 
 #### TDD Cycle
 
 ##### 🔴 Red
 
-`TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder` and `TestCodexLaunchTrustsFolder`. Expected failure: "spawn output has a trust notice although the Codex command trusts the folder".
+`TestClosure_SpawnTrustNoticeWithCodexBypassFlag`. Against 9efdee0f it fails, because the notice was left out with the flag.
 
 ##### 🟢 Green
 
-`codexLaunchTrustsFolder(command)` reports whether any shell word of the command is `--dangerously-bypass-approvals-and-sandbox`. `codexHookNotice` leaves out the trust notice when it's true. The spawn paths pass the command they are about to launch.
+`codexHookNotice` shows the trust notice whenever `FolderTrusted` is false. `InstallAndApproveCodexStopHook`, `installStopHookIfActive` and robot `writeStopHook` no longer take the launch command.
 
 ##### 🔵 Refactor
 
-- [ ] **No duplication:** one check, in `claudeconfig`, used by the CLI and robot paths.
-- [ ] **Reveals intent:** the comment cites the Sprint 1 evidence.
-- [ ] **Complexity went down:** one more condition in the notice switch, no new branch at the call sites.
+- [ ] **No duplication:** one notice function for the CLI and robot paths.
+- [ ] **Reveals intent:** the comment cites the Sprint 2 evidence.
+- [ ] **Complexity went down:** one fewer parameter on four functions, and one fewer helper.
 - [ ] **No shallow wrappers:** none.
 - [ ] **Fits existing patterns:** the notice function from Behavior 12.
 
 #### Success Criteria
 
-**Automated:** `go test -short -run 'TestCodexLaunchTrustsFolder|TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder|TestClosure_SpawnApprovesCodexHook' ./internal/claudeconfig/ ./internal/cli/` fails first, then passes.
+**Automated:** `go test -short -run 'TestCodexHookNotice|TestClosure_SpawnTrustNoticeWithCodexBypassFlag|TestClosure_SpawnApprovesCodexHook' ./internal/claudeconfig/ ./internal/cli/` passes, and the closure test was seen red with the notice turned off.
 
 ### Behavior 14: The hook reads Codex's Stop input, and its loop guard [LEAF: one parser]
 
@@ -1288,6 +1278,23 @@ Base commit `c634b157`. Behaviors 14 to 20 are built.
 - `go test -short ./...` failed only on the bd-5zbcm list.
 - Tamper check (base `c634b157`) clean.
 - golangci-lint, goimports and ubs aren't installed.
+
+**Human test (rocketman, 2026-11-10, built from b321deb3): steps 1 to 9 PASS.**
+- #12527 "idle test" was nudged once (`told_by=idle_nudge`).
+- #12528 "turn end test" was announced at turn end through "Blocked by hook" (`told_by=stop_hook`).
+- No repeats after 2 minutes.
+- Step 10 passed as written: there was no trust line. But that showed the first Behavior 20 was wrong. Codex 0.164.0 still shows "Trust this folder?" in a new folder with `--dangerously-bypass-approvals-and-sandbox`, in an empty repo and in a repo with one commit. After you accept it, ntm's first prompt is delivered normally.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop7-codex-hook-sprint2-local-2026-11-10/`.
+
+**Behavior 20 correction (2026-11-10):**
+- The notice is restored, with your wording: "Codex will ask you to trust `<folder>` on first launch; press Enter to accept. ntm's turn-end hook runs after that."
+- `codexLaunchTrustsFolder` and the launch-command parameter are removed. `spawn.go`, `add.go`, `robot/spawn.go` and `agent_hook.go` are back to Sprint 1's signatures.
+- Tests:
+  - `TestCodexHookNotice` replaces `TestCodexLaunchTrustsFolder` and `TestCodexHookNotice_LaunchTrustsFolder`.
+  - `TestClosure_SpawnTrustNoticeWithCodexBypassFlag` replaces `TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder`. It covers spawn, add and robot spawn with the flag, and no notice once the folder is trusted.
+- Red-at-seam: with the trust case turned off, the closure test was red with "spawn output has no trust notice with the bypass flag". Then it was reverted.
+- Verification: build and vet ok; `claudeconfig` and `robot` ok; the Codex and StopHook closure set passed 3 runs in a row; `internal/cli` failed only on the 2 known tests (bd-5zbcm).
+- **Tamper check (base 9efdee0f), exit 1.** `internal/claudeconfig/codex_hooks_test.go`: tests 17 → 16 and assertions 76 → 75. This is from removing `TestCodexLaunchTrustsFolder`, whose function no longer exists, and from merging the two notice tests into one. **Approved** by Maceo on 2026-11-10 (answer: "Approve it (Recommended)"). Sprint 2 was then marked passed (answer: "Mark passed, finish loop").
 
 ### Human test script
 

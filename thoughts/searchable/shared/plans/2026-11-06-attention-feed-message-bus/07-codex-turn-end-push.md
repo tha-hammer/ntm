@@ -96,7 +96,7 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 - [ ] One message is announced once across the hook and nudge (**One Telling**).
 - [ ] When the hook can't run (approval not saved, or the folder not trusted), the Codex agent still gets the Idle Nudge.
 - [ ] Fail-open behavior matches Claude's: a problem never blocks a Codex agent (**Fail Open**).
-- [ ] Spawn's folder trust notice shows only when Codex will really ask: not when the Codex launch command has `--dangerously-bypass-approvals-and-sandbox`, which makes Codex trust the folder itself (found in Sprint 1's human test, added 2026-11-10).
+- [ ] Spawn's folder trust notice shows whenever Codex hasn't trusted the folder, including with ntm's `--dangerously-bypass-approvals-and-sandbox` flag, and says to press Enter on first launch (added 2026-11-10 after Sprint 1's test; corrected after Sprint 2's test, where Codex 0.164 still asked).
 
 ### Requirements
 
@@ -116,7 +116,7 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 | Nothing new | Run again | Silent |
 | Told by nudge | Nudge already announced it | Silent |
 | Hook can't run | Hook not approved, idle agent | Idle Nudge still arrives |
-| Trust notice | Spawn with ntm's default Codex command in an untrusted folder | No folder trust notice; a custom command without the flag still gets it |
+| Trust notice | Spawn with ntm's default Codex command in an untrusted folder | One notice: Codex will ask to trust the folder on first launch; press Enter |
 
 ### Human test script
 

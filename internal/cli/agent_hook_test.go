@@ -1678,17 +1678,17 @@ func TestInstallClaudeStopHookIfActive_OffThenOn(t *testing.T) {
 	off, on := config.Default(), config.Default()
 	disabled := false
 	off.AgentMail.StopHookEnabled = &disabled
-	installStopHookIfActive(off, AgentTypeClaude, dir, dir, "claude", nil)
+	installStopHookIfActive(off, AgentTypeClaude, dir, dir, nil)
 	if after := mustReadFile(t, path); !bytes.Equal(after, before) {
 		t.Fatalf("switch off changed the file:\nbefore %s\nafter  %s", before, after)
 	}
 
-	installStopHookIfActive(on, AgentTypeClaude, dir, dir, "claude", nil)
+	installStopHookIfActive(on, AgentTypeClaude, dir, dir, nil)
 	entry := onlyNtmStopEntry(t, readSettingsFile(t, dir))
 	if entry.Command != claudeconfig.StopHookCommand(helperBinary(t), dir) {
 		t.Fatalf("after switching on, command = %q", entry.Command)
 	}
-	installStopHookIfActive(on, AgentTypeClaude, dir, dir, "claude", nil)
+	installStopHookIfActive(on, AgentTypeClaude, dir, dir, nil)
 	onlyNtmStopEntry(t, readSettingsFile(t, dir))
 }
 
@@ -1703,7 +1703,7 @@ func TestInstallStopHookIfActive_CodexOffThenOn(t *testing.T) {
 	off.AgentMail.StopHookEnabled = &disabled
 
 	notices := codexHookNotices{}
-	installStopHookIfActive(off, AgentTypeCodex, dir, dir, "codex", notices)
+	installStopHookIfActive(off, AgentTypeCodex, dir, dir, notices)
 	if _, err := os.Stat(filepath.Join(dir, claudeconfig.CodexHooksPath)); !os.IsNotExist(err) {
 		t.Fatalf("switch off wrote the Codex file: %v", err)
 	}
@@ -1714,7 +1714,7 @@ func TestInstallStopHookIfActive_CodexOffThenOn(t *testing.T) {
 		t.Fatalf("switch off gave notices: %v", notices)
 	}
 
-	installStopHookIfActive(on, AgentTypeCodex, dir, dir, "codex", notices)
+	installStopHookIfActive(on, AgentTypeCodex, dir, dir, notices)
 	hooksPath := filepath.Join(dir, claudeconfig.CodexHooksPath)
 	command := claudeconfig.StopHookCommand(helperBinary(t), dir)
 	if approval, err := claudeconfig.CodexHookApproval(codexHome, hooksPath, command); err != nil || approval.State != claudeconfig.ApprovalGranted {
@@ -2069,9 +2069,10 @@ func TestMain_IsolatesCodexHome(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 20: ntm's real Codex flag makes Codex trust the folder
-// itself, so spawn doesn't tell you to accept a prompt that never comes.
-func TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder(t *testing.T) {
+// Loop 7, Behavior 20 (corrected after Sprint 2's human test): Codex 0.164
+// still asks "Trust this folder?" in a new folder with ntm's real flag, so
+// spawn, add and robot spawn tell you once, with what to press.
+func TestClosure_SpawnTrustNoticeWithCodexBypassFlag(t *testing.T) {
 	const flag = "--dangerously-bypass-approvals-and-sandbox"
 	mail := newFakeAgentMail(t)
 	env := newClosureEnv(t)
@@ -2079,37 +2080,36 @@ func TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder(t *testing.T) {
 	env.privateTmux(t)
 	capture := env.standInAgentConfigCodexArgs(t, "", flag)
 	repo := gitInitForTest(t, env.projectDir("codtrusts"))
+	notice := func(dir string) string {
+		return "Codex will ask you to trust " + dir + " on first launch; press Enter to accept."
+	}
 
 	out := env.run(t, "execute", "spawn", "codtrusts", "--cod=1")
 	capture.waitForType(t, "codex", 1, 20*time.Second)
-	if strings.Contains(out, "Codex will ask") {
-		t.Fatalf("spawn output has a trust notice although the Codex command trusts the folder: %q", out)
+	if strings.Count(out, notice(repo)) != 1 {
+		t.Fatalf("spawn output has no trust notice with the bypass flag: %q", out)
 	}
 	assertCodexApproved(t, env, repo, repo)
 
 	addOut := env.run(t, "execute", "add", "codtrusts", "--cod=1")
 	capture.waitForType(t, "codex", 2, 20*time.Second)
-	if strings.Contains(addOut, "Codex will ask") {
-		t.Fatalf("add output has a trust notice: %q", addOut)
+	if strings.Count(addOut, notice(repo)) != 1 {
+		t.Fatalf("add output = %q", addOut)
 	}
 
 	other := gitInitForTest(t, filepath.Join(env.projectsBase(), "robottrusts"))
 	resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=robottrusts", "--spawn-cod=1", "--spawn-dir="+other))
-	if !resp.Success || len(resp.Warnings) != 0 {
+	if !resp.Success || len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], notice(other)) {
 		t.Fatalf("robot response = %+v", resp)
 	}
 	assertCodexApproved(t, env, other, other)
 
-	// Without the flag, Codex asks, so the notice still shows.
-	plain := newClosureEnv(t)
-	plain.useAgentMail(mail)
-	plain.privateTmux(t)
-	plainCapture := plain.standInAgentConfig(t, "")
-	plainRepo := gitInitForTest(t, plain.projectDir("codasks"))
-	plainOut := plain.run(t, "execute", "spawn", "codasks", "--cod=1")
-	plainCapture.waitForType(t, "codex", 1, 20*time.Second)
-	if strings.Count(plainOut, "Codex will ask you to trust "+plainRepo) != 1 {
-		t.Fatalf("spawn without the flag = %q", plainOut)
+	// Once Codex has trusted the folder, there's nothing to tell.
+	env.writeCodexConfig(t, string(mustReadFile(t, filepath.Join(env.codexHome(), "config.toml")))+"\n"+codexTrusted(repo))
+	again := env.run(t, "execute", "add", "codtrusts", "--cod=1")
+	capture.waitForType(t, "codex", 4, 20*time.Second)
+	if strings.Contains(again, "Codex will ask") {
+		t.Fatalf("trusted folder still got a notice: %q", again)
 	}
 }
 

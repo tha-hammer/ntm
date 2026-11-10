@@ -651,38 +651,21 @@ func TestCodexHomeDir(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 20: only the whole flag means Codex trusts the folder
-// itself (Sprint 1's human test on rocketman).
-func TestCodexLaunchTrustsFolder(t *testing.T) {
-	for command, want := range map[string]bool{
-		"codex --dangerously-bypass-approvals-and-sandbox -m 'gpt-6.1-sol'":        true,
-		"CARGO_BUILD_JOBS=1 codex -m x --dangerously-bypass-approvals-and-sandbox": true,
-		"codex -m x": false,
-		"codex --dangerously-bypass-approvals-and-sandboxX":                 false,
-		"codex -c note='--dangerously-bypass-approvals-and-sandbox is off'": false,
-		"": false,
-	} {
-		if got := codexLaunchTrustsFolder(command); got != want {
-			t.Fatalf("codexLaunchTrustsFolder(%q) = %v, want %v", command, got, want)
-		}
+// Loop 7, Behavior 20 (corrected after Sprint 2's human test): Codex asks to
+// trust a new folder on first launch whatever its flags, so an untrusted
+// folder always gets the trust notice, and the other notices come first.
+func TestCodexHookNotice(t *testing.T) {
+	trustNotice := "Codex will ask you to trust /p on first launch; press Enter to accept. ntm's turn-end hook runs after that."
+	if got := codexHookNotice("/p", CodexApproval{State: ApprovalGranted}, nil); got != trustNotice {
+		t.Fatalf("untrusted folder notice = %q, want %q", got, trustNotice)
 	}
-}
-
-// Loop 7, Behavior 20: with a launch command that trusts the folder, the
-// trust notice is left out, and the other notices stay.
-func TestCodexHookNotice_LaunchTrustsFolder(t *testing.T) {
-	trusting := "codex --dangerously-bypass-approvals-and-sandbox"
-	untrusted := CodexApproval{State: ApprovalGranted}
-	if got := codexHookNotice("/p", untrusted, nil, trusting); got != "" {
-		t.Fatalf("notice with a trusting command = %q", got)
+	if got := codexHookNotice("/p", CodexApproval{State: ApprovalGranted, FolderTrusted: true}, nil); got != "" {
+		t.Fatalf("trusted folder notice = %q, want none", got)
 	}
-	if got := codexHookNotice("/p", untrusted, nil, "codex"); !strings.Contains(got, "Codex will ask you to trust /p") {
-		t.Fatalf("notice without the flag = %q", got)
+	if got := codexHookNotice("/p", CodexApproval{State: ApprovalUnknown}, errors.New("boom")); !strings.Contains(got, "not approved in /p: boom") {
+		t.Fatalf("approval notice = %q", got)
 	}
-	if got := codexHookNotice("/p", CodexApproval{State: ApprovalUnknown}, errors.New("boom"), trusting); !strings.Contains(got, "not approved") {
-		t.Fatalf("approval notice dropped: %q", got)
-	}
-	if got := codexHookNotice("/p", CodexApproval{State: ApprovalDisabled}, nil, trusting); !strings.Contains(got, "turned off") {
-		t.Fatalf("turned-off notice dropped: %q", got)
+	if got := codexHookNotice("/p", CodexApproval{State: ApprovalDisabled}, nil); !strings.Contains(got, "turned off in /hooks for /p") {
+		t.Fatalf("turned-off notice = %q", got)
 	}
 }

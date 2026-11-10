@@ -90,12 +90,11 @@ func newAgentHookStopCmd() *cobra.Command {
 // folder before the agent launches, in the file that agent's tool reads at
 // startup: .claude/settings.local.json for Claude, .codex/hooks.json for
 // Codex. For Codex it also saves Codex's approval of ntm's entry, and adds
-// to notices anything you need to do; launchCommand is the command about to
-// run, which decides whether Codex will ask to trust the folder. It does nothing when the hook is
+// to notices anything you need to do. It does nothing when the hook is
 // switched off or Agent Mail is off, and it never removes an entry.
 // projectKey is the Agent Mail project. A failure is a warning: the agent
 // still launches, only without turn-end mail.
-func installStopHookIfActive(c *config.Config, agentType AgentType, workDir, projectKey, launchCommand string, notices codexHookNotices) {
+func installStopHookIfActive(c *config.Config, agentType AgentType, workDir, projectKey string, notices codexHookNotices) {
 	if c == nil || !c.AgentMail.StopHookActive() {
 		return
 	}
@@ -114,7 +113,7 @@ func installStopHookIfActive(c *config.Config, agentType AgentType, workDir, pro
 		if err == nil {
 			var result claudeconfig.CodexStopHookResult
 			var notice string
-			result, notice, err = claudeconfig.InstallAndApproveCodexStopHook(workDir, ntmPath, projectKey, claudeconfig.CodexHomeDir(), launchCommand)
+			result, notice, err = claudeconfig.InstallAndApproveCodexStopHook(workDir, ntmPath, projectKey, claudeconfig.CodexHomeDir())
 			written = result.HooksPath
 			notices.add(result.HooksPath, notice)
 		}

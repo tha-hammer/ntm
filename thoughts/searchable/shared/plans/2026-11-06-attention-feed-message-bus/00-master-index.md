@@ -23,7 +23,7 @@ Human tests run on this VPS, except Loop 8, Sprint 3, which runs on your local m
 | 4 | [04-cross-process-delivery.md](04-cross-process-delivery.md) | Cross-process delivery | 1 | Done: Sprint 1 passed |
 | 5 | [05-idle-nudge.md](05-idle-nudge.md) | Idle nudge | 5 | Done: Sprints 1 to 5 passed |
 | 6 | [06-agent-snooze.md](06-agent-snooze.md) | Agent snooze | 2 | Done: Sprints 1 and 2 passed |
-| 7 | [07-codex-turn-end-push.md](07-codex-turn-end-push.md) | Codex turn-end push | 2 | In progress: Sprint 1 passed |
+| 7 | [07-codex-turn-end-push.md](07-codex-turn-end-push.md) | Codex turn-end push | 2 | Done: Sprints 1 and 2 passed |
 | 8 | [08-hook-migration.md](08-hook-migration.md) | Hook migration | 3 | Not started |
 | 9 | [09-release-journey.md](09-release-journey.md) | Release journey | 1 | Not started |
 
