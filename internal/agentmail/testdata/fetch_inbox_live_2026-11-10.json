@@ -1,0 +1,33 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "[{\"id\":2418,\"subject\":\"Phase 4 COMPLETE — all 18 behaviors done, beads closed\",\"from\":\"HazyForge\",\"created_ts\":\"2026-07-09T19:16:05.531083+00:00\",\"importance\":\"high\",\"kind\":\"to\"},{\"id\":2414,\"subject\":\"Phase 4 Zig work complete — 15/18 behaviors done, 3 blocked on Phase 1\",\"from\":\"HazyForge\",\"created_ts\":\"2026-07-09T17:28:14.634629+00:00\",\"importance\":\"high\",\"kind\":\"to\"}]"
+      }
+    ],
+    "structuredContent": {
+      "result": [
+        {
+          "id": 2418,
+          "subject": "Phase 4 COMPLETE — all 18 behaviors done, beads closed",
+          "from": "HazyForge",
+          "created_ts": "2026-07-09T19:16:05.531083+00:00",
+          "importance": "high",
+          "kind": "to"
+        },
+        {
+          "id": 2414,
+          "subject": "Phase 4 Zig work complete — 15/18 behaviors done, 3 blocked on Phase 1",
+          "from": "HazyForge",
+          "created_ts": "2026-07-09T17:28:14.634629+00:00",
+          "importance": "high",
+          "kind": "to"
+        }
+      ]
+    },
+    "isError": false
+  }
+}

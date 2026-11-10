@@ -172,12 +172,11 @@ func TestParseSnoozeUntil_RoundTripProperty(t *testing.T) {
 	})
 }
 
-// seedEndedSnooze stores a mail notice for agent whose snooze ended a minute
-// before now, as a snooze that ran out leaves it.
-func seedEndedSnooze(t *testing.T, store *state.Store, project, agent string, id int64, from, subject string, now time.Time) {
+// seedMailNotice stores the mail notice for agent that the hook or the nudge
+// records when it announces a message, at ts and expiring at expires, and
+// returns its cursor.
+func seedMailNotice(t *testing.T, store *state.Store, project, agent string, id int64, from, subject string, ts, expires time.Time) int64 {
 	t.Helper()
-	ts := now.Add(-time.Hour)
-	expires := ts.Add(7 * 24 * time.Hour)
 	cursor, _, err := store.AppendAddressedAttentionEvent(&state.StoredAttentionEvent{
 		Ts: ts, Category: "mail", EventType: "mail.received", Source: "agent_mail",
 		Actionability: "interesting", Severity: "info", Summary: "mail for " + agent,
@@ -187,6 +186,15 @@ func seedEndedSnooze(t *testing.T, store *state.Store, project, agent string, id
 	if err != nil {
 		t.Fatal(err)
 	}
+	return cursor
+}
+
+// seedEndedSnooze stores a mail notice for agent whose snooze ended a minute
+// before now, as a snooze that ran out leaves it.
+func seedEndedSnooze(t *testing.T, store *state.Store, project, agent string, id int64, from, subject string, now time.Time) {
+	t.Helper()
+	ts := now.Add(-time.Hour)
+	cursor := seedMailNotice(t, store, project, agent, id, from, subject, ts, ts.Add(7*24*time.Hour))
 	until := now.Add(-time.Minute)
 	if err := store.UpsertAttentionItemState(&state.AttentionItemState{ItemKey: fmt.Sprintf("cursor:%d", cursor), State: state.AttentionStateSnoozed, SnoozedUntil: &until}); err != nil {
 		t.Fatal(err)
@@ -245,13 +253,22 @@ func TestMailToAnnounce(t *testing.T) {
 }
 
 // Behavior 11 property: the result is the fetched mail minus active snoozes,
-// plus ended snoozes, each id once.
+// plus ended snoozes, each id once. Loop 7, Behavior 2: with a random
+// created time per message, plain mail too old to announce is left out too.
 func TestMailToAnnounce_Property(t *testing.T) {
+	now := time.Now().UTC()
 	rapid.Check(t, func(rt *rapid.T) {
 		ids := rapid.SliceOfNDistinct(rapid.IntRange(1, 20), 0, 20, rapid.ID).Draw(rt, "fetched")
 		var msgs []agentmail.InboxMessage
+		tooOld := map[int]bool{}
 		for _, id := range ids {
-			msgs = append(msgs, agentmail.InboxMessage{ID: id})
+			msg := agentmail.InboxMessage{ID: id}
+			if rapid.Bool().Draw(rt, fmt.Sprintf("dated-%d", id)) {
+				age := time.Duration(rapid.Int64Range(-30*24*int64(time.Hour), 30*24*int64(time.Hour)).Draw(rt, fmt.Sprintf("age-%d", id)))
+				msg.CreatedTS = agentmail.FlexTime{Time: now.Add(-age)}
+				tooOld[id] = age > state.ToldRecordRetention
+			}
+			msgs = append(msgs, msg)
 		}
 		var snoozes fakeSnoozes
 		kind := map[int]string{}
@@ -267,7 +284,7 @@ func TestMailToAnnounce_Property(t *testing.T) {
 		}
 		want := map[int]bool{}
 		for _, id := range ids {
-			if kind[id] != "active" {
+			if kind[id] == "" && !tooOld[id] {
 				want[id] = true
 			}
 		}
@@ -276,7 +293,13 @@ func TestMailToAnnounce_Property(t *testing.T) {
 				want[id] = true
 			}
 		}
-		got, _ := announcedIDs(mailToAnnounce(snoozes, "/p", "BlueLake", msgs, time.Now()))
+		items := mailToAnnounce(snoozes, "/p", "BlueLake", msgs, now)
+		for _, it := range items {
+			if it.ended == nil && tooOldToAnnounce(it.msg.CreatedTS.Time, now) {
+				rt.Fatalf("plain item #%d is too old to announce (created %s)", it.msg.ID, it.msg.CreatedTS.Time)
+			}
+		}
+		got, _ := announcedIDs(items)
 		seen := map[int]bool{}
 		for _, id := range got {
 			if seen[id] || !want[id] {
@@ -320,6 +343,76 @@ func TestClaimUnread_EndedSnooze(t *testing.T) {
 	if out.Len() != 0 {
 		t.Fatalf("second run printed %q", out.String())
 	}
+}
+
+// Loop 7, Behavior 2: the shared step leaves out plain mail more than
+// ToldRecordRetention old, keeps mail with no time or a future time, in order,
+// and does so even when the snoozes can't be read.
+func TestMailToAnnounce_AgeCutoff(t *testing.T) {
+	now := time.Now().UTC()
+	at := func(d time.Duration) agentmail.FlexTime { return agentmail.FlexTime{Time: now.Add(d)} }
+	msgs := []agentmail.InboxMessage{
+		{ID: 61, CreatedTS: at(-8 * 24 * time.Hour)},
+		{ID: 62, CreatedTS: at(-6 * 24 * time.Hour)},
+		{ID: 63},
+		{ID: 64, CreatedTS: at(time.Hour)},
+	}
+	if ids, _ := announcedIDs(mailToAnnounce(fakeSnoozes{}, "/p", "BlueLake", msgs, now)); fmt.Sprint(ids) != "[62 63 64]" {
+		t.Fatalf("ids = %v, want [62 63 64]", ids)
+	}
+	if ids, _ := announcedIDs(mailToAnnounce(fakeSnoozes{err: errors.New("busy")}, "/p", "BlueLake", msgs, now)); fmt.Sprint(ids) != "[62 63 64]" {
+		t.Fatalf("on a read error: ids = %v, want [62 63 64]", ids)
+	}
+}
+
+// Loop 7, Behavior 9: a message back from a snooze is kept whatever its age,
+// once, marked ended, as the fetched message in its fetched place.
+func TestMailToAnnounce_EndedSnoozeIgnoresAge(t *testing.T) {
+	now := time.Now().UTC()
+	created := agentmail.FlexTime{Time: now.Add(-8 * 24 * time.Hour)}
+	snoozes := fakeSnoozes{ended: []state.SnoozedMessage{{MessageID: 910, From: "GreenCastle", Subject: "late"}}}
+	msgs := []agentmail.InboxMessage{
+		{ID: 910, From: "GreenCastle", Subject: "late", Importance: "high", CreatedTS: created},
+		{ID: 911, From: "RedStone", Subject: "fresh", CreatedTS: agentmail.FlexTime{Time: now}},
+	}
+	items := mailToAnnounce(snoozes, "/p", "BlueLake", msgs, now)
+	ids, ended := announcedIDs(items)
+	if fmt.Sprint(ids) != "[910 911]" || fmt.Sprint(ended) != "[910]" {
+		t.Fatalf("ids %v ended %v; want [910 911] and [910]", ids, ended)
+	}
+	if got := items[0].msg; got.Importance != "high" || !got.CreatedTS.Time.Equal(created.Time) {
+		t.Fatalf("returned item = %+v; want the fetched message", got)
+	}
+}
+
+// Behavior 9 property: every ended snooze is returned exactly once, marked
+// ended, whatever the age of its fetched message, and fetched or not.
+func TestMailToAnnounce_EndedSnoozeAgeProperty(t *testing.T) {
+	now := time.Now().UTC()
+	rapid.Check(t, func(rt *rapid.T) {
+		ids := rapid.SliceOfNDistinct(rapid.IntRange(1, 20), 1, 20, rapid.ID).Draw(rt, "ended")
+		var snoozes fakeSnoozes
+		var msgs []agentmail.InboxMessage
+		for _, id := range ids {
+			snoozes.ended = append(snoozes.ended, state.SnoozedMessage{MessageID: int64(id)})
+			if rapid.Bool().Draw(rt, fmt.Sprintf("fetched-%d", id)) {
+				age := time.Duration(rapid.Int64Range(-30*24*int64(time.Hour), 30*24*int64(time.Hour)).Draw(rt, fmt.Sprintf("age-%d", id)))
+				msgs = append(msgs, agentmail.InboxMessage{ID: id, CreatedTS: agentmail.FlexTime{Time: now.Add(-age)}})
+			}
+		}
+		count := map[int]int{}
+		for _, it := range mailToAnnounce(snoozes, "/p", "BlueLake", msgs, now) {
+			if it.ended == nil {
+				rt.Fatalf("#%d returned unmarked", it.msg.ID)
+			}
+			count[it.msg.ID]++
+		}
+		for _, id := range ids {
+			if count[id] != 1 {
+				rt.Fatalf("#%d returned %d times, want 1 (counts %v)", id, count[id], count)
+			}
+		}
+	})
 }
 
 // waitTypedCount waits until want appears n times in the stand-in's typed

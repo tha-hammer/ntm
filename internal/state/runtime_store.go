@@ -2027,6 +2027,11 @@ func upsertAttentionItemStateExec(exec sqlExecer, item *AttentionItemState, now 
 // records, so a longer snooze would end after its notice was gone.
 const SnoozeLimit = ToldRecordRetention
 
+// SnoozeReturnMargin is how long before its notice expires a snooze must end,
+// so the return is seen while the notice still exists (SnoozedMessages reads
+// only live notices).
+const SnoozeReturnMargin = time.Hour
+
 var (
 	// ErrSnoozeNotInFuture is returned for a snooze time at or before now.
 	ErrSnoozeNotInFuture = errors.New("snooze time must be in the future")
@@ -2091,9 +2096,11 @@ func (s *Store) SnoozeAddressedMessage(req SnoozeRequest) (time.Time, error) {
 	if event == nil {
 		return time.Time{}, ErrNoAddressedEvent
 	}
-	if event.ExpiresAt != nil && req.Until.After(*event.ExpiresAt) {
-		return time.Time{}, fmt.Errorf("%w: message %d's notice expires at %s; snooze until then at the latest",
-			ErrSnoozePastNotice, req.MessageID, event.ExpiresAt.UTC().Format(time.RFC3339))
+	if event.ExpiresAt != nil {
+		if latest := event.ExpiresAt.Add(-SnoozeReturnMargin); req.Until.After(latest) {
+			return time.Time{}, fmt.Errorf("%w: message %d's notice expires at %s; snooze until %s at the latest",
+				ErrSnoozePastNotice, req.MessageID, event.ExpiresAt.UTC().Format(time.RFC3339), latest.UTC().Format(time.RFC3339))
+		}
 	}
 	itemKey := attentionItemKeyForEvent(event.DedupKey, event.Cursor)
 	prior, err := s.GetAttentionItemState(itemKey)

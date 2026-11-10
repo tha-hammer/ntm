@@ -1,0 +1,7 @@
+# Captured 2026-11-10 from the live Agent Mail (Docker container mcp-agent-mail-rust,
+# http://127.0.0.1:8765/mcp/) on rocketman: one tools/call fetch_inbox, limit 2, for
+# RoseMeadow in /home/maceo/ntm_Dev/zigBrowser. Bodies and other fields dropped; no
+# credential fields were present to redact. created_ts carries a zone (+00:00) and microseconds.
+# id <TAB> raw created_ts <TAB> the UTC instant it means (RFC3339Nano)
+2418	2026-07-09T19:16:05.531083+00:00	2026-07-09T19:16:05.531083Z
+2414	2026-07-09T17:28:14.634629+00:00	2026-07-09T17:28:14.634629Z
