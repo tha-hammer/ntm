@@ -749,7 +749,7 @@ func runAdd(opts AddOptions) error {
 		// Claude Code and Codex read their hooks at startup, so the Stop hook
 		// is written before the launch. The added pane runs in the session
 		// folder, which is also its Agent Mail project.
-		installStopHookIfActive(cfg, agent.Type, dir, dir, codexNotices)
+		installStopHookIfActive(cfg, agent.Type, dir, dir, safeCmd, codexNotices)
 
 		if err := tmux.SendKeys(paneID, cmd, true); err != nil {
 			return outputError(fmt.Errorf("launching agent: %w", err))

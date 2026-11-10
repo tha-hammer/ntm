@@ -101,7 +101,9 @@
       "doc": "07-codex-turn-end-push.md",
       "tdd_plan": "07-codex-turn-end-push-tdd.md",
       "status": "building",
-      "sprints_passed": []
+      "sprints_passed": [
+        "Sprint 1: Hook written and approved"
+      ]
     },
     {
       "doc": "08-hook-migration.md",
@@ -583,8 +585,14 @@
       "step": "build",
       "event": "started",
       "detail": "07-codex-turn-end-push-tdd.md"
+    },
+    {
+      "at": "2026-11-10T15:30:15.902Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 1: Hook written and approved"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-10T13:47:12.664Z"
+  "updated_at": "2026-11-10T15:30:15.902Z"
 }

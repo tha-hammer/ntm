@@ -1,0 +1,15 @@
+{
+  "$comment": "Codex 0.167.0 stop.command.output, rebuilt from the schema text in the codex binary (2026-11-10). Codex also enforces that decision \"block\" has a reason.",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stop.command.output",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "continue": {"type": "boolean", "default": true},
+    "decision": {"enum": ["block"], "type": "string"},
+    "reason": {"type": "string"},
+    "stopReason": {"type": "string"},
+    "suppressOutput": {"type": "boolean", "default": false},
+    "systemMessage": {"type": "string"}
+  }
+}

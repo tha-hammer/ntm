@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -925,6 +926,13 @@ type agentCapture struct {
 // The copy shows what the settings file held before the agent started.
 func (e *closureEnv) standInAgentConfig(t *testing.T, extra string) *agentCapture {
 	t.Helper()
+	return e.standInAgentConfigCodexArgs(t, extra, "")
+}
+
+// standInAgentConfigCodexArgs is standInAgentConfig with arguments after the
+// stand-in Codex command, such as ntm's real Codex flags.
+func (e *closureEnv) standInAgentConfigCodexArgs(t *testing.T, extra, codexArgs string) *agentCapture {
+	t.Helper()
 	root := filepath.Dir(e.workDir)
 	capture := &agentCapture{dir: filepath.Join(root, "capture")}
 	if err := os.MkdirAll(capture.dir, 0o755); err != nil {
@@ -978,7 +986,7 @@ enabled = false
 
 [integrations.rch]
 enabled = false
-%s`, e.projectsBase(), scripts["claude"], scripts["codex"], extra))
+%s`, e.projectsBase(), scripts["claude"], strings.TrimSpace(scripts["codex"]+" "+codexArgs), extra))
 	return capture
 }
 
@@ -1670,17 +1678,17 @@ func TestInstallClaudeStopHookIfActive_OffThenOn(t *testing.T) {
 	off, on := config.Default(), config.Default()
 	disabled := false
 	off.AgentMail.StopHookEnabled = &disabled
-	installStopHookIfActive(off, AgentTypeClaude, dir, dir, nil)
+	installStopHookIfActive(off, AgentTypeClaude, dir, dir, "claude", nil)
 	if after := mustReadFile(t, path); !bytes.Equal(after, before) {
 		t.Fatalf("switch off changed the file:\nbefore %s\nafter  %s", before, after)
 	}
 
-	installStopHookIfActive(on, AgentTypeClaude, dir, dir, nil)
+	installStopHookIfActive(on, AgentTypeClaude, dir, dir, "claude", nil)
 	entry := onlyNtmStopEntry(t, readSettingsFile(t, dir))
 	if entry.Command != claudeconfig.StopHookCommand(helperBinary(t), dir) {
 		t.Fatalf("after switching on, command = %q", entry.Command)
 	}
-	installStopHookIfActive(on, AgentTypeClaude, dir, dir, nil)
+	installStopHookIfActive(on, AgentTypeClaude, dir, dir, "claude", nil)
 	onlyNtmStopEntry(t, readSettingsFile(t, dir))
 }
 
@@ -1695,7 +1703,7 @@ func TestInstallStopHookIfActive_CodexOffThenOn(t *testing.T) {
 	off.AgentMail.StopHookEnabled = &disabled
 
 	notices := codexHookNotices{}
-	installStopHookIfActive(off, AgentTypeCodex, dir, dir, notices)
+	installStopHookIfActive(off, AgentTypeCodex, dir, dir, "codex", notices)
 	if _, err := os.Stat(filepath.Join(dir, claudeconfig.CodexHooksPath)); !os.IsNotExist(err) {
 		t.Fatalf("switch off wrote the Codex file: %v", err)
 	}
@@ -1706,7 +1714,7 @@ func TestInstallStopHookIfActive_CodexOffThenOn(t *testing.T) {
 		t.Fatalf("switch off gave notices: %v", notices)
 	}
 
-	installStopHookIfActive(on, AgentTypeCodex, dir, dir, notices)
+	installStopHookIfActive(on, AgentTypeCodex, dir, dir, "codex", notices)
 	hooksPath := filepath.Join(dir, claudeconfig.CodexHooksPath)
 	command := claudeconfig.StopHookCommand(helperBinary(t), dir)
 	if approval, err := claudeconfig.CodexHookApproval(codexHome, hooksPath, command); err != nil || approval.State != claudeconfig.ApprovalGranted {
@@ -2058,5 +2066,282 @@ func TestMain_IsolatesCodexHome(t *testing.T) {
 	}
 	if dir := claudeconfig.CodexHomeDir(); dir == filepath.Join(home, ".codex") {
 		t.Fatalf("CLI tests would write the real Codex config: %s", dir)
+	}
+}
+
+// Loop 7, Behavior 20: ntm's real Codex flag makes Codex trust the folder
+// itself, so spawn doesn't tell you to accept a prompt that never comes.
+func TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder(t *testing.T) {
+	const flag = "--dangerously-bypass-approvals-and-sandbox"
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfigCodexArgs(t, "", flag)
+	repo := gitInitForTest(t, env.projectDir("codtrusts"))
+
+	out := env.run(t, "execute", "spawn", "codtrusts", "--cod=1")
+	capture.waitForType(t, "codex", 1, 20*time.Second)
+	if strings.Contains(out, "Codex will ask") {
+		t.Fatalf("spawn output has a trust notice although the Codex command trusts the folder: %q", out)
+	}
+	assertCodexApproved(t, env, repo, repo)
+
+	addOut := env.run(t, "execute", "add", "codtrusts", "--cod=1")
+	capture.waitForType(t, "codex", 2, 20*time.Second)
+	if strings.Contains(addOut, "Codex will ask") {
+		t.Fatalf("add output has a trust notice: %q", addOut)
+	}
+
+	other := gitInitForTest(t, filepath.Join(env.projectsBase(), "robottrusts"))
+	resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=robottrusts", "--spawn-cod=1", "--spawn-dir="+other))
+	if !resp.Success || len(resp.Warnings) != 0 {
+		t.Fatalf("robot response = %+v", resp)
+	}
+	assertCodexApproved(t, env, other, other)
+
+	// Without the flag, Codex asks, so the notice still shows.
+	plain := newClosureEnv(t)
+	plain.useAgentMail(mail)
+	plain.privateTmux(t)
+	plainCapture := plain.standInAgentConfig(t, "")
+	plainRepo := gitInitForTest(t, plain.projectDir("codasks"))
+	plainOut := plain.run(t, "execute", "spawn", "codasks", "--cod=1")
+	plainCapture.waitForType(t, "codex", 1, 20*time.Second)
+	if strings.Count(plainOut, "Codex will ask you to trust "+plainRepo) != 1 {
+		t.Fatalf("spawn without the flag = %q", plainOut)
+	}
+}
+
+// codexStopInput is Codex 0.167's real Stop input (evidence run, paths
+// changed), with stop_hook_active set.
+func codexStopInput(t *testing.T, active bool) string {
+	t.Helper()
+	var input map[string]any
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join("testdata", "codex_stop_input.json")), &input); err != nil {
+		t.Fatal(err)
+	}
+	input["stop_hook_active"] = active
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// assertCodexStopOutput fails unless out is one JSON object that Codex's
+// stop.command.output schema accepts (testdata/codex_stop_output_schema.json),
+// including Codex's rule that a block needs a reason.
+func assertCodexStopOutput(t *testing.T, out string) map[string]any {
+	t.Helper()
+	var schema struct {
+		AdditionalProperties bool `json:"additionalProperties"`
+		Properties           map[string]struct {
+			Type string   `json:"type"`
+			Enum []string `json:"enum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join("testdata", "codex_stop_output_schema.json")), &schema); err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(out))
+	var got map[string]any
+	if err := decoder.Decode(&got); err != nil || decoder.More() {
+		t.Fatalf("stdout isn't one JSON object (%v): %q", err, out)
+	}
+	for key, value := range got {
+		prop, ok := schema.Properties[key]
+		if !ok {
+			t.Fatalf("Codex's schema has no field %q (additionalProperties is false): %q", key, out)
+		}
+		switch prop.Type {
+		case "string":
+			s, ok := value.(string)
+			if !ok || (len(prop.Enum) > 0 && !slices.Contains(prop.Enum, s)) {
+				t.Fatalf("field %q = %v doesn't fit Codex's schema", key, value)
+			}
+		case "boolean":
+			if _, ok := value.(bool); !ok {
+				t.Fatalf("field %q = %v isn't a boolean", key, value)
+			}
+		}
+	}
+	if got["decision"] == "block" {
+		if reason, _ := got["reason"].(string); reason == "" {
+			t.Fatalf("block without a reason: %q", out)
+		}
+	}
+	return got
+}
+
+// Loop 7, Behavior 14: Codex's full Stop input parses, and its loop guard is
+// read.
+func TestReadTurnEndInput_CodexStop(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		got, ok := readTurnEndInput(strings.NewReader(codexStopInput(t, active)))
+		if !ok || got.StopHookActive != active {
+			t.Fatalf("active %v: ok %v, got %+v", active, ok, got)
+		}
+	}
+	withNulls := `{"session_id":"s","turn_id":"t","transcript_path":null,"cwd":"/p","hook_event_name":"Stop","model":"m","permission_mode":"default","stop_hook_active":false,"last_assistant_message":null}`
+	if got, ok := readTurnEndInput(strings.NewReader(withNulls)); !ok || got.StopHookActive {
+		t.Fatalf("null fields: ok %v, got %+v", ok, got)
+	}
+}
+
+// Loop 7, Behavior 14 property: any Codex Stop input built from its fields
+// parses, and keeps stop_hook_active.
+func TestReadTurnEndInput_CodexStopProperty(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		active := rapid.Bool().Draw(rt, "active")
+		input := map[string]any{"stop_hook_active": active, "hook_event_name": "Stop"}
+		for _, field := range []string{"session_id", "turn_id", "cwd", "model", "permission_mode"} {
+			if rapid.Bool().Draw(rt, "has-"+field) {
+				input[field] = rapid.String().Draw(rt, field)
+			}
+		}
+		for _, field := range []string{"transcript_path", "last_assistant_message"} {
+			if rapid.Bool().Draw(rt, "null-"+field) {
+				input[field] = nil
+			} else {
+				input[field] = hostileTextGen().Draw(rt, field)
+			}
+		}
+		data, err := json.Marshal(input)
+		if err != nil {
+			rt.Fatal(err)
+		}
+		got, ok := readTurnEndInput(bytes.NewReader(data))
+		if !ok || got.StopHookActive != active {
+			rt.Fatalf("input %s: ok %v, active %v", data, ok, got.StopHookActive)
+		}
+	})
+}
+
+// Loop 7, Behavior 14: Codex's second stop in a row (stop_hook_active true)
+// is silent and calls nothing.
+func TestRunAgentHookStop_CodexLoopGuard(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 42, From: "RedStone", Subject: "hi"})
+	withHookTestEnv(t, mail, "BlueLake")
+	var out bytes.Buffer
+	runAgentHookStop(strings.NewReader(codexStopInput(t, true)), &out, "/proj")
+	if out.Len() != 0 || len(mail.allCalls()) != 0 {
+		t.Fatalf("printed %q, calls %+v", out.String(), mail.allCalls())
+	}
+	runAgentHookStop(strings.NewReader(codexStopInput(t, false)), &out, "/proj")
+	assertCodexStopOutput(t, out.String())
+}
+
+// Loop 7, Behavior 16: the hook's output is exactly {"decision","reason"} and
+// a newline, the form both Claude Code and Codex read. No field is added for
+// either tool.
+func TestRunAgentHookStop_OutputBytesUnchanged(t *testing.T) {
+	for name, input := range map[string]string{"claude": "{}", "codex": ""} {
+		mail := newFakeAgentMail(t)
+		mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 42, From: "RedStone", Subject: "hi"})
+		withHookTestEnv(t, mail, "BlueLake")
+		if name == "codex" {
+			input = codexStopInput(t, false)
+		}
+		var out bytes.Buffer
+		runAgentHookStop(strings.NewReader(input), &out, "/proj")
+		text := out.String()
+		if !strings.HasPrefix(text, `{"decision":"block","reason":"`) || !strings.HasSuffix(text, "\"}\n") || strings.Count(text, "\n") != 1 {
+			t.Fatalf("%s: output = %q", name, text)
+		}
+		if got := assertCodexStopOutput(t, text); len(got) != 2 {
+			t.Fatalf("%s: fields = %v, want decision and reason only", name, got)
+		}
+	}
+}
+
+// Loop 7, Behavior 17: with Codex's input, problems stay silent as for
+// Claude, and a store failure still tells the agent.
+func TestAgentHookStop_CodexInputFailsOpen(t *testing.T) {
+	t.Run("agent mail down", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		withHookTestEnv(t, mail, "BlueLake")
+		t.Setenv("AGENT_MAIL_URL", closureClosedAgentMailURL)
+		logs := captureSlog(t)
+		var out bytes.Buffer
+		runAgentHookStop(strings.NewReader(codexStopInput(t, false)), &out, "/proj")
+		if out.Len() != 0 || logs.count("agent hook: fetch inbox failed") != 1 {
+			t.Fatalf("printed %q, logs %q", out.String(), logs.buf.String())
+		}
+	})
+	t.Run("no agent name", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 42, From: "RedStone", Subject: "hi"})
+		withHookTestEnv(t, mail, "")
+		t.Setenv("MCP_AGENT_MAIL_AGENT_NAME", "")
+		t.Setenv("TMUX_PANE", "")
+		input := codexStopInput(t, false) // read before leaving the package folder
+		t.Chdir(t.TempDir())
+		logs := captureSlog(t)
+		var out bytes.Buffer
+		runAgentHookStop(strings.NewReader(input), &out, "/proj")
+		if out.Len() != 0 || len(mail.allCalls()) != 0 || logs.count("agent hook: no agent name") != 1 {
+			t.Fatalf("printed %q, calls %+v, logs %q", out.String(), mail.allCalls(), logs.buf.String())
+		}
+	})
+	t.Run("store down still tells", func(t *testing.T) {
+		mail := newFakeAgentMail(t)
+		mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 42, From: "RedStone", Subject: "hi"})
+		withHookTestEnv(t, mail, "BlueLake")
+		blockStateDB(t)
+		var out bytes.Buffer
+		runAgentHookStop(strings.NewReader(codexStopInput(t, false)), &out, "/proj")
+		if got := assertCodexStopOutput(t, out.String()); !strings.Contains(got["reason"].(string), "from RedStone: hi") {
+			t.Fatalf("printed %q", out.String())
+		}
+	})
+}
+
+// Loop 7, Behavior 15: the command spawn wrote into .codex/hooks.json, run the
+// way Codex runs it, tells the agent about new mail in Codex's output form,
+// and the next turn end is silent. In a worktree it fetches as the main
+// project.
+func TestClosure_WrittenCodexHookCommandTellsAgent(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("codpush"))
+	wtRepo := gitInitForTest(t, env.projectDir("codpushwt"))
+	gitForTest(t, wtRepo, "commit", "-q", "--allow-empty", "-m", "first")
+
+	env.run(t, "execute", "spawn", "codpush", "--cod=1")
+	env.run(t, "execute", "spawn", "codpushwt", "--cod=1", "--worktrees")
+	agents := capture.waitForType(t, "codex", 2, 30*time.Second)
+	sawWorktree := false
+	for i, a := range agents {
+		project := repo
+		if a.Dir != repo {
+			project, sawWorktree = wtRepo, true
+		}
+		name := a.Env["AGENT_NAME"]
+		if name == "" || mail.token(name) == "" {
+			t.Fatalf("%s: name %q, token %q", a.Dir, name, mail.token(name))
+		}
+		id := 91 + i
+		mail.addMessage(name, agentmail.InboxMessage{ID: id, From: "GreenCastle", Subject: "deploy plan"})
+		command := onlyNtmStopEntry(t, a.CodexHooks).Command
+		run := func() string {
+			return env.runShell(t, a.Dir, command, codexStopInput(t, false), "AGENT_NAME="+name, closureHelperModeEnv+"=argv", closureHelperArgsEnv+"=")
+		}
+		got := assertCodexStopOutput(t, run())
+		reason, _ := got["reason"].(string)
+		if got["decision"] != "block" || !strings.Contains(reason, fmt.Sprintf("[#%d] from GreenCastle: deploy plan", id)) ||
+			!strings.Contains(reason, fmt.Sprintf("project_key %q", project)) {
+			t.Fatalf("%s: hook output = %v", a.Dir, got)
+		}
+		if again := run(); again != "" {
+			t.Fatalf("%s: second turn end printed %q", a.Dir, again)
+		}
+	}
+	if !sawWorktree {
+		t.Fatalf("no agent ran in a worktree: %+v", agents)
 	}
 }

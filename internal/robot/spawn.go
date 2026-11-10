@@ -639,7 +639,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	for i := 0; i < opts.CCCount && agentNum < len(panes); i++ {
 		pane := panes[agentNum]
 		if cfg != nil && cfg.AgentMail.StopHookActive() {
-			output.Warnings = appendNewWarnings(output.Warnings, writeStopHook("claude", dir)...)
+			output.Warnings = appendNewWarnings(output.Warnings, writeStopHook("claude", dir, "")...)
 		}
 		agent := launchAgent(pane, opts.Session, "claude", i+1, dir, agentCommands["claude"], amState)
 		agent.Name = nameMap.AssignNew("claude", agent.Pane)
@@ -653,7 +653,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	for i := 0; i < opts.CodCount && agentNum < len(panes); i++ {
 		pane := panes[agentNum]
 		if cfg != nil && cfg.AgentMail.StopHookActive() {
-			output.Warnings = appendNewWarnings(output.Warnings, writeStopHook("codex", dir)...)
+			output.Warnings = appendNewWarnings(output.Warnings, writeStopHook("codex", dir, agentCommands["codex"])...)
 		}
 		agent := launchAgent(pane, opts.Session, "codex", i+1, dir, agentCommands["codex"], amState)
 		agent.Name = nameMap.AssignNew("codex", agent.Pane)
@@ -738,10 +738,10 @@ var (
 
 // writeStopHook writes the ntm Stop entry for agentType ("claude" or
 // "codex") into dir with the same writers as ntm spawn, and for Codex saves
-// Codex's approval of it. Robot output must stay one JSON object, so it
+// Codex's approval of it; launchCommand is the Codex command about to run. Robot output must stay one JSON object, so it
 // prints nothing and returns problems, and anything you need to do, as
 // warnings.
-func writeStopHook(agentType, dir string) []string {
+func writeStopHook(agentType, dir, launchCommand string) []string {
 	tool := "Claude"
 	if agentType == "codex" {
 		tool = "Codex"
@@ -752,7 +752,7 @@ func writeStopHook(agentType, dir string) []string {
 	}
 	var notice string
 	if agentType == "codex" {
-		_, notice, err = claudeconfig.InstallAndApproveCodexStopHook(dir, ntmPath, dir, claudeconfig.CodexHomeDir())
+		_, notice, err = claudeconfig.InstallAndApproveCodexStopHook(dir, ntmPath, dir, claudeconfig.CodexHomeDir(), launchCommand)
 	} else {
 		_, err = claudeconfig.InstallStopHook(dir, ntmPath, dir)
 	}

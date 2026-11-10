@@ -650,3 +650,39 @@ func TestCodexHomeDir(t *testing.T) {
 		t.Fatalf("CodexHomeDir() = %q", got)
 	}
 }
+
+// Loop 7, Behavior 20: only the whole flag means Codex trusts the folder
+// itself (Sprint 1's human test on rocketman).
+func TestCodexLaunchTrustsFolder(t *testing.T) {
+	for command, want := range map[string]bool{
+		"codex --dangerously-bypass-approvals-and-sandbox -m 'gpt-6.1-sol'":        true,
+		"CARGO_BUILD_JOBS=1 codex -m x --dangerously-bypass-approvals-and-sandbox": true,
+		"codex -m x": false,
+		"codex --dangerously-bypass-approvals-and-sandboxX":                 false,
+		"codex -c note='--dangerously-bypass-approvals-and-sandbox is off'": false,
+		"": false,
+	} {
+		if got := codexLaunchTrustsFolder(command); got != want {
+			t.Fatalf("codexLaunchTrustsFolder(%q) = %v, want %v", command, got, want)
+		}
+	}
+}
+
+// Loop 7, Behavior 20: with a launch command that trusts the folder, the
+// trust notice is left out, and the other notices stay.
+func TestCodexHookNotice_LaunchTrustsFolder(t *testing.T) {
+	trusting := "codex --dangerously-bypass-approvals-and-sandbox"
+	untrusted := CodexApproval{State: ApprovalGranted}
+	if got := codexHookNotice("/p", untrusted, nil, trusting); got != "" {
+		t.Fatalf("notice with a trusting command = %q", got)
+	}
+	if got := codexHookNotice("/p", untrusted, nil, "codex"); !strings.Contains(got, "Codex will ask you to trust /p") {
+		t.Fatalf("notice without the flag = %q", got)
+	}
+	if got := codexHookNotice("/p", CodexApproval{State: ApprovalUnknown}, errors.New("boom"), trusting); !strings.Contains(got, "not approved") {
+		t.Fatalf("approval notice dropped: %q", got)
+	}
+	if got := codexHookNotice("/p", CodexApproval{State: ApprovalDisabled}, nil, trusting); !strings.Contains(got, "turned off") {
+		t.Fatalf("turned-off notice dropped: %q", got)
+	}
+}

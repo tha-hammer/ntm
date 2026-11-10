@@ -19,6 +19,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/claudeconfig"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"pgregory.net/rapid"
@@ -308,10 +309,17 @@ func (e *closureEnv) told(t *testing.T, project, agent string, messageID int64) 
 // added to the spawn command.
 func spawnNudgeAgent(t *testing.T, env *closureEnv, agents *screenAgents, session string, spawnArgs ...string) (pid, agent string) {
 	t.Helper()
+	return spawnNudgeAgentOfType(t, env, agents, session, "cc", spawnArgs...)
+}
+
+// spawnNudgeAgentOfType is spawnNudgeAgent for "cc" or "cod", showing that
+// tool's idle screen.
+func spawnNudgeAgentOfType(t *testing.T, env *closureEnv, agents *screenAgents, session, agentType string, spawnArgs ...string) (pid, agent string) {
+	t.Helper()
 	gitInitForTest(t, env.projectDir(session))
-	env.run(t, "execute", append([]string{"spawn", session, "--cc=1"}, spawnArgs...)...)
+	env.run(t, "execute", append([]string{"spawn", session, "--" + agentType + "=1"}, spawnArgs...)...)
 	pid = agents.waitStarted(t, 1, 20*time.Second)[0]
-	agents.setScreen(t, pid, "cc_idle.txt")
+	agents.setScreen(t, pid, agentType+"_idle.txt")
 	return pid, agents.agentEnv(t, pid, "AGENT_NAME")
 }
 
@@ -1491,5 +1499,78 @@ func TestRunIdleNudgeLoop_TicksAndStops(t *testing.T) {
 	}
 	if got := fake.count("targets"); got < 3 {
 		t.Fatalf("polls = %d, want at least 3", got)
+	}
+}
+
+// runCodexStopHook runs the Stop hook command spawn wrote into the session
+// folder's .codex/hooks.json, as Codex runs it at a turn end: from the work
+// folder, with Codex's Stop input on stdin. It returns stdout.
+func runCodexStopHook(t *testing.T, env *closureEnv, session, agent string) string {
+	t.Helper()
+	dir := env.projectDir(session)
+	command := onlyNtmStopEntry(t, codexHooksAt(t, dir)).Command
+	return env.runShell(t, dir, command, codexStopInput(t, false), "AGENT_NAME="+agent, closureHelperModeEnv+"=argv", closureHelperArgsEnv+"=")
+}
+
+// Loop 7, Behavior 18: for a Codex agent too, a message is told once, by the
+// nudge or by the Codex Stop hook, whichever comes first.
+func TestClosure_CodexToldOnceAcrossHookAndNudge(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	agents := env.screenAgentConfig(t, mail, "")
+	pid, agent := spawnNudgeAgentOfType(t, env, agents, "codonce", "cod")
+
+	// (a) Told by the hook at a turn end, so the nudge stays quiet.
+	agents.setScreen(t, pid, "cod_working.txt")
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 91, From: "GreenCastle", Subject: "deploy plan"})
+	env.startMonitor(t, "codonce")
+	time.Sleep(3 * time.Second)
+	// Spawn's own first prompt is typed at launch; no reminder may follow it.
+	if typed := agents.typed(t, pid); strings.Contains(typed, "deploy plan") || strings.Contains(typed, "new message") {
+		t.Fatalf("typed a reminder into a busy Codex agent: %q", typed)
+	}
+	got := assertCodexStopOutput(t, runCodexStopHook(t, env, "codonce", agent))
+	if reason, _ := got["reason"].(string); !strings.Contains(reason, "[#91] from GreenCastle: deploy plan") {
+		t.Fatalf("hook reason = %q", reason)
+	}
+	agents.setScreen(t, pid, "cod_idle.txt")
+	time.Sleep(3 * time.Second)
+	if typed := agents.typed(t, pid); strings.Contains(typed, "deploy plan") {
+		t.Fatalf("the nudge repeated what the hook told: %q", typed)
+	}
+
+	// (b) Told by the nudge while idle, so the hook stays quiet.
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 92, From: "GreenCastle", Subject: "second note"})
+	agents.waitTyped(t, pid, "from GreenCastle: second note", 15*time.Second)
+	agents.setScreen(t, pid, "cod_idle.txt")
+	if out := runCodexStopHook(t, env, "codonce", agent); out != "" {
+		t.Fatalf("the hook repeated what the nudge told: %q", out)
+	}
+	if typed := agents.typed(t, pid); strings.Count(typed, "second note") != 1 {
+		t.Fatalf("typed = %q", typed)
+	}
+}
+
+// Loop 7, Behavior 19: when no approval could be saved, the Codex hook can't
+// run, and the Idle Nudge still tells the idle agent.
+func TestClosure_CodexHookNotRunStillNudged(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.privateTmux(t)
+	env.writeCodexConfig(t, "[[[")
+	agents := env.screenAgentConfig(t, mail, "")
+	pid, agent := spawnNudgeAgentOfType(t, env, agents, "codnorun", "cod")
+	if _, err := os.Stat(filepath.Join(env.projectDir("codnorun"), claudeconfig.CodexHooksPath)); err != nil {
+		t.Fatalf("hook file not written: %v", err)
+	}
+	if got := string(mustReadFile(t, filepath.Join(env.codexHome(), "config.toml"))); got != "[[[" {
+		t.Fatalf("Codex config changed to %q", got)
+	}
+	mail.addMessage(agent, agentmail.InboxMessage{ID: 95, From: "RedStone", Subject: "hook can't run"})
+	env.startMonitor(t, "codnorun")
+	typed := agents.waitTyped(t, pid, "from RedStone: hook can't run", 20*time.Second)
+	if strings.Count(typed, "hook can't run") != 1 {
+		t.Fatalf("typed = %q", typed)
 	}
 }

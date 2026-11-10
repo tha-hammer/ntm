@@ -8,9 +8,9 @@ Epic `bd-7yrae`. Sprint beads `bd-7yrae.1` and `bd-7yrae.2`.
 
 Codex agents get the same turn-end reminder as Claude agents, through Codex's own hooks. Spawn writes `.codex/hooks.json` in each Codex work folder before launch and keeps it out of `git status`. It then saves Codex's approval for ntm's own Stop entry in `~/.codex/config.toml`, so Codex doesn't stop at its "Hooks need review" screen. It tells you when it couldn't save the approval, or when Codex hasn't trusted the folder yet. ntm never passes `--dangerously-bypass-hook-trust`, and your other hooks still need your own review. When the hook can't run, the Idle Nudge from Loop 5 still covers the agent.
 
-The behaviors are 19 observable results in 2 sprints:
+The behaviors are 20 observable results in 2 sprints:
 - **Sprint 1 (Behaviors 1 to 13):** the Codex hook file written and approved by every spawn path, and the notice when that couldn't be done.
-- **Sprint 2 (Behaviors 14 to 19):** an approved Codex agent told at turn end, once, with failures that stay silent.
+- **Sprint 2 (Behaviors 14 to 20):** an approved Codex agent told at turn end, once, with failures that stay silent. Behavior 20 was added after Sprint 1's human test.
 
 ## Current State Analysis
 
@@ -55,6 +55,7 @@ These come from strings in the Codex 0.167 binary on this VPS (`~/.codex/package
 17. Given Agent Mail is down or the store fails, when the Codex hook runs, then nothing is printed, it exits 0 and the log has the reason.
 18. Given a Codex pane, when the hook tells first and the nudge polls next (or the reverse), then the message is announced once.
 19. Given a Codex agent whose hook can't run (no approval saved), when mail arrives while it's idle, then the Idle Nudge still types the reminder.
+20. Given a folder Codex hasn't trusted, when spawn launches Codex with `--dangerously-bypass-approvals-and-sandbox`, then no folder trust notice is shown, because Codex trusts the folder itself. A Codex command without that flag still gets the notice.
 
 ## What We're NOT Doing
 
@@ -201,6 +202,18 @@ Behavior 19.
 - **FORBIDDEN SPAN**: the nudge internals, `nudgeTargets`.
 - **RED-AT-SEAM proof**: make the nudge skip panes whose folder has a Codex hook. Expected: "no reminder typed within 20s".
 - **DRIVABILITY**: as in Loop 5.
+- **EXECUTION (must run)**: as above.
+
+### Closure Test: No folder trust notice when ntm's Codex command trusts the folder itself [BLOCKING]
+
+Behavior 20.
+- **SOURCE (seed only)**: an untrusted repo, no `config.toml`, and the stand-in Codex command with and without `--dangerously-bypass-approvals-and-sandbox` in the env config.
+- **TRIGGER (start)**: `Execute` with `spawn`, `--robot-spawn` and `add` (boundary = highest_new_connector, the spawn paths passing the launch command).
+- **DRIVERS (async edges)**: `capture.waitForType`.
+- **OBSERVE (assert via)**: spawn stdout and robot `warnings`, plus `CodexHookApproval` to confirm the hook was still approved.
+- **FORBIDDEN SPAN**: `codexLaunchTrustsFolder`, `codexHookNotice`.
+- **RED-AT-SEAM proof**: pass "" as the launch command. Expected: "spawn output has a trust notice although the Codex command trusts the folder".
+- **DRIVABILITY**: the Codex command comes from the env's `[agents] codex`.
 - **EXECUTION (must run)**: as above.
 
 ## Sprint 1: Hook written and approved
@@ -922,7 +935,16 @@ Base commit `66662aa7`. All 13 behaviors are built.
 - Tamper check clean.
 - golangci-lint, goimports and ubs aren't installed.
 
-**Left behind:** `internal/config/testdata/rapid/TestCodexCommandNoHookTrustBypass/*.fail`, from the Behavior 13 red check. It will be deleted only with your permission.
+**Human test: PASSED on rocketman (2026-11-10, c634b157), all steps.**
+- Spawn wrote one Stop entry, `'/tmp/ntm-loop7' agent-hook stop --project '/home/maceo/ntm_Dev/codextest'`, timeout 5.
+- `git status --short` showed only `?? .ntm/`.
+- There was no "Hooks need review" screen. `/hooks` showed Stop installed 1 / active 1, with Trust Trusted.
+- The bypass-flag count was 0.
+- `~/.codex/config.toml` gained only ntm's `hooks.state` table and the folder's `trust_level`.
+- **Issue found:** the folder trust notice was wrong. With ntm's `--dangerously-bypass-approvals-and-sandbox` flag, Codex trusts the folder itself, writes `trust_level`, and shows no prompt.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop7-codex-hook-sprint1-local-2026-11-10/`.
+
+**Deleted with permission:** `internal/config/testdata/rapid/TestCodexCommandNoHookTrustBypass/TestCodexCommandNoHookTrustBypass-20261110140759-2649541.fail`, from the Behavior 13 red check, and its empty folders. Your answer was "Delete it (Recommended)" (2026-11-10). Commands: `rm` on that file, then `rmdir` on `internal/config/testdata/rapid/TestCodexCommandNoHookTrustBypass`, `internal/config/testdata/rapid` and `internal/config/testdata`, at 15:32:03Z.
 
 ### Human test script
 
@@ -943,7 +965,7 @@ Base commit `66662aa7`. All 13 behaviors are built.
 
 **Testable function:** "Send a working Codex agent mail, and see it learn about the mail when its turn ends."
 
-**Order of work:** 14, 16, 17, then 15 as the outer test, then 18 and 19.
+**Order of work:** 20 first (it fixes Sprint 1's notice), then 14, 16, 17, then 15 as the outer test, then 18 and 19.
 
 | Acceptance criterion | Behaviors |
 |---|---|
@@ -953,7 +975,57 @@ Base commit `66662aa7`. All 13 behaviors are built.
 | One message is announced once across the hook and nudge (**One Telling**) | 18 |
 | When the hook can't run (approval not saved, or the folder not trusted), the Codex agent still gets the Idle Nudge | 19 |
 | Fail-open behavior matches Claude's: a problem never blocks a Codex agent (**Fail Open**) | 17 |
+| Spawn's folder trust notice shows only when Codex will really ask: not when the Codex launch command has `--dangerously-bypass-approvals-and-sandbox` (added after Sprint 1's human test) | 20 |
 | Scenarios: Codex format, Claude format unchanged, loop guard, nothing new, told by nudge, hook can't run | 15, 16, 14, 15, 18, 19 |
+
+### Behavior 20: No folder trust notice when ntm's Codex command trusts the folder itself [BLOCKING]
+
+Added after Sprint 1's human test (rocketman, 2026-11-10). ntm's default Codex command has `--dangerously-bypass-approvals-and-sandbox`, and with it Codex trusted the folder and wrote `trust_level` itself, with no prompt. So the notice "Codex will ask you to trust …" was wrong.
+
+#### Test Specification
+
+**Given** a folder Codex hasn't trusted, and no other Codex hook problem. **When** each run below happens. **Then**:
+
+| Run | Codex command | Output |
+|---|---|---|
+| `spawn s --cod=1` | the stand-in plus `--dangerously-bypass-approvals-and-sandbox` | no trust notice; the hook is written and approved |
+| `--robot-spawn=s --spawn-cod=1` | the same | `warnings` empty |
+| `add s --cod=1` | the same | no trust notice |
+| `spawn s --cod=1` | the stand-in without the flag | the trust notice, once |
+
+The "approval not saved" and "turned off in /hooks" notices still show with the flag.
+
+**Edge Cases:** the flag must be a whole word in the command (`--dangerously-bypass-approvals-and-sandboxX` doesn't count).
+
+**Property:** no property: fixed commands. A unit table covers `codexLaunchTrustsFolder`.
+
+**Files touched:**
+- `internal/claudeconfig/codex_hooks.go`: `InstallAndApproveCodexStopHook` takes the launch command, `codexLaunchTrustsFolder`, and `codexHookNotice`.
+- `internal/cli/agent_hook.go`, `spawn.go` and `add.go`: pass the built Codex command.
+- `internal/robot/spawn.go`: passes `agentCommands["codex"]`.
+- Tests: `internal/claudeconfig/codex_hooks_test.go` and `internal/cli/agent_hook_test.go` (`TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder`).
+
+#### TDD Cycle
+
+##### 🔴 Red
+
+`TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder` and `TestCodexLaunchTrustsFolder`. Expected failure: "spawn output has a trust notice although the Codex command trusts the folder".
+
+##### 🟢 Green
+
+`codexLaunchTrustsFolder(command)` reports whether any shell word of the command is `--dangerously-bypass-approvals-and-sandbox`. `codexHookNotice` leaves out the trust notice when it's true. The spawn paths pass the command they are about to launch.
+
+##### 🔵 Refactor
+
+- [ ] **No duplication:** one check, in `claudeconfig`, used by the CLI and robot paths.
+- [ ] **Reveals intent:** the comment cites the Sprint 1 evidence.
+- [ ] **Complexity went down:** one more condition in the notice switch, no new branch at the call sites.
+- [ ] **No shallow wrappers:** none.
+- [ ] **Fits existing patterns:** the notice function from Behavior 12.
+
+#### Success Criteria
+
+**Automated:** `go test -short -run 'TestCodexLaunchTrustsFolder|TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder|TestClosure_SpawnApprovesCodexHook' ./internal/claudeconfig/ ./internal/cli/` fails first, then passes.
 
 ### Behavior 14: The hook reads Codex's Stop input, and its loop guard [LEAF: one parser]
 
@@ -1176,6 +1248,46 @@ No production change expected.
 #### Success Criteria
 
 **Automated:** `go test -short -run TestClosure_CodexHookNotRunStillNudged ./internal/cli/` passes.
+
+### Build record (2026-11-10)
+
+Base commit `c634b157`. Behaviors 14 to 20 are built.
+
+**Code:**
+- Behavior 20: `codexLaunchTrustsFolder` and the launch command passed into `InstallAndApproveCodexStopHook` and `codexHookNotice` (`internal/claudeconfig/codex_hooks.go`).
+- `installStopHookIfActive` takes the command spawn is about to launch: `safeAgentCmd` in spawn, `safeCmd` in add. Robot's `writeStopHook` takes `agentCommands["codex"]`.
+- No other production change. As planned, Codex reads the hook's existing `{"decision","reason"}` output, its loop guard and the shared told record.
+
+**Tests:**
+- Unit: `TestCodexLaunchTrustsFolder` and `TestCodexHookNotice_LaunchTrustsFolder` (Behavior 20), `TestReadTurnEndInput_CodexStop`, `TestReadTurnEndInput_CodexStopProperty` and `TestRunAgentHookStop_CodexLoopGuard` (Behavior 14), `TestRunAgentHookStop_OutputBytesUnchanged` (Behavior 16), and `TestAgentHookStop_CodexInputFailsOpen` (Behavior 17).
+- Closure: `TestClosure_SpawnNoTrustNoticeWhenCodexTrustsFolder` (Behavior 20), `TestClosure_WrittenCodexHookCommandTellsAgent` (Behavior 15, in a repo and a worktree), `TestClosure_CodexToldOnceAcrossHookAndNudge` (Behavior 18), and `TestClosure_CodexHookNotRunStillNudged` (Behavior 19).
+- Fixtures:
+  - `internal/cli/testdata/codex_stop_input.json`: the evidence run's Stop input, with paths changed to `/home/user`.
+  - `internal/cli/testdata/codex_stop_output_schema.json`: Codex's `stop.command.output` fields and rules, rebuilt by hand. The binary's strings dump drops short lines, so it couldn't be copied as it was.
+- Helpers: `standInAgentConfigCodexArgs`, `spawnNudgeAgentOfType` (`spawnNudgeAgent` now calls it with "cc"), `runCodexStopHook`, and `assertCodexStopOutput` (checks the output against the schema file).
+
+**Red-at-seam, each observed and then reverted:**
+- Behavior 20: before the fix, the closure test was red with "spawn output has a trust notice although the Codex command trusts the folder".
+- Behavior 15: the Codex entry written without `--project`. The closure test was red, with empty hook output.
+- Behavior 16: an extra `systemMessage` field in `stopDecision`. The output test was red, with "fields = … want decision and reason only".
+- Behavior 18: the hook skips `claimUnread` and tells everything. Red with "the nudge repeated what the hook told".
+- Behavior 19: Codex left out of `nudgeableAgentTypes`. Red with "no … typed within 20s".
+- Behaviors 14 and 17 passed at once: the Stop input parser ignores unknown fields, and the failure paths are shared with Claude. They stay as guards.
+
+**Differences from the plan:**
+- Behavior 18's busy check ignores spawn's own first prompt ("register with agent mail …"), which spawn types at launch. It asserts that no reminder was typed.
+- Behavior 15's worktree case uses a second session with its own repo, because spawn has no `--dir` flag.
+
+**Verification:**
+- `go build` ok.
+- gofmt lists only the 3 files that were already listed.
+- vet ok.
+- `-race` ok for `claudeconfig` and `git`.
+- `robot` and `config` ok.
+- The closure set (`TestClosure_.*Codex|.*StopHook|RobotSpawnWrites|ToldOnceAcrossHookAndNudge|SpawnNoTrustNotice`) passed 5 runs in a row.
+- `go test -short ./...` failed only on the bd-5zbcm list.
+- Tamper check (base `c634b157`) clean.
+- golangci-lint, goimports and ubs aren't installed.
 
 ### Human test script
 
