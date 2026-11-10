@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"pgregory.net/rapid"
 )
 
 func TestGenerateAgentCommand_LegacyMode(t *testing.T) {
@@ -604,4 +606,26 @@ func TestDefaultAgentTemplates_CargoBuildJobs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCodexCommandNoHookTrustBypass: you approve Codex hooks (or ntm saves the
+// approval for its own entry), so ntm's Codex command never skips Codex's
+// hook trust check. (Loop 7, Behavior 13)
+func TestCodexCommandNoHookTrustBypass(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		vars := AgentTemplateVars{
+			Model:           rapid.StringMatching(`[a-z0-9.-]{0,20}`).Draw(rt, "model"),
+			ReasoningEffort: rapid.SampledFrom([]string{"", "low", "medium", "high"}).Draw(rt, "effort"),
+		}
+		if rapid.Bool().Draw(rt, "prompt") {
+			vars.SystemPromptFile = "/tmp/prompt.txt"
+		}
+		cmd, err := GenerateAgentCommand(DefaultAgentTemplates().Codex, vars)
+		if err != nil {
+			rt.Fatal(err)
+		}
+		if strings.Contains(cmd, "bypass-hook-trust") || strings.Contains(cmd, "bypass_hook_trust") {
+			rt.Fatalf("Codex command skips hook trust: %s", cmd)
+		}
+	})
 }

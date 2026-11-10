@@ -60,6 +60,14 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	_ = os.Setenv("XDG_DATA_HOME", dataDir)
+	// Codex spawns save ntm's hook approval in Codex's config.toml (Loop 7), so
+	// tests get their own Codex folder rather than the user's ~/.codex.
+	codexHome, err := os.MkdirTemp("", "ntm-cli-test-codex-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create test Codex folder: %v\n", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("CODEX_HOME", codexHome)
 
 	// Clean up any orphan test sessions from previous runs before starting.
 	// This catches sessions left behind when tests are interrupted (Ctrl+C, timeout, etc.)
@@ -73,6 +81,7 @@ func TestMain(m *testing.M) {
 	closeRobotPersistence()
 	_ = os.RemoveAll(configDir)
 	_ = os.RemoveAll(dataDir)
+	_ = os.RemoveAll(codexHome)
 
 	os.Exit(code)
 }

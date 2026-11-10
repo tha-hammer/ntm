@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -638,7 +639,7 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 	for i := 0; i < opts.CCCount && agentNum < len(panes); i++ {
 		pane := panes[agentNum]
 		if cfg != nil && cfg.AgentMail.StopHookActive() {
-			output.Warnings = append(output.Warnings, writeClaudeStopHook(dir)...)
+			output.Warnings = appendNewWarnings(output.Warnings, writeStopHook("claude", dir)...)
 		}
 		agent := launchAgent(pane, opts.Session, "claude", i+1, dir, agentCommands["claude"], amState)
 		agent.Name = nameMap.AssignNew("claude", agent.Pane)
@@ -647,9 +648,13 @@ func GetSpawn(opts SpawnOptions, cfg *config.Config) (*SpawnOutput, error) {
 		agentNum++
 	}
 
-	// Launch Codex agents
+	// Launch Codex agents. Codex reads its hooks at startup, so the Stop hook
+	// is written, and its approval saved, before each launch.
 	for i := 0; i < opts.CodCount && agentNum < len(panes); i++ {
 		pane := panes[agentNum]
+		if cfg != nil && cfg.AgentMail.StopHookActive() {
+			output.Warnings = appendNewWarnings(output.Warnings, writeStopHook("codex", dir)...)
+		}
 		agent := launchAgent(pane, opts.Session, "codex", i+1, dir, agentCommands["codex"], amState)
 		agent.Name = nameMap.AssignNew("codex", agent.Pane)
 		output.Agents = append(output.Agents, agent)
@@ -731,21 +736,47 @@ var (
 	sendKeysForAgentHook = tmux.SendKeysForAgent
 )
 
-// launchAgent launches a single agent and returns its info.
-// writeClaudeStopHook writes the ntm Stop entry into dir with the same writer
-// as ntm spawn. Robot output must stay one JSON object, so it prints nothing
-// and returns any failure as a warning naming the settings file.
-func writeClaudeStopHook(dir string) []string {
+// writeStopHook writes the ntm Stop entry for agentType ("claude" or
+// "codex") into dir with the same writers as ntm spawn, and for Codex saves
+// Codex's approval of it. Robot output must stay one JSON object, so it
+// prints nothing and returns problems, and anything you need to do, as
+// warnings.
+func writeStopHook(agentType, dir string) []string {
+	tool := "Claude"
+	if agentType == "codex" {
+		tool = "Codex"
+	}
 	ntmPath, err := resilience.CurrentExecutablePath()
 	if err != nil {
-		return []string{fmt.Sprintf("Claude Stop hook not written in %s: %v", dir, err)}
+		return []string{fmt.Sprintf("%s Stop hook not written in %s: %v", tool, dir, err)}
 	}
-	if _, err := claudeconfig.InstallStopHook(dir, ntmPath, dir); err != nil {
-		return []string{fmt.Sprintf("Claude Stop hook not written: %v", err)}
+	var notice string
+	if agentType == "codex" {
+		_, notice, err = claudeconfig.InstallAndApproveCodexStopHook(dir, ntmPath, dir, claudeconfig.CodexHomeDir())
+	} else {
+		_, err = claudeconfig.InstallStopHook(dir, ntmPath, dir)
+	}
+	if err != nil {
+		return []string{fmt.Sprintf("%s Stop hook not written: %v", tool, err)}
+	}
+	if notice != "" {
+		return []string{notice}
 	}
 	return nil
 }
 
+// appendNewWarnings appends each warning not already in warnings, so many
+// agents in one folder report a hook problem once.
+func appendNewWarnings(warnings []string, more ...string) []string {
+	for _, warning := range more {
+		if !slices.Contains(warnings, warning) {
+			warnings = append(warnings, warning)
+		}
+	}
+	return warnings
+}
+
+// launchAgent launches a single agent and returns its info.
 func launchAgent(pane tmux.Pane, session, agentType string, num int, dir, command string, am *agentMailState) SpawnedAgent {
 	startTime := time.Now()
 

@@ -4,7 +4,7 @@ Index: [00-master-index.md](00-master-index.md). Scope: [SCOPE.md](SCOPE.md), pr
 
 ## Overview
 
-Codex agents get the same turn-end reminder as Claude agents, using Codex's own hooks feature. You approve the hook manually, so ntm keeps Codex's trust check on and doesn't pass `--dangerously-bypass-hook-trust`. Until you approve it, a Codex agent still gets the Idle Nudge from Loop 5.
+Codex agents get the same turn-end reminder as Claude agents, using Codex's own hooks feature. Spawn saves Codex's approval for ntm's own Stop entry, so Codex doesn't stop at its "Hooks need review" screen (decision, 2026-11-10). ntm still never passes `--dangerously-bypass-hook-trust`, and your other hooks still need your own review. When the hook can't run, a Codex agent still gets the Idle Nudge from Loop 5.
 
 Covers deliverable 10. Needs Loop 3, for the command and hook writer. Its Idle Nudge fallback comes from Loop 5, which the build order places first.
 
@@ -13,15 +13,15 @@ Covers deliverable 10. Needs Loop 3, for the command and hook writer. Its Idle N
 - `codex --help` describes `--dangerously-bypass-hook-trust` as running enabled hooks "without requiring persisted hook trust". So trust is saved somewhere.
 - `codex --help` has no `hooks` subcommand.
 
-**What isn't known yet:** the hook file's location and format, whether a Codex hook can make the agent continue, how you approve a hook, and how ntm can tell that a hook isn't approved. Sprint 1's evidence check answers these before any of it is built. The requirements below may change as a result.
+**Found by Sprint 1's evidence check (2026-11-10):** the hook file is `.codex/hooks.json`, in Claude's format. ntm's `block` decision makes Codex continue. Approval is a `trusted_hash` in `~/.codex/config.toml` under `hooks.state."<file>:stop:<group>:<handler>"`, and ntm can compute it. An unapproved or changed hook stops Codex at startup on a "Hooks need review" screen, which is why spawn saves the approval for its own entry. Details: the evidence record in [07-codex-turn-end-push-tdd.md](07-codex-turn-end-push-tdd.md).
 
 ---
 
-## Sprint 1: Hook written, and approval notice
+## Sprint 1: Hook written and approved
 
 ### Testable function
 
-"Spawn a Codex agent, see the hook file written, and see ntm tell you that the project's hook still needs your approval."
+"Spawn a Codex agent, see the hook file written and approved, and see Codex start without stopping at its hook review screen."
 
 ### Evidence check at sprint start
 
@@ -39,7 +39,7 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 - [ ] `ntm spawn` (including `--worktrees`), robot spawn and `ntm add` each write one Codex hook entry before launching a Codex agent.
 - [ ] The entry has the absolute ntm path and the project key, and no tokens, with the same safe merge as the Claude file: other entries kept, atomic write, no duplicates.
 - [ ] The file's path is added to the git exclude file, and `stop_hook_enabled = false` also stops this file being written.
-- [ ] When a project's hook still needs approval, the spawn output tells you and says how to approve it. Robot spawn puts this in `warnings`.
+- [ ] Spawn saves Codex's approval for ntm's own entry only, changing nothing else in Codex's config. If it can't, or Codex hasn't trusted the folder yet, the spawn output tells you and says what to do. Robot spawn puts this in `warnings`.
 - [ ] ntm's Codex launch command doesn't gain `--dangerously-bypass-hook-trust`.
 
 ### Requirements
@@ -48,9 +48,9 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 
 **API:**
 - The hook writer from Loop 3 gains a Codex format, chosen by agent type at the same call sites.
-- If approval state can't be read, the notice shows on every Codex spawn in a project and says it couldn't check. **Assumption.**
+- If Codex's config can't be read or written, the approval isn't saved, and the notice says so on that spawn.
 
-**UI:** One clear notice per project, not one per agent, with the exact approval steps.
+**UI:** At most one notice per hook file, not one per agent, with the exact steps.
 
 ### Test scenarios
 
@@ -61,8 +61,10 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 | Re-run | Spawn twice | One entry |
 | Worktrees | `--worktrees` with Codex | One file per worktree, with the main project key |
 | Mixed session | Claude and Codex in one folder | Each file gets one entry |
-| Unapproved | Fresh project | Notice with approval steps |
-| Approved | Project already approved, if it can be detected | No notice |
+| Approval saved | Fresh project, Codex folder trusted | Approval entry for ntm's entry only, no notice |
+| Approval kept | Spawn again | Config unchanged |
+| Folder not trusted | Codex hasn't trusted the folder | Approval saved, and a notice that Codex will ask to trust the folder |
+| Config unusable | `config.toml` can't be parsed | Nothing written, and a notice |
 | Launch command | Inspect the built Codex command | No bypass flag |
 | Hook switch off | `stop_hook_enabled = false` | No file, no notice |
 
@@ -70,13 +72,14 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 
 1. Build the binary: `go build -o /tmp/ntm-loop7 ./cmd/ntm`.
 2. In a new scratch git repo, run `/tmp/ntm-loop7 spawn codextest --cod=1`.
-3. Pass: the spawn output tells you this project's Codex hook needs approval, and says how.
-4. Open the Codex hook file named in that notice.
+3. Pass: the spawn output names the Codex hook file it wrote. If Codex hadn't trusted this folder yet, it also says Codex will ask you to trust it.
+4. Attach to the session, accept the folder trust prompt if Codex shows one, and open the hook file named in the spawn output.
 5. Pass: it has one entry, with the absolute ntm path and this project's key.
 6. Run `git status --short`.
 7. Pass: the hook file isn't listed.
-8. Run `tmux list-panes -a -F '#{pane_start_command}' | grep -c dangerously-bypass-hook-trust`.
-9. Pass: it prints `0`.
+8. Pass: Codex didn't stop on a "Hooks need review" screen. In the Codex pane, type `/hooks`, and see the ntm Stop hook shown as Trusted.
+9. Run `tmux list-panes -a -F '#{pane_start_command}' | grep -c dangerously-bypass-hook-trust`.
+10. Pass: it prints `0`.
 
 ---
 
@@ -84,21 +87,21 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 
 ### Testable function
 
-"Approve the hook, send the working Codex agent mail, and see it learn about the mail when its turn ends, as far as Codex's hooks allow."
+"Send a working Codex agent mail, and see it learn about the mail when its turn ends."
 
 ### Acceptance criteria
 
-- [ ] After your approval, a working Codex agent learns about new mail at turn end, with sender and subject (**Reminder Format**).
+- [ ] With the hook approved, a working Codex agent learns about new mail at turn end, with sender and subject (**Reminder Format**).
 - [ ] The response uses the form Codex expects, and the Claude output doesn't change.
 - [ ] One message is announced once across the hook and nudge (**One Telling**).
-- [ ] Before approval, the hook doesn't run, and the Codex agent still gets the Idle Nudge.
+- [ ] When the hook can't run (approval not saved, or the folder not trusted), the Codex agent still gets the Idle Nudge.
 - [ ] Fail-open behavior matches Claude's: a problem never blocks a Codex agent (**Fail Open**).
 
 ### Requirements
 
 **Data:** Uses `told_records`, like Claude.
 
-**API:** The hook command chooses its output format from the agent tool. **Assumption:** a flag in the registered command, such as `--format=codex`, because the file written for each tool is already specific to it. `AGENT_NAME` is already set for Codex panes on the CLI and robot paths.
+**API:** No new flag: Codex takes the same `{"decision":"block","reason":...}` output as Claude (evidence check, decided at 4c). `AGENT_NAME` is already set for Codex panes on the CLI and robot paths, and reaches the hook.
 
 **UI:** None beyond the reminder.
 
@@ -106,19 +109,19 @@ If Codex hooks can't force a continue, Sprint 2's reminder becomes whatever Code
 
 | Scenario | Steps | Expected result |
 |---|---|---|
-| Codex format | Run the command with the Codex format and new mail | Output matches the evidence check's format |
-| Claude format unchanged | Run without the flag | Same as Loop 3 |
+| Codex format | Run the command with Codex's input and new mail | Output passes Codex's output schema |
+| Claude format unchanged | Run with Claude's input | Same as Loop 3 |
 | Loop guard | Codex's equivalent of `stop_hook_active`, if any | No loop |
 | Nothing new | Run again | Silent |
 | Told by nudge | Nudge already announced it | Silent |
-| Before approval | Unapproved hook, idle agent | Idle Nudge still arrives |
+| Hook can't run | Hook not approved, idle agent | Idle Nudge still arrives |
 
 ### Human test script
 
-1. Keep the session from Sprint 1. Leave the hook unapproved for now.
-2. With the Codex agent idle, send mail: `/tmp/ntm-loop7 mail send codextest --to <agent> "before approval"`.
-3. Pass: within about a minute, the Idle Nudge arrives.
-4. Follow the approval steps from the spawn notice, then kill the session and spawn again.
+1. Keep the session from Sprint 1.
+2. With the Codex agent idle, send mail: `/tmp/ntm-loop7 mail send codextest --to <agent> "idle test"`.
+3. Pass: within about a minute, the Idle Nudge arrives, once.
+4. Let the agent finish handling that reminder.
 5. Give it slow work: `/tmp/ntm-loop7 send codextest --cod "Run sleep 60, then reply done."`.
 6. While it works, send mail: `/tmp/ntm-loop7 mail send codextest --to <agent> "turn end test"`.
 7. Run `/tmp/ntm-loop7 --robot-tail=codextest --lines=40` after the turn ends.

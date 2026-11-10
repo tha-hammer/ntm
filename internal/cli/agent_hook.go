@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,32 +86,78 @@ func newAgentHookStopCmd() *cobra.Command {
 	return cmd
 }
 
-// installClaudeStopHookIfActive writes the ntm Stop entry into a Claude
-// agent's work folder before the agent launches, because Claude Code reads its
-// settings at startup. It does nothing when the hook is switched off or Agent
-// Mail is off, and it never removes an entry. projectKey is the Agent Mail
-// project. A failure is a warning: the agent still launches, only without
-// turn-end mail.
-func installClaudeStopHookIfActive(c *config.Config, workDir, projectKey string) {
+// installStopHookIfActive writes the ntm Stop entry into an agent's work
+// folder before the agent launches, in the file that agent's tool reads at
+// startup: .claude/settings.local.json for Claude, .codex/hooks.json for
+// Codex. For Codex it also saves Codex's approval of ntm's entry, and adds
+// to notices anything you need to do. It does nothing when the hook is
+// switched off or Agent Mail is off, and it never removes an entry.
+// projectKey is the Agent Mail project. A failure is a warning: the agent
+// still launches, only without turn-end mail.
+func installStopHookIfActive(c *config.Config, agentType AgentType, workDir, projectKey string, notices codexHookNotices) {
 	if c == nil || !c.AgentMail.StopHookActive() {
 		return
 	}
+	var tool, written string
 	ntmPath, err := resilience.CurrentExecutablePath()
-	if err == nil {
-		var result claudeconfig.StopHookResult
-		result, err = claudeconfig.InstallStopHook(workDir, ntmPath, projectKey)
+	switch agentType {
+	case AgentTypeClaude:
+		tool = "Claude"
 		if err == nil {
-			if !IsJSONOutput() {
-				output.PrintInfof("Claude Stop hook written: %s", result.SettingsPath)
-			}
-			return
+			var result claudeconfig.StopHookResult
+			result, err = claudeconfig.InstallStopHook(workDir, ntmPath, projectKey)
+			written = result.SettingsPath
 		}
-	}
-	if IsJSONOutput() {
-		slog.Warn("claude stop hook not written", "dir", workDir, "error", err)
+	case AgentTypeCodex:
+		tool = "Codex"
+		if err == nil {
+			var result claudeconfig.CodexStopHookResult
+			var notice string
+			result, notice, err = claudeconfig.InstallAndApproveCodexStopHook(workDir, ntmPath, projectKey, claudeconfig.CodexHomeDir())
+			written = result.HooksPath
+			notices.add(result.HooksPath, notice)
+		}
+	default:
 		return
 	}
-	output.PrintWarningf("Claude Stop hook not written in %s: %v", workDir, err)
+	if err == nil {
+		if !IsJSONOutput() {
+			output.PrintInfof("%s Stop hook written: %s", tool, written)
+		}
+		return
+	}
+	if IsJSONOutput() {
+		slog.Warn("stop hook not written", "tool", tool, "dir", workDir, "error", err)
+		return
+	}
+	output.PrintWarningf("%s Stop hook not written in %s: %v", tool, workDir, err)
+}
+
+// codexHookNotices holds one notice per Codex hook file, so a spawn with many
+// Codex agents in one folder tells you once.
+type codexHookNotices map[string]string
+
+func (n codexHookNotices) add(hooksPath, notice string) {
+	if n != nil && notice != "" {
+		n[hooksPath] = notice
+	}
+}
+
+// print shows the notices after the launches, sorted by file. In JSON mode
+// they go to the log, so the output stays one JSON object.
+func (n codexHookNotices) print() {
+	paths := make([]string, 0, len(n))
+	for path := range n {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		if IsJSONOutput() {
+			slog.Warn("codex hook", "file", path, "notice", n[path])
+			continue
+		}
+		output.PrintWarningf("%s", n[path])
+	}
 }
 
 // stopHookProject picks the Agent Mail project key for the hook: the flag,

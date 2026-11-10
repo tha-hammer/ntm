@@ -147,3 +147,72 @@ func TestEnsureExcluded_OnceAndNotARepo(t *testing.T) {
 		}
 	})
 }
+
+// TestIsTracked: a committed or staged file is tracked. An untracked or
+// ignored file, or a folder outside git, is not. (Loop 7, Behavior 7)
+func TestIsTracked(t *testing.T) {
+	const path = ".codex/hooks.json"
+	write := func(t *testing.T, dir string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(dir, ".codex"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, path), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newRepo := func(t *testing.T) string {
+		t.Helper()
+		repo := t.TempDir()
+		gitOutput(t, repo, "init", "-q")
+		return repo
+	}
+
+	t.Run("committed", func(t *testing.T) {
+		repo := newRepo(t)
+		write(t, repo)
+		gitOutput(t, repo, "add", path)
+		gitOutput(t, repo, "-c", "user.name=ntm test", "-c", "user.email=ntm-test@example.invalid", "commit", "-q", "-m", "hooks")
+		if tracked, err := IsTracked(repo, path); err != nil || !tracked {
+			t.Fatalf("tracked %v, err %v", tracked, err)
+		}
+	})
+	t.Run("staged only", func(t *testing.T) {
+		repo := newRepo(t)
+		write(t, repo)
+		gitOutput(t, repo, "add", path)
+		if tracked, err := IsTracked(repo, path); err != nil || !tracked {
+			t.Fatalf("tracked %v, err %v", tracked, err)
+		}
+	})
+	t.Run("untracked", func(t *testing.T) {
+		repo := newRepo(t)
+		write(t, repo)
+		if tracked, err := IsTracked(repo, path); err != nil || tracked {
+			t.Fatalf("tracked %v, err %v", tracked, err)
+		}
+	})
+	t.Run("missing", func(t *testing.T) {
+		repo := newRepo(t)
+		if tracked, err := IsTracked(repo, path); err != nil || tracked {
+			t.Fatalf("tracked %v, err %v", tracked, err)
+		}
+	})
+	t.Run("ignored", func(t *testing.T) {
+		repo := newRepo(t)
+		write(t, repo)
+		if _, err := EnsureExcluded(repo, path); err != nil {
+			t.Fatal(err)
+		}
+		if tracked, err := IsTracked(repo, path); err != nil || tracked {
+			t.Fatalf("tracked %v, err %v", tracked, err)
+		}
+	})
+	t.Run("not a repo", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir)
+		if tracked, err := IsTracked(dir, path); err != nil || tracked {
+			t.Fatalf("tracked %v, err %v", tracked, err)
+		}
+	})
+}

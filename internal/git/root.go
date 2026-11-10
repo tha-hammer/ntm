@@ -26,6 +26,24 @@ func FindProjectRoot(startDir string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// IsTracked reports whether git tracks path in dir's repo: committed or
+// staged. path is relative to dir. A folder that isn't in a git repo reports
+// false with no error.
+func IsTracked(dir, path string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "ls-files", "-z", "--", path)
+	output, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 128 {
+			return false, nil // not a git repo
+		}
+		return false, fmt.Errorf("check whether git tracks %s in %s: %w", path, dir, err)
+	}
+	return len(output) > 0, nil
+}
+
 // EnsureExcluded adds pattern to the repo's info/exclude unless a line already
 // equals it, so it's safe to call again. In a linked worktree git reports the
 // common exclude file, which applies to every worktree. It reports false with

@@ -911,6 +911,7 @@ type launchedAgent struct {
 	Env         map[string]string
 	Settings    map[string]any // nil when the folder had no settings file or it wasn't JSON
 	SettingsRaw string         // the copy as written
+	CodexHooks  map[string]any // .codex/hooks.json at launch; nil when absent or not JSON
 }
 
 // agentCapture is the folder stand-in agents write into.
@@ -939,6 +940,7 @@ func (e *closureEnv) standInAgentConfig(t *testing.T, extra string) *agentCaptur
 			"pwd > \"$d/pwd\"\n" +
 			"env > \"$d/env\"\n" +
 			"if [ -f .claude/settings.local.json ]; then cp .claude/settings.local.json \"$d/settings.json\"; fi\n" +
+			"if [ -f .codex/hooks.json ]; then cp .codex/hooks.json \"$d/codex-hooks.json\"; fi\n" +
 			"touch \"$d/done\"\n" +
 			"exec sleep 300\n"
 		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
@@ -1038,7 +1040,42 @@ func readLaunchedAgent(t *testing.T, dir string) launchedAgent {
 		agent.SettingsRaw = string(data)
 		_ = json.Unmarshal(data, &agent.Settings) // stays nil when the copy isn't JSON
 	}
+	if data, err := os.ReadFile(filepath.Join(dir, "codex-hooks.json")); err == nil {
+		_ = json.Unmarshal(data, &agent.CodexHooks)
+	}
 	return agent
+}
+
+// codexHome is the helpers' CODEX_HOME.
+func (e *closureEnv) codexHome() string {
+	return e.vars["CODEX_HOME"]
+}
+
+// writeCodexConfig writes the helpers' Codex config.toml, so Codex's folder
+// trust and hook state are what the test says.
+func (e *closureEnv) writeCodexConfig(t *testing.T, content string) {
+	t.Helper()
+	writeFile(t, filepath.Join(e.codexHome(), "config.toml"), content)
+}
+
+// codexTrusted is config.toml text in which Codex trusts each folder.
+func codexTrusted(dirs ...string) string {
+	var b strings.Builder
+	for _, dir := range dirs {
+		fmt.Fprintf(&b, "[projects.%q]\ntrust_level = \"trusted\"\n\n", dir)
+	}
+	return b.String()
+}
+
+// assertCodexApproved fails unless Codex's config approves ntm's entry for
+// projectKey in workDir's hook file, read the way spawn reads it.
+func assertCodexApproved(t *testing.T, env *closureEnv, workDir, projectKey string) {
+	t.Helper()
+	hooksPath := filepath.Join(workDir, claudeconfig.CodexHooksPath)
+	approval, err := claudeconfig.CodexHookApproval(env.codexHome(), hooksPath, claudeconfig.StopHookCommand(helperBinary(t), projectKey))
+	if err != nil || approval.State != claudeconfig.ApprovalGranted {
+		t.Fatalf("approval for %s = %v (%v), want granted", hooksPath, approval.State, err)
+	}
 }
 
 func mustReadFile(t *testing.T, path string) []byte {
@@ -1333,6 +1370,8 @@ func TestClosure_RobotSpawnWritesClaudeStopHook(t *testing.T) {
 	capture := env.standInAgentConfig(t, "")
 	repo1 := gitInitForTest(t, filepath.Join(env.projectsBase(), "one"))
 	repo2 := gitInitForTest(t, filepath.Join(env.projectsBase(), "two"))
+	// Codex trusts both folders, so the Codex agent brings no notice (Loop 7).
+	env.writeCodexConfig(t, codexTrusted(repo1, repo2))
 
 	resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=robottest", "--spawn-cc=1", "--spawn-cod=1", "--spawn-dir="+repo1))
 	if !resp.Success || len(resp.Warnings) != 0 {
@@ -1571,6 +1610,20 @@ func TestClosure_StopHookSwitchOffWritesNothing(t *testing.T) {
 		{"agent mail off", agentMailOffHookOnConfig, 1, func(t *testing.T, env *closureEnv, session, repo string) {
 			env.run(t, "execute", "spawn", session, "--cc=1")
 		}},
+		// Loop 7, Behavior 9: the switch also stops the Codex file and approval.
+		{"codex spawn", stopHookOffConfig, 2, func(t *testing.T, env *closureEnv, session, repo string) {
+			env.run(t, "execute", "spawn", session, "--cc=1", "--cod=1")
+		}},
+		{"codex robot", stopHookOffConfig, 1, func(t *testing.T, env *closureEnv, session, repo string) {
+			resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn="+session, "--spawn-cod=1", "--spawn-dir="+repo))
+			if !resp.Success || len(resp.Warnings) != 0 {
+				t.Fatalf("robot spawn = %+v", resp)
+			}
+		}},
+		{"codex add", stopHookOffConfig, 2, func(t *testing.T, env *closureEnv, session, repo string) {
+			env.run(t, "execute", "spawn", session, "--cod=1")
+			env.run(t, "execute", "add", session, "--cod=1")
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1588,10 +1641,19 @@ func TestClosure_StopHookSwitchOffWritesNothing(t *testing.T) {
 					t.Fatalf("agent in %s launched with settings %q", agent.Dir, agent.SettingsRaw)
 				}
 				assertNoSettingsFile(t, agent.Dir)
+				if agent.CodexHooks != nil {
+					t.Fatalf("agent in %s launched with Codex hooks %v", agent.Dir, agent.CodexHooks)
+				}
 			}
 			assertNoSettingsFile(t, repo)
 			if n := countExcludeLines(t, repo, claudeconfig.LocalSettingsPath); n != 0 {
 				t.Fatalf("exclude lines = %d, want 0", n)
+			}
+			if _, err := os.Stat(filepath.Join(repo, claudeconfig.CodexHooksPath)); !os.IsNotExist(err) {
+				t.Fatalf("Codex hook file written with the switch off: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(env.codexHome(), "config.toml")); !os.IsNotExist(err) {
+				t.Fatalf("Codex config written with the switch off: %v", err)
 			}
 		})
 	}
@@ -1608,18 +1670,51 @@ func TestInstallClaudeStopHookIfActive_OffThenOn(t *testing.T) {
 	off, on := config.Default(), config.Default()
 	disabled := false
 	off.AgentMail.StopHookEnabled = &disabled
-	installClaudeStopHookIfActive(off, dir, dir)
+	installStopHookIfActive(off, AgentTypeClaude, dir, dir, nil)
 	if after := mustReadFile(t, path); !bytes.Equal(after, before) {
 		t.Fatalf("switch off changed the file:\nbefore %s\nafter  %s", before, after)
 	}
 
-	installClaudeStopHookIfActive(on, dir, dir)
+	installStopHookIfActive(on, AgentTypeClaude, dir, dir, nil)
 	entry := onlyNtmStopEntry(t, readSettingsFile(t, dir))
 	if entry.Command != claudeconfig.StopHookCommand(helperBinary(t), dir) {
 		t.Fatalf("after switching on, command = %q", entry.Command)
 	}
-	installClaudeStopHookIfActive(on, dir, dir)
+	installStopHookIfActive(on, AgentTypeClaude, dir, dir, nil)
 	onlyNtmStopEntry(t, readSettingsFile(t, dir))
+}
+
+// TestInstallStopHookIfActive_CodexOffThenOn: the switch also covers the
+// Codex file and its approval. (Loop 7, Behavior 9)
+func TestInstallStopHookIfActive_CodexOffThenOn(t *testing.T) {
+	dir := t.TempDir()
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	off, on := config.Default(), config.Default()
+	disabled := false
+	off.AgentMail.StopHookEnabled = &disabled
+
+	notices := codexHookNotices{}
+	installStopHookIfActive(off, AgentTypeCodex, dir, dir, notices)
+	if _, err := os.Stat(filepath.Join(dir, claudeconfig.CodexHooksPath)); !os.IsNotExist(err) {
+		t.Fatalf("switch off wrote the Codex file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(codexHome, "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("switch off wrote Codex's config: %v", err)
+	}
+	if len(notices) != 0 {
+		t.Fatalf("switch off gave notices: %v", notices)
+	}
+
+	installStopHookIfActive(on, AgentTypeCodex, dir, dir, notices)
+	hooksPath := filepath.Join(dir, claudeconfig.CodexHooksPath)
+	command := claudeconfig.StopHookCommand(helperBinary(t), dir)
+	if approval, err := claudeconfig.CodexHookApproval(codexHome, hooksPath, command); err != nil || approval.State != claudeconfig.ApprovalGranted {
+		t.Fatalf("approval = %+v, %v", approval, err)
+	}
+	if len(notices) != 1 || !strings.Contains(notices[hooksPath], "trust "+dir) {
+		t.Fatalf("notices = %v, want the folder trust notice", notices)
+	}
 }
 
 func TestClosure_StopHookSwitchOffIsSilent(t *testing.T) {
@@ -1669,5 +1764,299 @@ func TestClosure_StopHookSkipsReadMailAndRecordsAck(t *testing.T) {
 	events := parseRobotEvents(t, env.run(t, "execute", "--robot-events", "--events-recipient=BlueLake"))
 	if len(events) != 1 || events[0].MessageID != 44 || events[0].Type != "mail.ack_required" {
 		t.Fatalf("events = %+v", events)
+	}
+}
+
+// --- Loop 7: Codex turn-end hook ---
+
+// codexHooksAt reads a folder's .codex/hooks.json.
+func codexHooksAt(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	var hooks map[string]any
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(dir, claudeconfig.CodexHooksPath)), &hooks); err != nil {
+		t.Fatalf("Codex hook file isn't JSON: %v", err)
+	}
+	return hooks
+}
+
+func assertCodexHooksNotInGitStatus(t *testing.T, dir string) {
+	t.Helper()
+	if status := gitForTest(t, dir, "status", "--porcelain", "--untracked-files=all"); strings.Contains(status, "hooks.json") {
+		t.Fatalf("git status lists the Codex hook file:\n%s", status)
+	}
+}
+
+// Loop 7, Behavior 8 (and 12, approved and trusted): ntm spawn writes one
+// Codex entry before launch, keeps the project's other entries, saves the
+// approval, and says nothing more.
+func TestClosure_SpawnWritesCodexStopHookBeforeLaunch(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("codexhook"))
+	writeFile(t, filepath.Join(repo, claudeconfig.CodexHooksPath), `{"description":"team","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./check.sh"}]}],"Stop":[{"hooks":[{"type":"command","command":"echo done"}]}]}}`)
+	userConfig := "# my settings\nmodel = \"gpt-6.1-sol\"\n\n" + codexTrusted(repo)
+	env.writeCodexConfig(t, userConfig)
+
+	out := env.run(t, "execute", "spawn", "codexhook", "--cod=1")
+	launched := capture.waitForType(t, "codex", 1, 20*time.Second)[0]
+
+	entry := onlyNtmStopEntry(t, launched.CodexHooks)
+	if entry.Command != claudeconfig.StopHookCommand(helperBinary(t), repo) || entry.Timeout != claudeconfig.StopHookTimeoutSeconds {
+		t.Fatalf("entry = %+v", entry)
+	}
+	if len(stopEntries(t, launched.CodexHooks)) != 2 || launched.CodexHooks["description"] != "team" {
+		t.Fatalf("other entries dropped: %v", launched.CodexHooks)
+	}
+	if hooks, _ := launched.CodexHooks["hooks"].(map[string]any); hooks["PreToolUse"] == nil {
+		t.Fatalf("PreToolUse dropped: %v", launched.CodexHooks)
+	}
+	assertNoIssuedTokens(t, mail, filepath.Join(repo, claudeconfig.CodexHooksPath))
+	assertCodexHooksNotInGitStatus(t, repo)
+	assertCodexApproved(t, env, repo, repo)
+	config := string(mustReadFile(t, filepath.Join(env.codexHome(), "config.toml")))
+	if !strings.HasPrefix(config, userConfig) {
+		t.Fatalf("your Codex settings changed:\n%s", config)
+	}
+	if strings.Count(out, "Codex Stop hook written") != 1 || strings.Contains(out, "Codex will ask") || strings.Contains(out, "not approved") {
+		t.Fatalf("spawn output = %q", out)
+	}
+
+	env.run(t, "execute", "kill", "codexhook", "--force")
+	env.run(t, "execute", "spawn", "codexhook", "--cod=1")
+	capture.waitForType(t, "codex", 2, 20*time.Second)
+	onlyNtmStopEntry(t, codexHooksAt(t, repo))
+	if n := countExcludeLines(t, repo, claudeconfig.CodexHooksPath); n != 1 {
+		t.Fatalf("exclude lines = %d, want 1", n)
+	}
+	if again := string(mustReadFile(t, filepath.Join(env.codexHome(), "config.toml"))); again != config {
+		t.Fatalf("a second spawn changed Codex's config:\n%s", again)
+	}
+}
+
+// Loop 7, Behaviors 8 and 12: each worktree gets its own Codex file with the
+// main project key and its own approval, and one notice per folder Codex
+// hasn't trusted.
+func TestClosure_WorktreeSpawnCodexHooksUseMainProject(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("codwt"))
+	gitForTest(t, repo, "commit", "-q", "--allow-empty", "-m", "first")
+
+	out := env.run(t, "execute", "spawn", "codwt", "--cod=2", "--worktrees")
+	agents := capture.waitForType(t, "codex", 2, 30*time.Second)
+	seen := map[string]bool{}
+	for _, a := range agents {
+		if a.Dir == repo || seen[a.Dir] {
+			t.Fatalf("agent didn't run in its own worktree: %s", a.Dir)
+		}
+		seen[a.Dir] = true
+		if entry := onlyNtmStopEntry(t, a.CodexHooks); entry.Command != claudeconfig.StopHookCommand(helperBinary(t), repo) {
+			t.Fatalf("%s: command %q", a.Dir, entry.Command)
+		}
+		assertCodexApproved(t, env, a.Dir, repo)
+		assertCodexHooksNotInGitStatus(t, a.Dir)
+		if !strings.Contains(out, "Codex will ask you to trust "+a.Dir) {
+			t.Fatalf("no trust notice for %s in %q", a.Dir, out)
+		}
+	}
+	if n := strings.Count(out, "Codex will ask you to trust"); n != 2 {
+		t.Fatalf("trust notices = %d, want 2: %q", n, out)
+	}
+	if _, err := os.Stat(filepath.Join(repo, claudeconfig.CodexHooksPath)); !os.IsNotExist(err) {
+		t.Fatalf("main folder got a Codex hook file: %v", err)
+	}
+}
+
+// Loop 7, Behaviors 8 and 12: robot spawn writes both tools' files, saves the
+// Codex approval, and reports a folder notice once in warnings.
+func TestClosure_RobotSpawnWritesBothHookFiles(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo1 := gitInitForTest(t, filepath.Join(env.projectsBase(), "one"))
+	repo2 := gitInitForTest(t, filepath.Join(env.projectsBase(), "two"))
+	env.writeCodexConfig(t, codexTrusted(repo1))
+
+	resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=mixed", "--spawn-cc=1", "--spawn-cod=2", "--spawn-dir="+repo1))
+	if !resp.Success || len(resp.Warnings) != 0 {
+		t.Fatalf("response = %+v", resp)
+	}
+	claude := capture.waitForType(t, "claude", 1, 20*time.Second)[0]
+	codex := capture.waitForType(t, "codex", 2, 20*time.Second)
+	want := claudeconfig.StopHookCommand(helperBinary(t), repo1)
+	if entry := onlyNtmStopEntry(t, claude.Settings); entry.Command != want {
+		t.Fatalf("Claude command = %q", entry.Command)
+	}
+	for _, a := range codex {
+		if entry := onlyNtmStopEntry(t, a.CodexHooks); entry.Command != want {
+			t.Fatalf("Codex command = %q", entry.Command)
+		}
+	}
+	assertCodexApproved(t, env, repo1, repo1)
+
+	resp = parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=untrusted", "--spawn-cod=2", "--spawn-dir="+repo2))
+	if !resp.Success || len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], "Codex will ask you to trust "+repo2) {
+		t.Fatalf("untrusted response = %+v", resp)
+	}
+	assertCodexApproved(t, env, repo2, repo2)
+}
+
+// Loop 7, Behavior 8: ntm add writes the Codex entry before the added agent
+// launches, and creates Codex's config when there's none.
+func TestClosure_AddedCodexAgentGetsHook(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+	repo := gitInitForTest(t, env.projectDir("codadd"))
+
+	env.run(t, "execute", "spawn", "codadd", "--cc=1")
+	first := capture.waitForType(t, "claude", 1, 20*time.Second)[0]
+	if _, err := os.Stat(filepath.Join(repo, claudeconfig.CodexHooksPath)); !os.IsNotExist(err) {
+		t.Fatalf("a Claude-only spawn wrote the Codex file: %v", err)
+	}
+	out := env.run(t, "execute", "add", "codadd", "--cod=1")
+	added := capture.waitForType(t, "codex", 1, 20*time.Second)[0]
+	if added.ID == first.ID {
+		t.Fatal("no Codex agent was added")
+	}
+	onlyNtmStopEntry(t, added.CodexHooks) // written before the added agent launched
+	assertCodexApproved(t, env, repo, repo)
+	if !strings.Contains(out, "Codex Stop hook written") || strings.Count(out, "Codex will ask you to trust "+repo) != 1 {
+		t.Fatalf("add output = %q", out)
+	}
+}
+
+// Loop 7, Behaviors 7 and 10: a Codex hook file ntm can't or mustn't write
+// gives a warning naming it, stays as it was, and the agent still launches.
+func TestClosure_SpawnCodexHookFailuresStillLaunch(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.privateTmux(t)
+	capture := env.standInAgentConfig(t, "")
+
+	bad := gitInitForTest(t, env.projectDir("codbad"))
+	writeFile(t, filepath.Join(bad, claudeconfig.CodexHooksPath), `{"hooks": `)
+	asFile := gitInitForTest(t, env.projectDir("codfile"))
+	writeFile(t, filepath.Join(asFile, ".codex"), "a file")
+	committed := gitInitForTest(t, env.projectDir("codcommit"))
+	writeFile(t, filepath.Join(committed, claudeconfig.CodexHooksPath), `{"hooks":{}}`)
+	gitForTest(t, committed, "add", claudeconfig.CodexHooksPath)
+	gitForTest(t, committed, "commit", "-q", "-m", "team hooks")
+
+	for i, tc := range []struct{ session, dir, file, content, reason string }{
+		{"codbad", bad, filepath.Join(bad, claudeconfig.CodexHooksPath), `{"hooks": `, "can't be parsed"},
+		{"codfile", asFile, filepath.Join(asFile, ".codex"), "a file", ".codex"},
+		{"codcommit", committed, filepath.Join(committed, claudeconfig.CodexHooksPath), `{"hooks":{}}`, "committed to git"},
+	} {
+		out := env.run(t, "execute", "spawn", tc.session, "--cod=1")
+		capture.waitForType(t, "codex", i+1, 20*time.Second)
+		if !strings.Contains(out, "Codex Stop hook not written in "+tc.dir) || !strings.Contains(out, tc.reason) {
+			t.Fatalf("%s: spawn output = %q", tc.session, out)
+		}
+		if got := string(mustReadFile(t, tc.file)); got != tc.content {
+			t.Fatalf("%s: %s changed to %q", tc.session, tc.file, got)
+		}
+	}
+	assertCodexHooksNotInGitStatus(t, committed) // a change to the committed file would show as modified
+	if _, err := os.Stat(filepath.Join(env.codexHome(), "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("an approval was saved for a hook that wasn't written: %v", err)
+	}
+
+	resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=codbadrobot", "--spawn-cod=1", "--spawn-dir="+bad))
+	if !resp.Success || len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], "Codex Stop hook not written") {
+		t.Fatalf("robot response = %+v", resp)
+	}
+	capture.waitForType(t, "codex", 4, 20*time.Second)
+}
+
+// Loop 7, Behavior 12: spawn saves the approval for ntm's entry, and tells
+// you once per file when it couldn't or when you turned the hook off.
+func TestClosure_SpawnApprovesCodexHook(t *testing.T) {
+	setup := func(t *testing.T, session string) (*closureEnv, *agentCapture, string, string) {
+		t.Helper()
+		mail := newFakeAgentMail(t)
+		env := newClosureEnv(t)
+		env.useAgentMail(mail)
+		env.privateTmux(t)
+		capture := env.standInAgentConfig(t, "")
+		repo := gitInitForTest(t, env.projectDir(session))
+		return env, capture, repo, filepath.Join(repo, claudeconfig.CodexHooksPath)
+	}
+	stateKey := func(hooksPath string) string { return fmt.Sprintf("[hooks.state.%q]\n", hooksPath+":stop:0:0") }
+
+	t.Run("no config, two agents, one notice", func(t *testing.T) {
+		env, capture, repo, _ := setup(t, "codnew")
+		out := env.run(t, "execute", "spawn", "codnew", "--cod=2")
+		capture.waitForType(t, "codex", 2, 20*time.Second)
+		assertCodexApproved(t, env, repo, repo)
+		if n := strings.Count(out, "Codex will ask you to trust "+repo); n != 1 {
+			t.Fatalf("trust notices = %d: %q", n, out)
+		}
+	})
+
+	t.Run("older approval is replaced", func(t *testing.T) {
+		env, capture, repo, hooksPath := setup(t, "codold")
+		env.writeCodexConfig(t, codexTrusted(repo)+stateKey(hooksPath)+"trusted_hash = \"sha256:old\"\n")
+		out := env.run(t, "execute", "spawn", "codold", "--cod=1")
+		capture.waitForType(t, "codex", 1, 20*time.Second)
+		assertCodexApproved(t, env, repo, repo)
+		if strings.Contains(out, "Codex will ask") || strings.Contains(out, "not approved") {
+			t.Fatalf("spawn output = %q", out)
+		}
+		if config := string(mustReadFile(t, filepath.Join(env.codexHome(), "config.toml"))); strings.Contains(config, "sha256:old") {
+			t.Fatalf("old hash kept:\n%s", config)
+		}
+	})
+
+	t.Run("unparseable config", func(t *testing.T) {
+		env, capture, repo, _ := setup(t, "codbadcfg")
+		env.writeCodexConfig(t, "[[[")
+		out := env.run(t, "execute", "spawn", "codbadcfg", "--cod=1")
+		capture.waitForType(t, "codex", 1, 20*time.Second)
+		if !strings.Contains(out, "Codex hook not approved in "+repo) || !strings.Contains(out, "Trust all and continue") {
+			t.Fatalf("spawn output = %q", out)
+		}
+		if got := string(mustReadFile(t, filepath.Join(env.codexHome(), "config.toml"))); got != "[[[" {
+			t.Fatalf("Codex config changed to %q", got)
+		}
+		resp := parseRobotSpawn(t, env.run(t, "execute", "--robot-spawn=codbadcfgrobot", "--spawn-cod=2", "--spawn-dir="+repo))
+		if !resp.Success || len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], "Codex hook not approved in "+repo) {
+			t.Fatalf("robot response = %+v", resp)
+		}
+	})
+
+	t.Run("turned off in /hooks", func(t *testing.T) {
+		env, capture, repo, hooksPath := setup(t, "codoff")
+		config := codexTrusted(repo) + stateKey(hooksPath) + "enabled = false\n"
+		env.writeCodexConfig(t, config)
+		out := env.run(t, "execute", "spawn", "codoff", "--cod=1")
+		capture.waitForType(t, "codex", 1, 20*time.Second)
+		if !strings.Contains(out, "turned off in /hooks for "+repo) {
+			t.Fatalf("spawn output = %q", out)
+		}
+		if got := string(mustReadFile(t, filepath.Join(env.codexHome(), "config.toml"))); got != config {
+			t.Fatalf("Codex config changed to %q", got)
+		}
+	})
+}
+
+func TestMain_IsolatesCodexHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	if dir := claudeconfig.CodexHomeDir(); dir == filepath.Join(home, ".codex") {
+		t.Fatalf("CLI tests would write the real Codex config: %s", dir)
 	}
 }

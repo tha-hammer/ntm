@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/claudeconfig"
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
@@ -22,11 +23,20 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.Setenv("XDG_CONFIG_HOME", configDir)
 	_ = os.Unsetenv("NTM_CONFIG")
+	// Codex spawns save ntm's hook approval in Codex's config.toml (Loop 7), so
+	// tests get their own Codex folder rather than the user's ~/.codex.
+	codexHome, err := os.MkdirTemp("", "ntm-robot-test-codex-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create test Codex folder: %v\n", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("CODEX_HOME", codexHome)
 
 	code := m.Run()
 
 	ensemble.CloseDefaultStateStore()
 	_ = os.RemoveAll(configDir)
+	_ = os.RemoveAll(codexHome)
 
 	os.Exit(code)
 }
@@ -39,5 +49,15 @@ func TestMain_IsolatesStateDB(t *testing.T) {
 	realConfig := filepath.Join(home, ".config") + string(filepath.Separator)
 	if path := state.DefaultPath(); strings.HasPrefix(path, realConfig) {
 		t.Fatalf("robot tests would use the real state.db: %s", path)
+	}
+}
+
+func TestMain_IsolatesCodexHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	if dir := claudeconfig.CodexHomeDir(); dir == filepath.Join(home, ".codex") {
+		t.Fatalf("robot tests would write the real Codex config: %s", dir)
 	}
 }

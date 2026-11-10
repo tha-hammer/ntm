@@ -264,10 +264,19 @@ const (
 var ErrUnparseableSettings = errors.New("settings file can't be parsed")
 
 // ErrHomeFolder means the Stop hook wasn't written because the work folder is
-// the user's home folder. There the local settings file sits inside ~/.claude,
-// next to the user's own settings, and a home folder is never an agent's
-// project: getting it means the project lookup went wrong.
-var ErrHomeFolder = errors.New("refusing to write the Claude Stop hook into the home folder")
+// the user's home folder. There the hook file would be the user's own global
+// one (~/.claude/settings.local.json or ~/.codex/hooks.json), and a home
+// folder is never an agent's project: getting it means the project lookup
+// went wrong.
+var ErrHomeFolder = errors.New("refusing to write an agent Stop hook into the home folder")
+
+// refuseHomeFolder returns ErrHomeFolder when workDir is the home folder.
+func refuseHomeFolder(workDir string) error {
+	if home, err := os.UserHomeDir(); err == nil && home != "" && filepath.Clean(workDir) == filepath.Clean(home) {
+		return fmt.Errorf("%w: %s", ErrHomeFolder, workDir)
+	}
+	return nil
+}
 
 // StopHookCommand is the command Claude Code runs at turn end. Hooks don't
 // get an interactive PATH, so the binary is absolute. Both paths are shell
@@ -318,42 +327,59 @@ func afterFirstShellWord(command string) (string, bool) {
 }
 
 // WriteStopHook makes <workDir>/.claude/settings.local.json hold exactly one
-// ntm Stop entry with this command: it removes any ntm entries, whatever
-// binary they name, drops groups that removal emptied, and appends one group.
-// Every other field and hook is kept. A file that isn't the expected shape is
-// left unchanged and ErrUnparseableSettings is returned. It reports the path
-// and whether the file was written; a run that would change nothing doesn't
-// write.
+// ntm Stop entry with this command. See WriteStopHookFile.
 func WriteStopHook(workDir, command string) (path string, changed bool, err error) {
 	path = filepath.Join(workDir, filepath.FromSlash(LocalSettingsPath))
-	// #nosec G304 -- the path is the agent work folder's settings file.
+	changed, err = WriteStopHookFile(path, command)
+	return path, changed, err
+}
+
+// WriteStopHookFile makes a hook settings file hold exactly one ntm Stop
+// entry with this command: it removes any ntm entries, whatever binary they
+// name, drops groups that removal emptied, and appends one group. Every other
+// field and hook is kept. Claude Code and Codex read the same shape, so both
+// files go through here. A file that isn't the expected shape is left
+// unchanged and ErrUnparseableSettings is returned. It reports whether the
+// file was written; a run that would change nothing doesn't write.
+func WriteStopHookFile(path, command string) (changed bool, err error) {
+	// #nosec G304 -- the path is an agent work folder's hook settings file.
 	raw, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return path, false, fmt.Errorf("read %s: %w", path, err)
+		return false, fmt.Errorf("read %s: %w", path, err)
 	}
 	existed := err == nil
 
-	parsed := map[string]any{}
-	if len(strings.TrimSpace(string(raw))) > 0 {
-		if err := json.Unmarshal(raw, &parsed); err != nil {
-			return path, false, fmt.Errorf("%w: %s: %v", ErrUnparseableSettings, path, err)
-		}
-		if parsed == nil { // JSON null
-			parsed = map[string]any{}
-		}
+	parsed, err := decodeSettings(raw)
+	if err != nil {
+		return false, fmt.Errorf("%w: %s: %v", ErrUnparseableSettings, path, err)
 	}
-
 	merged, err := mergeStopHook(parsed, command)
 	if err != nil {
-		return path, false, fmt.Errorf("%w: %s: %v", ErrUnparseableSettings, path, err)
+		return false, fmt.Errorf("%w: %s: %v", ErrUnparseableSettings, path, err)
 	}
 	if existed && sameJSON(parsed, merged) {
-		return path, false, nil
+		return false, nil
 	}
 	if err := writeSettingsAtomic(path, merged); err != nil {
-		return path, false, fmt.Errorf("write %s: %w", path, err)
+		return false, fmt.Errorf("write %s: %w", path, err)
 	}
-	return path, true, nil
+	return true, nil
+}
+
+// decodeSettings parses a hook settings file. Empty input and JSON null are
+// an empty object.
+func decodeSettings(raw []byte) (map[string]any, error) {
+	parsed := map[string]any{}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return parsed, nil
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, err
+	}
+	if parsed == nil { // JSON null
+		parsed = map[string]any{}
+	}
+	return parsed, nil
 }
 
 // StopHookResult is what InstallStopHook did.
@@ -368,8 +394,8 @@ type StopHookResult struct {
 // which differs from workDir in a worktree. The command holds paths only,
 // never a token.
 func InstallStopHook(workDir, ntmPath, projectKey string) (StopHookResult, error) {
-	if home, err := os.UserHomeDir(); err == nil && home != "" && filepath.Clean(workDir) == filepath.Clean(home) {
-		return StopHookResult{}, fmt.Errorf("%w: %s", ErrHomeFolder, workDir)
+	if err := refuseHomeFolder(workDir); err != nil {
+		return StopHookResult{}, err
 	}
 	path, changed, err := WriteStopHook(workDir, StopHookCommand(ntmPath, projectKey))
 	result := StopHookResult{SettingsPath: path, Changed: changed}

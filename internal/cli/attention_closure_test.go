@@ -73,6 +73,7 @@ func newClosureEnv(t *testing.T) *closureEnv {
 	}
 	env.vars = map[string]string{
 		"HOME":                  filepath.Join(root, "home"),
+		"CODEX_HOME":            filepath.Join(root, "codex-home"),
 		"XDG_CONFIG_HOME":       env.configDir,
 		"XDG_DATA_HOME":         filepath.Join(root, "data"),
 		"NTM_CONFIG":            "",

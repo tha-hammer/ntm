@@ -1588,3 +1588,14 @@ func TestLoadLatestHandoff_NoHandoff(t *testing.T) {
 
 	t.Log("loadLatestHandoff correctly returns nil when no handoff found")
 }
+
+// TestRobotCodexCommandNoHookTrustBypass: robot spawn's Codex command never
+// skips Codex's hook trust check. (Loop 7, Behavior 13)
+func TestRobotCodexCommandNoHookTrustBypass(t *testing.T) {
+	for name, cfg := range map[string]*config.Config{"nil config": nil, "default config": config.Default()} {
+		cmd := getAgentCommands(cfg)["codex"]
+		if cmd == "" || strings.Contains(cmd, "bypass-hook-trust") || strings.Contains(cmd, "bypass_hook_trust") {
+			t.Fatalf("%s: Codex command = %q", name, cmd)
+		}
+	}
+}

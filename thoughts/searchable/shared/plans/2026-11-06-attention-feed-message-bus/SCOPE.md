@@ -170,10 +170,10 @@ Given a Claude session started by hand in the same folder, with no `AGENT_NAME` 
 | 1 | Spawn path | Agent type and work folder | Picks the Claude or Codex hook file | Target file |
 | 2 | Hook writer | Existing file, if any | Merges the `HookRegistration`, keeping other entries | Atomically written file |
 | 3 | Hook writer | Work folder | Adds the path to the exclude file from `git rev-parse --git-path info/exclude` | File kept out of `git status` |
-| 4 | Spawn path, Codex only | Hook state | Tells you if this project's hook still needs your approval | Visible notice |
+| 4 | Spawn path, Codex only | Codex's `config.toml` | Saves Codex's approval for ntm's own entry; tells you if it couldn't, or if Codex hasn't trusted the folder | Approval entry, or a visible notice |
 
 **Rules:** The registration holds the absolute path of the ntm binary, because hooks don't get an interactive shell's PATH. It also holds the project key, because worktree panes run in a different folder from the project key given to Agent Mail (`internal/cli/spawn.go:2346`, `:2788`). The file stays after the session ends. A folder that isn't a git repo skips step 3.
-**Required Variants:** Claude writes `<workdir>/.claude/settings.local.json`. The Codex file is set by the format check in Evidence Needed. ntm keeps Codex's trust check on and doesn't pass `--dangerously-bypass-hook-trust`.
+**Required Variants:** Claude writes `<workdir>/.claude/settings.local.json`. Codex writes `<workdir>/.codex/hooks.json` (Evidence Needed item 1). ntm saves Codex's approval for its own entry only, and doesn't pass `--dangerously-bypass-hook-trust` (changed 2026-11-10, Loop 7 evidence).
 **Completion:** The file holds exactly one ntm Stop entry, and the agent launches.
 **Effects and Ordering:** The file is written before the agent starts, so the agent reads it at startup.
 **Failure:** A hook write failure shows a warning and the spawn continues, as failed DCG and RCH hook setup does today. A settings file that can't be parsed is left untouched. **Assumption.**
@@ -557,7 +557,7 @@ quality_target:
 | Batched reminders plus agent snooze | Confirmed | Idle Nudge, Agent Snooze | Approved answer | You |
 | Keystroke check plus text style check | Confirmed | Human Typing Guard | Approved answer | You |
 | Reminders show sender and subject | Confirmed | Reminder Format | Approved answer | You |
-| Codex hooks approved manually; ntm doesn't bypass trust | Confirmed | Codex hook | Approved answer | You |
+| ntm saves Codex's approval for its own Stop entry; it never passes `--dangerously-bypass-hook-trust` | Confirmed 2026-11-10 (replaced "approved manually" after Loop 7's evidence check) | Codex hook | Approved answer | You |
 | Hook file stays, and is added to `.git/info/exclude` | Confirmed | Hook Installation | Approved answer | You |
 | On by default, with config switches | Confirmed | Hook Installation, Idle Nudge | Approved answer | You |
 | Migration previews by default and scans named folders | Confirmed | Hook Migration | Approved answers | You |
@@ -663,9 +663,9 @@ quality_target:
 **Confirmed Limitations:** Stop hooks fire only when a turn ends, so idle agents need the nudge.
 
 **Dependency / Purpose:** Codex, for turn-end hooks.
-**Exchange:** To be confirmed (Evidence Needed item 1).
-**Availability / Failure:** An unapproved hook doesn't run. ntm tells you, and the Idle Nudge still covers that agent.
-**Confirmed Limitations:** Codex 0.167 applies a trust check to hooks. You approve them manually, and new worktrees may each need approval.
+**Exchange:** Reads `<workdir>/.codex/hooks.json` at startup in Claude's format, passes JSON on stdin with `stop_hook_active`, and accepts `{"decision":"block","reason":...}` (Loop 7 evidence record).
+**Availability / Failure:** An unapproved or changed hook stops Codex at startup on a "Hooks need review" screen, so ntm saves the approval for its own entry. If it can't, the hook doesn't run, ntm tells you, and the Idle Nudge still covers that agent.
+**Confirmed Limitations:** Codex 0.167 keeps approval as `trusted_hash` under `hooks.state."<file>:stop:<group>:<handler>"` in `~/.codex/config.toml`. Each worktree's file has its own key. Codex must also trust the folder before it reads `.codex/`.
 
 **Dependency / Purpose:** tmux, for pane state and typing.
 **Exchange:** Existing capture and send functions, plus `client_activity`.

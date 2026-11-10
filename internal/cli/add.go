@@ -533,6 +533,7 @@ func runAdd(opts AddOptions) error {
 		}
 	}
 
+	codexNotices := codexHookNotices{}
 	for _, agent := range flatAgents {
 		agentTypeStr := string(agent.Type)
 		// Seed keys are canonical (see seedMaxIndices); key the increment
@@ -745,12 +746,10 @@ func runAdd(opts AddOptions) error {
 			return outputError(fmt.Errorf("building agent command: %w", err))
 		}
 
-		// Claude Code reads its settings at startup, so the Stop hook is
-		// written before the launch. The added pane runs in the session folder,
-		// which is also its Agent Mail project.
-		if agent.Type == AgentTypeClaude {
-			installClaudeStopHookIfActive(cfg, dir, dir)
-		}
+		// Claude Code and Codex read their hooks at startup, so the Stop hook
+		// is written before the launch. The added pane runs in the session
+		// folder, which is also its Agent Mail project.
+		installStopHookIfActive(cfg, agent.Type, dir, dir, codexNotices)
 
 		if err := tmux.SendKeys(paneID, cmd, true); err != nil {
 			return outputError(fmt.Errorf("launching agent: %w", err))
@@ -843,6 +842,7 @@ func runAdd(opts AddOptions) error {
 		})
 		newPaneIDs = append(newPaneIDs, paneID)
 	}
+	codexNotices.print()
 
 	// Best-effort pane record append, once per new pane, before the JSON
 	// emit so both modes record. Never fails add; warnings go to stderr.

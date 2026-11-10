@@ -23,7 +23,7 @@ Human tests run on this VPS, except Loop 8, Sprint 3, which runs on your local m
 | 4 | [04-cross-process-delivery.md](04-cross-process-delivery.md) | Cross-process delivery | 1 | Done: Sprint 1 passed |
 | 5 | [05-idle-nudge.md](05-idle-nudge.md) | Idle nudge | 5 | Done: Sprints 1 to 5 passed |
 | 6 | [06-agent-snooze.md](06-agent-snooze.md) | Agent snooze | 2 | Done: Sprints 1 and 2 passed |
-| 7 | [07-codex-turn-end-push.md](07-codex-turn-end-push.md) | Codex turn-end push | 2 | Not started |
+| 7 | [07-codex-turn-end-push.md](07-codex-turn-end-push.md) | Codex turn-end push | 2 | In progress: Sprint 1 building |
 | 8 | [08-hook-migration.md](08-hook-migration.md) | Hook migration | 3 | Not started |
 | 9 | [09-release-journey.md](09-release-journey.md) | Release journey | 1 | Not started |
 
@@ -43,7 +43,7 @@ Total: 9 loops, 26 sprints.
 
 **Loop 6: Agent snooze.** An agent can defer a message to a chosen time with `ntm mail snooze`. Reminders skip it until then, and the nudge brings it back afterward. Covers deliverable 14.
 
-**Loop 7: Codex turn-end push.** Spawn writes a Codex turn-end hook and tells you when a project's hook still needs your approval. An approved Codex agent learns about mail when its turn ends, as far as Codex's hooks allow. Covers deliverable 10.
+**Loop 7: Codex turn-end push.** Spawn writes a Codex turn-end hook and saves Codex's approval for it, and tells you when it couldn't. A Codex agent then learns about mail when its turn ends. Covers deliverable 10.
 
 **Loop 8: Hook migration.** `ntm agent-hook migrate` previews and then applies the move from the old hook scripts to the Go command, with a guide for your local machine. Covers deliverable 17.
 

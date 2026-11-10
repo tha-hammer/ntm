@@ -2034,6 +2034,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 	}
 
 	// Launch agents using flattened specs (preserves model info for pane naming)
+	codexNotices := codexHookNotices{}
 	for _, agent := range opts.Agents {
 		if agentNum >= len(panes) {
 			break
@@ -2345,13 +2346,11 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 			return outputError(fmt.Errorf("building %s agent command: %w", agent.Type, err))
 		}
 
-		// Claude Code reads its settings at startup, so the Stop hook is written
-		// before the launch below, in the folder the agent runs in. The project
-		// key is the session folder even for a worktree agent, because that is
-		// the key the agent was registered under with Agent Mail.
-		if agent.Type == AgentTypeClaude {
-			installClaudeStopHookIfActive(cfg, workingDir, dir)
-		}
+		// Claude Code and Codex read their hooks at startup, so the Stop hook is
+		// written before the launch below, in the folder the agent runs in. The
+		// project key is the session folder even for a worktree agent, because
+		// that is the key the agent was registered under with Agent Mail.
+		installStopHookIfActive(cfg, agent.Type, workingDir, dir, codexNotices)
 
 		if err := tmux.SendKeys(pane.ID, cmd, true); err != nil {
 			return outputError(fmt.Errorf("launching %s agent: %w", agent.Type, err))
@@ -2532,6 +2531,7 @@ func spawnSessionLogic(opts SpawnOptions) (err error) {
 		staggerAgentIdx++
 		agentNum++
 	}
+	codexNotices.print()
 
 	// Complete the launching step
 	if !IsJSONOutput() {
