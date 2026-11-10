@@ -1,0 +1,63 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd '/home/user/Dev/mcp_agent_mail' && uv run python -m mcp_agent_mail.cli file_reservations active '/home/user/Dev/mcp_agent_mail'"
+          },
+          {
+            "type": "command",
+            "command": "/home/user/Dev/mcp_agent_mail/.claude/hooks/ensure_window_id.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd '/home/user/Dev/mcp_agent_mail' && uv run python -m mcp_agent_mail.cli file_reservations soon '/home/user/Dev/mcp_agent_mail' --minutes 10"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__mcp-agent-mail__file_reservation_paths",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd '/home/user/Dev/mcp_agent_mail' && uv run python -m mcp_agent_mail.cli file_reservations list '/home/user/Dev/mcp_agent_mail'"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/user/Dev/mcp_agent_mail/.claude/hooks/check_mail_on_close.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/user/Dev/mcp_agent_mail/.claude/hooks/check_critical_on_stop.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

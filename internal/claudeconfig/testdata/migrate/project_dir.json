@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo closed"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/check_mail_on_close.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd sync"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check_critical_on_stop.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

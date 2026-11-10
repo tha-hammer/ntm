@@ -64,6 +64,7 @@ func newAgentHookCmd() *cobra.Command {
 		Hidden: true,
 	}
 	cmd.AddCommand(newAgentHookStopCmd())
+	cmd.AddCommand(newAgentHookMigrateCmd())
 	return cmd
 }
 

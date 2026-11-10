@@ -26,6 +26,29 @@ func FindProjectRoot(startDir string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// MainWorktree returns the main worktree of dir's repo, and whether dir is in
+// a linked worktree of it. A folder that isn't in a git repo returns "" and
+// false with no error.
+func MainWorktree(dir string) (main string, linked bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", false, nil // not a git repo
+		}
+		return "", false, fmt.Errorf("find the main worktree of %s: %w", dir, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) != 2 {
+		return "", false, fmt.Errorf("find the main worktree of %s: unexpected git output %q", dir, output)
+	}
+	gitDir, commonDir := filepath.Clean(lines[0]), filepath.Clean(lines[1])
+	return filepath.Dir(commonDir), gitDir != commonDir, nil
+}
+
 // IsTracked reports whether git tracks path in dir's repo: committed or
 // staged. path is relative to dir. A folder that isn't in a git repo reports
 // false with no error.

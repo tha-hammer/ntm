@@ -38,6 +38,8 @@ Covers deliverable 17. Needs Loop 3, for the finished command and identity looku
 - [ ] Nothing is written. File modification times and `git status` don't change.
 - [ ] A file that can't be parsed is reported as failed, the scan continues, and the exit code is non-zero.
 
+After Sprint 1's human test (2026-11-10): only files whose text names an old script are parsed strictly; folders the scan can't read are skipped with one summary line; and a worktree's shared copy counts under its main repo in the totals.
+
 ### Requirements
 
 **Data:** Reads `.claude/settings.json` and `.claude/settings.local.json`. A local settings file can register the old scripts too, and it isn't committed. **Assumption:** it's handled the same way, and the report marks that file as having nothing to commit.

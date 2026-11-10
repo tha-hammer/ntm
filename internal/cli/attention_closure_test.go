@@ -57,6 +57,7 @@ type closureEnv struct {
 	configDir string
 	workDir   string
 	vars      map[string]string
+	binary    string // the helper binary to run; "" means os.Args[0]
 }
 
 func newClosureEnv(t *testing.T) *closureEnv {
@@ -100,7 +101,11 @@ type closureRun struct {
 
 // helperCommand builds one helper process with the environment's variables.
 func (e *closureEnv) helperCommand(mode, stdin string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
-	cmd := exec.Command(os.Args[0])
+	binary := os.Args[0]
+	if e.binary != "" {
+		binary = e.binary
+	}
+	cmd := exec.Command(binary)
 	cmd.Dir = e.workDir
 	cmd.Env = append(os.Environ(),
 		closureHelperModeEnv+"="+mode,

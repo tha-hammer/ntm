@@ -216,3 +216,31 @@ func TestIsTracked(t *testing.T) {
 		}
 	})
 }
+
+// TestMainWorktree: a linked worktree names its main worktree; the main
+// worktree and a plain folder don't. (Loop 8, Behavior 5)
+func TestMainWorktree(t *testing.T) {
+	repo := t.TempDir()
+	gitOutput(t, repo, "init", "-q")
+	gitOutput(t, repo, "-c", "user.name=ntm test", "-c", "user.email=ntm-test@example.invalid", "commit", "-q", "--allow-empty", "-m", "first")
+	worktree := filepath.Join(t.TempDir(), "wt")
+	gitOutput(t, repo, "worktree", "add", "-q", worktree)
+	sub := filepath.Join(worktree, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realRepo, _ := filepath.EvalSymlinks(repo)
+
+	for _, dir := range []string{worktree, sub} {
+		main, linked, err := MainWorktree(dir)
+		if err != nil || !linked || main != realRepo {
+			t.Fatalf("MainWorktree(%s) = %q, %v, %v; want %q, true", dir, main, linked, err, realRepo)
+		}
+	}
+	if main, linked, err := MainWorktree(repo); err != nil || linked || main != realRepo {
+		t.Fatalf("MainWorktree(main) = %q, %v, %v", main, linked, err)
+	}
+	if main, linked, err := MainWorktree(t.TempDir()); err != nil || linked || main != "" {
+		t.Fatalf("MainWorktree(plain) = %q, %v, %v", main, linked, err)
+	}
+}
