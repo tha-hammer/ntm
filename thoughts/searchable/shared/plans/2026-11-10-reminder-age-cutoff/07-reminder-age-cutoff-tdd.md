@@ -1,4 +1,4 @@
-# Loop 7 — Reminder age cutoff: TDD Implementation Plan
+# Loop 10 — Reminder age cutoff: TDD Implementation Plan
 
 Loop document: [07-reminder-age-cutoff.md](07-reminder-age-cutoff.md). Behavior list and 4c answers:
 [07-reminder-age-cutoff-behaviors.md](07-reminder-age-cutoff-behaviors.md). Scope: [SCOPE.md](SCOPE.md).
@@ -71,7 +71,7 @@ notice's expiry never came back.
 
 The master index sets no beads rule. The VPS agent files and owns this repo's beads, so this plan
 proposes issues but doesn't create them:
-- an epic, "Reminder age cutoff (Loop 7)";
+- an epic, "Reminder age cutoff (Loop 10)";
 - one child per sprint.
 
 ---
@@ -401,9 +401,9 @@ Keep the fixture minimal: two messages, with no bodies.
 #### Test Specification
 **Given** this sprint's change. **When** it lands. **Then**:
 - `TestClaimToldRecord_ExpiredClaimWinsAgain` has a comment: "Reminders don't repeat after expiry:
-  mailToAnnounce skips messages older than ToldRecordRetention (Loop 7)."
+  mailToAnnounce skips messages older than ToldRecordRetention (Loop 10)."
 - Line 623 of `../2026-11-06-attention-feed-message-bus/SCOPE.md` reads: "A message older than 7
-  days is never announced again (Loop 7 age cutoff); a snooze still returns once."
+  days is never announced again (Loop 10 age cutoff); a snooze still returns once."
 
 No property: there's no input.
 
@@ -411,7 +411,7 @@ No property: there's no input.
 
 #### TDD Cycle
 ##### 🔴 Red
-`grep -q 'Loop 7' internal/state/state_test.go` fails.
+`grep -q 'Loop 10' internal/state/state_test.go` fails.
 ##### 🟢 Green
 Add the comment and the note.
 ##### 🔵 Refactor
@@ -729,7 +729,7 @@ go test ./internal/state/ -run 'Snooze|ToldRecord' -count=1 -race
 go test ./internal/agentmail/ -run 'FlexTime' -count=1
 for i in $(seq 5); do go test ./internal/cli/ -run 'Closure_(AgeCutoff|LateSnooze|Snooze)' -count=1 || break; done
 go test -short ./...    # only the known failures (bd-5zbcm, bd-dwpes, bd-cxa1s) may fail
-grep -q 'Loop 7' internal/state/state_test.go
+grep -q 'Loop 10' internal/state/state_test.go
 gofmt -l internal/cli internal/state internal/agentmail
 ```
 

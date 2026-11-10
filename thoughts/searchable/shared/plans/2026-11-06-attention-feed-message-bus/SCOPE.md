@@ -620,7 +620,7 @@ quality_target:
 **Partial Failure:** Events held in memory during a failure aren't written to the store later. **Assumption:** they're lost when that process exits, and the report says so.
 **Interruption / Resume:** A hook killed before responding leaves a claim with no reminder. The Agent Mail message stays unread and visible, but it won't be announced again. **Assumption:** this rare case is accepted. It may be revisited if Evidence Needed item 6 shows it happens in practice.
 **Cancellation:** Not applicable.
-**Retention / Deletion:** Events and told records expire after 7 days, through the existing cleanup. A message older than 7 days is never announced again (Loop 7 age cutoff); a snooze still returns once.
+**Retention / Deletion:** Events and told records expire after 7 days, through the existing cleanup. A message older than 7 days is never announced again (age cutoff, `2026-11-10-reminder-age-cutoff` Loop 10); a snooze still returns once.
 **Saved-Data Compatibility:** A numbered migration adds the new columns and table. Existing rows have no recipient.
 
 ---

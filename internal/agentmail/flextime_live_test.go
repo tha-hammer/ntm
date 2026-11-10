@@ -65,7 +65,7 @@ func readLiveExpected(t *testing.T) map[int]liveExpected {
 	return want
 }
 
-// Loop 7, Behavior 7: a fetch_inbox response captured from the live Agent
+// Loop 10, Behavior 7: a fetch_inbox response captured from the live Agent
 // Mail, served unchanged to the real FetchInbox, decodes each created_ts to
 // the UTC instant recorded next to the fixture.
 func TestFlexTime_LiveFetchInboxCreatedTS(t *testing.T) {

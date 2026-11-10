@@ -69,6 +69,6 @@ Solved when:
    a. As one small loop with one or two sprints, added to the existing attention-feed plan's numbering
       (suggested)
    b. As a standalone project in this new folder
-   **Answer:** a. One small loop (one or two sprints), numbered after the attention-feed plan's loops (Loop 7).
+   **Answer:** a. One small loop (one or two sprints), numbered after the attention-feed plan's loops (written as Loop 7; renumbered Loop 10 on merge, 2026-11-10).
 
 **Deliverables:** kept as listed. **Next:** write the scope.

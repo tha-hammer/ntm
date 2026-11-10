@@ -253,7 +253,7 @@ func TestMailToAnnounce(t *testing.T) {
 }
 
 // Behavior 11 property: the result is the fetched mail minus active snoozes,
-// plus ended snoozes, each id once. Loop 7, Behavior 2: with a random
+// plus ended snoozes, each id once. Loop 10, Behavior 2: with a random
 // created time per message, plain mail too old to announce is left out too.
 func TestMailToAnnounce_Property(t *testing.T) {
 	now := time.Now().UTC()
@@ -345,7 +345,7 @@ func TestClaimUnread_EndedSnooze(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 2: the shared step leaves out plain mail more than
+// Loop 10, Behavior 2: the shared step leaves out plain mail more than
 // ToldRecordRetention old, keeps mail with no time or a future time, in order,
 // and does so even when the snoozes can't be read.
 func TestMailToAnnounce_AgeCutoff(t *testing.T) {
@@ -365,7 +365,7 @@ func TestMailToAnnounce_AgeCutoff(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 9: a message back from a snooze is kept whatever its age,
+// Loop 10, Behavior 9: a message back from a snooze is kept whatever its age,
 // once, marked ended, as the fetched message in its fetched place.
 func TestMailToAnnounce_EndedSnoozeIgnoresAge(t *testing.T) {
 	now := time.Now().UTC()

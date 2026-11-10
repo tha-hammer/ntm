@@ -116,7 +116,7 @@ func TestSnoozeAddressedMessage_IdempotentProperty(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		next++
 		cursor := mailEvent(t, store, now, "/p", "BlueLake", next, "RedStone", "s")
-		// A fresh notice expires in 7 days, so the latest snooze is SnoozeReturnMargin before that (Loop 7).
+		// A fresh notice expires in 7 days, so the latest snooze is SnoozeReturnMargin before that (Loop 10).
 		until := now.Add(time.Duration(rapid.Int64Range(1, int64((SnoozeLimit-SnoozeReturnMargin)/time.Second)).Draw(rt, "seconds")) * time.Second)
 		if _, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", next, until, now)); err != nil {
 			rt.Fatal(err)
@@ -277,7 +277,7 @@ func TestSnoozeAddressedMessage_EventExpiry(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 11: a snooze must end SnoozeReturnMargin before its notice
+// Loop 10, Behavior 11: a snooze must end SnoozeReturnMargin before its notice
 // expires, so the notice is still there to show the snooze ended.
 func TestSnoozeAddressedMessage_ReturnMargin(t *testing.T) {
 	store := testRuntimeAttentionStore(t)

@@ -1,7 +1,7 @@
 # Loop plan: reminder age cutoff
 
 Scope: `SCOPE.md` (this folder). The deliverable numbers refer to SCOPE.md section 6, "Required Deliverables".
-Numbering continues the attention-feed plan (`2026-11-06-attention-feed-message-bus`), which ends at Loop 6.
+Numbering continues the attention-feed plan (`2026-11-06-attention-feed-message-bus`), which has Loops 1 to 9 (its Loop 7 is the Codex turn-end push). This plan is Loop 10; it was written as Loop 7 and renumbered when merged (2026-11-10).
 
 ## 1. Loops
 
@@ -14,7 +14,7 @@ the cutoff exists.
 
 ## 2. Sprints
 
-### Loop 7 — Reminder age cutoff
+### Loop 10 — Reminder age cutoff
 
 **Sprint 1 — Old mail stays quiet.** An agent with a message more than 7 days old, whose told record
 has expired, gets no reminder for it at turn end or from the idle nudge. A message 6 days old with

@@ -1,7 +1,7 @@
 # Reminder Age Cutoff — Product Scope
 
 Scope version: 1.0 (2026-11-10)
-Intended release: Loop 7 of the attention-feed plan
+Intended release: Loop 10 of the attention-feed plan
 (`thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus`), one small loop.
 
 ## 0. Overview and Release Boundary
@@ -172,7 +172,7 @@ are announced.
 | Missing time is announced | Confirmed | mailToAnnounce | Q2 answer | Maceo |
 | Pin parsing to a captured real response | Confirmed | agentmail tests | Q3 answer | Maceo |
 | The feed skips old messages | Confirmed | hook | Q4 answer | Maceo |
-| One loop (Loop 7) | Confirmed | plan | Q5 answer | Maceo |
+| One loop (Loop 10) | Confirmed | plan | Q5 answer | Maceo |
 | The cutoff lives in `mailToAnnounce`, not in `unreadMessages` | **Assumption** | code | `mailToAnnounce` is the only step that knows which items are ended snoozes | planning agent |
 | The comparison is strict (`>`), so a message exactly 7 days old is kept | **Assumption** | Age Cutoff Rule | lines up with `ClaimToldRecord`'s expiry boundary | planning agent |
 | The nudge's own feed recording (`Record` dep) follows the same list | **Assumption** | nudge | same reason as the hook | planning agent |

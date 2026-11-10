@@ -1,4 +1,4 @@
-# Loop 7 — behavior list (step 4b)
+# Loop 10 — behavior list (step 4b)
 
 Loop document: [07-reminder-age-cutoff.md](07-reminder-age-cutoff.md). Repository: `/home/maceo/Dev/ntm`.
 Test framework: Go `testing`, with `pgregory.net/rapid` (already in go.mod) for property tests, and the

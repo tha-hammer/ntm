@@ -13,7 +13,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
-// Loop 7, Behavior 1: a message is too old to announce only when it has a
+// Loop 10, Behavior 1: a message is too old to announce only when it has a
 // time and that time is more than ToldRecordRetention before now.
 func TestTooOldToAnnounce(t *testing.T) {
 	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
@@ -88,7 +88,7 @@ func (e *closureEnv) stopHook(t *testing.T) string {
 	return e.runWithStdin(t, "{}", "execute", "agent-hook", "stop", "--project", e.workDir)
 }
 
-// Loop 7, Behavior 3: at turn end the hook says nothing about a message more
+// Loop 10, Behavior 3: at turn end the hook says nothing about a message more
 // than 7 days old whose told record has expired, rewrites no told record, and
 // records no feed notice for it.
 func TestClosure_AgeCutoffHookQuiet(t *testing.T) {
@@ -112,7 +112,7 @@ func TestClosure_AgeCutoffHookQuiet(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 4: the idle nudge types nothing about a message more than
+// Loop 10, Behavior 4: the idle nudge types nothing about a message more than
 // 7 days old whose told record has expired, over at least 5 polls, and leaves
 // its told record alone. A fresh message sent afterwards is still typed, so
 // the quiet window isn't a stalled monitor.
@@ -144,7 +144,7 @@ func TestClosure_AgeCutoffNudgeQuiet(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 5: a message 6 days old with no told record is still told
+// Loop 10, Behavior 5: a message 6 days old with no told record is still told
 // at turn end, once.
 func TestClosure_AgeCutoffYoungMessageTold(t *testing.T) {
 	env, mail := newHookClosure(t, "agecut", "BlueLake")
@@ -162,7 +162,7 @@ func TestClosure_AgeCutoffYoungMessageTold(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 6 (Sprint 1 failure check): a message dated 1 hour in the
+// Loop 10, Behavior 6 (Sprint 1 failure check): a message dated 1 hour in the
 // future is announced, with no warning in the hook log, and the told record
 // and notice an earlier run left for another message don't change.
 func TestClosure_AgeCutoffFutureTimeTold(t *testing.T) {
@@ -219,7 +219,7 @@ func (e *closureEnv) openStore(t *testing.T) *state.Store {
 	return store
 }
 
-// Loop 7, Behavior 10: an ended snooze for a message that isn't in the fetch
+// Loop 10, Behavior 10: an ended snooze for a message that isn't in the fetch
 // is told at turn end once, with the sender and subject its notice saved.
 func TestClosure_EndedSnoozeOutsideFetchTold(t *testing.T) {
 	env, mail := newHookClosure(t, "agecut", "BlueLake")
@@ -243,7 +243,7 @@ func (e *closureEnv) seedNotice(t *testing.T, project, agent string, id int64, f
 	return seedMailNotice(t, e.openStore(t), project, agent, id, from, subject, expires.Add(-7*24*time.Hour), expires)
 }
 
-// Loop 7, Behavior 11 (Sprint 2 failure check): ntm mail snooze refuses a
+// Loop 10, Behavior 11 (Sprint 2 failure check): ntm mail snooze refuses a
 // time less than SnoozeReturnMargin before the notice expires, and changes
 // neither the snooze state nor the told record. The latest allowed time is
 // accepted.
@@ -283,7 +283,7 @@ func TestClosure_SnoozeMarginRefused(t *testing.T) {
 	}
 }
 
-// Loop 7, Behavior 12 (closure b): a message more than 7 days old, snoozed
+// Loop 10, Behavior 12 (closure b): a message more than 7 days old, snoozed
 // through ntm mail snooze until the latest time its notice allows, comes back
 // in exactly one reminder from the idle nudge, and never again: not over 5
 // more polls, and not at the next turn end.

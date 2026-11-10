@@ -2675,7 +2675,7 @@ func randomCase(rt *rapid.T, name string) string {
 }
 
 // Reminders don't repeat after expiry: mailToAnnounce skips messages older than
-// ToldRecordRetention (Loop 7).
+// ToldRecordRetention (Loop 10).
 func TestClaimToldRecord_ExpiredClaimWinsAgain(t *testing.T) {
 	store := testRuntimeAttentionStore(t)
 	now := time.Now().UTC()

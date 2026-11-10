@@ -1,4 +1,4 @@
-# Loop 7 — Reminder age cutoff
+# Loop 10 — Reminder age cutoff
 
 ## Overview
 

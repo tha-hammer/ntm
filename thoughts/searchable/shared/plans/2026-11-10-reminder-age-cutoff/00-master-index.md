@@ -11,7 +11,7 @@ old is never announced. A message returning from an ended snooze is always kept,
 Messages with a missing or future time are announced.
 
 Full scope: [SCOPE.md](SCOPE.md). Loop plan: [LOOP_PLAN.md](LOOP_PLAN.md).
-Numbering continues the attention-feed plan (`../2026-11-06-attention-feed-message-bus`), which ends at Loop 6.
+Numbering continues the attention-feed plan (`../2026-11-06-attention-feed-message-bus`), which has Loops 1 to 9 (its Loop 7 is the Codex turn-end push). This plan is Loop 10; it was written as Loop 7 and renumbered when merged (2026-11-10).
 
 ## Sprint rule
 
@@ -26,7 +26,7 @@ Each sprint ends with 1 human-testable function, and only 1. It is used at its r
 
 ## Loop summaries
 
-**Loop 7 — Reminder age cutoff.**
+**Loop 10 — Reminder age cutoff.**
 - Sprint 1, "Old mail stays quiet": the cutoff, the rules for missing and future times, the pinned
   `created_ts` parsing, and closure tests (a) and (c).
 - Sprint 2, "A late snooze still returns": the snooze exemption, and closure test (b), a snooze that
@@ -34,6 +34,6 @@ Each sprint ends with 1 human-testable function, and only 1. It is used at its r
 
 ## Order
 
-Loop 7 needs only what Loops 3 to 6 of the attention-feed plan already built: told records (Loop 3),
+Loop 10 needs only what Loops 3 to 6 of the attention-feed plan already built: told records (Loop 3),
 the idle nudge (Loop 5), and snooze and return (Loop 6). Inside the loop, Sprint 2 needs Sprint 1's
 cutoff, because the exemption only matters once the cutoff exists.
