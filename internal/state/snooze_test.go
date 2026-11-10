@@ -116,7 +116,8 @@ func TestSnoozeAddressedMessage_IdempotentProperty(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		next++
 		cursor := mailEvent(t, store, now, "/p", "BlueLake", next, "RedStone", "s")
-		until := now.Add(time.Duration(rapid.Int64Range(1, 7*24*3600).Draw(rt, "seconds")) * time.Second)
+		// A fresh notice expires in 7 days, so the latest snooze is SnoozeReturnMargin before that (Loop 7).
+		until := now.Add(time.Duration(rapid.Int64Range(1, int64((SnoozeLimit-SnoozeReturnMargin)/time.Second)).Draw(rt, "seconds")) * time.Second)
 		if _, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", next, until, now)); err != nil {
 			rt.Fatal(err)
 		}
@@ -264,7 +265,8 @@ func TestSnoozeAddressedMessage_EventExpiry(t *testing.T) {
 	expires := now.Add(2 * 24 * time.Hour)
 
 	_, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", 42, now.Add(3*24*time.Hour), now))
-	if !errors.Is(err, ErrSnoozePastNotice) || !strings.Contains(err.Error(), "message 42's notice expires at "+expires.Format(time.RFC3339)) {
+	if !errors.Is(err, ErrSnoozePastNotice) || !strings.Contains(err.Error(), "message 42's notice expires at "+expires.Format(time.RFC3339)+
+		"; snooze until "+expires.Add(-SnoozeReturnMargin).Format(time.RFC3339)+" at the latest") {
 		t.Fatalf("past the notice: %v", err)
 	}
 	if item, _ := store.GetAttentionItemStateByCursor(cursor); item != nil {
@@ -273,6 +275,45 @@ func TestSnoozeAddressedMessage_EventExpiry(t *testing.T) {
 	if _, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", 42, now.Add(24*time.Hour), now)); err != nil {
 		t.Fatalf("within the notice: %v", err)
 	}
+}
+
+// Loop 7, Behavior 11: a snooze must end SnoozeReturnMargin before its notice
+// expires, so the notice is still there to show the snooze ended.
+func TestSnoozeAddressedMessage_ReturnMargin(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	cursor := mailEvent(t, store, now.Add(-5*24*time.Hour), "/p", "BlueLake", 42, "RedStone", "old")
+	expires := now.Add(2 * 24 * time.Hour)
+
+	_, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", 42, expires.Add(-30*time.Minute), now))
+	want := "snooze would end after its notice expires: message 42's notice expires at " + expires.Format(time.RFC3339) +
+		"; snooze until " + expires.Add(-time.Hour).Format(time.RFC3339) + " at the latest"
+	if !errors.Is(err, ErrSnoozePastNotice) || err.Error() != want {
+		t.Fatalf("30 minutes before the notice expires: %v; want %q", err, want)
+	}
+	if item, _ := store.GetAttentionItemStateByCursor(cursor); item != nil {
+		t.Fatalf("a rejected snooze wrote state: %+v", item)
+	}
+	if _, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", 42, expires.Add(-SnoozeReturnMargin), now)); err != nil {
+		t.Fatalf("at the latest allowed time: %v", err)
+	}
+}
+
+// Behavior 11 property: a snooze until a time in (now, E] is accepted exactly
+// when it ends at least SnoozeReturnMargin before the notice expires at E.
+func TestSnoozeAddressedMessage_ReturnMarginProperty(t *testing.T) {
+	store := testRuntimeAttentionStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	mailEvent(t, store, now.Add(-5*24*time.Hour), "/p", "BlueLake", 42, "RedStone", "old")
+	expires := now.Add(2 * 24 * time.Hour)
+	rapid.Check(t, func(rt *rapid.T) {
+		until := now.Add(time.Duration(rapid.Int64Range(1, int64(expires.Sub(now)/time.Second)).Draw(rt, "seconds")) * time.Second)
+		_, err := store.SnoozeAddressedMessage(snoozeRequest("BlueLake", 42, until, now))
+		want := !until.After(expires.Add(-SnoozeReturnMargin))
+		if (err == nil) != want || (err != nil && !errors.Is(err, ErrSnoozePastNotice)) {
+			rt.Fatalf("until %s (notice expires %s): err %v, want accepted %v", until, expires, err, want)
+		}
+	})
 }
 
 // endedSnoozeOf returns the agent's one ended snooze, failing otherwise.

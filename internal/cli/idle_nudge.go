@@ -85,13 +85,16 @@ func plainAnnounceItems(msgs []agentmail.InboxMessage) []announceItem {
 // still active, and adds those whose snooze has ended, from the store, with the
 // sender and subject their notice saved. So a returning message doesn't depend
 // on the fetch window, or on Agent Mail's read state, which it doesn't report.
-// If the snoozes can't be read, the mail is announced as it is, because a
-// repeat is better than a missed message (Fail Open).
+// Plain mail more than ToldRecordRetention old is left out (tooOldToAnnounce),
+// because Agent Mail never reports it read and its told record may have
+// expired. A message back from a snooze is kept whatever its age.
+// If the snoozes can't be read, the fetched mail is announced as it is, minus
+// what is too old, because a repeat is better than a missed message (Fail Open).
 func mailToAnnounce(store snoozeReader, project, agent string, msgs []agentmail.InboxMessage, now time.Time) []announceItem {
 	active, ended, err := store.SnoozedMessages(project, agent, now)
 	if err != nil {
 		slog.Warn("snoozes not checked", "agent", agent, "project", project, "error", err)
-		return plainAnnounceItems(msgs)
+		return plainAnnounceItems(withoutTooOld(msgs, nil, now))
 	}
 	held := make(map[int64]bool, len(active))
 	for _, s := range active {
@@ -101,6 +104,7 @@ func mailToAnnounce(store snoozeReader, project, agent string, msgs []agentmail.
 	for i := range ended {
 		back[ended[i].MessageID] = &ended[i]
 	}
+	msgs = withoutTooOld(msgs, back, now)
 	items := make([]announceItem, 0, len(msgs)+len(ended))
 	for _, msg := range msgs {
 		id := int64(msg.ID)
@@ -116,6 +120,26 @@ func mailToAnnounce(store snoozeReader, project, agent string, msgs []agentmail.
 		}
 	}
 	return items
+}
+
+// tooOldToAnnounce reports whether a message is older than a told record can
+// vouch for. A message with no time, or a time in the future, is never too old
+// (Fail Open).
+func tooOldToAnnounce(created, now time.Time) bool {
+	return !created.IsZero() && now.Sub(created) > state.ToldRecordRetention
+}
+
+// withoutTooOld drops fetched messages too old to announce, except those
+// returning from a snooze (keep).
+func withoutTooOld(msgs []agentmail.InboxMessage, keep map[int64]*state.SnoozedMessage, now time.Time) []agentmail.InboxMessage {
+	out := msgs[:0:0]
+	for _, m := range msgs {
+		if keep[int64(m.ID)] == nil && tooOldToAnnounce(m.CreatedTS.Time, now) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // claimAnnounce claims one item as rec: a returning snooze through

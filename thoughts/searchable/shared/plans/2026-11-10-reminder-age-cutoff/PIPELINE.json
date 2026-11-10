@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "project": "2026-11-10-reminder-age-cutoff",
+  "type": "code",
+  "output_folder": "/home/maceo/Dev/ntm/thoughts/searchable/shared/plans/2026-11-10-reminder-age-cutoff",
+  "repository": "/home/maceo/Dev/ntm",
+  "scope_input": "Scope this project.\nRequest: Fix the slow repeat in ntm's mail reminders. Told records expire after 7 days and Agent Mail never reports read state, so a message the agent read long ago but still among its 50 newest is announced again about every 7 days, forever. Never announce a plain inbox message older than the 7-day told retention, in mailToAnnounce (shared by the Stop hook and the idle nudge), but always keep a message returning from an ended snooze, even when it is just past 7 days old (a snooze may end at its notice's expiry, which is ntm's notice time plus 7 days). Pin how Agent Mail's created_ts is parsed (time zone). Add a closure test: a snooze ending at the notice expiry still returns exactly once.\nType: code\nSources: /home/maceo/Dev/ntm (internal/cli/idle_nudge.go mailToAnnounce and claimAnnounce, internal/cli/agent_hook.go, internal/state/runtime_store.go ToldRecordRetention, ClaimToldRecord, SnoozeAddressedMessage, SnoozedMessages, ClaimEndedSnooze; test TestClaimToldRecord_ExpiredClaimWinsAgain); the existing plan thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus; Loop 6 Sprint 2 evidence on the VPS at /home/debian/Dev/ntm-test-evidence/loop6-sprint2-local-2026-11-10/\nOutput folder: /home/maceo/Dev/ntm/thoughts/searchable/shared/plans/2026-11-10-reminder-age-cutoff",
+  "run": null,
+  "cursor": {
+    "step": "build",
+    "loop": "07-reminder-age-cutoff.md"
+  },
+  "steps": {
+    "scope": {
+      "status": "done",
+      "files": [
+        "SCOPE_DRAFT.md",
+        "SCOPE.md"
+      ]
+    },
+    "loops": {
+      "status": "done",
+      "files": [
+        "LOOP_PLAN.md"
+      ]
+    },
+    "documents": {
+      "status": "done",
+      "files": [
+        "00-master-index.md"
+      ]
+    }
+  },
+  "loops": [
+    {
+      "doc": "07-reminder-age-cutoff.md",
+      "tdd_plan": "07-reminder-age-cutoff-tdd.md",
+      "status": "planned",
+      "sprints_passed": []
+    }
+  ],
+  "history": [
+    {
+      "at": "2026-11-10T13:24:05.573Z",
+      "step": "scope",
+      "event": "start"
+    },
+    {
+      "at": "2026-11-10T13:24:05.733Z",
+      "step": "scope",
+      "event": "armed (fresh)",
+      "detail": "05976ab0-e4e0-4c11-94b2-42b6147a2c5a"
+    },
+    {
+      "at": "2026-11-10T13:25:58.550Z",
+      "step": "scope",
+      "event": "started"
+    },
+    {
+      "at": "2026-11-10T13:35:15.192Z",
+      "step": "scope",
+      "event": "done",
+      "detail": "SCOPE_DRAFT.md,SCOPE.md"
+    },
+    {
+      "at": "2026-11-10T13:38:21.031Z",
+      "step": "loops",
+      "event": "armed (fresh)",
+      "detail": "05976ab0-e4e0-4c11-94b2-42b6147a2c5a"
+    },
+    {
+      "at": "2026-11-10T13:38:38.684Z",
+      "step": "loops",
+      "event": "started"
+    },
+    {
+      "at": "2026-11-10T13:40:46.720Z",
+      "step": "loops",
+      "event": "done",
+      "detail": "LOOP_PLAN.md"
+    },
+    {
+      "at": "2026-11-10T13:42:37.665Z",
+      "step": "documents",
+      "event": "armed (fresh)",
+      "detail": "05976ab0-e4e0-4c11-94b2-42b6147a2c5a"
+    },
+    {
+      "at": "2026-11-10T13:43:09.817Z",
+      "step": "documents",
+      "event": "started",
+      "detail": "00-master-index.md"
+    },
+    {
+      "at": "2026-11-10T13:48:51.362Z",
+      "step": "documents",
+      "event": "started"
+    },
+    {
+      "at": "2026-11-10T13:52:23.331Z",
+      "step": "documents",
+      "event": "done"
+    },
+    {
+      "at": "2026-11-10T13:53:34.457Z",
+      "step": "tdd",
+      "event": "armed (fresh)",
+      "detail": "05976ab0-e4e0-4c11-94b2-42b6147a2c5a"
+    },
+    {
+      "at": "2026-11-10T13:55:50.458Z",
+      "step": "tdd",
+      "event": "started",
+      "detail": "07-reminder-age-cutoff.md"
+    },
+    {
+      "at": "2026-11-10T14:47:39.700Z",
+      "step": "tdd",
+      "event": "done",
+      "detail": "07-reminder-age-cutoff.md"
+    }
+  ],
+  "created_at": "2026-11-10T13:24:05.573Z",
+  "updated_at": "2026-11-10T14:47:39.700Z"
+}
