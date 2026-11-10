@@ -5,13 +5,10 @@
   "output_folder": "/home/debian/Dev/ntm/thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus",
   "repository": "/home/debian/Dev/ntm",
   "scope_input": "Scope this project.\nRequest: We started research on my local machine. You are running on a VPS. We need to modify the existing \"attention feed\" to be better suited for a message bus. by default the \"attention feed\" is an in-memory list inside one ntm process (GetAttentionFeed, internal/robot/attention_feed.go:2956). It can be backed by SQLite so events survive restarts (attention_feed.go:399-402) and we need to make it so. We need to create a stop hook that is saved to the settings.local.json file in the ntm session creation process for the /.claude/ folder. The stop hook is what fires when the agent turn is complete and can serve as the \"push\" and/or \"check messages\" reminder.\nType: code\nSources: thoughts/searchable/shared/research/2026-11-06-09-56-agent-messaging-push-stop-hooks-agent-mail.md; repository /home/debian/Dev/ntm\nOutput folder: /home/debian/Dev/ntm/thoughts/searchable/shared/plans/2026-11-06-attention-feed-message-bus",
-  "run": {
-    "session": "ca971f3a-bdb1-4b10-9208-206026adcd94",
-    "pipeline": "planning-build"
-  },
+  "run": null,
   "cursor": {
-    "step": "build",
-    "loop": "06-agent-snooze.md"
+    "step": "tdd",
+    "loop": "07-codex-turn-end-push.md"
   },
   "steps": {
     "scope": {
@@ -91,9 +88,10 @@
     {
       "doc": "06-agent-snooze.md",
       "tdd_plan": "06-agent-snooze-tdd.md",
-      "status": "building",
+      "status": "built",
       "sprints_passed": [
-        "Sprint 1: Snooze a message"
+        "Sprint 1: Snooze a message",
+        "Sprint 2: Reminder after the snooze ends"
       ]
     },
     {
@@ -540,8 +538,20 @@
       "step": "build",
       "event": "sprint",
       "detail": "Sprint 1: Snooze a message"
+    },
+    {
+      "at": "2026-11-10T13:11:40.583Z",
+      "step": "build",
+      "event": "sprint",
+      "detail": "Sprint 2: Reminder after the snooze ends"
+    },
+    {
+      "at": "2026-11-10T13:11:40.597Z",
+      "step": "build",
+      "event": "done",
+      "detail": "06-agent-snooze-tdd.md"
     }
   ],
   "created_at": "2026-11-06T17:38:14.983Z",
-  "updated_at": "2026-11-10T02:18:02.115Z"
+  "updated_at": "2026-11-10T13:11:40.597Z"
 }

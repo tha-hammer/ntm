@@ -1028,6 +1028,21 @@ Notes for the run:
 - Make sure `idle_nudge_enabled` is back on, or removed, before step 1.
 - Step 3's note to the agent no longer matters for the result. The message returns whether or not it was read.
 
+**Result (2026-11-10), passed:** run on rocketman at `d1a6cb6d`, nudge on, with agent GrayFinch in pane `%73`.
+- **The first reminder:**
+  - At 07:37:28, mail 12525 was sent.
+  - At 07:37:51, the reminder was sent for [12525], showing "[#12525] from HumanOverseer: come back".
+- **The snooze:**
+  - At 07:38:01: "Snoozed message 12525 until 2026-11-10T12:41:01Z (in 3m)".
+  - At 07:40:07, the tail showed no new reminder.
+- **The return:**
+  - At 07:41:21, the second reminder was sent for [12525], 20 seconds after the snooze ended.
+  - Through 07:44:24 there were no more reminders. A pane watcher checking every 10 seconds counted 1, then 2, never 3. There were no Stop hook repeats.
+- **The text inbox** shows "[#12525] [URGENT] come back" (Behavior 16).
+- `told_records` has one row, `12525|idle_nudge|12:41:20Z`, updated by the return.
+- **The tester's note:** the pane title is now `returntest__cc_1`, not the agent's name as in earlier builds, and older test steps used `#{pane_title}` to find the name. Loop 6 didn't change pane titles (no commit since `e3ccd63c` touches `internal/tmux` or `spawn.go`). Claude Code sets its own terminal title, so this varies with Claude. Use the spawn output, or `AGENT_NAME` in the pane's environment, to find the name.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop6-sprint2-local-2026-11-10/`.
+
 ---
 
 ## Sprint verification (every sprint)
