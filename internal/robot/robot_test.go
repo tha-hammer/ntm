@@ -723,6 +723,33 @@ func TestPrintHelpOperatorLoopGuardrails(t *testing.T) {
 	}
 }
 
+// Loop 9, Behavior 9: --robot-help names the --robot-events filters that
+// --robot-capabilities lists, including --events-recipient (Loop 2).
+func TestPrintHelp_EventsFilters(t *testing.T) {
+	output := RenderHelp()
+	caps, err := GetCapabilities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := map[string]bool{}
+	for _, cmd := range caps.Commands {
+		if cmd.Flag != "--robot-events" {
+			continue
+		}
+		for _, param := range cmd.Parameters {
+			listed[param.Flag] = true
+		}
+	}
+	for _, filter := range []string{"--events-category", "--events-session", "--events-recipient", "--events-actionability"} {
+		if !listed[filter] {
+			t.Fatalf("--robot-capabilities doesn't list %s for --robot-events", filter)
+		}
+		if !strings.Contains(output, filter) {
+			t.Errorf("--robot-help lacks the --robot-events filter %s", filter)
+		}
+	}
+}
+
 func TestPrintHelp_AttentionLoopMatchesCapabilities(t *testing.T) {
 	output := RenderHelp()
 

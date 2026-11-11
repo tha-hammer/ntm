@@ -241,6 +241,50 @@ ntm coordinator digest payments
 ntm coordinator conflicts payments
 ```
 
+#### Mail reminders
+
+Agents spawned by NTM hear about new Agent Mail messages without checking their inbox, and
+without a dashboard or `ntm serve` running:
+
+- **At turn end.** `ntm spawn`, robot spawn and `ntm add` write a Stop hook into the work
+  folder (`.claude/settings.local.json` for Claude, `.codex/hooks.json` for Codex). When a
+  turn ends, `ntm agent-hook stop` checks Agent Mail and tells the agent about new mail,
+  with the sender and subject, so it can call `fetch_inbox`.
+- **When idle.** The session's monitor checks idle Claude and Codex agents every 30
+  seconds and types one reminder covering all their new mail. It waits while a person is
+  typing in that pane.
+- **Once per message.** The hook and the idle reminder share one record, so an agent is
+  told about each message once. Events are kept for 7 days in `state.db`, and any NTM
+  process can read them: `ntm --robot-events --events-recipient=<agent>`.
+
+An agent can put a message off until later. It's left out of reminders until then, and
+included once after:
+
+```bash
+ntm mail snooze 42 --until 30m
+ntm mail snooze 42 --until 2026-11-12T09:00:00Z
+```
+
+Both reminders are on by default when Agent Mail is enabled. Turn them off or tune them in
+`~/.config/ntm/config.toml`:
+
+```toml
+[agent_mail]
+stop_hook_enabled = true          # write and run the turn-end hook
+idle_nudge_enabled = true         # type reminders into idle agents
+idle_nudge_interval_seconds = 30  # how often the monitor checks
+human_typing_quiet_seconds = 60   # how long a person must have stopped typing
+```
+
+Projects that still register the old Agent Mail hook scripts can move to the new hook with
+`ntm agent-hook migrate`, which previews the change, and then:
+
+```bash
+ntm agent-hook migrate --apply
+```
+
+See [the migration guide](docs/agent-hook-migration.md).
+
 ### 5. Safety Policy and Approvals
 
 NTM includes a first-class safety system for destructive or sensitive actions. Policy

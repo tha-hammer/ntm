@@ -31,8 +31,12 @@ func TestRCHHookInterception(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateRCHHookEntry failed: %v", err)
 	}
+	if len(entry.Hooks) != 1 {
+		t.Fatalf("GenerateRCHHookEntry made %d handlers, want 1", len(entry.Hooks))
+	}
+	command := entry.Hooks[0].Command
 
-	cmd := exec.Command("sh", "-c", entry.Command)
+	cmd := exec.Command("sh", "-c", command)
 	cmd.Env = append(os.Environ(), "CLAUDE_TOOL_INPUT_command=go build ./...")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -50,7 +54,7 @@ func TestRCHHookInterception(t *testing.T) {
 		t.Fatalf("expected intercept invocation, got: %s", string(logData))
 	}
 
-	cmd = exec.Command("sh", "-c", entry.Command)
+	cmd = exec.Command("sh", "-c", command)
 	cmd.Env = append(os.Environ(), "CLAUDE_TOOL_INPUT_command=ls -la")
 	output, err = cmd.CombinedOutput()
 	if err != nil {

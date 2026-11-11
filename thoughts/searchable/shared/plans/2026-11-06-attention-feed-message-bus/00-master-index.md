@@ -25,7 +25,7 @@ Human tests run on this VPS, except Loop 8, Sprint 3, which runs on your local m
 | 6 | [06-agent-snooze.md](06-agent-snooze.md) | Agent snooze | 2 | Done: Sprints 1 and 2 passed |
 | 7 | [07-codex-turn-end-push.md](07-codex-turn-end-push.md) | Codex turn-end push | 2 | Done: Sprints 1 and 2 passed |
 | 8 | [08-hook-migration.md](08-hook-migration.md) | Hook migration | 3 | Done: Sprints 1 to 3 passed |
-| 9 | [09-release-journey.md](09-release-journey.md) | Release journey | 1 | Not started |
+| 9 | [09-release-journey.md](09-release-journey.md) | Release journey | 1 | Done: Sprint 1 passed (migration completeness waits on your migration) |
 
 Total: 9 loops, 26 sprints.
 

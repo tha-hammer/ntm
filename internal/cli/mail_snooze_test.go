@@ -5,16 +5,85 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"pgregory.net/rapid"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
+
+// Loop 9, Behavior 10: README's "Mail reminders" section covers the turn-end
+// hook, the idle nudge, the [agent_mail] switches and snoozing, and every key
+// and command in it is real.
+func TestREADMEMailReminders(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(data)
+	_, section, ok := strings.Cut(readme, "\n#### Mail reminders\n")
+	if !ok {
+		t.Fatal("README has no Mail reminders section")
+	}
+	if coordination := strings.Index(readme, "### 4. Coordination, Reservations, and Human Oversight"); coordination < 0 || coordination > strings.Index(readme, "#### Mail reminders") {
+		t.Fatal("the Mail reminders section isn't under Coordination, Reservations, and Human Oversight")
+	}
+	if end := strings.Index(section, "\n### "); end >= 0 {
+		section = section[:end]
+	}
+
+	tags := map[string]bool{}
+	agentMail := reflect.TypeOf(config.AgentMailConfig{})
+	for i := 0; i < agentMail.NumField(); i++ {
+		tag, _, _ := strings.Cut(agentMail.Field(i).Tag.Get("toml"), ",")
+		tags[tag] = true
+	}
+	for _, key := range []string{"stop_hook_enabled", "idle_nudge_enabled", "idle_nudge_interval_seconds", "human_typing_quiet_seconds"} {
+		if !strings.Contains(section, key) {
+			t.Errorf("the section doesn't name the switch %s", key)
+		}
+	}
+	for _, match := range regexp.MustCompile(`(?m)^([a-z_]+) = `).FindAllStringSubmatch(section, -1) {
+		if !tags[match[1]] {
+			t.Errorf("the section names %s, which isn't an [agent_mail] key", match[1])
+		}
+	}
+
+	commands := 0
+	for _, line := range strings.Split(section, "\n") {
+		line = strings.TrimSpace(line)
+		var cmd *cobra.Command
+		var rest string
+		switch {
+		case strings.HasPrefix(line, "ntm mail snooze "):
+			cmd, rest = newMailSnoozeCmd(), strings.TrimPrefix(line, "ntm mail snooze ")
+		case strings.HasPrefix(line, "ntm agent-hook migrate"):
+			cmd, rest = newAgentHookMigrateCmd(), strings.TrimPrefix(line, "ntm agent-hook migrate")
+		default:
+			continue
+		}
+		commands++
+		if err := cmd.ParseFlags(strings.Fields(rest)); err != nil {
+			t.Errorf("README command %q: %v", line, err)
+		}
+	}
+	if commands < 2 {
+		t.Errorf("the section shows %d snooze or migrate commands, want at least 2", commands)
+	}
+	if !strings.Contains(section, "(docs/agent-hook-migration.md)") {
+		t.Error("the section doesn't link docs/agent-hook-migration.md")
+	}
+}
 
 // snoozes reads an agent's active and ended snoozes from the helpers'
 // state.db, through the read the hook and the nudge use.

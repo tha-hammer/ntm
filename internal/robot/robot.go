@@ -2059,6 +2059,8 @@ If cursor expires: re-run --robot-snapshot to resync.
 
 Attention Feed Commands:
   --robot-events         Raw event replay (--since-cursor=N, --events-limit=50)
+                         Filters: --events-category, --events-session,
+                         --events-recipient=AGENT, --events-actionability
   --robot-digest         Aggregated summary of recent changes
   --robot-attention      Wait-then-digest (the one obvious tending command)
   --robot-overlay        Human handoff actuator (optionally non-blocking with --overlay-no-wait)

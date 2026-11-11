@@ -1,12 +1,13 @@
 # Attention Feed Contract
 
 > **Authoritative specification for the ntm attention feed system.**
-> This document defines the JSON semantics, event envelopes, cursor mechanics, and operator loop for AI agents consuming ntm's attention feed.
+> This document defines the JSON semantics, event envelope, cursor mechanics, and operator loop for AI agents consuming ntm's attention feed. Every field, flag, and number here is taken from the code. The test `TestAttentionContractDocMatchesCode` (internal/robot/attention_contract_doc_test.go) checks the parts that can be checked mechanically.
 
 **Status:** IMPLEMENTED
+**Contract version:** 1.2.0 (`AttentionContractVersion` in internal/robot/attention_contract.go)
 **Bead:** br-aa0nj (initial), bd-j9jo3.9.4 (refresh)
 **Created:** 2026-03-21
-**Updated:** 2026-03-26
+**Updated:** 2026-11-11
 
 ---
 
@@ -25,76 +26,95 @@ ntm does NOT provide:
 
 The attention feed is a **read-only event stream** that tells the operator "what changed" so they can decide what to do next. All actions flow through existing robot commands.
 
+`--robot-capabilities` states this boundary as machine-readable guardrails (`attention.guardrails`): `nervous_system_not_planner`, `one_obvious_tending_loop`, `cursor_resync_is_explicit`, and `unsupported_conditions_stay_explicit`.
+
 ---
 
 ## 2. The Operator Loop
 
-The canonical operator loop is:
+The canonical operator loop (the same one `--robot-help` prints) is:
 
+```text
+1. BOOTSTRAP:  ntm --robot-snapshot
+               -> full state, latest_cursor, replay_window
+2. ATTEND:     ntm --robot-attention --attention-cursor=<cursor>
+               -> sleeps until something needs attention, then returns a digest,
+                  a wake_reason, and cursor_info.next_command
+3. ACT:        ntm --robot-send=..., ntm --robot-interrupt=..., or a next_actions entry
+4. LOOP:       run cursor_info.next_command (it carries the new cursor)
+
+If CURSOR_EXPIRED: run ntm --robot-snapshot again and start from its latest_cursor.
 ```
-1. BOOTSTRAP:  snapshot → establish baseline state, get initial cursor
-2. POLL:       events?cursor=X → get new events since cursor
-3. TRIAGE:     digest/attention → get prioritized what-changed summary
-4. ACT:        robot-send, robot-interrupt, etc. → take action
-5. WAIT:       wait?condition=X → block until condition met
-6. REPEAT:     goto POLL
-```
+
+Use `--robot-events` for raw replay and debugging, and `--robot-digest` for a summary without waiting. `--robot-wait` blocks on a named pane-state or attention condition in one session.
 
 ### 2.1 Cold Start
 
-On first invocation or after context loss, an operator MUST call `--robot-snapshot` to establish baseline state. This returns:
-- Full system state (sessions, agents, beads, alerts, mail)
-- An initial cursor for subsequent `--robot-events` calls
-- Profile/defaults in effect
+On first invocation or after context loss, an operator MUST call `--robot-snapshot` to establish baseline state. The snapshot returns:
+- Full system state (`sessions`, `summary`, `work`, `beads_summary`, `alerts`, `agent_mail`, `sources`, and more)
+- `latest_cursor`: the newest event cursor, to pass as `--attention-cursor` or `--since-cursor`
+- `replay_window`: the cursor range that can still be replayed, and the retention period
+- `attention_summary`: event counts, the top action-required items, and `next_steps`
 
 ### 2.2 Cursor Expiration and Resync
 
-If a cursor expires (events have been garbage-collected), the events command returns:
+A cursor expires when the events right after it have been deleted (see §6.3). `--robot-events` then replies (real output):
 
 ```json
 {
   "success": false,
+  "timestamp": "2026-11-11T16:20:40Z",
+  "version": "1.0.0",
+  "output_format": "json",
+  "error": "cursor 1 has expired (earliest available: 9, retention: 168h0m0s)",
   "error_code": "CURSOR_EXPIRED",
-  "error": "Cursor 'evt_2026032102300000' has expired. Events before this cursor have been garbage-collected.",
-  "hint": "Call --robot-snapshot to resync full state and obtain a fresh cursor.",
-  "resync_required": true
+  "hint": "ntm --robot-snapshot",
+  "events": [],
+  "next_cursor": 0,
+  "has_more": false,
+  "replay_window": {
+    "supported": true,
+    "oldest_cursor": 9,
+    "latest_cursor": 0,
+    "event_count": 0,
+    "retention_period": "168h0m0s",
+    "resync_command": "ntm --robot-snapshot"
+  }
 }
 ```
 
-The operator MUST call `--robot-snapshot` to resync and obtain a fresh cursor.
+The operator MUST run `replay_window.resync_command` (always `ntm --robot-snapshot`) and continue from the new snapshot's `latest_cursor`. Do not guess what was missed.
 
 ---
 
 ## 3. Event Envelope
 
-All events share a normalized envelope:
+Every event, on every surface, is one `AttentionEvent` (internal/robot/attention_contract.go). Example:
 
 ```json
 {
-  "cursor": "evt_20260321023045123456",
-  "ts": "2026-03-21T02:30:45.123456Z",
+  "cursor": 1234,
+  "ts": "2026-11-11T16:18:15.775271473Z",
   "session": "myproject",
-  "pane": "0.2",
+  "pane": 2,
   "category": "agent",
-  "type": "state_change",
-  "source": "activity_detector",
+  "type": "agent.state_change",
+  "source": "state_tracker",
   "actionability": "interesting",
   "severity": "info",
-  "summary": "Agent cc_2 transitioned from busy to idle",
+  "summary": "Agent cc_2 transitioned from generating to idle",
   "details": {
-    "agent_type": "claude",
-    "previous_state": "busy",
-    "current_state": "idle",
-    "duration_sec": 342
+    "agent_id": "cc_2",
+    "from_state": "generating",
+    "to_state": "idle",
+    "signal": "agent_state_changed",
+    "signal_reason": "agent lifecycle or state changed"
   },
   "next_actions": [
     {
-      "label": "Check output",
-      "command": "ntm --robot-tail=myproject --panes=2 --lines=100"
-    },
-    {
-      "label": "Send next task",
-      "command": "ntm --robot-send=myproject --panes=2 --msg=\"...\""
+      "action": "robot-tail",
+      "args": "--robot-tail=myproject --panes=2 --lines=50",
+      "reason": "Check what the agent produced"
     }
   ]
 }
@@ -104,84 +124,46 @@ All events share a normalized envelope:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `cursor` | string | Yes | Monotonically increasing cursor for replay. Format: `evt_<timestamp_nanos>` |
-| `ts` | string | Yes | RFC3339Nano timestamp when event occurred |
-| `session` | string | No | Session name if event is session-scoped. Absent for global events. |
-| `pane` | string | No | Pane identifier (`window.pane`) if event is pane-scoped. Absent otherwise. |
+| `cursor` | integer (int64) | Yes | Position in the event sequence, e.g. `1234`. Strictly increasing. See §6. |
+| `ts` | string | Yes | RFC3339 UTC timestamp (usually with nanoseconds) when the event occurred |
+| `session` | string | No | Session name if the event is session-scoped. Absent for system-wide events. |
+| `recipient_project` | string | No | Agent Mail project key a mail event is addressed to. Absent on other events. See §16. |
+| `recipient_agent` | string | No | Agent Mail agent name a mail event is addressed to. Absent on other events. See §16. |
+| `message_id` | integer (int64) | No | Agent Mail message id of an addressed mail event. Absent on other events. See §16. |
+| `pane` | integer | No | Pane index if the event is pane-scoped. Omitted when 0, so pane 0 and "no pane" look the same. |
 | `category` | string | Yes | Event category. See §3.2 |
-| `type` | string | Yes | Event type within category. See §3.2 |
-| `source` | string | Yes | Component that generated event (e.g., `activity_detector`, `health_monitor`, `bead_tracker`) |
-| `actionability` | string | Yes | See §4 |
+| `type` | string | Yes | Event type, written `category.name` (e.g. `agent.state_change`). See §3.2 |
+| `source` | string | No | Component that generated the event (e.g. `agent_mail`, `state_tracker`, `conflict_detector`, `adapter.work_coordination`) |
+| `actionability` | string | Yes | `background`, `interesting`, or `action_required`. See §4 |
 | `severity` | string | Yes | `debug`, `info`, `warning`, `error`, `critical` |
+| `reason_code` | string | No | Machine-readable reason (e.g. `health:ok`), so consumers can classify without parsing `summary` |
 | `summary` | string | Yes | Human-readable one-line summary |
-| `details` | object | No | Event-specific structured data. Schema varies by type. |
-| `next_actions` | array | No | Mechanical follow-up commands. See §5. |
+| `details` | object | No | Event-specific structured data. Keys vary by type. |
+| `next_actions` | array of NextAction | No | Mechanical follow-up commands. Omitted when there are none. See §5. |
+
+`details` is free-form, but replayed events usually carry operator-state annotations such as `attention_state`, `attention_item_key`, `attention_fingerprint`, and `attention_explanation_code`. Many events also carry `signal` and `signal_reason`, which the wait conditions in §7.4 match on.
 
 ### 3.2 Event Categories and Types
 
-**Category: `agent`**
-| Type | Description |
-|------|-------------|
-| `state_change` | Agent transitioned between idle/busy/error/compacting |
-| `output_detected` | New output appeared in agent pane |
-| `error_detected` | Error pattern detected in output |
-| `compaction_started` | Agent began context compaction |
-| `compaction_completed` | Agent finished context compaction |
-| `crash_detected` | Agent process appears to have crashed |
-| `restart_required` | Agent needs restart (e.g., rate limit hit) |
+Categories (the `EventCategory` constants): `session`, `pane`, `agent`, `actuation`, `file`, `mail`, `bead`, `system`, `alert`, `incident`, `health`.
 
-**Category: `session`**
-| Type | Description |
-|------|-------------|
-| `created` | New session spawned |
-| `attached` | Session attached |
-| `detached` | Session detached |
-| `killed` | Session terminated |
-| `agent_added` | New agent pane added |
-| `agent_removed` | Agent pane removed |
+Types the code defines (`EventType` constants):
 
-**Category: `bead`**
-| Type | Description |
-|------|-------------|
-| `ready` | Bead became ready (blockers cleared) |
-| `claimed` | Bead claimed by an agent |
-| `closed` | Bead closed |
-| `blocked` | Bead became blocked |
-| `priority_changed` | Bead priority changed |
+| Category | Types |
+|----------|-------|
+| `session` | `session.created`, `session.destroyed`, `session.attached`, `session.detached` |
+| `pane` | `pane.created`, `pane.destroyed`, `pane.output`, `pane.resized`, `pane.context_hot` |
+| `agent` | `agent.started`, `agent.stopped`, `agent.state_change`, `agent.error`, `agent.handoff`, `agent.stalled`, `agent.recovered`, `agent.compacted`, `agent.idle`, `agent.prompt_wait` |
+| `actuation` | `actuation.requested`, `actuation.outcome`, `actuation.verified` |
+| `file` | `file.changed`, `file.conflict`, `file.reserved`, `file.released` |
+| `mail` | `mail.received`, `mail.ack_required`, `mail.acknowledged`, `mail.unread` |
+| `bead` | `bead.created`, `bead.updated`, `bead.closed`, `bead.unblocked` |
+| `system` | `system.startup`, `system.shutdown`, `system.health_change`, `system.cursor_reset`, `system.spawn`, `system.heartbeat` (live only, see §10.1) |
+| `alert` | `alert.attention_required`, `alert.warning`, `alert.info`, `alert.generic` |
+| `incident` | `incident.opened`, `incident.promoted`, `incident.recurred`, `incident.resolved`, `incident.muted` |
+| `health` | `health.change` |
 
-**Category: `mail`**
-| Type | Description |
-|------|-------------|
-| `received` | New mail received |
-| `ack_requested` | Message requires acknowledgment |
-| `thread_updated` | Thread received new message |
-
-**Category: `alert`**
-| Type | Description |
-|------|-------------|
-| `raised` | New alert raised |
-| `cleared` | Alert condition cleared |
-| `escalated` | Alert escalated in severity |
-
-**Category: `conflict`**
-| Type | Description |
-|------|-------------|
-| `file_conflict` | Multiple agents editing same file |
-| `reservation_conflict` | File reservation conflict |
-
-**Category: `health`**
-| Type | Description |
-|------|-------------|
-| `degraded` | System health degraded |
-| `recovered` | System health recovered |
-| `quota_warning` | API quota approaching limit |
-| `quota_exceeded` | API quota exceeded |
-
-**Category: `system`**
-| Type | Description |
-|------|-------------|
-| `heartbeat` | Periodic liveness signal (see §10) |
-| `cursor_expiry_warning` | Cursor approaching expiration |
+There is also `reservation.conflict`. Treat unknown categories and types as forward-compatible additions, not errors.
 
 ---
 
@@ -191,25 +173,23 @@ Events are classified by how urgently they demand operator attention:
 
 | Class | Meaning | Examples |
 |-------|---------|----------|
-| `background` | Informational, no action typically needed | Agent became idle, session attached, heartbeat |
-| `interesting` | Worth noticing but not urgent | Agent output detected, bead ready, mail received |
-| `action_required` | Demands prompt operator decision | Error detected, quota exceeded, conflict, crash |
+| `background` | Informational, no action typically needed | Source health OK, agent started generating, heartbeat |
+| `interesting` | Worth noticing but not urgent | Agent became idle, new mail (`mail.received`) |
+| `action_required` | Cannot be resolved without the operator | Agent error, file conflict, mail that needs an ack (`mail.ack_required`) |
 
-**Important:** Actionability is NOT the same as severity. A `warning` severity event might be `background` (e.g., quota at 80%), while an `info` severity event might be `action_required` (e.g., explicit approval request).
+**Important:** Actionability is NOT the same as severity. A high-severity event may resolve itself, and a low-severity event may block progress. Severity order, lowest first: `debug`, `info`, `warning`, `error`, `critical`.
 
 ---
 
 ## 5. Next Actions
 
-The `next_actions` array provides mechanical follow-up commands. These are NOT suggestions or heuristics—they are concrete robot commands that make sense as immediate responses.
+The `next_actions` array lists mechanical follow-up commands. They are not suggestions or heuristics. Each one is a robot command that makes sense as an immediate response.
 
 ### 5.1 Rules
 
-1. **Must be executable:** Each action must be a valid ntm robot command.
-2. **Must be self-contained:** No placeholders or `...` that require operator inference.
-3. **Must point to real surfaces:** Only reference commands that exist in `--robot-capabilities`.
-4. **Must be mechanically derivable:** If the action requires judgment, omit it.
-5. **No hypothetical commands:** Never suggest commands that might exist in the future.
+1. **Real surfaces only:** the feed drops any action whose `action` name is not on its allow-list: `robot-attention`, `robot-bead-show`, `robot-context`, `robot-diff`, `robot-digest`, `robot-events`, `robot-graph`, `robot-inspect-coordination`, `robot-mail-check`, `robot-plan`, `robot-send`, `robot-snapshot`, `robot-status`, `robot-tail`, `robot-watch-bead`.
+2. **Copy-paste ready:** `args` is the full flag string. Run it as `ntm <args>`.
+3. **Mechanically derivable:** if an action would need judgment, it is left out.
 
 ### 5.2 Structure
 
@@ -217,14 +197,14 @@ The `next_actions` array provides mechanical follow-up commands. These are NOT s
 {
   "next_actions": [
     {
-      "label": "Check agent output",
-      "command": "ntm --robot-tail=myproject --panes=2 --lines=50",
-      "rationale": "Agent just finished work"
+      "action": "robot-mail-check",
+      "args": "--robot-mail-check --mail-project=/home/you/projects/myproject --mail-status=unread --mail-agent=BlueLake",
+      "reason": "Inspect the unread message"
     },
     {
-      "label": "Diagnose error",
-      "command": "ntm --robot-diagnose=myproject --pane=2",
-      "rationale": "Error pattern detected"
+      "action": "robot-diff",
+      "args": "--robot-diff=myproject",
+      "reason": "Compare agent changes"
     }
   ]
 }
@@ -232,9 +212,11 @@ The `next_actions` array provides mechanical follow-up commands. These are NOT s
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `label` | string | Yes | Short human-readable action name |
-| `command` | string | Yes | Complete ntm command to execute |
-| `rationale` | string | No | Brief explanation why this action is relevant |
+| `action` | string | Yes | Robot command name, without `--` (e.g. `robot-tail`) |
+| `args` | string | Yes | Complete flags for that command |
+| `reason` | string | No | Why this action is relevant |
+
+The same `NextAction` shape is used by `attention_summary.next_steps` in the snapshot.
 
 ---
 
@@ -242,33 +224,55 @@ The `next_actions` array provides mechanical follow-up commands. These are NOT s
 
 ### 6.1 Format
 
-Cursors are opaque strings with the format: `evt_<timestamp_nanos>`
+A cursor is a 64-bit integer, for example `1234`. Cursors are assigned by the SQLite store (an AUTOINCREMENT column in `state.db`), so every ntm process that shares the store shares one cursor sequence. A feed with no store counts in memory.
 
-Example: `evt_20260321023045123456789`
+Two values are reserved when you pass a cursor in:
+- `0` means "from the beginning" (everything still retained).
+- `-1` means "from now" (skip history). Snapshot `latest_cursor` is the usual way to start from now.
 
 ### 6.2 Properties
 
-1. **Monotonically increasing:** cursor A < cursor B iff A's timestamp < B's timestamp
-2. **Globally ordered:** Cursors are ordered across all event sources
-3. **Replay-safe:** Requesting events with cursor X returns all events with cursor > X
-4. **Idempotent:** Same cursor always returns same events (modulo garbage collection)
+1. **Strictly increasing:** a later event always has a larger cursor.
+2. **Gaps allowed:** cursors can skip values (filtered or deleted events).
+3. **Replay-safe:** asking for events after cursor X returns events with cursor > X, in cursor order.
+4. **Resumable:** pass `next_cursor` (events), `cursor_info.end_cursor` (attention), or `cursor_info.next_cursor` (wait) to the next call.
 
 ### 6.3 Retention and Expiration
 
-- Events are retained for at least **7 days** after generation
-- Retention may be extended based on system load and storage
-- When a cursor expires, `CURSOR_EXPIRED` error is returned (see §2.2)
+- Events are kept for **7 days** after they are written (`RetentionPeriod` in `DefaultAttentionFeedConfig()`, reported as `"retention_period": "168h0m0s"`).
+- Expired rows are deleted when a replay reads the store. A feed with no store also caps its in-memory journal at 10,000 events.
+- A cursor is expired when it is older than the event just before the oldest one kept (`since_cursor < oldest_cursor - 1`). `0` and `-1` never expire.
+- On expiry, commands return `CURSOR_EXPIRED` (see §2.2 and §12.2).
 
 ### 6.4 Cursor in Snapshot
 
-`--robot-snapshot` always returns a `cursor` field representing the current event position:
+`--robot-snapshot` returns `latest_cursor` and `replay_window` (real output, trimmed):
 
 ```json
 {
   "success": true,
-  "cursor": "evt_20260321023045123456789",
-  "ts": "2026-03-21T02:30:45Z",
-  "sessions": [...]
+  "timestamp": "2026-11-11T16:18:56Z",
+  "version": "1.0.0",
+  "output_format": "json",
+  "schema_id": "ntm:robot:snapshot:v1",
+  "schema_version": "ntm.robot.snapshot.v1",
+  "ts": "2026-11-11T16:18:56Z",
+  "attention_contract_version": "1.2.0",
+  "latest_cursor": 13,
+  "replay_window": {
+    "supported": true,
+    "reason": "ready",
+    "oldest_cursor": 9,
+    "latest_cursor": 13,
+    "event_count": 5,
+    "oldest_timestamp": "2026-11-11T15:05:31.989416597Z",
+    "latest_timestamp": "2026-11-11T16:18:54.464172245Z",
+    "retention_period": "168h0m0s",
+    "resync_command": "ntm --robot-snapshot"
+  },
+  "sessions": [
+    ...
+  ]
 }
 ```
 
@@ -276,234 +280,427 @@ Example: `evt_20260321023045123456789`
 
 ## 7. Command Cluster
 
+All flags below are listed in `ntm --robot-capabilities`.
+
 ### 7.1 `--robot-snapshot`
 
-Full state dump with cursor for subsequent event polling.
+Full state dump with the cursor for later polling.
 
 ```bash
 ntm --robot-snapshot
-ntm --robot-snapshot --since=2026-03-21T00:00:00Z  # Delta since timestamp
+ntm --robot-snapshot --since=2026-11-11T00:00:00Z
 ```
 
-**Response:**
+With `--since=<RFC3339>` the snapshot is a delta of state-tracker changes (`ts`, `since`, `changes`). A delta has no cursor; use `--robot-events` for cursor-based change history.
+
+**Response (trimmed):**
 ```json
 {
   "success": true,
-  "timestamp": "2026-03-21T02:30:45Z",
-  "cursor": "evt_20260321023045123456789",
-  "ts": "2026-03-21T02:30:45Z",
-  "sessions": [...],
-  "beads_summary": {...},
-  "agent_mail": {...},
-  "alerts": [...],
-  "alerts_detailed": [...],
-  "profile": {
-    "name": "default",
-    "description": "Standard monitoring profile"
+  "timestamp": "2026-11-11T16:18:56Z",
+  "version": "1.0.0",
+  "schema_id": "ntm:robot:snapshot:v1",
+  "ts": "2026-11-11T16:18:56Z",
+  "attention_contract_version": "1.2.0",
+  "latest_cursor": 13,
+  "replay_window": {
+    "supported": true,
+    "oldest_cursor": 9,
+    "latest_cursor": 13,
+    "retention_period": "168h0m0s",
+    "resync_command": "ntm --robot-snapshot"
   },
-  "_agent_hints": {...}
-}
-```
-
-### 7.2 `--robot-events`
-
-Incremental event stream since cursor.
-
-```bash
-ntm --robot-events --cursor=evt_20260321023045123456789
-ntm --robot-events --cursor=evt_... --limit=100
-ntm --robot-events --cursor=evt_... --category=agent,bead
-ntm --robot-events --cursor=evt_... --actionability=action_required
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "timestamp": "2026-03-21T02:31:00Z",
-  "cursor": "evt_20260321023100987654321",
-  "events": [
-    { /* event envelope */ },
-    { /* event envelope */ }
+  "sessions": [
+    ...
   ],
-  "has_more": false,
-  "retention_expires_at": "2026-03-21T03:30:45Z"
-}
-```
-
-**Parameters:**
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--cursor` | string | Required | Cursor from previous snapshot/events call |
-| `--limit` | int | 100 | Max events to return |
-| `--category` | string | all | Comma-separated category filter |
-| `--actionability` | string | all | Filter: `background`, `interesting`, `action_required` |
-| `--severity` | string | all | Filter: `debug`, `info`, `warning`, `error`, `critical` |
-| `--session` | string | all | Filter to specific session |
-
-### 7.3 `--robot-digest`
-
-Token-efficient summary of what changed since cursor.
-
-```bash
-ntm --robot-digest --cursor=evt_20260321023045123456789
-ntm --robot-digest --cursor=evt_... --format=terse
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "timestamp": "2026-03-21T02:31:00Z",
-  "cursor": "evt_20260321023100987654321",
-  "digest": {
-    "period_start": "2026-03-21T02:30:45Z",
-    "period_end": "2026-03-21T02:31:00Z",
-    "event_count": 12,
+  "summary": {
+    "total_sessions": 2,
+    "total_agents": 4
+  },
+  "alerts": [],
+  "attention_summary": {
+    "total_events": 5,
+    "action_required_count": 0,
+    "interesting_count": 0,
     "by_category": {
-      "agent": 5,
-      "bead": 3,
-      "alert": 2,
-      "health": 2
+      "health": 5
     },
-    "by_actionability": {
-      "background": 8,
-      "interesting": 3,
-      "action_required": 1
-    },
-    "highlights": [
-      "Agent cc_2 finished task (idle after 5m42s)",
-      "Bead br-xyz became ready",
-      "Alert: quota at 85%"
+    "unsupported_signals": [
+      "bead_orphaned"
     ],
-    "action_required_summary": [
+    "next_steps": [
       {
-        "event_type": "alert.raised",
-        "summary": "API quota at 85% - consider throttling",
-        "command": "ntm --robot-diagnose=myproject"
+        "action": "robot-events",
+        "args": "--robot-events --since-cursor=13 --events-limit=20",
+        "reason": "Continue following new attention events from the snapshot cursor"
+      },
+      {
+        "action": "robot-snapshot",
+        "args": "--robot-snapshot",
+        "reason": "Resync if a saved cursor falls outside the current replay window"
       }
     ]
   }
 }
 ```
 
-### 7.4 `--robot-wait`
+### 7.2 `--robot-events`
 
-Block until a named condition is met.
+Raw event replay after a cursor.
 
 ```bash
-ntm --robot-wait=myproject --condition=idle --timeout=5m
-ntm --robot-wait=myproject --condition=any_output --timeout=2m
-ntm --robot-wait=myproject --condition=action_required --timeout=10m
+ntm --robot-events --since-cursor=1234
+ntm --robot-events --since-cursor=1234 --events-limit=50
+ntm --robot-events --since-cursor=1234 --events-category=agent --events-actionability=action_required
+ntm --robot-events --since-cursor=0 --events-recipient=BlueLake
+ntm --robot-events --events-incident=inc-20260322-abc --events-window-before=5m --events-window-after=1m
+ntm --robot-events --events-as-of=2026-11-11T03:50:00Z --events-limit=25
 ```
 
-**Named Conditions (exhaustive list):**
+**Response:**
+```json
+{
+  "success": true,
+  "timestamp": "2026-11-11T16:18:31Z",
+  "version": "1.2.0",
+  "output_format": "json",
+  "events": [
+    {
+      "cursor": 1234,
+      "ts": "2026-11-11T16:18:15.775271473Z",
+      "category": "health",
+      "type": "health.change",
+      "source": "adapter.work_coordination",
+      "actionability": "background",
+      "severity": "info",
+      "reason_code": "health:ok",
+      "summary": "source work_coordination healthy",
+      "details": {
+        "source_name": "work_coordination",
+        "available": true,
+        "fresh": true,
+        "attention_state": "new"
+      },
+      "next_actions": [
+        {
+          "action": "robot-status",
+          "args": "--robot-status",
+          "reason": "Inspect normalized source health"
+        }
+      ]
+    }
+  ],
+  "next_cursor": 1234,
+  "has_more": false,
+  "replay_window": {
+    "supported": true,
+    "oldest_cursor": 1100,
+    "latest_cursor": 1234,
+    "event_count": 0,
+    "retention_period": "168h0m0s",
+    "resync_command": "ntm --robot-snapshot"
+  }
+}
+```
 
-| Condition | Description |
-|-----------|-------------|
-| `idle` | All agents in session are idle |
-| `any_idle` | At least one agent is idle |
-| `busy` | At least one agent is busy |
-| `all_busy` | All agents are busy |
-| `any_output` | Any agent produced new output |
-| `any_error` | Any agent encountered an error |
-| `action_required` | Any action_required event occurred |
-| `bead_ready` | Any bead became ready |
-| `mail_received` | Any mail was received |
+- `next_cursor` is where the next call continues: pass it as `--since-cursor`. With no events it is the newest cursor.
+- `has_more` is true when more matching events exist past this page, or when a filtered scan stopped after 50,000 events. Call again from `next_cursor`.
+- Historical modes (`--events-incident`, `--events-as-of`) add `replay_target`, `boundedness`, `reconstruction`, and `incident`. The two modes cannot be combined.
+
+**Parameters:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--since-cursor` | int | 0 | Replay events after this cursor (0 = all retained, -1 = from now) |
+| `--events-limit` | int | 100 | Max events to return (capped at 1000) |
+| `--events-category` | string | all | One category, exact match |
+| `--events-actionability` | string | all | One actionability level, exact match |
+| `--events-session` | string | all | Only events for this session |
+| `--events-recipient` | string | none | Only events addressed to this agent, in any project, any letter case (§16) |
+| `--events-incident` | string | none | Bounded replay around a durable incident id |
+| `--events-as-of` | RFC3339 | none | Bounded reconstruction at or before a time (at most 24h ago) |
+| `--events-window-before` | duration | 5m | Context before the incident start (incident mode) |
+| `--events-window-after` | duration | 1m | Context after the incident end (incident mode). Before + after must be at most 1h. |
+| `--profile` | string | none | Profile thresholds applied before the explicit filters (§9) |
+
+There is no severity filter flag. Filters are applied while reading, so `--events-limit` counts matching events, not events scanned.
+
+### 7.3 `--robot-digest`
+
+Token-efficient summary of recent events, without waiting.
+
+```bash
+ntm --robot-digest
+ntm --robot-digest --profile=minimal
+ntm --robot-digest --since-cursor=1234
+```
+
+The digest starts after `--attention-cursor`, or `--since-cursor` when that is not set, and covers everything retained when neither is set. `--attention-session` limits it to one session.
+
+**Response (real shape, trimmed):**
+```json
+{
+  "success": true,
+  "timestamp": "2026-11-11T16:18:54Z",
+  "version": "1.2.0",
+  "output_format": "json",
+  "cursor_start": 1230,
+  "cursor_end": 1234,
+  "period_start": "2026-11-11T15:05:31.989416597Z",
+  "period_end": "2026-11-11T16:18:52.1180643Z",
+  "event_count": 4,
+  "by_category": {
+    "health": 4
+  },
+  "by_actionability": {
+    "background": 4
+  },
+  "buckets": {
+    "background": [
+      {
+        "event": {
+          "cursor": 1234,
+          "ts": "2026-11-11T16:18:52.1180643Z",
+          "category": "health",
+          "type": "health.change",
+          "actionability": "background",
+          "severity": "info",
+          "summary": "source work_coordination healthy"
+        },
+        "cursor_start": 1234,
+        "cursor_end": 1234,
+        "source_event_count": 1
+      }
+    ]
+  },
+  "suppressed": {
+    "total": 1,
+    "by_reason": {
+      ...
+    }
+  },
+  "summary": "source work_coordination healthy; 0 action_required, 0 interesting, 3 background; 1 suppressed from 4 events",
+  "prioritized_queue": [
+    ...
+  ],
+  "active_incidents": [],
+  "replay_window": {
+    "supported": true,
+    "oldest_cursor": 1100,
+    "latest_cursor": 1234,
+    "event_count": 0,
+    "retention_period": "168h0m0s",
+    "resync_command": "ntm --robot-snapshot"
+  }
+}
+```
+
+`buckets` has `action_required`, `interesting`, and `background` lists (each omitted when empty). The default bucket limits are 5, 4, and 3 items. Repeated events are coalesced into one item and counted in `suppressed`. `suppressed.by_reason` maps a reason to a count; in the run above it was `{"bucket_limit": 1}`.
+
+### 7.4 `--robot-wait`
+
+Block until a named condition is met in one session.
+
+```bash
+ntm --robot-wait=myproject --wait-until=idle --timeout=5m
+ntm --robot-wait=myproject --wait-until=idle --wait-transition --timeout=2m --panes=1,2
+ntm --robot-wait=myproject --wait-until=action_required --attention-cursor=1234 --profile=operator
+```
+
+**Named conditions (exhaustive list):**
+
+| Condition | Kind | Met when |
+|-----------|------|----------|
+| `idle` | pane | Agents are waiting for input |
+| `complete` | pane | Idle and no output for 5 seconds |
+| `generating` | pane | Agents are generating |
+| `healthy` | pane | No agent is in error or stalled |
+| `stalled` | pane | Agents are stalled |
+| `rate_limited` | pane | Rate-limit text or telemetry seen in the pane |
+| `attention` | attention | Any `interesting` or `action_required` event after the cursor |
+| `action_required` | attention | Any `action_required` event after the cursor |
+| `mail_pending` | attention | A `mail.received` event |
+| `mail_ack_required` | attention | A `mail.ack_required` event |
+| `context_hot` | attention | An event with the `context_hot` signal |
+| `reservation_conflict` | attention | A file reservation conflict event |
+| `file_conflict` | attention | A file conflict event |
+| `session_changed` | attention | A session lifecycle event |
+| `pane_changed` | attention | A pane lifecycle or geometry event |
+
+Pane conditions apply to all matching agents (or any one with `--any`). Several conditions can be given comma-separated; they are ANDed. Attention conditions scan events after `--attention-cursor`.
+
+`bead_orphaned` is **deliberately unsupported**: `--wait-until=bead_orphaned` fails with `INVALID_FLAG`, and `--robot-capabilities` explains why under `attention.unsupported_conditions`.
 
 **No free-form condition DSL.** Conditions are enumerated and documented. This prevents:
 - Ambiguity in condition parsing
 - Version skew between client expectations and server capabilities
 - Untestable condition combinations
 
-**Response:**
+**Response (attention condition met):**
 ```json
 {
   "success": true,
-  "timestamp": "2026-03-21T02:35:00Z",
-  "condition": "idle",
-  "met": true,
-  "waited_ms": 45230,
-  "cursor": "evt_20260321023500123456789",
-  "triggering_event": {
-    "cursor": "evt_20260321023459987654321",
-    "type": "agent.state_change",
-    "summary": "Agent cc_2 became idle"
+  "timestamp": "2026-11-11T16:35:00Z",
+  "version": "1.0.0",
+  "session": "myproject",
+  "condition": "action_required",
+  "waited_seconds": 45.2,
+  "wake_payload": {
+    "matched_condition": "action_required",
+    "trigger_event": {
+      "cursor": 1240,
+      "ts": "2026-11-11T16:34:59Z",
+      "session": "myproject",
+      "category": "file",
+      "type": "file.conflict",
+      "actionability": "action_required",
+      "severity": "error",
+      "summary": "File conflict: internal/robot/types.go modified by [cc_1 cc_2]"
+    },
+    "trigger_count": 1,
+    "details": {
+      "matched_conditions": ["action_required"]
+    }
+  },
+  "cursor_info": {
+    "observed_cursor": 1240,
+    "next_cursor": 1241,
+    "oldest_cursor": 1100
   }
 }
 ```
+
+Pane conditions instead return `agents` (each with `pane`, `state`, `met_at`, `agent_type`). A timeout returns `TIMEOUT` with `agents_pending`.
 
 ### 7.5 `--robot-attention`
 
-Get prioritized items that currently need attention.
+The one obvious tending command: wait until something needs attention, then return a digest of what changed.
 
 ```bash
-ntm --robot-attention
-ntm --robot-attention --limit=5
-ntm --robot-attention --attention-session=myproject
+ntm --robot-attention --attention-cursor=1234
+ntm --robot-attention --attention-cursor=1234 --attention-timeout=2m
+ntm --robot-attention --attention-session=myproject --profile=debug --attention-condition=action_required
 ```
 
-**Response:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--attention-cursor` | 0 | Wait for events after this cursor. With 0, any retained interesting event wakes it at once. |
+| `--attention-condition` | `attention` | `attention`, `action_required`, or `mail_pending` (the other attention conditions in §7.4 also work) |
+| `--attention-session` | all | Only events for this session |
+| `--attention-timeout` | 5m | Return after this long even if nothing happened |
+| `--attention-poll` | 1s | How often to check |
+| `--profile` | none | Profile applied to the condition check and the digest |
+
+**Response (real output, timeout case):**
 ```json
 {
   "success": true,
-  "timestamp": "2026-03-21T02:31:00Z",
-  "items": [
-    {
-      "rank": 1,
-      "category": "alert",
-      "type": "quota_warning",
-      "summary": "API quota at 85%",
-      "severity": "warning",
-      "age_sec": 120,
-      "next_actions": [...]
+  "timestamp": "2026-11-11T16:19:10Z",
+  "version": "1.2.0",
+  "output_format": "json",
+  "wake_reason": "timeout",
+  "waited_seconds": 2.001065656,
+  "digest": {
+    "cursor_start": 1234,
+    "cursor_end": 1234,
+    "event_count": 0,
+    "by_category": {},
+    "by_actionability": {},
+    "buckets": {},
+    "suppressed": {
+      "total": 0
     },
-    {
-      "rank": 2,
-      "category": "bead",
-      "type": "ready",
-      "summary": "Bead br-xyz ready: Implement auth flow",
-      "severity": "info",
-      "age_sec": 45,
-      "next_actions": [...]
-    }
-  ],
-  "total_action_required": 3,
-  "_agent_hints": {
-    "summary": "1 alert, 2 ready beads need attention"
+    "summary": "no matching changes"
+  },
+  "cursor_info": {
+    "start_cursor": 1234,
+    "end_cursor": 1234,
+    "oldest_cursor": 1100,
+    "next_command": "ntm --robot-attention --attention-cursor=1234"
+  },
+  "replay_window": {
+    "supported": true,
+    "oldest_cursor": 1100,
+    "latest_cursor": 1234,
+    "event_count": 6,
+    "retention_period": "168h0m0s",
+    "resync_command": "ntm --robot-snapshot"
   }
 }
+```
+
+When something needs attention, `wake_reason` is `attention`, `matched_condition` names the condition, and `trigger_event` holds the event that woke it. On `CURSOR_EXPIRED`, `wake_reason` is `cursor_expired` and `cursor_info.next_command` is the resync command.
+
+### 7.6 `--robot-overlay`
+
+Hands a session (and optionally a cursor) back to a human in a tmux popup. Its reply (`session`, `cursor`, `no_wait`, `launched`, `dismissed`, `pid`) is not part of the event stream. It does not use the durable store.
+
+```bash
+ntm --robot-overlay --overlay-session=myproject --overlay-cursor=1234 --overlay-no-wait
 ```
 
 ---
 
-## 8. Transport Parity
+## 8. Transports
 
-All attention feed commands MUST produce identical JSON schemas across:
-- **CLI:** stdout JSON (primary interface)
-- **HTTP:** REST API response body
-- **SSE:** Server-Sent Events stream (each event = one SSE message)
-- **WebSocket:** JSON messages over WebSocket
+The same `AttentionEvent` objects reach every surface. The reply envelopes around them differ by transport, as described below.
+
+- **CLI:** one JSON object on stdout per command (§7).
+- **HTTP** (`ntm serve`): under `/api/v1`.
+  - `GET /attention/events`: replay. Query: `since_cursor`, `limit`, `category`, `actionability` (comma-separated), `session`, `incident_id`, `as_of`, `window_before_ms`, `window_after_ms`.
+  - `GET /attention/digest`: digest. Query: `since_cursor`, `category`, `session`, `action_required_limit`, `interesting_limit`, `background_limit`, `trace`.
+  - `GET /attention/stream`: SSE (§8.1).
+  - `POST /attention/items/{cursor}/state`: operator state (acknowledge, snooze, pin, mute) for one item.
+  - `GET /robot/snapshot`, `GET /robot/digest`, `GET /robot/attention`: the robot outputs over HTTP. `/robot/attention` is a non-blocking digest.
+  - `GET /ws`: WebSocket (§8.2).
+- The HTTP replay reply uses its own envelope: `success`, `timestamp`, `version`, `output_format`, `events`, `since_cursor`, `next_cursor`, `newest_cursor`, `oldest_cursor`, `event_count`, and `truncated` (the CLI's `has_more`). An expired cursor gets HTTP 409 with `error_code`, `message`, `oldest_cursor`, `newest_cursor`, and `resync_command`.
 
 ### 8.1 SSE Format
 
-```
-event: ntm_event
-data: {"cursor":"evt_...","type":"agent.state_change",...}
+`GET /api/v1/attention/stream?since_cursor=1234` sends a `connected` event, replays events after the cursor, then streams live ones. Query filters: `category`, `session`, `actionability`, and `heartbeat` (seconds; 0 turns heartbeats off).
 
-event: ntm_event
-data: {"cursor":"evt_...","type":"bead.ready",...}
+```text
+event: connected
+data: {"status":"connected","time":"2026-11-11T16:30:00Z","since_cursor":1234,"oldest_cursor":1100,"newest_cursor":1236}
 
-event: ntm_heartbeat
-data: {"cursor":"evt_...","ts":"2026-03-21T02:31:00Z"}
+event: attention
+data: {"cursor":1235,"ts":"2026-11-11T16:30:01Z","session":"myproject","pane":2,"category":"agent","type":"agent.state_change","actionability":"interesting","severity":"info","summary":"Agent cc_2 transitioned from generating to idle"}
+
+event: heartbeat
+data: {"type":"heartbeat","stream_id":"watch_20261111T163000Z","time":"2026-11-11T16:30:05Z","oldest_cursor":1100,"newest_cursor":1236,"cursor_position":1235,"event_count":137,"subscriber_count":1,"next_heartbeat_ms":5000,"subscription_active":true}
 ```
+
+If `since_cursor` has expired, the stream sends one `event: error` whose data holds `error_code` `CURSOR_EXPIRED`, `oldest_cursor`, `newest_cursor`, and `resync_command`, then closes.
 
 ### 8.2 WebSocket Format
 
+Subscribe to the `attention` topic, or `attention:<session>`, with a `subscribe` message. Options go in `data`: `topics`, `since_cursor` (0 = beginning, -1 = now), `session`, `profile`, `category`, `actionability`, `exclude_muted`, `exclude_snoozed`.
+
 ```json
-{"type":"event","payload":{"cursor":"evt_...","type":"agent.state_change",...}}
-{"type":"event","payload":{"cursor":"evt_...","type":"bead.ready",...}}
-{"type":"heartbeat","payload":{"cursor":"evt_...","ts":"2026-03-21T02:31:00Z"}}
+{"type": "subscribe", "ts": "2026-11-11T16:30:00Z", "request_id": "r1", "data": {"topics": ["attention"], "since_cursor": 1234}}
+```
+
+The server answers with an `ack`. Its `data.attention` has `subscribed`, `since_cursor`, `oldest_cursor`, `newest_cursor`, and `replay_count`, or `error_code` `CURSOR_EXPIRED` with a `resync_command`. Each event then arrives as a `WSEvent`. `seq` is the event's cursor, and `data` is the `AttentionEvent`:
+
+```json
+{
+  "type": "event",
+  "ts": "2026-11-11T16:30:01.120Z",
+  "seq": 1235,
+  "topic": "attention",
+  "event_type": "agent.state_change",
+  "data": {
+    "cursor": 1235,
+    "session": "myproject",
+    "type": "agent.state_change",
+    "summary": "Agent cc_2 transitioned from generating to idle"
+  }
+}
+```
+
+Request errors arrive as `WSError` frames:
+
+```json
+{"type": "error", "ts": "2026-11-11T16:30:00Z", "request_id": "r1", "code": "empty_topics", "message": "at least one topic required"}
 ```
 
 ---
@@ -512,75 +709,59 @@ data: {"cursor":"evt_...","ts":"2026-03-21T02:31:00Z"}
 
 ### 9.1 Profile Semantics
 
-A **profile** is a named preset of filter/verbosity settings:
+A **profile** is a named set of minimum thresholds and category limits. The built-in profiles, as `--robot-capabilities` lists them:
 
 ```json
 {
-  "profiles": {
-    "default": {
-      "description": "Standard monitoring",
-      "categories": ["agent", "bead", "alert", "mail", "conflict", "health"],
-      "min_actionability": "background",
-      "min_severity": "info"
+  "default_profile": "operator",
+  "profiles": [
+    {
+      "name": "operator",
+      "description": "Default profile for operator agents. Shows actionable events and important state changes.",
+      "filters": {"min_severity": "info", "min_actionability": "interesting"}
     },
-    "quiet": {
-      "description": "Action-required events only",
-      "categories": ["agent", "alert", "conflict"],
-      "min_actionability": "action_required",
-      "min_severity": "warning"
+    {
+      "name": "debug",
+      "description": "Full verbosity for debugging. Shows all events including debug level.",
+      "filters": {"min_severity": "debug", "min_actionability": "background"}
     },
-    "verbose": {
-      "description": "All events including debug",
-      "categories": ["*"],
-      "min_actionability": "background",
-      "min_severity": "debug"
+    {
+      "name": "minimal",
+      "description": "Only critical items requiring immediate action.",
+      "filters": {"min_severity": "error", "min_actionability": "action_required"}
+    },
+    {
+      "name": "alerts",
+      "description": "Only synthesized alert events.",
+      "filters": {"categories": ["alert"]}
     }
-  }
+  ]
 }
 ```
 
 ### 9.2 Profile Selection
 
 ```bash
-ntm --robot-events --profile=quiet --cursor=evt_...
+ntm --robot-events --since-cursor=1234 --profile=minimal
+ntm --robot-attention --attention-cursor=1234 --profile=operator
 ```
 
-### 9.3 Explicit Filters Override Profile
+`--profile` applies to `--robot-events`, `--robot-digest`, `--robot-attention`, and `--robot-wait`. Profile names match in any letter case.
 
-When explicit filters are provided alongside a profile, explicit filters win:
+### 9.3 Explicit Filters Narrow the Profile
+
+With `--robot-events`, the profile's thresholds apply first, then `--events-category`, `--events-actionability`, `--events-session`, and `--events-recipient` keep only exact matches. An explicit filter never widens what the profile allows.
 
 ```bash
-# Uses quiet profile but adds bead category
-ntm --robot-events --profile=quiet --category=bead --cursor=evt_...
+# operator thresholds, then only agent events
+ntm --robot-events --since-cursor=1234 --profile=operator --events-category=agent
 ```
 
-Response includes `filters_applied`:
-
-```json
-{
-  "success": true,
-  "filters_applied": {
-    "profile": "quiet",
-    "overrides": {
-      "category": ["agent", "alert", "conflict", "bead"]
-    }
-  },
-  "events": [...]
-}
-```
+Replies do not echo the filters they applied.
 
 ### 9.4 No Profile Specified
 
-When no profile is specified, `default` is used:
-
-```json
-{
-  "filters_applied": {
-    "profile": "default",
-    "overrides": null
-  }
-}
-```
+`--robot-capabilities` reports `default_profile: "operator"`, and `--robot-help` calls operator the default. In the commands themselves, though, the `--profile` flag defaults to empty, and **no profile filter is applied when `--profile` is not given**. Every retained event is eligible, including `background` and `debug` ones. Pass `--profile=operator` to get operator filtering.
 
 ---
 
@@ -588,44 +769,25 @@ When no profile is specified, `default` is used:
 
 ### 10.1 Heartbeat
 
-For long-lived connections (SSE, WebSocket), a heartbeat event is sent every **30 seconds**:
-
-```json
-{
-  "cursor": "evt_20260321023100000000000",
-  "ts": "2026-03-21T02:31:00Z",
-  "category": "system",
-  "type": "heartbeat",
-  "source": "event_stream",
-  "actionability": "background",
-  "severity": "debug",
-  "summary": "Connection alive"
-}
-```
-
-**Client responsibility:** If no heartbeat received for 60 seconds, consider connection dead and reconnect.
+- **Feed heartbeat:** a feed with subscribers publishes a `system.heartbeat` event (`source` `attention_feed`, `background`, `debug`) after **30 seconds** with no other events. It goes only to that process's live subscribers. It is never stored and never appears in replay, and it reuses the current cursor instead of taking a new one.
+- **SSE heartbeat:** the SSE stream drops feed heartbeats and sends its own `event: heartbeat` (§8.1). The interval adapts: 1 second right after a replay, 5 seconds when idle, and 30 seconds during sustained traffic. The `heartbeat` query parameter fixes it. Treat a gap of more than twice `next_heartbeat_ms` as a dead connection and reconnect from your last cursor.
+- **WebSocket:** feed heartbeats are not forwarded. The server sends WebSocket ping frames, and clients may send `{"type":"ping"}` to get a `pong`.
 
 ### 10.2 Schema Version
 
-All responses include schema version in the envelope:
+Robot replies carry `version` in the envelope:
+- `--robot-events`, `--robot-digest`, and `--robot-attention` success replies report the attention contract version, `"version": "1.2.0"`.
+- `--robot-snapshot` reports the envelope version `"1.0.0"`, plus `attention_contract_version: "1.2.0"`, `schema_id`, and `schema_version`.
+- Error replies built by the shared error helper report `"version": "1.0.0"`.
 
-```json
-{
-  "success": true,
-  "schema_version": "1.0.0",
-  "timestamp": "2026-03-21T02:31:00Z",
-  ...
-}
-```
-
-Schema version follows semver:
+The contract version follows semver:
 - **Major:** Breaking changes to field semantics
 - **Minor:** New fields added
 - **Patch:** Documentation/bug fixes only
 
 ### 10.3 Capability Discovery
 
-`--robot-capabilities` includes attention feed commands and their parameters:
+`--robot-capabilities` lists every attention command with its parameters (`commands[]`), plus an `attention` object (real output, trimmed):
 
 ```json
 {
@@ -634,84 +796,65 @@ Schema version follows semver:
       "name": "events",
       "flag": "--robot-events",
       "category": "attention",
-      "description": "Get events since cursor",
       "parameters": [
-        {"name": "cursor", "type": "string", "required": true},
-        {"name": "limit", "type": "int", "default": 100},
-        {"name": "category", "type": "string", "default": "all"},
-        {"name": "profile", "type": "string", "default": "default"}
+        {"name": "since-cursor", "flag": "--since-cursor", "type": "int", "required": false, "default": "0", "description": "Replay events after this cursor (0 = all)"},
+        {"name": "events-recipient", "flag": "--events-recipient", "type": "string", "required": false, "description": "Only events addressed to this agent, in any project (any letter case)"}
       ]
-    },
-    ...
+    }
   ],
-  "attention_feed": {
-    "schema_version": "1.0.0",
-    "categories": ["agent", "session", "bead", "mail", "alert", "conflict", "health", "system"],
-    "actionability_classes": ["background", "interesting", "action_required"],
-    "severity_levels": ["debug", "info", "warning", "error", "critical"],
-    "profiles": ["default", "quiet", "verbose"],
-    "wait_conditions": ["idle", "any_idle", "busy", "all_busy", "any_output", "any_error", "action_required", "bead_ready", "mail_received"],
-    "heartbeat_interval_sec": 30,
-    "cursor_retention_min_sec": 604800
+  "attention": {
+    "contract_version": "1.2.0",
+    "default_profile": "operator",
+    "features": {
+      ...
+    },
+    "signal_availability": {
+      ...
+    },
+    "unsupported_conditions": [
+      {
+        "name": "bead_orphaned",
+        "status": "unavailable",
+        "reason": "ntm cannot prove work is orphaned from observable state alone. ...",
+        "observables_available": ["bead status (open/in_progress/closed) via br/bv", "agent pane liveness (alive/stalled/dead)", "time since last pane output", "Agent Mail message history"],
+        "what_would_change": "Agent Mail gains explicit 'bead abandon' or 'bead handoff' messages, giving ntm positive evidence of intent rather than inferring abandonment from silence."
+      }
+    ],
+    "guardrails": [
+      {"name": "cursor_resync_is_explicit", "rule": "When replay is stale or CURSOR_EXPIRED occurs, resync with --robot-snapshot instead of guessing missed history."}
+    ]
   }
 }
 ```
+
+`features` and `signal_availability` are maps from a name to `{"status": ..., "note": ...}`. Today `features` has `cursor_replay`, `profile_presets`, and `operator_boundary`, all `available`. `signal_availability` has `bead_orphaned`, with status `unavailable`.
 
 ---
 
 ## 11. Degraded State Handling
 
-### 11.1 Component Health
+### 11.1 Source Health
 
-Snapshot and digest outputs include component health markers:
-
-```json
-{
-  "success": true,
-  "component_health": {
-    "activity_detector": {"status": "healthy"},
-    "bead_tracker": {"status": "healthy"},
-    "mail_checker": {"status": "degraded", "reason": "Agent Mail server unreachable", "since": "2026-03-21T02:00:00Z"},
-    "alert_manager": {"status": "healthy"}
-  },
-  "degraded_components": ["mail_checker"],
-  "sessions": [...]
-}
-```
-
-### 11.2 Degraded Summary Markers
-
-When a component is degraded, affected fields include a marker:
+The snapshot reports the health of its data sources under `sources` and lists unhealthy ones in `degraded_sources`. `sources.sources` maps each source name (for example `work_coordination`) to its `name`, `available`, `fresh`, `reason_code`, `age_ms`, and `updated_at`. Source health changes also appear in the feed as `health.change` events.
 
 ```json
 {
-  "agent_mail": {
-    "_degraded": true,
-    "_degraded_reason": "Agent Mail server unreachable",
-    "_degraded_since": "2026-03-21T02:00:00Z",
-    "unread": null,
-    "threads": null
+  "sources": {
+    "sources": {
+      ...
+    },
+    "all_fresh": true
   }
 }
 ```
 
-### 11.3 Capabilities with Degraded State
+### 11.2 Store Outage
 
-`--robot-capabilities` reports current degradation:
+If `state.db` cannot be opened or written, the feed keeps working in memory. New events are held in that process only and are not seen by other processes. The feed tries the store again every 30 seconds, and the log records `attention feed store unavailable` and later `attention feed store recovered`. The dashboard shows when the feed is not durable. No robot reply carries a store-health field.
 
-```json
-{
-  "attention_feed": {
-    "degraded_features": [
-      {
-        "feature": "mail_events",
-        "reason": "Agent Mail server unreachable",
-        "impact": "mail.* events will not be generated"
-      }
-    ]
-  }
-}
-```
+### 11.3 Capabilities
+
+`AttentionCapabilities` has a `degraded` list (`feature`, `status`, `reason`, `impact`, `hint`), but ntm does not fill it today. Read degradation from snapshot `sources` / `degraded_sources` instead. Unsupported signals are always reported (`signal_availability`, `unsupported_conditions`, and snapshot `attention_summary.unsupported_signals`).
 
 ---
 
@@ -719,158 +862,201 @@ When a component is degraded, affected fields include a marker:
 
 ### 12.1 `--robot-help` Operator Loop
 
-`--robot-help` includes the canonical operator loop:
+`--robot-help` includes the operator loop, the attention commands, the profiles, the guardrails, and the unsupported conditions. An excerpt:
 
-```
-ATTENTION FEED — Operator Loop
-==============================
+```text
+Attention Feed (Operator Loop):
+-------------------------------
+The recommended tending loop for operator agents:
 
-1. BOOTSTRAP:  ntm --robot-snapshot
-   → Get full state, receive initial cursor
+  1. Bootstrap:  ntm --robot-snapshot
+     → Get system state + latest_cursor + replay_window
+  2. Attend:     ntm --robot-attention --attention-cursor=<cursor>
+     → Sleep until attention needed, wake with digest + reason
+  3. Act:        ntm --robot-send=proj --msg="fix X"
+     → Execute the suggested action
+  4. Loop:       Use cursor from step 2 response as --attention-cursor
+     → Repeat from step 2
 
-2. POLL:       ntm --robot-events --cursor=<cursor>
-   → Get new events since cursor
+If cursor expires: re-run --robot-snapshot to resync.
 
-3. TRIAGE:     ntm --robot-digest --cursor=<cursor>
-   → Get prioritized what-changed summary
-
-4. ACT:        Use suggested commands from next_actions
-   → e.g., ntm --robot-send=... or ntm --robot-diagnose=...
-
-5. WAIT:       ntm --robot-wait=SESSION --condition=idle
-   → Block until condition met
-
-If CURSOR_EXPIRED:
-   → Call --robot-snapshot to resync
-
-Wait conditions: idle, any_idle, busy, all_busy, any_output, any_error,
-                 action_required, bead_ready, mail_received
+Attention Feed Commands:
+  --robot-events         Raw event replay (--since-cursor=N, --events-limit=50)
+                         Filters: --events-category, --events-session,
+                         --events-recipient=AGENT, --events-actionability
+  --robot-digest         Aggregated summary of recent changes
+  --robot-attention      Wait-then-digest (the one obvious tending command)
+  --robot-overlay        Human handoff actuator (optionally non-blocking with --overlay-no-wait)
 ```
 
 ### 12.2 Error Examples
 
-**CURSOR_EXPIRED:**
+**CURSOR_EXPIRED** (`--robot-events`, `--robot-digest`, `--robot-attention`, `--robot-wait`): see §2.2. `--robot-attention` also sets `"wake_reason": "cursor_expired"`.
+
+**INVALID_FLAG** (unsupported wait condition):
 ```json
 {
   "success": false,
-  "error_code": "CURSOR_EXPIRED",
-  "error": "Cursor 'evt_20260320120000000000000' has expired",
-  "hint": "Call --robot-snapshot to resync and obtain fresh cursor",
-  "resync_required": true
+  "timestamp": "2026-11-11T16:40:00Z",
+  "version": "1.0.0",
+  "error": "unsupported condition 'bead_orphaned'",
+  "error_code": "INVALID_FLAG",
+  "hint": "Condition 'bead_orphaned' is deliberately unsupported. Use --robot-capabilities to see rationale.",
+  "session": "myproject",
+  "condition": "bead_orphaned",
+  "waited_seconds": 0
 }
 ```
 
-**INVALID_CURSOR:**
+An unknown condition gets `"error": "invalid condition 'foo'"`, also `INVALID_FLAG`, and a hint listing the valid conditions. `INVALID_FLAG` is also returned for combining `--events-incident` with `--events-as-of`, an `--events-as-of` time in the future or more than 24h ago, and an incident window over 1h.
+
+**TIMEOUT** (`--robot-wait`):
 ```json
 {
   "success": false,
-  "error_code": "INVALID_CURSOR",
-  "error": "Cursor 'foo' is malformed",
-  "hint": "Cursor must be in format evt_<timestamp_nanos>"
+  "timestamp": "2026-11-11T16:45:00Z",
+  "version": "1.0.0",
+  "error": "timeout after 5m0s",
+  "error_code": "TIMEOUT",
+  "hint": "Try increasing --timeout (or deprecated --wait-timeout) or check agent status with --robot-activity",
+  "session": "myproject",
+  "condition": "idle",
+  "waited_seconds": 300.0,
+  "agents_pending": ["%12"]
 }
 ```
 
-**UNKNOWN_CONDITION:**
-```json
-{
-  "success": false,
-  "error_code": "INVALID_INPUT",
-  "error": "Unknown wait condition 'foo'",
-  "hint": "Valid conditions: idle, any_idle, busy, all_busy, any_output, any_error, action_required, bead_ready, mail_received"
-}
-```
+Other codes: `SESSION_NOT_FOUND` and `PANE_NOT_FOUND` (wait), `NOT_FOUND` (unknown incident id), `INTERNAL_ERROR`, `FEED_UNAVAILABLE`, and `AGENT_ERROR` (wait with `--wait-exit-on-error`). There is no `INVALID_CURSOR` code. A cursor that is not an integer is rejected by flag parsing, with a message on stderr and exit code 1.
 
 ---
 
-## 13. Golden Fixtures for Testing
+## 13. Tests
 
-The following scenarios MUST have golden fixtures in the test suite:
+The contract is checked by:
 
-### 13.1 Success Scenarios
-
-1. **Snapshot bootstrap:** Fresh snapshot with cursor, sessions, beads, alerts
-2. **Event replay:** Events returned for valid cursor, new cursor returned
-3. **Digest generation:** Summarized what-changed with highlights
-4. **Wait condition met:** Successful wait with triggering event
-5. **Attention list:** Prioritized action-required items
-
-### 13.2 Error Scenarios
-
-1. **CURSOR_EXPIRED:** Cursor too old, resync required
-2. **INVALID_CURSOR:** Malformed cursor string
-3. **UNKNOWN_CONDITION:** Invalid wait condition name
-4. **TIMEOUT:** Wait timed out without condition met
-
-### 13.3 Profile Scenarios
-
-1. **Default profile:** No profile specified, default applied
-2. **Explicit profile:** quiet/verbose profile selected
-3. **Override profile:** Profile with explicit filter override
-4. **Conflicting filters:** Profile + contradictory explicit filters
-
-### 13.4 Degraded Scenarios
-
-1. **Single component degraded:** mail_checker down, other healthy
-2. **Multiple components degraded:** Partial observability
-3. **Full degradation:** All components unhealthy
-
-### 13.5 Transport Scenarios
-
-1. **Heartbeat:** SSE/WebSocket heartbeat after 30s
-2. **Reconnect:** Client reconnects after heartbeat timeout
-3. **Schema version:** Version included in all responses
+1. **This document:** internal/robot/attention_contract_doc_test.go (field table, JSON examples, flags, retention, poll interval).
+2. **Feed and cursors:** internal/robot/attention_feed_test.go (append, replay, expiry, addressed events, the store poll).
+3. **Profiles:** internal/robot/attention_profile_test.go.
+4. **Wait conditions:** internal/robot/wait_test.go.
+5. **Capabilities:** internal/robot/capabilities_test.go and capabilities_snapshot_test.go.
+6. **Transports:** internal/serve/server_test.go, ws_events_test.go, ws_sse_reconnect_contract_test.go.
+7. **End to end:** e2e/attention_journey_test.go.
 
 ---
 
 ## 14. Exit Codes
 
-Following robot API conventions:
+The attention commands do not all follow the project-wide 0/1/2 convention. Always read `success` and `error_code`.
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Error (invalid input, command failed) |
-| 2 | Unavailable (feature not implemented, dependency missing) |
+| Command | 0 | 1 | 2 | 3 |
+|---------|---|---|---|---|
+| `--robot-events`, `--robot-digest` | Any JSON reply, **including** `success: false` (e.g. `CURSOR_EXPIRED`) | A flag value that cannot be parsed (stderr, no JSON) | — | — |
+| `--robot-attention` | Woke on attention | Timed out (`success: true`, `wake_reason: "timeout"`) | `CURSOR_EXPIRED`, feed unavailable, or internal error | — |
+| `--robot-wait` | Condition met | `TIMEOUT` | `SESSION_NOT_FOUND`, `INVALID_FLAG`, `PANE_NOT_FOUND`, `CURSOR_EXPIRED`, `INTERNAL_ERROR` | `AGENT_ERROR` |
 
-**Mapping:**
-- `CURSOR_EXPIRED` → exit 1 (recoverable error)
-- `INVALID_CURSOR` → exit 1
-- `INVALID_INPUT` → exit 1
-- `TIMEOUT` → exit 1
-- `NOT_IMPLEMENTED` → exit 2
+No attention command returns `NOT_IMPLEMENTED`. Unsupported conditions are reported as `INVALID_FLAG`.
 
 ---
 
-## 15. Implementation Notes for Future Beads
+## 15. Implementation Notes
 
-### 15.1 Event Generation
+### 15.1 Where the Code Lives
 
-Events should be generated at the source (activity detector, health monitor, etc.) and published to a central event bus. The event bus:
-- Assigns monotonic cursors
-- Manages retention
-- Handles subscriber delivery
+- Envelope, types, profiles, capabilities: internal/robot/attention_contract.go
+- Feed, cursors, store, poll, heartbeat: internal/robot/attention_feed.go
+- `--robot-events`, `--robot-digest`, `--robot-attention`: internal/robot/events.go
+- `--robot-wait`: internal/robot/wait.go
+- Durable rows: the `attention_events` table in internal/state (runtime_store.go, migrations)
+- HTTP, SSE, WebSocket: internal/serve/server.go
 
-### 15.2 Cursor Storage
+### 15.2 Event Generation
 
-Cursors are timestamp-based for simplicity. Consider:
-- Nanosecond precision for ordering
-- UTC timezone always
-- No external sequence generator dependency
+Producers call the feed (`Append`, `AppendAddressed`, `AppendDeduplicated`, `PublishEphemeral`). The store assigns the cursor. Events are kept for replay, and the feed delivers them to subscribers. Running `--robot-*` commands can itself append events, such as `health.change` from the source-health refresh.
 
-### 15.3 Testing Requirements
+### 15.3 Logging
 
-- **Unit tests:** Envelope validation, cursor comparison, profile merging
-- **Integration tests:** Event generation from real components
-- **E2E tests:** Full operator loop with real sessions
-- **Golden fixtures:** Canonical examples for all scenarios in §13
+The feed logs these contract-relevant conditions with `log/slog`:
+- `attention feed store unavailable` / `attention feed store recovered`
+- `attention feed poll failed` / `attention feed poll recovered`
+- `attention feed poll cursor expired` (with `since_cursor` and `oldest_cursor`, see §17)
 
-### 15.4 Logging
+---
 
-Log contract mismatches when commands cannot satisfy guarantees:
-- Missing cursor in snapshot (should never happen)
-- Event ordering violation (cursor A > B but ts(A) > ts(B))
-- Profile not found
-- Unknown category/type (forward compatibility)
+## 16. Addressed Mail Events
+
+An addressed mail event is a `mail` event that names the agent it is for. ntm writes one when it learns of an unread Agent Mail message for an agent. This happens in the Agent Mail Stop hook (`ntm agent-hook stop`), the dashboard, the idle nudge, and `ntm mail` snooze handling.
+
+- `mail.received`: `interesting`, `info`. Summary `New mail from <sender>: <subject>`.
+- `mail.ack_required`: `action_required`, `warning`, when the message asks for an acknowledgment.
+
+Three envelope fields say who the event is for:
+
+| Field | Meaning |
+|-------|---------|
+| `recipient_project` | Agent Mail project key (usually the project path) |
+| `recipient_agent` | Agent Mail agent name |
+| `message_id` | Agent Mail message id |
+
+`details` repeats `project_key`, `from`, `to`, `subject`, `message_id`, and `thread_id`, plus `ack_required` on ack events. `next_actions` points at `--robot-mail-check` for that project and agent. A mail event with no recipient is written as an ordinary, unaddressed event.
+
+```json
+{
+  "cursor": 1250,
+  "ts": "2026-11-11T16:50:00.123456789Z",
+  "recipient_project": "/home/you/projects/myproject",
+  "recipient_agent": "BlueLake",
+  "message_id": 4521,
+  "category": "mail",
+  "type": "mail.received",
+  "source": "agent_mail",
+  "actionability": "interesting",
+  "severity": "info",
+  "summary": "New mail from RedStone: Schema review ready",
+  "details": {
+    "project_key": "/home/you/projects/myproject",
+    "from": "RedStone",
+    "to": "BlueLake",
+    "subject": "Schema review ready",
+    "message_id": 4521,
+    "thread_id": "br-123"
+  },
+  "next_actions": [
+    {
+      "action": "robot-mail-check",
+      "args": "--robot-mail-check --mail-project=/home/you/projects/myproject --mail-status=unread --mail-agent=BlueLake --thread=br-123",
+      "reason": "Inspect the unread message"
+    }
+  ]
+}
+```
+
+**Mail events are unique.** There is at most one mail event per project + recipient + message id, and the recipient name is compared in any letter case. The store enforces this with a unique index on `attention_events(recipient_project, recipient_agent COLLATE NOCASE, message_id)` (migration 017_attention_recipient_unique.sql, which also removed older duplicates and kept the oldest). Inserts use `ON CONFLICT ... DO NOTHING`. Recording the same message again writes nothing, returns the existing event, and does not deliver it to subscribers again, even when two processes record it at the same moment. A feed with no store checks its in-memory journal instead.
+
+**Reading one agent's events.** `--events-recipient=AGENT` returns only events addressed to that agent, in any project and any letter case. The filter runs in the store query, so a busy feed cannot push the agent's events past the scan limit.
+
+```bash
+ntm --robot-events --since-cursor=0 --events-recipient=BlueLake
+ntm --robot-events --since-cursor=1234 --events-recipient=bluelake --events-limit=20
+```
+
+---
+
+## 17. Durable Feed and Cross-Process Delivery
+
+**One store for every process.** Every ntm process uses the SQLite store `state.db` by default. At startup ntm registers a store opener (`SetAttentionStoreOpener`), and the feed opens `state.db` the first time it is used. Commands that never touch the feed never open it. `--robot-overlay` is the one exception and keeps its feed in memory. `state.db` sits next to the selected config file (`NTM_CONFIG`), or else at `$XDG_CONFIG_HOME/ntm/state.db`, or else at `~/.config/ntm/state.db`.
+
+Because all processes write the same table, cursors form a single sequence, and a short-lived command such as `--robot-events`, `--robot-digest`, or `--robot-attention` sees events written by any process: the dashboard, hooks, `ntm serve`, and other robot calls.
+
+**Live delivery across processes.** A long-running store-backed process with subscribers, such as `ntm serve` (which feeds SSE and WebSocket clients), reads other processes' events from the store **every 1 second** (`AttentionPollInterval`). It also reads immediately when it appends an event itself. Each pass reads up to 500 events after the last cursor it delivered and hands them to subscribers in cursor order.
+
+- **Each event is delivered once.** That includes events the process appended itself: in a store-backed feed, its own events are delivered through the same read as everyone else's, not directly, so nothing arrives twice or out of order. A mail event first delivered from memory during a store outage is not delivered again when its stored copy appears.
+- **Start point:** when the first subscriber arrives, the read starts at the newest cursor. To get history, replay with a cursor (`since_cursor` on SSE or WebSocket, or `--since-cursor` on the CLI).
+- **Expired position:** if the read position has expired (the process fell more than 7 days behind), the read continues from the oldest event still kept. This is reported in the log as `attention feed poll cursor expired`, with the old position (`since_cursor`) and `oldest_cursor`.
+- **Failures:** a failed read leaves the position where it was and is retried on the next pass. The first failure and the recovery are logged.
+- The once-a-second read never deletes rows. Expired rows are removed by replays (§6.3).
+- Feed heartbeats (§10.1) are live-only and never written to the store.
+
+**Store outage.** When `state.db` cannot be written, the process's new events stay in memory with cursors above every stored cursor it has seen. Its own subscribers and replays still get them, but other processes do not, until the store comes back (§11.2).
 
 ---
 
@@ -880,110 +1066,104 @@ Log contract mismatches when commands cannot satisfy guarantees:
 
 ```json
 {
-  "cursor": "evt_20260321023045123456789",
-  "ts": "2026-03-21T02:30:45.123456789Z",
+  "cursor": 1301,
+  "ts": "2026-11-11T17:00:45.123456789Z",
   "session": "myproject",
-  "pane": "0.2",
+  "pane": 2,
   "category": "agent",
-  "type": "state_change",
-  "source": "activity_detector",
+  "type": "agent.state_change",
+  "source": "state_tracker",
   "actionability": "interesting",
   "severity": "info",
-  "summary": "Agent cc_2 became idle after 5m42s",
+  "summary": "Agent cc_2 transitioned from generating to idle",
   "details": {
-    "agent_type": "claude",
-    "previous_state": "busy",
-    "current_state": "idle",
-    "duration_sec": 342,
-    "model": "claude-sonnet-4-6"
-  },
-  "next_actions": [
-    {
-      "label": "Check output",
-      "command": "ntm --robot-tail=myproject --panes=2 --lines=100"
-    }
-  ]
+    "agent_id": "cc_2",
+    "from_state": "generating",
+    "to_state": "idle",
+    "signal": "agent_state_changed"
+  }
 }
 ```
 
-### A.2 Bead Ready
+### A.2 File Conflict
 
 ```json
 {
-  "cursor": "evt_20260321023100987654321",
-  "ts": "2026-03-21T02:31:00.987654321Z",
-  "category": "bead",
-  "type": "ready",
-  "source": "bead_tracker",
-  "actionability": "interesting",
-  "severity": "info",
-  "summary": "Bead br-xyz ready: Implement OAuth flow",
-  "details": {
-    "bead_id": "br-xyz",
-    "title": "Implement OAuth flow",
-    "priority": 1,
-    "type": "task",
-    "unblocked_by": ["br-abc", "br-def"]
-  },
-  "next_actions": [
-    {
-      "label": "View bead",
-      "command": "br show br-xyz"
-    },
-    {
-      "label": "Claim bead",
-      "command": "br update br-xyz --status=in_progress"
-    }
-  ]
-}
-```
-
-### A.3 Alert Raised
-
-```json
-{
-  "cursor": "evt_20260321023200123456789",
-  "ts": "2026-03-21T02:32:00.123456789Z",
+  "cursor": 1302,
+  "ts": "2026-11-11T17:01:00.987654321Z",
   "session": "myproject",
-  "pane": "0.3",
-  "category": "alert",
-  "type": "raised",
-  "source": "health_monitor",
+  "category": "file",
+  "type": "file.conflict",
+  "source": "conflict_detector",
+  "actionability": "action_required",
+  "severity": "error",
+  "summary": "File conflict: internal/robot/types.go modified by [cc_1 cc_2]",
+  "details": {
+    "file": "internal/robot/types.go",
+    "agents": ["cc_1", "cc_2"],
+    "signal": "file_conflict"
+  },
+  "next_actions": [
+    {
+      "action": "robot-diff",
+      "args": "--robot-diff=myproject",
+      "reason": "Compare agent changes"
+    }
+  ]
+}
+```
+
+### A.3 Mail That Needs an Acknowledgment
+
+```json
+{
+  "cursor": 1303,
+  "ts": "2026-11-11T17:02:00.123456789Z",
+  "recipient_project": "/home/you/projects/myproject",
+  "recipient_agent": "RedStone",
+  "message_id": 4522,
+  "category": "mail",
+  "type": "mail.ack_required",
+  "source": "agent_mail",
   "actionability": "action_required",
   "severity": "warning",
-  "summary": "Agent cc_3: API quota at 85%",
+  "summary": "Ack required from BlueLake: Please confirm the migration order",
   "details": {
-    "alert_id": "alert_quota_001",
-    "quota_type": "anthropic_api",
-    "current_usage": 85,
-    "threshold": 80,
-    "reset_at": "2026-03-22T00:00:00Z"
+    "project_key": "/home/you/projects/myproject",
+    "from": "BlueLake",
+    "to": "RedStone",
+    "subject": "Please confirm the migration order",
+    "message_id": 4522,
+    "thread_id": "br-124",
+    "ack_required": true
   },
   "next_actions": [
     {
-      "label": "Diagnose",
-      "command": "ntm --robot-diagnose=myproject --pane=3"
-    },
-    {
-      "label": "Check tokens",
-      "command": "ntm --robot-tokens --tokens-session=myproject"
+      "action": "robot-mail-check",
+      "args": "--robot-mail-check --mail-project=/home/you/projects/myproject --mail-agent=RedStone --thread=br-124",
+      "reason": "Inspect the message before acknowledging it"
     }
   ]
 }
 ```
 
-### A.4 Heartbeat
+### A.4 Heartbeat (live only)
+
+The heartbeat's `source` is `attention_feed` (left out of the example below).
 
 ```json
 {
-  "cursor": "evt_20260321023300000000000",
-  "ts": "2026-03-21T02:33:00Z",
+  "cursor": 1303,
+  "ts": "2026-11-11T17:02:30Z",
   "category": "system",
-  "type": "heartbeat",
-  "source": "event_stream",
+  "type": "system.heartbeat",
   "actionability": "background",
   "severity": "debug",
-  "summary": "Connection alive"
+  "summary": "Heartbeat",
+  "details": {
+    "subscriber_count": 1,
+    "idle_ms": 30000
+  }
 }
 ```
 
@@ -991,6 +1171,7 @@ Log contract mismatches when commands cannot satisfy guarantees:
 
 ## Appendix B: Changelog
 
+- **2026-11-11:** Brought in line with the code: integer cursors, real flags (`--since-cursor`, `--events-limit`, `--attention-cursor`, `--wait-until`), real reply fields (`next_cursor`, `has_more`, `replay_window`, `cursor_info`), real profiles, conditions, error codes, and exit codes. Removed claims the code does not support (string cursors, a retention expiry field in events replies, `filters_applied`, `component_health`, `INVALID_CURSOR`, a severity filter, the `quiet`/`verbose` profiles). Added §16 Addressed Mail Events and §17 Durable Feed and Cross-Process Delivery.
 - **2026-03-26:** Status updated to IMPLEMENTED; aligned with robot redesign (bd-j9jo3.9.4)
 - **2026-03-21:** Initial contract (br-aa0nj)
 
