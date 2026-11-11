@@ -19,9 +19,10 @@ Run `ntm agent-hook migrate --help` to see all the options.
 
 The new Stop command is written into committed files, and those are shared by every machine that checks the repo out. So it names ntm from your home folder (`~/.local/bin/ntm`), not by an absolute path like `/home/you/...`. The migration refuses to run if ntm isn't under your home folder.
 
-From your ntm checkout:
+Sessions that are already running use whatever is at `~/.local/bin/ntm`, so installing replaces the ntm they run too. Keep a copy of the old one first, so you can put it back. From your ntm checkout:
 
 ```bash
+cp ~/.local/bin/ntm ~/.local/bin/ntm.before-migration
 git pull
 go build -o ~/.local/bin/ntm ./cmd/ntm
 ```
@@ -58,6 +59,8 @@ You should see one block per repo. Each file shows what you commit and where, th
 
 Preview only: 1 file would change in 1 repo. Run with --apply to write them.
 ```
+
+Your script paths may differ. Here the scripts sit in the repo's own `.claude/hooks` folder; in other repos they may be in `~/.claude/hooks`, or somewhere else. The migration matches the script names wherever they are.
 
 ## Apply
 
@@ -127,9 +130,11 @@ Check that a plain Claude session, not one started by ntm, still hears about new
 1. Start the session from the repo root: `cd ~/Dev/zero-knowledge-proofs && claude`. The hook takes the project from the folder the session started in, so a session started in a subfolder looks for mail under that subfolder.
 2. In the session, register with Agent Mail as you normally do. Agent Mail saves the session's name and token in the repo's git folder, and the hook reads them from there. They are never written into `settings.json`.
 3. Give the session some slow work. While it works, send it a message through Agent Mail.
-4. You should see: when its turn ends, the session is told about the message, with the sender and subject.
+4. You should see: when its turn ends, the session is told about the message, with the sender and subject. Claude Code shows this under the label "Stop hook error:". That label is normal: it's how Claude Code shows a Stop hook that asks the session to carry on, and here it carries the mail reminder.
 
-If it isn't told, look at the end of `~/.local/share/ntm/logs/agent-hook.log`. The hook writes there any problem it hits, such as no name found for the session.
+Claude may put slow work in the background and end its turn early. In that case the reminder comes at the next turn end, after the message has arrived.
+
+When everything works, `~/.local/share/ntm/logs/agent-hook.log` gets no new lines. If the session isn't told, look at the end of that log. The hook writes there any problem it hits, such as no name found for the session.
 
 ## Roll back
 

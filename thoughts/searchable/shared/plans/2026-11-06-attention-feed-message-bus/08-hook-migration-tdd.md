@@ -1035,6 +1035,19 @@ Base commit `bc848836`. Behaviors 12 to 15 are built. There's no production code
 - Tamper check (base `bc848836`) clean.
 - golangci-lint, goimports and ubs weren't run (not installed).
 
+**Human test: PASSED on rocketman (2026-11-11), at cec89365.** Your choices: you kept `~/.local/bin/ntm` as it was and used `~/.local/bin/ntm-loop8`, you didn't commit, and you restored the `zero-knowledge-proofs` settings file afterwards.
+- The preview listed 8 files in 5 repos (3 shared worktree copies), including all 4 named repos.
+- `--apply` on `zero-knowledge-proofs` changed 1 file. The diff was the Stop line plus the PostToolUse block removed.
+- A plain `claude` session started in the repo root registered as SunnyDeer (its identity was in `.git/agent-mail/`). Mail #12529 was announced at turn end and read once (`told_by=stop_hook`). `agent-hook.log` got no new lines.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop8-hook-migrate-guide-local-2026-11-11/`.
+
+**Guide fixes from the test** (the two guide tests re-checked the file):
+1. "Test one repo" says Claude Code shows the reminder under the label "Stop hook error:", and that this is normal.
+2. It says Claude may put slow work in the background and end its turn early, so the reminder comes at the next turn end.
+3. "Install" says installing replaces the ntm that running sessions use, and keeps a copy first (`ntm.before-migration`).
+4. After the example preview, it says script paths vary: the repo's `.claude/hooks`, `~/.claude/hooks`, or elsewhere.
+5. It says the hook log gets no new lines when everything works.
+
 ### Human test script
 
 Run this on your local machine.
