@@ -6,10 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 )
 
 // migrateFixture copies a settings fixture from internal/claudeconfig/testdata/migrate.
@@ -488,5 +491,136 @@ func TestClosure_MigrateApplyFailures(t *testing.T) {
 	}
 	if after := snapshotSettings(t, outside.vars["HOME"]); !reflect.DeepEqual(after, before) {
 		t.Fatal("--apply with a binary outside home changed files")
+	}
+}
+
+// Loop 8, Behavior 15: a plain Claude session (not started by ntm, no
+// AGENT_NAME) in a migrated repo is told about new mail at turn end. The
+// committed command runs under sh -c from the repo root, as Claude Code
+// runs it, and finds the agent from the breadcrumb.
+func TestClosure_MigratedRepoPlainSessionTold(t *testing.T) {
+	mail := newFakeAgentMail(t)
+	mail.addMessage("BlueLake", agentmail.InboxMessage{ID: 61, From: "RedStone", Subject: "migrated repo"})
+	token := mail.issueToken("BlueLake")
+	env := newClosureEnv(t)
+	env.useAgentMail(mail)
+	env.clearIdentityEnv()
+	env.useBinaryUnderHome(t, "ntm-test")
+	repo := commitMigrateRepo(t, filepath.Join(env.vars["HOME"], "Dev", "zero-knowledge-proofs"))
+	env.run(t, "execute", "agent-hook", "migrate", "--apply", repo)
+
+	var settings map[string]any
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(repo, ".claude", "settings.json")), &settings); err != nil {
+		t.Fatal(err)
+	}
+	command := onlyNtmStopEntry(t, settings).Command
+	if command != "~/.local/bin/ntm-test agent-hook stop" {
+		t.Fatalf("migrated Stop command = %q", command)
+	}
+	writeBreadcrumb(t, repo, "identity.json", "BlueLake", token)
+
+	input := `{"session_id": "plain-1", "hook_event_name": "Stop", "stop_hook_active": false, "cwd": ` + strconv.Quote(repo) + `}`
+	asNtm := []string{closureHelperModeEnv + "=argv", closureHelperArgsEnv + "="}
+	out := env.runShell(t, repo, command, input, asNtm...)
+	if d := parseStopDecision(t, out); d.Decision != "block" || !strings.Contains(d.Reason, "[#61] from RedStone: migrated repo") {
+		t.Fatalf("plain session's turn end = %q", out)
+	}
+	assertFetchesUsed(t, mail, 1, repo, "BlueLake", token)
+	if again := env.runShell(t, repo, command, input, asNtm...); again != "" {
+		t.Fatalf("second turn end printed %q", again)
+	}
+}
+
+// readMigrationGuide is docs/agent-hook-migration.md.
+func readMigrationGuide(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "agent-hook-migration.md"))
+	if err != nil {
+		t.Fatalf("read docs/agent-hook-migration.md: %v", err)
+	}
+	return string(data)
+}
+
+// Loop 8, Behavior 12: the guide has its steps in order, says what stays,
+// and every migrate command in it parses.
+func TestAgentHookMigrationGuide(t *testing.T) {
+	guide := readMigrationGuide(t)
+	lines := strings.Split(guide, "\n")
+	want := []string{"Install", "Preview", "Apply", "Check the diff", "Commit each repo", "Test one repo", "Roll back"}
+	next := 0
+	for _, line := range lines {
+		if heading, ok := strings.CutPrefix(line, "## "); ok && next < len(want) && strings.HasPrefix(heading, want[next]) {
+			next++
+		}
+	}
+	if next != len(want) {
+		t.Fatalf("the guide lacks a %q section, in the order %v", want[next], want)
+	}
+	for _, phrase := range []string{"stay on disk", "under your home folder", "worktree", "repo root"} {
+		if !strings.Contains(guide, phrase) {
+			t.Fatalf("the guide doesn't mention %q", phrase)
+		}
+	}
+
+	commands, inBlock := 0, false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			inBlock = !inBlock
+			continue
+		}
+		rest, ok := strings.CutPrefix(trimmed, "ntm agent-hook migrate")
+		if !inBlock || !ok {
+			continue
+		}
+		commands++
+		if err := newAgentHookMigrateCmd().ParseFlags(strings.Fields(rest)); err != nil {
+			t.Fatalf("guide command %q: %v", trimmed, err)
+		}
+	}
+	if commands < 3 {
+		t.Fatalf("the guide has %d migrate commands in code blocks", commands)
+	}
+}
+
+// guideBlock is the first fenced block after the heading.
+func guideBlock(t *testing.T, guide, heading string) string {
+	t.Helper()
+	_, after, ok := strings.Cut(guide, "\n"+heading+"\n")
+	if !ok {
+		t.Fatalf("the guide has no %q heading", heading)
+	}
+	_, after, ok = strings.Cut(after, "```text\n")
+	if !ok {
+		t.Fatalf("no text block after %q", heading)
+	}
+	block, _, ok := strings.Cut(after, "```")
+	if !ok {
+		t.Fatalf("the block after %q isn't closed", heading)
+	}
+	return block
+}
+
+// Loop 8, Behavior 13: the guide's example output is the real report. When
+// the report's format changes, this fails until the guide is updated.
+func TestAgentHookMigrationGuide_ExampleOutput(t *testing.T) {
+	guide := readMigrationGuide(t)
+	home := t.TempDir()
+	repo := gitInitForTest(t, filepath.Join(home, "Dev", "zero-knowledge-proofs"))
+	writeFile(t, filepath.Join(repo, ".claude", "settings.json"), string(mustReadFile(t, filepath.Join("testdata", "migrate", "guide", "settings.json"))))
+	gitForTest(t, repo, "add", ".claude")
+	gitForTest(t, repo, "commit", "-q", "-m", "hooks")
+	ntmPath := func() (string, error) { return filepath.Join(home, ".local", "bin", "ntm"), nil }
+
+	for _, example := range []struct {
+		heading string
+		apply   bool
+	}{{"### Example preview", false}, {"### Example apply", true}} {
+		var out strings.Builder
+		renderMigrationReport(&out, buildMigrationReport([]string{filepath.Join(home, "Dev")}, home, ntmPath, example.apply))
+		got := strings.ReplaceAll(out.String(), home, "/home/you")
+		if want := guideBlock(t, guide, example.heading); got != want {
+			t.Fatalf("the guide's %q block isn't the real report. Update the guide to:\n%s", example.heading, got)
+		}
 	}
 }

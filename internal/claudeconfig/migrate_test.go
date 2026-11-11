@@ -580,3 +580,54 @@ func TestApplyHookMigration_Properties(t *testing.T) {
 		}
 	})
 }
+
+// Loop 8, Behavior 14: the guide's "Roll back" section says reverting the
+// migration commit restores the file, and the scripts were never touched.
+func TestHookMigration_RollbackRestoresFile(t *testing.T) {
+	const newCmd = "~/.local/bin/ntm agent-hook stop"
+	repo := t.TempDir()
+	gitInit(t, repo)
+	original, err := os.ReadFile(filepath.Join("testdata", "migrate", "agentmail.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(repo, ".claude", "settings.json")
+	scripts := filepath.Join(repo, ".claude", "hooks")
+	if err := os.MkdirAll(scripts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settings, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, script := range []string{OldStopScript, OldCloseScript, OldWindowScript} {
+		if err := os.WriteFile(filepath.Join(scripts, script), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitRun(t, repo, "add", ".claude")
+	gitRun(t, repo, "commit", "-q", "-m", "hooks")
+
+	decoded, err := decodeSettings(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanHookMigration(decoded, newCmd)
+	if err != nil || !plan.HasChanges() {
+		t.Fatalf("plan = %+v, %v", plan, err)
+	}
+	if err := WriteMigratedSettings(settings, original, plan, newCmd); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "commit", "-q", "-am", "Move Agent Mail hooks to ntm agent-hook stop")
+	if status := gitRun(t, repo, "status", "--porcelain"); status != "" {
+		t.Fatalf("migration touched more than the settings file:\n%s", status)
+	}
+
+	gitRun(t, repo, "revert", "--no-edit", "HEAD")
+	if got, _ := os.ReadFile(settings); string(got) != string(original) {
+		t.Fatalf("after git revert the file is:\n%s", got)
+	}
+	if changed := gitRun(t, repo, "diff", "--name-only", "HEAD~2", "--", ".claude/hooks"); changed != "" {
+		t.Fatalf("scripts changed: %s", changed)
+	}
+}

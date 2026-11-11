@@ -996,6 +996,45 @@ No production change expected beyond Behaviors 3 and 10. If the subfolder case i
 
 **Automated:** `go test -short -run TestClosure_MigratedRepoPlainSessionTold ./internal/cli/` passes.
 
+### Build record (2026-11-11)
+
+Base commit `bc848836`. Behaviors 12 to 15 are built. There's no production code change: Behaviors 3 and 10 already hold the code these behaviors rely on.
+
+**The guide:** `docs/agent-hook-migration.md` (new). Its sections:
+- a table of the three scripts and what happens to each;
+- Install (the binary must be under your home folder, at the same place on every machine);
+- Preview, with an example;
+- Apply (one repo first, then the rest), with an example;
+- Check the diff;
+- Commit each repo (the printed commands, and how to bring the commit into a worktree);
+- Test one repo (start from the repo root, register with Agent Mail, and where the hook's log is);
+- Roll back (`git revert`; the old scripts stay on disk).
+
+**Tests:**
+- `TestAgentHookMigrationGuide` checks the section order, the "stay on disk", "under your home folder", "worktree" and "repo root" notes, and that each `ntm agent-hook migrate` line in a code block parses with the command's flags.
+- `TestAgentHookMigrationGuide_ExampleOutput` renders the real report (preview, then apply) for `/home/you/Dev/zero-knowledge-proofs` and compares it with the guide's two example blocks. The fixture is `internal/cli/testdata/migrate/guide/settings.json`. It's a flat file, not under a `.claude` folder, so a real `migrate ~/Dev` never finds it in an ntm checkout.
+- `TestHookMigration_RollbackRestoresFile` (claudeconfig): apply, commit, then `git revert --no-edit HEAD` gives the original bytes back, and the scripts never change.
+- `TestClosure_MigratedRepoPlainSessionTold`: `--apply` on a repo, then the committed Stop command runs under `sh -c` from the repo root, with Claude's Stop input and no `AGENT_NAME`. It blocks with "[#61] from RedStone: migrated repo". The fake server saw one fetch as BlueLake, with the breadcrumb's token and the repo as the project. A second run prints nothing.
+
+**Red:**
+- Both guide tests were red with "read docs/agent-hook-migration.md: … no such file or directory".
+- The rollback and plain-session tests passed when first written, as the plan expected (they guard Behaviors 3 and 10).
+
+**Red-at-seam, observed and then reverted:** with the `~/` part quoted, the plain-session test was red on the command check (`'~/.local/bin/ntm-test' agent-hook stop`). With that check turned off as well, `sh` failed with "~/.local/bin/ntm-test: not found" (exit 127).
+
+**Differences from the plan:**
+- The guide fixture lives in `testdata/migrate/guide/settings.json`, not a `.claude` folder (see above).
+- The guide doesn't suggest running `ntm agent-hook stop` by hand to check things. That run could use up the reminder that the real session should get. It points to the hook's log instead.
+
+**Verification:**
+- `go build` ok, and vet ok.
+- gofmt lists only the 3 files that were already listed.
+- `-race` ok for `claudeconfig` and `git`.
+- The migrate and guide tests passed 5 runs in a row.
+- `go test -short -timeout 40m ./...` failed only on the bd-5zbcm list.
+- Tamper check (base `bc848836`) clean.
+- golangci-lint, goimports and ubs weren't run (not installed).
+
 ### Human test script
 
 Run this on your local machine.
