@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -301,5 +302,191 @@ func TestClosure_MigrateSkipsUnreadableAndUnrelated(t *testing.T) {
 	}
 	if strings.Count(out, "Skipped 1 folder that couldn't be read.") != 1 || !strings.Contains(out, tree.agentmail+"\n") {
 		t.Fatalf("output:\n%s", out)
+	}
+}
+
+// commitMigrateRepo makes dir a git repo holding the agentmail fixture and
+// its scripts, committed.
+func commitMigrateRepo(t *testing.T, dir string) string {
+	t.Helper()
+	repo := gitInitForTest(t, dir)
+	migrateFixture(t, "agentmail.json", filepath.Join(repo, ".claude", "settings.json"))
+	for _, script := range []string{"check_critical_on_stop.sh", "check_mail_on_close.sh", "ensure_window_id.sh"} {
+		writeFile(t, filepath.Join(repo, ".claude", "hooks", script), "#!/bin/sh\n")
+	}
+	gitForTest(t, repo, "add", ".claude")
+	gitForTest(t, repo, "commit", "-q", "-m", "hooks")
+	return repo
+}
+
+// fileIdentity is a file's inode and modification time, to show it wasn't
+// rewritten.
+func fileIdentity(t *testing.T, path string) [2]int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return [2]int64{int64(info.Sys().(*syscall.Stat_t).Ino), info.ModTime().UnixNano()}
+}
+
+// Loop 8, Behavior 10: --apply writes minimal diffs, keeps the scripts and
+// the file mode, never commits, skips a worktree's shared copy, writes
+// through a symlink, and a re-run writes nothing.
+func TestClosure_MigrateApply(t *testing.T) {
+	env := newClosureEnv(t)
+	env.useBinaryUnderHome(t, "ntm-test")
+	tree := newMigrateTree(t, env)
+	const newCmd = "~/.local/bin/ntm-test agent-hook stop"
+	settings := filepath.Join(tree.agentmail, ".claude", "settings.json")
+	if err := os.Chmod(settings, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	head := gitForTest(t, tree.agentmail, "rev-parse", "HEAD")
+	worktreeSettings := filepath.Join(tree.worktree, ".claude", "settings.json")
+	worktreeBefore := string(mustReadFile(t, worktreeSettings))
+	// zk's local file is a symlink to a file kept elsewhere.
+	local := filepath.Join(tree.zk, ".claude", "settings.local.json")
+	target := filepath.Join(tree.home, "ntm_Dev", "zk-settings.json")
+	if err := os.Rename(local, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, local); err != nil {
+		t.Fatal(err)
+	}
+
+	out := env.run(t, "execute", "agent-hook", "migrate", "--apply")
+	for _, want := range []string{
+		".claude/settings.json (commit in " + tree.agentmail + ")",
+		".claude/settings.json (skipped: migrate and commit " + tree.agentmail + ", then update this worktree)",
+		".claude/settings.local.json (nothing to commit (local file))",
+		"Changed 2 files in 2 repos.",
+		"git -C " + tree.agentmail + " add .claude/settings.json && git -C " + tree.agentmail + ` commit -m "Move Agent Mail hooks to ntm agent-hook stop"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("--apply output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "git -C "+tree.worktree) || strings.Contains(out, "git -C "+tree.zk) || strings.Contains(out, "Preview only") {
+		t.Fatalf("--apply output:\n%s", out)
+	}
+	// The skipped copy shows no change lines, which would read as if it
+	// changed (Sprint 2 human test note).
+	worktreeBlock := out[strings.Index(out, tree.worktree+"\n"):]
+	worktreeBlock = worktreeBlock[:strings.Index(worktreeBlock, "\n\n")]
+	if strings.Contains(worktreeBlock, "replace ") || strings.Contains(worktreeBlock, "remove ") || strings.Contains(worktreeBlock, "keep ") {
+		t.Fatalf("skipped worktree copy lists changes:\n%s", worktreeBlock)
+	}
+
+	got := string(mustReadFile(t, settings))
+	for _, want := range []string{`"command": "` + newCmd + `",`, "ensure_window_id.sh", "file_reservations active", "file_reservations soon", "file_reservations list"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("migrated file lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "check_mail_on_close.sh") || strings.Contains(got, "check_critical_on_stop.sh") || strings.Contains(got, `"matcher": "Bash"`) {
+		t.Fatalf("old entries left:\n%s", got)
+	}
+	// The command line changes, and the Bash group's 11 lines go.
+	if numstat := gitForTest(t, tree.agentmail, "diff", "--numstat", "--", ".claude/settings.json"); !strings.HasPrefix(numstat, "1\t11\t") {
+		t.Fatalf("numstat = %q\n%s", numstat, gitForTest(t, tree.agentmail, "diff"))
+	}
+	for _, script := range []string{"check_critical_on_stop.sh", "check_mail_on_close.sh", "ensure_window_id.sh"} {
+		if _, err := os.Stat(filepath.Join(tree.agentmail, ".claude", "hooks", script)); err != nil {
+			t.Fatalf("script %s: %v", script, err)
+		}
+	}
+	if now := gitForTest(t, tree.agentmail, "rev-parse", "HEAD"); now != head {
+		t.Fatalf("--apply committed: HEAD %s, was %s", now, head)
+	}
+	if info, err := os.Stat(settings); err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("mode = %v, %v", info.Mode(), err)
+	}
+	if string(mustReadFile(t, worktreeSettings)) != worktreeBefore {
+		t.Fatal("the worktree's shared copy was written")
+	}
+	if info, err := os.Lstat(local); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink replaced: %v, %v", info, err)
+	}
+	if linked := string(mustReadFile(t, target)); !strings.Contains(linked, newCmd) || strings.Contains(linked, "check_critical_on_stop.sh") {
+		t.Fatalf("symlink target:\n%s", linked)
+	}
+
+	// A second run writes nothing; the worktree copy is still skipped.
+	ids := map[string][2]int64{settings: fileIdentity(t, settings), target: fileIdentity(t, target)}
+	again := env.run(t, "execute", "agent-hook", "migrate", "--apply")
+	if strings.Contains(again, tree.agentmail+"\n") || strings.Contains(again, tree.zk) || !strings.Contains(again, "No files changed.") {
+		t.Fatalf("second --apply:\n%s", again)
+	}
+	for path, id := range ids {
+		if fileIdentity(t, path) != id {
+			t.Fatalf("second --apply rewrote %s", path)
+		}
+	}
+	if only := env.run(t, "execute", "agent-hook", "migrate", "--apply", tree.agentmail); strings.TrimSpace(only) != "Nothing to migrate." {
+		t.Fatalf("--apply on the migrated repo = %q", only)
+	}
+
+	// Following the skip note: commit in the main repo, update the worktree,
+	// and nothing is left.
+	gitForTest(t, tree.agentmail, "commit", "-q", "-am", "Move Agent Mail hooks to ntm agent-hook stop")
+	gitForTest(t, tree.worktree, "merge", "-q", "--ff-only", gitForTest(t, tree.agentmail, "rev-parse", "HEAD"))
+	if done := env.run(t, "execute", "agent-hook", "migrate", "--apply"); strings.TrimSpace(done) != "Nothing to migrate." {
+		t.Fatalf("after committing and updating the worktree:\n%s", done)
+	}
+
+	var report migrateJSON
+	if err := json.Unmarshal([]byte(env.run(t, "execute", "--json", "agent-hook", "migrate", "--apply")), &report); err != nil || !report.Success || !report.Applied {
+		t.Fatalf("--json --apply = %+v, %v", report, err)
+	}
+}
+
+// Loop 8, Behavior 11: a failed write leaves its repo alone and the others
+// migrated; a binary outside home writes nothing. Both exit 1.
+func TestClosure_MigrateApplyFailures(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Fatal("this test needs a non-root user, because root writes into read-only folders")
+	}
+	env := newClosureEnv(t)
+	env.useBinaryUnderHome(t, "ntm-test")
+	dev := filepath.Join(env.vars["HOME"], "Dev")
+	first := commitMigrateRepo(t, filepath.Join(dev, "a"))
+	middle := commitMigrateRepo(t, filepath.Join(dev, "b"))
+	third := commitMigrateRepo(t, filepath.Join(dev, "c"))
+	middleSettings := filepath.Join(middle, ".claude", "settings.json")
+	middleBefore := string(mustReadFile(t, middleSettings))
+	if err := os.Chmod(filepath.Dir(middleSettings), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Dir(middleSettings), 0o755) })
+
+	out, err := env.tryRun("execute", "agent-hook", "migrate", "--apply")
+	if err == nil {
+		t.Fatalf("a failed write still exited 0:\n%s", out)
+	}
+	if !strings.Contains(out, "Failed:\n  "+middleSettings+": ") || !strings.Contains(out, "Changed 2 files in 2 repos.") {
+		t.Fatalf("output:\n%s", out)
+	}
+	for _, repo := range []string{first, third} {
+		if got := string(mustReadFile(t, filepath.Join(repo, ".claude", "settings.json"))); strings.Contains(got, "check_critical_on_stop.sh") {
+			t.Fatalf("%s wasn't migrated", repo)
+		}
+	}
+	if string(mustReadFile(t, middleSettings)) != middleBefore {
+		t.Fatal("the failed repo's file changed")
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(middleSettings)); len(entries) != 2 { // settings.json and hooks
+		t.Fatalf("leftover files in the failed .claude folder: %v", entries)
+	}
+
+	outside := newClosureEnv(t) // runs os.Args[0], which isn't under its home
+	repo := commitMigrateRepo(t, filepath.Join(outside.vars["HOME"], "Dev", "a"))
+	before := snapshotSettings(t, outside.vars["HOME"])
+	out, err = outside.tryRun("execute", "agent-hook", "migrate", "--apply")
+	if err == nil || !strings.Contains(out, "  "+repo+": ntm binary is outside your home folder") {
+		t.Fatalf("binary outside home: %v\n%s", err, out)
+	}
+	if after := snapshotSettings(t, outside.vars["HOME"]); !reflect.DeepEqual(after, before) {
+		t.Fatal("--apply with a binary outside home changed files")
 	}
 }

@@ -1,0 +1,14 @@
+{
+    "permissions": { "allow": ["Bash(ls:*)", "Read"] },
+    "hooks": {
+        "PostToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    { "type": "command", "command": "~/.claude/hooks/check_mail_on_close.sh", "timeout": 5 }
+                ]
+            }
+        ]
+    },
+    "env": { "A": "<&>" }
+}

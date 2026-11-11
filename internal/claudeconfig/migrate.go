@@ -1,8 +1,11 @@
 package claudeconfig
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -147,11 +150,7 @@ func CommittedStopHookCommand(ntmPath, home string) (string, error) {
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("%w: ntm is at %s, outside %s; install it under your home folder so committed files work on every machine", ErrBinaryOutsideHome, ntmPath, home)
 	}
-	rel = filepath.ToSlash(rel)
-	if !shellSafePath.MatchString(rel) {
-		rel = tmux.ShellQuote(rel)
-	}
-	return "~/" + rel + stopHookMarker, nil
+	return "~/" + QuotedPath(filepath.ToSlash(rel)) + stopHookMarker, nil
 }
 
 // MigrationAction is what happens to one hook entry.
@@ -337,6 +336,322 @@ func ParseHookSettings(path string, raw []byte) (map[string]any, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrUnparseableSettings, path, err)
 	}
 	return settings, nil
+}
+
+// spanNode is one JSON value and where it sits in the file's text. Objects
+// also record each key's span. Migration edits a committed file by splicing
+// these spans, so every byte it doesn't change, including hand formatting,
+// stays as it was and git diff shows only the changed lines.
+type spanNode struct {
+	start, end int
+	kind       byte // '{', '[' or 's' for a scalar
+	keys       []string
+	keyStarts  []int
+	keyEnds    []int
+	children   []*spanNode
+}
+
+// member returns the value of an object's key, or nil.
+func (n *spanNode) member(key string) (int, *spanNode) {
+	for i, k := range n.keys {
+		if k == key {
+			return i, n.children[i]
+		}
+	}
+	return -1, nil
+}
+
+// parseSettingsSpans indexes one JSON document's values by byte span.
+func parseSettingsSpans(raw []byte) (*spanNode, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	root, err := parseSpanValue(dec, raw)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("text after the JSON value")
+	}
+	return root, nil
+}
+
+// skipSeparators moves past blanks, commas and colons to a token's first byte.
+func skipSeparators(raw []byte, i int) int {
+	for i < len(raw) && strings.IndexByte(" \t\r\n,:", raw[i]) >= 0 {
+		i++
+	}
+	return i
+}
+
+func parseSpanValue(dec *json.Decoder, raw []byte) (*spanNode, error) {
+	before := int(dec.InputOffset())
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	n := &spanNode{start: skipSeparators(raw, before), kind: 's'}
+	if delim, ok := tok.(json.Delim); ok {
+		n.kind = byte(delim)
+		for dec.More() {
+			if n.kind == '{' {
+				keyBefore := int(dec.InputOffset())
+				keyTok, err := dec.Token()
+				if err != nil {
+					return nil, err
+				}
+				key, _ := keyTok.(string)
+				n.keys = append(n.keys, key)
+				n.keyStarts = append(n.keyStarts, skipSeparators(raw, keyBefore))
+				n.keyEnds = append(n.keyEnds, int(dec.InputOffset()))
+			}
+			child, err := parseSpanValue(dec, raw)
+			if err != nil {
+				return nil, err
+			}
+			n.children = append(n.children, child)
+		}
+		if _, err := dec.Token(); err != nil { // the closing } or ]
+			return nil, err
+		}
+	}
+	n.end = int(dec.InputOffset())
+	return n, nil
+}
+
+// textEdit replaces raw[start:end] with text.
+type textEdit struct {
+	start, end int
+	text       string
+}
+
+// deletionEdits removes the marked elements of a list whose element spans
+// are starts[i]:ends[i], with the separators around them, keeping the list
+// well formed. At least one element must stay.
+func deletionEdits(starts, ends []int, removed []bool) []textEdit {
+	var edits []textEdit
+	for i := 0; i < len(removed); i++ {
+		if !removed[i] {
+			continue
+		}
+		j := i
+		for j+1 < len(removed) && removed[j+1] {
+			j++
+		}
+		if j+1 < len(removed) {
+			edits = append(edits, textEdit{starts[i], starts[j+1], ""}) // up to the next kept element
+		} else {
+			edits = append(edits, textEdit{ends[i-1], ends[j], ""}) // from the previous kept element's end
+		}
+		i = j
+	}
+	return edits
+}
+
+// jsonText is s as a JSON string, without HTML escaping.
+func jsonText(s string) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(s)
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
+// lineIndent is the blanks at the start of the line holding raw[i].
+func lineIndent(raw []byte, i int) string {
+	lineStart := bytes.LastIndexByte(raw[:i], '\n') + 1
+	end := lineStart
+	for end < len(raw) && (raw[end] == ' ' || raw[end] == '\t') {
+		end++
+	}
+	return string(raw[lineStart:end])
+}
+
+// replaceEntryEdits points one hook entry at newCommand, with the
+// HookRegistration timeout of 5 seconds.
+func replaceEntryEdits(raw []byte, entry *spanNode, newCommand string) ([]textEdit, error) {
+	c, command := entry.member("command")
+	if command == nil {
+		return nil, fmt.Errorf("hook entry has no command")
+	}
+	edits := []textEdit{{command.start, command.end, jsonText(newCommand)}}
+	timeout := fmt.Sprint(StopHookTimeoutSeconds)
+	switch _, value := entry.member("timeout"); {
+	case value != nil && string(raw[value.start:value.end]) != timeout:
+		edits = append(edits, textEdit{value.start, value.end, timeout})
+	case value == nil && bytes.IndexByte(raw[entry.start:entry.end], '\n') < 0:
+		edits = append(edits, textEdit{command.end, command.end, `, "timeout": ` + timeout})
+	case value == nil:
+		edits = append(edits, textEdit{command.end, command.end, ",\n" + lineIndent(raw, entry.keyStarts[c]) + `"timeout": ` + timeout})
+	}
+	return edits, nil
+}
+
+// ApplyHookMigration applies a plan to a settings file's text. It replaces
+// the planned entries' commands, removes the planned entries, and removes a
+// group, event list or the hooks object's content when that leaves it empty.
+// Everything else stays byte for byte. A plan with no changes returns raw.
+func ApplyHookMigration(raw []byte, plan HookMigrationPlan) ([]byte, error) {
+	if !plan.HasChanges() {
+		return raw, nil
+	}
+	root, err := parseSettingsSpans(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnparseableSettings, err)
+	}
+	_, hooks := root.member("hooks")
+	if root.kind != '{' || hooks == nil || hooks.kind != '{' {
+		return nil, fmt.Errorf("%w: no hooks object", ErrUnparseableSettings)
+	}
+	type at struct {
+		event          string
+		group, handler int
+	}
+	replace := map[at]string{}
+	remove := map[at]bool{}
+	for _, c := range plan.Changes {
+		switch c.Action {
+		case MigrationReplace:
+			replace[at{c.Event, c.Group, c.Handler}] = c.New
+		case MigrationRemove:
+			remove[at{c.Event, c.Group, c.Handler}] = true
+		}
+	}
+
+	var edits []textEdit
+	eventRemoved := make([]bool, len(hooks.children))
+	for e, event := range hooks.children {
+		name := hooks.keys[e]
+		if event.kind != '[' {
+			return nil, fmt.Errorf("%w: hooks.%s isn't a list", ErrUnparseableSettings, name)
+		}
+		groupRemoved := make([]bool, len(event.children))
+		var groupStarts, groupEnds []int
+		for g, group := range event.children {
+			groupStarts, groupEnds = append(groupStarts, group.start), append(groupEnds, group.end)
+			_, list := group.member("hooks")
+			if group.kind != '{' || list == nil || list.kind != '[' {
+				return nil, fmt.Errorf("%w: hooks.%s[%d] has no hooks list", ErrUnparseableSettings, name, g)
+			}
+			handlerRemoved := make([]bool, len(list.children))
+			var starts, ends []int
+			kept := 0
+			for h, entry := range list.children {
+				starts, ends = append(starts, entry.start), append(ends, entry.end)
+				handlerRemoved[h] = remove[at{name, g, h}]
+				if handlerRemoved[h] {
+					continue
+				}
+				kept++
+				if newCommand, ok := replace[at{name, g, h}]; ok {
+					entryEdits, err := replaceEntryEdits(raw, entry, newCommand)
+					if err != nil {
+						return nil, fmt.Errorf("%w: hooks.%s[%d].hooks[%d]: %v", ErrUnparseableSettings, name, g, h, err)
+					}
+					edits = append(edits, entryEdits...)
+				}
+			}
+			switch {
+			case kept == 0 && len(list.children) > 0:
+				groupRemoved[g] = true
+			case kept < len(list.children):
+				edits = append(edits, deletionEdits(starts, ends, handlerRemoved)...)
+			}
+		}
+		if allTrue(groupRemoved) && len(groupRemoved) > 0 {
+			eventRemoved[e] = true
+			continue
+		}
+		edits = append(edits, deletionEdits(groupStarts, groupEnds, groupRemoved)...)
+	}
+	switch {
+	case allTrue(eventRemoved) && len(eventRemoved) > 0:
+		edits = filterEditsOutside(edits, hooks.start, hooks.end)
+		edits = append(edits, textEdit{hooks.start, hooks.end, "{}"})
+	default:
+		edits = append(edits, deletionEdits(hooks.keyStarts, childEnds(hooks), eventRemoved)...)
+	}
+	return spliceEdits(raw, edits)
+}
+
+// WriteMigratedSettings applies plan to raw, the text read from path, checks
+// that planning the result finds nothing left to change, and writes it
+// atomically to the file path points to (through a symlink), keeping that
+// file's mode.
+func WriteMigratedSettings(path string, raw []byte, plan HookMigrationPlan, newCommand string) error {
+	out, err := ApplyHookMigration(raw, plan)
+	if err != nil {
+		return err
+	}
+	after, err := decodeSettings(out)
+	if err != nil {
+		return fmt.Errorf("the migrated text isn't valid JSON: %w", err)
+	}
+	if again, err := PlanHookMigration(after, newCommand); err != nil || again.HasChanges() {
+		return fmt.Errorf("the migrated settings still need changes")
+	}
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(target, out, info.Mode().Perm())
+}
+
+// QuotedPath is p, single-quoted for a shell when it isn't plain.
+func QuotedPath(p string) string {
+	if shellSafePath.MatchString(p) {
+		return p
+	}
+	return tmux.ShellQuote(p)
+}
+
+func allTrue(values []bool) bool {
+	for _, v := range values {
+		if !v {
+			return false
+		}
+	}
+	return true
+}
+
+func childEnds(n *spanNode) []int {
+	ends := make([]int, len(n.children))
+	for i, child := range n.children {
+		ends[i] = child.end
+	}
+	return ends
+}
+
+// filterEditsOutside drops edits inside [start, end), which a larger edit
+// replaces.
+func filterEditsOutside(edits []textEdit, start, end int) []textEdit {
+	kept := edits[:0]
+	for _, e := range edits {
+		if e.end <= start || e.start >= end {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// spliceEdits applies non-overlapping edits to raw.
+func spliceEdits(raw []byte, edits []textEdit) ([]byte, error) {
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
+	var out bytes.Buffer
+	pos := 0
+	for _, e := range edits {
+		if e.start < pos {
+			return nil, fmt.Errorf("overlapping edits at byte %d", e.start)
+		}
+		out.Write(raw[pos:e.start])
+		out.WriteString(e.text)
+		pos = e.end
+	}
+	out.Write(raw[pos:])
+	return out.Bytes(), nil
 }
 
 // hookScanSkip are folders the scan never enters: version control, package

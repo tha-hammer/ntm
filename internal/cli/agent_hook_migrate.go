@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -20,8 +21,12 @@ import (
 // folders are named.
 var migrationDefaultFolders = []string{"Dev", "ntm_Dev"}
 
+// migrationCommitMessage is the message in the commit lines --apply prints.
+const migrationCommitMessage = "Move Agent Mail hooks to ntm agent-hook stop"
+
 func newAgentHookMigrateCmd() *cobra.Command {
-	return &cobra.Command{
+	var apply bool
+	cmd := &cobra.Command{
 		Use:   "migrate [folders...]",
 		Short: "Move Claude settings from the old Agent Mail hook scripts to ntm agent-hook stop",
 		Long: `Finds .claude/settings.json and .claude/settings.local.json files that register
@@ -30,8 +35,11 @@ the old Agent Mail hook scripts, and shows the change for each:
   check_mail_on_close.sh     removed (turn-end reminders cover new mail)
   ensure_window_id.sh        left alone (the breadcrumb lookup needs it)
 
-With no folders named, it scans ~/Dev and ~/ntm_Dev. Nothing is written.
-It never commits and never deletes a script.`,
+With no folders named, it scans ~/Dev and ~/ntm_Dev. Without --apply nothing
+is written. With --apply it edits only the changed lines of each file, skips
+a worktree's shared copy (migrate and commit the main repo, then update the
+worktree), and prints the git commands to commit each repo. It never commits
+and never deletes a script.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			home, err := os.UserHomeDir()
 			if err != nil {
@@ -41,7 +49,7 @@ It never commits and never deletes a script.`,
 			if err != nil {
 				return err
 			}
-			report := buildMigrationReport(roots, home, resilience.CurrentExecutablePath)
+			report := buildMigrationReport(roots, home, resilience.CurrentExecutablePath, apply)
 			out := cmd.OutOrStdout()
 			if mailJSONEnabled(cmd) {
 				if err := encodeJSONResult(out, report); err != nil {
@@ -56,6 +64,8 @@ It never commits and never deletes a script.`,
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&apply, "apply", false, "write the changes (default: preview only)")
+	return cmd
 }
 
 // migrationRoots is the folders to scan: the named ones, each of which must
@@ -91,6 +101,7 @@ type migrationFile struct {
 	Repo         string                       `json:"repo"`
 	CommitStatus string                       `json:"commit_status"`
 	SharedWith   string                       `json:"shared_with,omitempty"` // main repo, for a worktree's copy
+	Written      bool                         `json:"written"`
 	Changes      []claudeconfig.PlannedChange `json:"changes"`
 }
 
@@ -102,22 +113,27 @@ type migrationFailure struct {
 
 // migrationTotals counts files, the repos you commit in (a worktree's shared
 // copy counts under its main repo), shared copies, failures, and folders the
-// scan couldn't read.
+// scan couldn't read. With --apply it also counts the files written and the
+// repos they're in.
 type migrationTotals struct {
-	Files      int `json:"files"`
-	Repos      int `json:"repos"`
-	Shared     int `json:"shared"`
-	Failed     int `json:"failed"`
-	Unreadable int `json:"unreadable_folders"`
+	Files        int `json:"files"`
+	Repos        int `json:"repos"`
+	Shared       int `json:"shared"`
+	Failed       int `json:"failed"`
+	Unreadable   int `json:"unreadable_folders"`
+	Written      int `json:"written"`
+	WrittenRepos int `json:"written_repos"`
 }
 
-// migrationReport is what ntm agent-hook migrate found and did.
+// migrationReport is what ntm agent-hook migrate found and did. Commits are
+// the git commands that commit each written repo, which ntm never runs.
 type migrationReport struct {
 	Success  bool               `json:"success"`
 	Applied  bool               `json:"applied"`
 	Command  string             `json:"command,omitempty"`
 	Files    []migrationFile    `json:"files"`
 	Failures []migrationFailure `json:"failures"`
+	Commits  []string           `json:"commit_commands"`
 	Totals   migrationTotals    `json:"totals"`
 }
 
@@ -125,9 +141,10 @@ type migrationReport struct {
 // names an old script. Files that name one but can't be read or parsed, and
 // repos that would need a committed command while ntm is outside home, are
 // failures; the rest go on. Files naming no old script, and folders the scan
-// isn't allowed to read, are skipped.
-func buildMigrationReport(roots []string, home string, ntmPath func() (string, error)) migrationReport {
-	report := migrationReport{Files: []migrationFile{}, Failures: []migrationFailure{}}
+// isn't allowed to read, are skipped. With apply, each planned file is
+// written, except a worktree's shared copy; a failed write is a failure.
+func buildMigrationReport(roots []string, home string, ntmPath func() (string, error), apply bool) migrationReport {
+	report := migrationReport{Applied: apply, Files: []migrationFile{}, Failures: []migrationFailure{}, Commits: []string{}}
 	newCommand, commandErr := "", error(nil)
 	if path, err := ntmPath(); err != nil {
 		commandErr = err
@@ -177,23 +194,68 @@ func buildMigrationReport(roots []string, home string, ntmPath func() (string, e
 			continue
 		}
 		status, sharedWith := commitStatus(path, repo)
-		report.Files = append(report.Files, migrationFile{Path: path, Repo: repo, CommitStatus: status, SharedWith: sharedWith, Changes: plan.Changes})
+		file := migrationFile{Path: path, Repo: repo, CommitStatus: status, SharedWith: sharedWith, Changes: plan.Changes}
+		switch {
+		case !apply:
+		case sharedWith != "":
+			file.CommitStatus = "skipped: migrate and commit " + sharedWith + ", then update this worktree"
+		default:
+			if err := claudeconfig.WriteMigratedSettings(path, raw, plan, newCommand); err != nil {
+				report.Failures = append(report.Failures, migrationFailure{Path: path, Error: err.Error()})
+				continue
+			}
+			file.Written = true
+		}
+		report.Files = append(report.Files, file)
 	}
 
 	sort.SliceStable(report.Files, func(i, j int) bool { return report.Files[i].Repo < report.Files[j].Repo })
+	report.Totals = migrationTotals{Files: len(report.Files), Failed: len(report.Failures), Unreadable: unreadable}
 	repos := map[string]bool{}
-	shared := 0
+	writtenRepos := map[string]bool{}
 	for _, f := range report.Files {
 		if f.SharedWith != "" {
-			shared++
+			report.Totals.Shared++
 			repos[f.SharedWith] = true
 		} else {
 			repos[f.Repo] = true
 		}
+		if f.Written {
+			report.Totals.Written++
+			writtenRepos[f.Repo] = true
+		}
 	}
-	report.Totals = migrationTotals{Files: len(report.Files), Repos: len(repos), Shared: shared, Failed: len(report.Failures), Unreadable: unreadable}
+	report.Totals.Repos, report.Totals.WrittenRepos = len(repos), len(writtenRepos)
+	report.Commits = commitCommands(report.Files)
 	report.Success = len(report.Failures) == 0
 	return report
+}
+
+// commitCommands is one git command line per repo with written files to
+// commit, in the order the files are listed.
+func commitCommands(files []migrationFile) []string {
+	var repos []string
+	paths := map[string][]string{}
+	for _, f := range files {
+		if !f.Written || !strings.HasPrefix(f.CommitStatus, "commit in ") {
+			continue
+		}
+		rel, err := filepath.Rel(f.Repo, f.Path)
+		if err != nil {
+			continue
+		}
+		if paths[f.Repo] == nil {
+			repos = append(repos, f.Repo)
+		}
+		paths[f.Repo] = append(paths[f.Repo], claudeconfig.QuotedPath(rel))
+	}
+	commands := []string{}
+	for _, repo := range repos {
+		quoted := claudeconfig.QuotedPath(repo)
+		commands = append(commands, fmt.Sprintf("git -C %s add %s && git -C %s commit -m %q",
+			quoted, strings.Join(paths[repo], " "), quoted, migrationCommitMessage))
+	}
+	return commands
 }
 
 // walkErrPath is the path a scan error names, when it names one.
@@ -253,6 +315,9 @@ func renderMigrationReport(w io.Writer, r migrationReport) {
 			rel = f.Path
 		}
 		fmt.Fprintf(w, "  %s (%s)\n", rel, f.CommitStatus)
+		if r.Applied && f.SharedWith != "" {
+			continue // skipped; its changes come from the main repo's commit
+		}
 		for _, c := range f.Changes {
 			fmt.Fprintf(w, "    %s\n", describeChange(c))
 		}
@@ -272,7 +337,16 @@ func renderMigrationReport(w io.Writer, r migrationReport) {
 		}
 		fmt.Fprintf(w, "Skipped %s that couldn't be read.\n", plural(r.Totals.Unreadable, "folder"))
 	}
-	if len(r.Files) > 0 {
+	switch {
+	case r.Applied && r.Totals.Written > 0:
+		fmt.Fprintf(w, "\nChanged %s in %s. Check each diff, then commit:\n",
+			plural(r.Totals.Written, "file"), plural(r.Totals.WrittenRepos, "repo"))
+		for _, c := range r.Commits {
+			fmt.Fprintf(w, "  %s\n", c)
+		}
+	case r.Applied && len(r.Files) > 0:
+		fmt.Fprintln(w, "\nNo files changed.")
+	case len(r.Files) > 0:
 		fmt.Fprintln(w)
 		shared := ""
 		switch r.Totals.Shared {

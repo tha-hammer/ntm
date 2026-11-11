@@ -1,0 +1,15 @@
+{
+	"hooks": {
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "~/.claude/hooks/check_critical_on_stop.sh"
+					}
+				]
+			}
+		]
+	},
+	"model": "opus"
+}

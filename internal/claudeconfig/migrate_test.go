@@ -1,6 +1,7 @@
 package claudeconfig
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -321,4 +322,261 @@ func TestFindHookSettings_HomeClaudeOnlyWhenNamed(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("home scan = %v", got)
 	}
+}
+
+// --- Sprint 2: apply ---
+
+// Loop 8, Behavior 8: every value's recorded span holds exactly that value,
+// so edits can splice the text and leave the rest byte for byte.
+func TestSettingsSpans_ExactProperty(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		indent := rapid.SampledFrom([]string{"", "  ", "    ", "\t"}).Draw(rt, "indent")
+		value := settingsObjectGen().Draw(rt, "settings")
+		var raw []byte
+		var err error
+		if indent == "" {
+			raw, err = json.Marshal(value)
+		} else {
+			raw, err = json.MarshalIndent(value, "", indent)
+		}
+		if err != nil {
+			rt.Fatal(err)
+		}
+		root, err := parseSettingsSpans(raw)
+		if err != nil {
+			rt.Fatalf("parse: %v\n%s", err, raw)
+		}
+		var check func(n *spanNode)
+		check = func(n *spanNode) {
+			var got, want any
+			if err := json.Unmarshal(raw[n.start:n.end], &got); err != nil {
+				rt.Fatalf("span %d:%d isn't one value: %q", n.start, n.end, raw[n.start:n.end])
+			}
+			_ = json.Unmarshal(raw[n.start:n.end], &want)
+			for i, child := range n.children {
+				check(child)
+				if n.kind == '{' {
+					var key string
+					if err := json.Unmarshal(raw[n.keyStarts[i]:n.keyEnds[i]], &key); err != nil || key != n.keys[i] {
+						rt.Fatalf("key span = %q, want %q", raw[n.keyStarts[i]:n.keyEnds[i]], n.keys[i])
+					}
+				}
+			}
+			if !reflect.DeepEqual(got, want) {
+				rt.Fatal("unreachable")
+			}
+		}
+		check(root)
+		if root.start != 0 || strings.TrimSpace(string(raw[root.end:])) != "" {
+			rt.Fatalf("root span %d:%d of %d bytes", root.start, root.end, len(raw))
+		}
+	})
+}
+
+func applyFixture(t *testing.T, name string) (raw, out []byte) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "migrate", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := decodeSettings(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanHookMigration(settings, "~/.local/bin/ntm agent-hook stop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = ApplyHookMigration(raw, plan)
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return raw, out
+}
+
+// Loop 8, Behavior 9: applying a plan changes only the old entries, by
+// splicing their text.
+func TestApplyHookMigration(t *testing.T) {
+	const newCmd = "~/.local/bin/ntm agent-hook stop"
+
+	raw, out := applyFixture(t, "agentmail.json")
+	want := strings.Replace(string(raw), `"/home/user/Dev/mcp_agent_mail/.claude/hooks/check_critical_on_stop.sh"`, `"`+newCmd+`"`, 1)
+	closeGroup := `,
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/user/Dev/mcp_agent_mail/.claude/hooks/check_mail_on_close.sh",
+            "timeout": 5
+          }
+        ]
+      }`
+	if !strings.Contains(want, closeGroup) {
+		t.Fatal("fixture changed; update the expected text")
+	}
+	want = strings.Replace(want, closeGroup, "", 1)
+	if string(out) != want {
+		t.Fatalf("agentmail.json migrated to:\n%s\nwant:\n%s", out, want)
+	}
+
+	_, out = applyFixture(t, "project_dir.json")
+	settings, _ := decodeSettings(out)
+	stop := settings["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)
+	post := settings["hooks"].(map[string]any)["PostToolUse"].([]any)[0].(map[string]any)["hooks"].([]any)
+	if len(stop) != 2 || stop[0].(map[string]any)["command"] != "bd sync" || stop[1].(map[string]any)["command"] != newCmd ||
+		len(post) != 1 || post[0].(map[string]any)["command"] != "echo closed" {
+		t.Fatalf("project_dir.json migrated to:\n%s", out)
+	}
+
+	_, out = applyFixture(t, "ntm_and_old.json")
+	settings, _ = decodeSettings(out)
+	groups := settings["hooks"].(map[string]any)["Stop"].([]any)
+	if len(groups) != 1 || groups[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)["command"] != newCmd {
+		t.Fatalf("ntm_and_old.json migrated to:\n%s", out)
+	}
+
+	raw, out = applyFixture(t, "tabs_no_timeout.json")
+	if !strings.Contains(string(out), "\t\t\t\t\t\t\"command\": \""+newCmd+"\",\n\t\t\t\t\t\t\"timeout\": 5\n") || !strings.HasSuffix(string(out), "\t\"model\": \"opus\"\n}\n") {
+		t.Fatalf("tabs_no_timeout.json migrated to:\n%s", out)
+	}
+	_ = raw
+
+	raw, out = applyFixture(t, "close_only.json")
+	wantClose := strings.Replace(string(raw), `    "hooks": {
+        "PostToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    { "type": "command", "command": "~/.claude/hooks/check_mail_on_close.sh", "timeout": 5 }
+                ]
+            }
+        ]
+    },
+`, `    "hooks": {},
+`, 1)
+	if string(out) != wantClose {
+		t.Fatalf("close_only.json migrated to:\n%s\nwant:\n%s", out, wantClose)
+	}
+
+	for _, unchanged := range []string{"plain.json", "migrated.json"} {
+		if raw, out := applyFixture(t, unchanged); string(raw) != string(out) {
+			t.Fatalf("%s changed:\n%s", unchanged, out)
+		}
+	}
+}
+
+// otherEntries lists the commands that aren't old scripts or ntm entries, by
+// event, in order.
+func otherEntries(t hookTB, settings map[string]any) []string {
+	t.Helper()
+	entries, _, err := settingsHookEntries(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if ClassifyOldHookCommand(e.command) == OldHookNone && !IsStopHookCommand(e.command) {
+			out = append(out, e.event+": "+e.command)
+		}
+	}
+	return out
+}
+
+// oldScriptHookGen draws a command hook that is sometimes an old script.
+func oldScriptHookGen() *rapid.Generator[any] {
+	return rapid.Custom(func(rt *rapid.T) any {
+		command := rapid.SampledFrom([]string{
+			"~/.claude/hooks/check_critical_on_stop.sh", "/home/u/.claude/hooks/check_mail_on_close.sh",
+			"~/.claude/hooks/ensure_window_id.sh", "/old/ntm agent-hook stop", "echo hi", "bd sync",
+		}).Draw(rt, "command")
+		hook := map[string]any{"type": "command", "command": command}
+		if rapid.Bool().Draw(rt, "timeout") {
+			hook["timeout"] = float64(rapid.IntRange(1, 9).Draw(rt, "seconds"))
+		}
+		return hook
+	})
+}
+
+func hooksSettingsGen() *rapid.Generator[map[string]any] {
+	return rapid.Custom(func(rt *rapid.T) map[string]any {
+		hooks := map[string]any{}
+		for _, event := range []string{"SessionStart", "PostToolUse", "Stop"} {
+			if !rapid.Bool().Draw(rt, "has-"+event) {
+				continue
+			}
+			groups := []any{}
+			for g, n := 0, rapid.IntRange(1, 3).Draw(rt, "groups"); g < n; g++ {
+				list := []any{}
+				for h, m := 0, rapid.IntRange(1, 3).Draw(rt, "hooks"); h < m; h++ {
+					list = append(list, oldScriptHookGen().Draw(rt, "hook"))
+				}
+				groups = append(groups, map[string]any{"matcher": "", "hooks": list})
+			}
+			hooks[event] = groups
+		}
+		settings := map[string]any{"hooks": hooks}
+		if rapid.Bool().Draw(rt, "model") {
+			settings["model"] = "opus"
+		}
+		return settings
+	})
+}
+
+// Loop 8, Behavior 9 properties: applying is idempotent, every other entry
+// stays in order, and a file with old scripts ends with one ntm Stop entry.
+func TestApplyHookMigration_Properties(t *testing.T) {
+	const newCmd = "~/.local/bin/ntm agent-hook stop"
+	rapid.Check(t, func(rt *rapid.T) {
+		settings := hooksSettingsGen().Draw(rt, "settings")
+		indent := rapid.SampledFrom([]string{"  ", "    ", "\t"}).Draw(rt, "indent")
+		raw, _ := json.MarshalIndent(settings, "", indent)
+		plan, err := PlanHookMigration(settings, newCmd)
+		if err != nil {
+			rt.Fatal(err)
+		}
+		once, err := ApplyHookMigration(raw, plan)
+		if err != nil {
+			rt.Fatalf("apply: %v\n%s", err, raw)
+		}
+		after, err := decodeSettings(once)
+		if err != nil {
+			rt.Fatalf("result isn't JSON: %v\n%s", err, once)
+		}
+		again, err := PlanHookMigration(after, newCmd)
+		if err != nil || again.HasChanges() {
+			rt.Fatalf("second plan = %+v, %v\n%s", again, err, once)
+		}
+		twice, _ := ApplyHookMigration(once, again)
+		if string(twice) != string(once) {
+			rt.Fatalf("not idempotent:\n%s\n%s", once, twice)
+		}
+		if !reflect.DeepEqual(otherEntries(rt, after), otherEntries(rt, settings)) {
+			rt.Fatalf("other entries changed:\n%v\n%v", otherEntries(rt, settings), otherEntries(rt, after))
+		}
+		if plan.HasChanges() {
+			// The old installer registered the stop script under Stop; a
+			// file that had it there ends with exactly one ntm Stop entry.
+			hadStop := false
+			before, _, _ := settingsHookEntries(settings)
+			for _, e := range before {
+				if e.event == "Stop" && ClassifyOldHookCommand(e.command) == OldHookStop {
+					hadStop = true
+				}
+			}
+			ntm := 0
+			entries, _, _ := settingsHookEntries(after)
+			for _, e := range entries {
+				if e.event == "Stop" && IsStopHookCommand(e.command) {
+					ntm++
+				}
+				if kind := ClassifyOldHookCommand(e.command); kind == OldHookStop || kind == OldHookClose {
+					rt.Fatalf("old script left: %s", e.command)
+				}
+			}
+			if hadStop && ntm != 1 {
+				rt.Fatalf("ntm Stop entries = %d:\n%s", ntm, once)
+			}
+		}
+	})
 }

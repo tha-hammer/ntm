@@ -756,6 +756,68 @@ Write failures go into the same failure list as Behavior 7.
 
 **Automated:** `go test -short -run TestClosure_MigrateApplyFailures ./internal/cli/` passes.
 
+### Build record (2026-11-11)
+
+Base commit `477b61f9`. Behaviors 8 to 11 are built.
+
+**Design change (Behaviors 8 and 9):** the plan said to decode each file into ordered nodes and write it back in `MarshalIndent` layout. Instead, migration edits the file's text. `parseSettingsSpans` records the byte span of every JSON value (and each object key), using `json.Decoder.Token` and `InputOffset`. `ApplyHookMigration` then splices only the changed spans. Every other byte stays as written: tabs, inline objects, odd spacing and `<&>` in strings. So there's no "reformatted" case, and the round-trip property became "every recorded span decodes to the same value".
+
+**Code:**
+- `internal/claudeconfig/migrate.go`:
+  - Spans: `spanNode`, `parseSettingsSpans`, `skipSeparators`.
+  - Applying: `ApplyHookMigration`, `replaceEntryEdits` (sets the command and timeout 5; inserts `"timeout": 5` on its own line, at the command's indent, when it's missing), `deletionEdits` (removes a run of list items with the right comma), `spliceEdits`. An emptied group, then an emptied event, is removed; an emptied hooks object becomes `{}`.
+  - Writing: `WriteMigratedSettings` applies the plan, checks that planning the result finds nothing left, resolves symlinks, and writes with `writeFileAtomic` in the file's own mode.
+  - `QuotedPath`, now shared by `CommittedStopHookCommand` and the commit lines.
+- `internal/cli/agent_hook_migrate.go`:
+  - `--apply`.
+  - A worktree's shared copy is skipped, with "skipped: migrate and commit <main repo>, then update this worktree" (your 4c answer).
+  - Write failures join the failure list.
+  - New output: "Changed N files in M repos. Check each diff, then commit:", then one `git -C <repo> add … && git -C <repo> commit -m "Move Agent Mail hooks to ntm agent-hook stop"` line per repo. Local files and files outside a repo get no commit line.
+  - "No files changed." when only skipped copies are left.
+  - JSON gains `written`, `commit_commands`, `totals.written` and `totals.written_repos`.
+
+**Tests:**
+- Unit: `TestSettingsSpans_ExactProperty`, `TestApplyHookMigration` (all 7 fixtures), `TestApplyHookMigration_Properties` (idempotent, other entries kept in order, no old scripts left, exactly one ntm Stop entry when the file had the old stop script under Stop).
+- New fixtures: `tabs_no_timeout.json` and `close_only.json`.
+- Closure:
+  - `TestClosure_MigrateApply` checks numstat `1 11` for agentmail, the scripts kept, HEAD unchanged, mode 0640 kept, the worktree copy untouched, a symlink written through, and the second run's inode and timestamp. It then follows the skip note (commit, then fast-forward the worktree) and gets "Nothing to migrate.".
+  - `TestClosure_MigrateApplyFailures` covers a 0500 `.claude` folder between two good repos (no temp file left behind) and a binary outside home (nothing written). Both exit 1.
+
+**Red-at-seam, each observed and then reverted:**
+- The write skipped: `TestClosure_MigrateApply` was red with "migrated file lacks `"command": "~/.local/bin/ntm-test agent-hook stop",`".
+- A failed write not recorded: `TestClosure_MigrateApplyFailures` was red with "a failed write still exited 0".
+
+**Real run on this VPS** (scratch home folder, a repo holding `agentmail.json`, plus its worktree): `git diff` showed only the Bash group removed and the Stop command line changed. The second `--apply` listed only the worktree copy as skipped, printed "No files changed.", and exited 0.
+
+**Differences from the plan:**
+- The round trip is by spans, not re-encoding (see above).
+- The "one ntm entry" property applies only to files that had the stop script under Stop. That's where the old installer put it, and where the planner replaces it.
+- The second run says "Nothing to migrate." only once the worktree copies are updated. Until then it lists them as skipped.
+
+**Verification:**
+- `go build` ok, and vet ok.
+- gofmt lists only the 3 files that were already listed.
+- `-race` ok for `claudeconfig` and `git`.
+- The migrate closure tests passed 5 runs in a row.
+- `go test -short -timeout 40m ./...` failed only on the bd-5zbcm list.
+- Tamper check (base `477b61f9`) clean.
+- golangci-lint, goimports and ubs weren't run (not installed).
+
+**Process notes:**
+- The new closure tests were appended to `agent_hook_migrate_test.go` with a shell heredoc, not the Edit tool. The text is the same as an Edit would have made.
+- During verification, `rm -f ntm` removed the repo-root `ntm` binary, the git-ignored output of `go build ./cmd/ntm`. It was rebuilt straight away. No source was affected.
+
+**Human test: PASSED on rocketman (2026-11-11), steps 1 to 8.** You tested the uncommitted work applied onto 477b61f9.
+- The first `--apply` changed 5 files in 5 repos, skipped the `CodeWriter9.0-conformance` worktree, and printed 5 commit lines.
+- The `mcp_agent_mail` diff was 1 line added and 11 deleted. The Stop command became `~/.local/bin/ntm-loop8 agent-hook stop`, and the `check_mail_on_close.sh` group was removed. The `file_reservations` hooks and `ensure_window_id.sh` were unchanged, and the JSON was still valid.
+- The hooks folder was unchanged. The second `--apply` printed only the skipped worktree and "No files changed.", with the diffstat unchanged.
+- The new command runs under `sh -c` and exits 0.
+- The Sprint 1 fixes held ("Skipped 2 folders that couldn't be read.").
+- You restored all 6 settings files from backup afterwards.
+- Evidence: `/home/debian/Dev/ntm-test-evidence/loop8-hook-migrate-sprint2-local-2026-11-10/`.
+
+**Note fixed before the commit:** a skipped worktree copy still printed its keep, remove and replace lines, which read as if it would change. With `--apply`, a skipped copy now shows only its "skipped: …" line. The preview still lists the changes. `TestClosure_MigrateApply` checks this; it went red without the fix.
+
 ### Human test script
 
 1. Run `ntm-loop8 agent-hook migrate ~/Dev --apply`.
@@ -764,7 +826,7 @@ Write failures go into the same failure list as Behavior 7.
 4. Run `ls ~/Dev/mcp_agent_mail/.claude/hooks/`.
 5. Pass: the script files are all still there.
 6. Run `ntm-loop8 agent-hook migrate ~/Dev --apply` again.
-7. Pass: it reports no change, and `git diff --stat` for that file is the same as before.
+7. Pass: `mcp_agent_mail` isn't listed again. Worktree copies, if any, show as "skipped", and the run ends with "No files changed.". `git diff --stat` for that file is the same as before.
 8. Run `git -C ~/Dev/mcp_agent_mail checkout -- .claude/settings.json` only if you don't want to keep this test change. Otherwise, commit it in that repo yourself.
 
 ## Sprint 3: Guide, tried on your local machine
