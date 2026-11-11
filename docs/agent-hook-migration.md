@@ -24,12 +24,12 @@ Sessions that are already running use whatever is at `~/.local/bin/ntm`, so inst
 ```bash
 cp ~/.local/bin/ntm ~/.local/bin/ntm.before-migration
 git pull
-go build -o ~/.local/bin/ntm ./cmd/ntm
+make install-user
 ```
 
-Install it at the same place (`~/.local/bin/ntm`) on every machine that uses these repos.
+`make install-user` builds ntm with its version and commit stamped in, and installs it at `~/.local/bin/ntm`. (A plain `go build -o ~/.local/bin/ntm ./cmd/ntm` works too, but `ntm version` then says "dev" and commit "none".) Install it at the same place on every machine that uses these repos.
 
-You should see: `ntm agent-hook migrate --help` prints the migrate help.
+You should see: `ntm version` names the commit you pulled, and `ntm agent-hook migrate --help` prints the migrate help.
 
 ## Preview
 
@@ -95,7 +95,7 @@ ntm agent-hook migrate --apply
       with ~/.local/bin/ntm agent-hook stop
 
 Changed 1 file in 1 repo. Check each diff, then commit:
-  git -C /home/you/Dev/zero-knowledge-proofs add .claude/settings.json && git -C /home/you/Dev/zero-knowledge-proofs commit -m "Move Agent Mail hooks to ntm agent-hook stop"
+  git -C /home/you/Dev/zero-knowledge-proofs commit -m "Move Agent Mail hooks to ntm agent-hook stop" -- .claude/settings.json
 ```
 
 Run the same command again and you should see that nothing more is written. Worktree copies still show as skipped until you update them (see "Commit each repo").
@@ -118,10 +118,12 @@ Nothing else in the file changes.
 The apply report ends with one command per repo. Paste each one after you've checked that repo's diff:
 
 ```bash
-git -C ~/Dev/zero-knowledge-proofs add .claude/settings.json && git -C ~/Dev/zero-knowledge-proofs commit -m "Move Agent Mail hooks to ntm agent-hook stop"
+git -C ~/Dev/zero-knowledge-proofs commit -m "Move Agent Mail hooks to ntm agent-hook stop" -- .claude/settings.json
 ```
 
-For a repo with linked worktrees: commit in the main repo first. Then bring that commit into each worktree's branch, for example with `git merge` or `git rebase` there. After that, `ntm agent-hook migrate` no longer lists the worktree.
+It commits only the named files, with no `git add`, so it works even when the repo's `.gitignore` covers `.claude` (a tracked file stays tracked). A settings file that git doesn't track gets no command: it says "nothing to commit (not tracked by git)".
+
+For a repo with linked worktrees, the report lists every one of them under "After committing, bring the commit into these worktrees:", wherever they live, including ones outside the folders you scanned. Commit in the main repo first. Then bring that commit into each listed worktree's branch, for example with `git merge` or `git rebase` there. After that, `ntm agent-hook migrate` no longer lists the worktree. Run it with no folder named to check both `~/Dev` and `~/ntm_Dev`.
 
 ## Test one repo
 

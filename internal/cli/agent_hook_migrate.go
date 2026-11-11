@@ -128,13 +128,14 @@ type migrationTotals struct {
 // migrationReport is what ntm agent-hook migrate found and did. Commits are
 // the git commands that commit each written repo, which ntm never runs.
 type migrationReport struct {
-	Success  bool               `json:"success"`
-	Applied  bool               `json:"applied"`
-	Command  string             `json:"command,omitempty"`
-	Files    []migrationFile    `json:"files"`
-	Failures []migrationFailure `json:"failures"`
-	Commits  []string           `json:"commit_commands"`
-	Totals   migrationTotals    `json:"totals"`
+	Success   bool                `json:"success"`
+	Applied   bool                `json:"applied"`
+	Command   string              `json:"command,omitempty"`
+	Files     []migrationFile     `json:"files"`
+	Failures  []migrationFailure  `json:"failures"`
+	Commits   []string            `json:"commit_commands"`
+	Worktrees []migrationWorktree `json:"worktrees_to_update"`
+	Totals    migrationTotals     `json:"totals"`
 }
 
 // buildMigrationReport scans the roots and plans each settings file that
@@ -227,6 +228,7 @@ func buildMigrationReport(roots []string, home string, ntmPath func() (string, e
 	}
 	report.Totals.Repos, report.Totals.WrittenRepos = len(repos), len(writtenRepos)
 	report.Commits = commitCommands(report.Files)
+	report.Worktrees = worktreesToUpdate(report.Files)
 	report.Success = len(report.Failures) == 0
 	return report
 }
@@ -251,11 +253,41 @@ func commitCommands(files []migrationFile) []string {
 	}
 	commands := []string{}
 	for _, repo := range repos {
-		quoted := claudeconfig.QuotedPath(repo)
-		commands = append(commands, fmt.Sprintf("git -C %s add %s && git -C %s commit -m %q",
-			quoted, strings.Join(paths[repo], " "), quoted, migrationCommitMessage))
+		// commit -- <files> commits tracked files without an add, which git
+		// refuses when .gitignore covers .claude.
+		commands = append(commands, fmt.Sprintf("git -C %s commit -m %q -- %s",
+			claudeconfig.QuotedPath(repo), migrationCommitMessage, strings.Join(paths[repo], " ")))
 	}
 	return commands
+}
+
+// migrationWorktree is a linked worktree of a repo with a commit to make. It
+// checks out its own copy of the committed file, so it needs that commit too.
+type migrationWorktree struct {
+	Repo   string `json:"repo"`
+	Path   string `json:"path"`
+	Branch string `json:"branch,omitempty"`
+}
+
+// worktreesToUpdate lists the linked worktrees, wherever they live, of each
+// repo that has a commit to make.
+func worktreesToUpdate(files []migrationFile) []migrationWorktree {
+	worktrees := []migrationWorktree{}
+	seen := map[string]bool{}
+	for _, f := range files {
+		if !f.Written || !strings.HasPrefix(f.CommitStatus, "commit in ") || seen[f.Repo] {
+			continue
+		}
+		seen[f.Repo] = true
+		linked, err := git.LinkedWorktrees(f.Repo)
+		if err != nil {
+			continue
+		}
+		for _, wt := range linked {
+			worktrees = append(worktrees, migrationWorktree{Repo: f.Repo, Path: wt.Path, Branch: wt.Branch})
+		}
+	}
+	return worktrees
 }
 
 // walkErrPath is the path a scan error names, when it names one.
@@ -290,9 +322,11 @@ func commitStatus(path, repo string) (status, sharedWith string) {
 		return "nothing to commit (not in a git repo)", ""
 	case linked:
 		return "shared with " + main + "; commit once there", main
-	default:
-		return "commit in " + repo, ""
 	}
+	if tracked, err := git.IsTracked(filepath.Dir(path), filepath.Base(path)); err == nil && !tracked {
+		return "nothing to commit (not tracked by git)", ""
+	}
+	return "commit in " + repo, ""
 }
 
 // renderMigrationReport prints the report for a person: one block per repo,
@@ -343,6 +377,16 @@ func renderMigrationReport(w io.Writer, r migrationReport) {
 			plural(r.Totals.Written, "file"), plural(r.Totals.WrittenRepos, "repo"))
 		for _, c := range r.Commits {
 			fmt.Fprintf(w, "  %s\n", c)
+		}
+		if len(r.Worktrees) > 0 {
+			fmt.Fprintln(w, "After committing, bring the commit into these worktrees:")
+			for _, wt := range r.Worktrees {
+				branch := "detached"
+				if wt.Branch != "" {
+					branch = "branch " + wt.Branch
+				}
+				fmt.Fprintf(w, "  %s (%s)\n", wt.Path, branch)
+			}
 		}
 	case r.Applied && len(r.Files) > 0:
 		fmt.Fprintln(w, "\nNo files changed.")

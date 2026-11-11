@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -139,12 +140,17 @@ func TestCommitStatus(t *testing.T) {
 	gitForTest(t, repo, "worktree", "add", "-q", worktree)
 	plain := t.TempDir()
 	realRepo, _ := filepath.EvalSymlinks(repo)
+	// A settings file in a repo that git doesn't track isn't shared, so
+	// there's nothing to commit (rocketman migration finding 1).
+	untracked := gitInitForTest(t, filepath.Join(t.TempDir(), "untracked"))
+	writeFile(t, filepath.Join(untracked, ".claude", "settings.json"), "{}")
 
 	for path, want := range map[string]string{
 		filepath.Join(repo, ".claude", "settings.json"):       "commit in " + repo,
 		filepath.Join(repo, ".claude", "settings.local.json"): "nothing to commit (local file)",
 		filepath.Join(worktree, ".claude", "settings.json"):   "shared with " + realRepo + "; commit once there",
 		filepath.Join(plain, ".claude", "settings.json"):      "nothing to commit (not in a git repo)",
+		filepath.Join(untracked, ".claude", "settings.json"):  "nothing to commit (not tracked by git)",
 	} {
 		repoOf := migrationRepo(path)
 		got, sharedWith := commitStatus(path, repoOf)
@@ -364,7 +370,12 @@ func TestClosure_MigrateApply(t *testing.T) {
 		".claude/settings.json (skipped: migrate and commit " + tree.agentmail + ", then update this worktree)",
 		".claude/settings.local.json (nothing to commit (local file))",
 		"Changed 2 files in 2 repos.",
-		"git -C " + tree.agentmail + " add .claude/settings.json && git -C " + tree.agentmail + ` commit -m "Move Agent Mail hooks to ntm agent-hook stop"`,
+		// commit -- <files> needs no add, so it works when .gitignore covers
+		// .claude (rocketman migration finding 1).
+		"git -C " + tree.agentmail + ` commit -m "Move Agent Mail hooks to ntm agent-hook stop" -- .claude/settings.json`,
+		// Every linked worktree of a committed repo, wherever it lives
+		// (finding 3).
+		"After committing, bring the commit into these worktrees:\n  " + tree.worktree + " (branch agentmail-wt)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("--apply output lacks %q:\n%s", want, out)
@@ -622,5 +633,53 @@ func TestAgentHookMigrationGuide_ExampleOutput(t *testing.T) {
 		if want := guideBlock(t, guide, example.heading); got != want {
 			t.Fatalf("the guide's %q block isn't the real report. Update the guide to:\n%s", example.heading, got)
 		}
+	}
+}
+
+// Rocketman migration findings 1 and 3: in a repo whose .gitignore covers
+// .claude (as mcp_agent_mail's does) the printed commit line works as
+// printed, and a linked worktree outside the scanned folders is named, so
+// following the report leaves nothing to migrate anywhere.
+func TestClosure_MigrateCommitLineAndOutsideWorktree(t *testing.T) {
+	env := newClosureEnv(t)
+	env.useBinaryUnderHome(t, "ntm-test")
+	home := env.vars["HOME"]
+	repo := gitInitForTest(t, filepath.Join(home, "Dev", "ignored"))
+	writeFile(t, filepath.Join(repo, ".gitignore"), ".claude\n")
+	migrateFixture(t, "agentmail.json", filepath.Join(repo, ".claude", "settings.json"))
+	gitForTest(t, repo, "add", ".gitignore")
+	gitForTest(t, repo, "add", "-f", ".claude/settings.json")
+	gitForTest(t, repo, "commit", "-q", "-m", "hooks")
+	outside := filepath.Join(home, "ntm_Dev", "ignored-wt")
+	gitForTest(t, repo, "worktree", "add", "-q", outside)
+
+	out := env.run(t, "execute", "agent-hook", "migrate", "--apply", filepath.Join(home, "Dev"))
+	if !strings.Contains(out, "After committing, bring the commit into these worktrees:\n  "+outside+" (branch ignored-wt)") {
+		t.Fatalf("the worktree outside the scan isn't named:\n%s", out)
+	}
+	var commitLine string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "git -C ") {
+			commitLine = strings.TrimSpace(line)
+		}
+	}
+	if commitLine == "" {
+		t.Fatalf("no commit line:\n%s", out)
+	}
+	cmd := exec.Command("sh", "-c", commitLine)
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=ntm test", "GIT_AUTHOR_EMAIL=ntm-test@example.invalid", "GIT_COMMITTER_NAME=ntm test", "GIT_COMMITTER_EMAIL=ntm-test@example.invalid")
+	if commitOut, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the printed commit line failed: %v\n%s\n%s", err, commitLine, commitOut)
+	}
+	if subject := strings.TrimSpace(gitForTest(t, repo, "log", "-1", "--format=%s")); subject != "Move Agent Mail hooks to ntm agent-hook stop" {
+		t.Fatalf("last commit = %q", subject)
+	}
+	if status := gitForTest(t, repo, "status", "--porcelain"); status != "" {
+		t.Fatalf("the repo isn't clean after the commit line:\n%s", status)
+	}
+
+	gitForTest(t, outside, "merge", "-q", "--ff-only", strings.TrimSpace(gitForTest(t, repo, "rev-parse", "HEAD")))
+	if done := env.run(t, "execute", "agent-hook", "migrate"); strings.TrimSpace(done) != "Nothing to migrate." {
+		t.Fatalf("after following the report:\n%s", done)
 	}
 }

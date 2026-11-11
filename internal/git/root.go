@@ -49,6 +49,46 @@ func MainWorktree(dir string) (main string, linked bool, err error) {
 	return filepath.Dir(commonDir), gitDir != commonDir, nil
 }
 
+// Worktree is one linked worktree of a repo. Branch is empty when it's
+// detached.
+type Worktree struct {
+	Path   string
+	Branch string
+}
+
+// LinkedWorktrees lists the linked worktrees of repo, wherever they live,
+// leaving out the main checkout. A folder that isn't in a git repo has none.
+func LinkedWorktrees(repo string) ([]Worktree, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return nil, nil // not a git repo
+		}
+		return nil, fmt.Errorf("list the worktrees of %s: %w", repo, err)
+	}
+	var worktrees []Worktree
+	for i, block := range strings.Split(strings.TrimSpace(string(output)), "\n\n") {
+		if i == 0 {
+			continue // git lists the main checkout first
+		}
+		var wt Worktree
+		for _, line := range strings.Split(block, "\n") {
+			if path, ok := strings.CutPrefix(line, "worktree "); ok {
+				wt.Path = path
+			} else if branch, ok := strings.CutPrefix(line, "branch "); ok {
+				wt.Branch = strings.TrimPrefix(branch, "refs/heads/")
+			}
+		}
+		if wt.Path != "" {
+			worktrees = append(worktrees, wt)
+		}
+	}
+	return worktrees, nil
+}
+
 // IsTracked reports whether git tracks path in dir's repo: committed or
 // staged. path is relative to dir. A folder that isn't in a git repo reports
 // false with no error.

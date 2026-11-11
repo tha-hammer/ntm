@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -242,5 +243,31 @@ func TestMainWorktree(t *testing.T) {
 	}
 	if main, linked, err := MainWorktree(t.TempDir()); err != nil || linked || main != "" {
 		t.Fatalf("MainWorktree(plain) = %q, %v, %v", main, linked, err)
+	}
+}
+
+// Loop 8 follow-up (rocketman migration finding 3): a repo's linked
+// worktrees are listed wherever they live, without the main checkout.
+func TestLinkedWorktrees(t *testing.T) {
+	repo := t.TempDir()
+	gitOutput(t, repo, "init", "-q")
+	gitOutput(t, repo, "-c", "user.name=ntm test", "-c", "user.email=ntm-test@example.invalid", "commit", "-q", "--allow-empty", "-m", "first")
+	if got, err := LinkedWorktrees(repo); err != nil || len(got) != 0 {
+		t.Fatalf("LinkedWorktrees(no worktrees) = %+v, %v", got, err)
+	}
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere wt")
+	gitOutput(t, repo, "worktree", "add", "-q", "-b", "feature", elsewhere)
+	detached := filepath.Join(t.TempDir(), "detached")
+	gitOutput(t, repo, "worktree", "add", "-q", "--detach", detached)
+	realElsewhere, _ := filepath.EvalSymlinks(elsewhere)
+	realDetached, _ := filepath.EvalSymlinks(detached)
+
+	got, err := LinkedWorktrees(repo)
+	want := []Worktree{{Path: realElsewhere, Branch: "feature"}, {Path: realDetached}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("LinkedWorktrees = %+v, %v; want %+v", got, err, want)
+	}
+	if got, err := LinkedWorktrees(t.TempDir()); err != nil || len(got) != 0 {
+		t.Fatalf("LinkedWorktrees(plain) = %+v, %v", got, err)
 	}
 }

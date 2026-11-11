@@ -1062,6 +1062,23 @@ Run this on your local machine.
 8. Pass: when the turn ends, it's told about the message.
 9. Note any step where the guide was wrong or unclear, and bring those back to be fixed.
 
+## Follow-up: the real migration on rocketman (2026-11-11)
+
+You migrated rocketman with b7d203d8 installed at `~/.local/bin/ntm`, and committed in 5 repos (not pushed): CodeWriter7 `f0d45c4`, CodeWriter9.0 `568a5bf`, mcp_agent_mail `23d90f5`, silmari-writer `976329c` and zero-knowledge-proofs `c2e708b`. Every diff was as expected, the JSON stayed valid, and the hook exits 0 from the zero-knowledge-proofs root. The re-run still lists the CodeWriter9.0-conformance worktree (branch `dev/conformance-gate`) until that branch picks up `568a5bf`. Notes: `/home/debian/Dev/ntm-test-evidence/migration-rocketman-2026-11-11/`.
+
+**Findings, and what changed:**
+1. **The commit line failed in mcp_agent_mail.** Its `.gitignore` covers `.claude`, so `git add .claude/settings.json` stops with the ignored-path hint, even though the file is tracked.
+   - The line is now `git -C <repo> commit -m "Move Agent Mail hooks to ntm agent-hook stop" -- <files>`, which needs no add.
+   - A settings file in a repo that git doesn't track now says "nothing to commit (not tracked by git)" and gets no line, because `commit -- <file>` only works for tracked files. That's `commitStatus` with `git.IsTracked`.
+   - `TestClosure_MigrateCommitLineAndOutsideWorktree` runs the printed line in a repo whose `.gitignore` covers `.claude`, and checks the commit lands and the repo is clean. `TestCommitStatus` gains the untracked case. `TestClosure_MigrateApply` expects the new line.
+2. **The guide's build said "version dev / commit none".** The guide now installs with `make install-user` (the Makefile's version flags, into `~/.local/bin`), and says `ntm version` should name the pulled commit. Checked: `make build` gives `commit: b7d203d8…`.
+3. **Worktrees outside the scanned folders weren't covered.** Two worktrees in `~/ntm_Dev` share zero-knowledge-proofs' file, but `migrate ~/Dev` doesn't scan there.
+   - After the commit lines, `--apply` now lists every linked worktree of each repo with a commit to make, wherever it lives: "After committing, bring the commit into these worktrees:", with each path and branch (`git.LinkedWorktrees`, new, from `git worktree list --porcelain`). JSON: `worktrees_to_update`.
+   - The guide says so, and suggests running with no folder named, to check both `~/Dev` and `~/ntm_Dev`.
+   - Tests: `TestLinkedWorktrees`, plus the closure test above, which follows the report (commit, then fast-forward the outside worktree) and ends with "Nothing to migrate.".
+
+**Red:** each new or changed test failed first: the untracked case ("commit in …"), the new commit line and worktree list (the old `add … &&` line was printed), and the new closure test. The tamper check (base b7d203d8) is clean.
+
 ## Sprint verification (every sprint)
 
 ```bash
